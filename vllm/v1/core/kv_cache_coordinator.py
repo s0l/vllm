@@ -555,6 +555,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # can be a multiple of hash_block_size.
         self.hash_block_size = hash_block_size
         self.dcp_world_size = dcp_world_size
+        self.pcp_world_size = pcp_world_size
         group_block_sizes = [
             manager.block_size for manager in self.single_type_managers
         ]
@@ -758,11 +759,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     kv_cache_spec=spec,
                     drop_eagle_block=drop_eagle_block,
                     alignment_tokens=self._cache_hit_alignment_tokens,
-                    dcp_world_size=(
-                        self.dcp_world_size
-                        if isinstance(spec, FullAttentionSpec)
-                        else 1
-                    ),
+                    dcp_world_size=self.dcp_world_size,
+                    pcp_world_size=self.pcp_world_size,
                 )
                 if drop_eagle_block:
                     eagle_verified.add(idx)
@@ -825,6 +823,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 kv_cache_spec=spec,
                 drop_eagle_block=use_eagle,
                 alignment_tokens=self._cache_hit_alignment_tokens,
+                dcp_world_size=self.dcp_world_size,
+                pcp_world_size=self.pcp_world_size,
             )
             for gid, blks in zip(group_ids, blocks):
                 hit_blocks[gid] = blks
