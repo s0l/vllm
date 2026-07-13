@@ -25,6 +25,7 @@
 """Inference-only Qwen3.5 Series compatible with HuggingFace weights."""
 
 from collections.abc import Iterable
+import os
 
 import torch
 from torch import nn
@@ -34,6 +35,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
+    get_tensor_model_parallel_rank,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
@@ -268,7 +270,25 @@ class Qwen3_5Model(Qwen3NextModel):
                 orig_to_new_substr={"mlp.shared_expert.": f"mlp.experts.{num_routed}."}
             )
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=mapper)
+        loaded = loader.load_weights(weights, mapper=mapper)
+        if os.getenv("VLLM_EXPERIMENTAL_DUAL_VIEW_INSPECT", "0") == "1":
+            layer = self.layers[0].mlp
+            for linear_name in ("gate_up_proj", "down_proj"):
+                linear = getattr(layer, linear_name)
+                logger.warning(
+                    "DUAL_VIEW_INSPECT rank=%s linear=%s attrs=%s",
+                    get_tensor_model_parallel_rank(),
+                    linear_name,
+                    {
+                        name: tuple(getattr(linear, name).shape)
+                        for name in (
+                            "weight", "weight_scale", "input_global_scale",
+                            "weight_global_scale", "logical_widths",
+                        )
+                        if isinstance(getattr(linear, name, None), torch.Tensor)
+                    },
+                )
+        return loaded
 
 
 class Qwen3_5ForCausalLMBase(

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 import math
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -24,6 +25,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.experimental.dual_view import (
+    choose_dual_view_prefill_phase,
+    dual_view_enabled,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsManager,
@@ -38,7 +43,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import BlockHashListWithBlockSize, KVCacheBlock
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -113,6 +118,11 @@ class Scheduler(SchedulerInterface):
             else self.scheduler_config.max_num_batched_tokens
         )
         self.max_model_len = vllm_config.model_config.max_model_len
+        self.dual_view_phase_separation = dual_view_enabled()
+        self.dual_view_prefill_cadence = max(
+            1,
+            int(os.getenv("VLLM_EXPERIMENTAL_DUAL_VIEW_PREFILL_CADENCE", "2")),
+        )
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
             and self.kv_events_config.enable_kv_cache_events
@@ -336,6 +346,32 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
+    @property
+    def _gdn_checkpoint_coordinator(self) -> HybridKVCacheCoordinator | None:
+        coordinator = self.kv_cache_manager.coordinator
+        if (
+            isinstance(coordinator, HybridKVCacheCoordinator)
+            and coordinator.gdn_checkpoint_keys is not None
+        ):
+            return coordinator
+        return None
+
+    def _gdn_boundary_key(self, request: Request, boundary: int) -> bytes | None:
+        if boundary <= 0 or boundary % self.block_size != 0:
+            return None
+        coordinator = self._gdn_checkpoint_coordinator
+        if coordinator is None:
+            return None
+        block_hashes = BlockHashListWithBlockSize(
+            request.block_hashes,
+            coordinator.hash_block_size,
+            self.block_size,
+        )
+        block_idx = boundary // self.block_size - 1
+        if block_idx >= len(block_hashes):
+            return None
+        return bytes(block_hashes[block_idx])
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -422,6 +458,7 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
+        gdn_checkpoint_restore: dict[str, bytes] = {}
         token_budget = self.max_num_scheduled_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
@@ -434,6 +471,23 @@ class Scheduler(SchedulerInterface):
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         # Whether the running batch contains any prefill requests.
         prefill_scheduled = False
+        # A dual-view weight layout changes both weight ownership and the
+        # collective group at the prefill/decode boundary. Mixed-phase forwards
+        # therefore cannot be represented by one CUDA graph. Keep this local to
+        # a scheduling step; requests remain in their normal queues.
+        dual_view_step_prefill: bool | None = None
+        if self.dual_view_phase_separation:
+            dual_view_step_prefill = choose_dual_view_prefill_phase(
+                current_step=self.current_step,
+                cadence=self.dual_view_prefill_cadence,
+                has_running_prefill=any(
+                    req.is_prefill_chunk for req in self.running
+                ),
+                has_running_decode=any(
+                    not req.is_prefill_chunk for req in self.running
+                ),
+                has_waiting_work=bool(self.waiting or self.skipped_waiting),
+            )
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -450,6 +504,14 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if (
+                self.dual_view_phase_separation
+                and dual_view_step_prefill is not None
+                and request.is_prefill_chunk != dual_view_step_prefill
+            ):
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -593,6 +655,8 @@ class Scheduler(SchedulerInterface):
             # Schedule the request.
             scheduled_running_reqs.append(request)
             prefill_scheduled |= request.is_prefill_chunk
+            if self.dual_view_phase_separation and dual_view_step_prefill is None:
+                dual_view_step_prefill = request.is_prefill_chunk
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
@@ -798,6 +862,18 @@ class Scheduler(SchedulerInterface):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
+                request_is_prefill = (
+                    num_computed_tokens < request.num_prompt_tokens
+                )
+                if (
+                    self.dual_view_phase_separation
+                    and dual_view_step_prefill is not None
+                    and request_is_prefill != dual_view_step_prefill
+                ):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
@@ -978,6 +1054,25 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self.running.append(request)
+                if num_new_local_computed_tokens > 0:
+                    checkpoint_key = self._gdn_boundary_key(
+                        request, num_computed_tokens
+                    )
+                    coordinator = self._gdn_checkpoint_coordinator
+                    if (
+                        checkpoint_key is not None
+                        and coordinator is not None
+                        and coordinator.has_gdn_checkpoint(
+                            checkpoint_key, touch=False
+                        )
+                    ):
+                        gdn_checkpoint_restore[request_id] = checkpoint_key
+                        logger.info(
+                            "Exact GDN prefix hit request=%s tokens=%d key=%s",
+                            request_id,
+                            num_computed_tokens,
+                            checkpoint_key.hex()[:16],
+                        )
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -995,6 +1090,8 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
+                if self.dual_view_phase_separation and dual_view_step_prefill is None:
+                    dual_view_step_prefill = request_is_prefill
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
@@ -1101,6 +1198,18 @@ class Scheduler(SchedulerInterface):
                 len(num_scheduled_tokens)
             ]
 
+        gdn_checkpoint_save: dict[str, bytes] = {}
+        if self._gdn_checkpoint_coordinator is not None:
+            for req_id, scheduled_tokens in num_scheduled_tokens.items():
+                request = self.requests[req_id]
+                boundary = request.num_computed_tokens + scheduled_tokens
+                # The hash covers only finalized input tokens. A sampled token
+                # is not part of this state until it is scheduled next step.
+                if boundary <= request.num_tokens:
+                    checkpoint_key = self._gdn_boundary_key(request, boundary)
+                    if checkpoint_key is not None:
+                        gdn_checkpoint_save[req_id] = checkpoint_key
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1118,6 +1227,8 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+            gdn_checkpoint_save=gdn_checkpoint_save or None,
+            gdn_checkpoint_restore=gdn_checkpoint_restore or None,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1522,6 +1633,13 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+
+        coordinator = self._gdn_checkpoint_coordinator
+        if coordinator is not None and scheduler_output.gdn_checkpoint_save:
+            # Reaching update_from_output proves the worker forward completed;
+            # only now may a boundary become eligible for future prefix hits.
+            for key in scheduler_output.gdn_checkpoint_save.values():
+                coordinator.register_gdn_checkpoint(key)
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.

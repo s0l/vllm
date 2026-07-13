@@ -120,6 +120,9 @@ if TYPE_CHECKING:
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
+    VLLM_EXP_GDN_ONE_SLOT: bool = False
+    VLLM_EXP_GDN_SEPARATE_POOL: bool = False
+    VLLM_EXP_GDN_POOL_BLOCKS: int = 25
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1141,6 +1144,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": lambda: bool(
         int(os.getenv("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", "1"))
+    ),
+    "VLLM_EXP_GDN_ONE_SLOT": lambda: bool(
+        int(os.getenv("VLLM_EXP_GDN_ONE_SLOT", "0"))
+    ),
+    "VLLM_EXP_GDN_SEPARATE_POOL": lambda: bool(
+        int(os.getenv("VLLM_EXP_GDN_SEPARATE_POOL", "0"))
+    ),
+    "VLLM_EXP_GDN_POOL_BLOCKS": lambda: int(
+        os.getenv("VLLM_EXP_GDN_POOL_BLOCKS", "25")
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (

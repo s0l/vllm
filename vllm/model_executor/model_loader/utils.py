@@ -3,6 +3,7 @@
 """Utilities for selecting and loading models."""
 
 import inspect
+import os
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -101,6 +102,14 @@ def initialize_model(
 def process_weights_after_loading(
     model: nn.Module, model_config: ModelConfig, target_device: torch.device
 ) -> None:
+    if os.getenv("VLLM_EXPERIMENTAL_DUAL_VIEW_MLP", "0") == "1":
+        from vllm.experimental.dual_view_nvfp4 import (
+            materialize_qwopus_dual_view_mlps,
+        )
+
+        converted = materialize_qwopus_dual_view_mlps(model)
+        logger.warning("Materialized %d raw experimental dual-view MLPs", converted)
+
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
@@ -139,6 +148,7 @@ def process_weights_after_loading(
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`
     if model_config.quantization == "torchao":
         set_torchao_reload_attrs(model, model_config)
+
 
 
 @contextmanager

@@ -49,6 +49,7 @@ from vllm.distributed.parallel_state import (
     is_global_first_rank,
     prepare_communication_buffer_for_model,
 )
+from vllm.experimental.dual_view import dual_view_enabled
 from vllm.forward_context import (
     BatchDescriptor,
     set_forward_context,
@@ -933,6 +934,7 @@ class GPUModelRunner(
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
+        self.gdn_checkpoint_store = mamba_utils.GDNPrefixCheckpointStore(limit=8)
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
         self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
         if self.cache_config.mamba_cache_mode == "all" and self.num_spec_tokens > 0:
@@ -2337,6 +2339,13 @@ class GPUModelRunner(
         # Zero out padded rows so stale data from condense() doesn't
         # misclassify padding as prefill in CUDA graph mode.
         is_prefilling[num_reqs:] = False
+        if dual_view_enabled():
+            actual_phases = is_prefilling[:num_reqs]
+            if actual_phases.any() and not actual_phases.all():
+                raise RuntimeError(
+                    "Dual-view runtime received a mixed prefill/decode batch; "
+                    "one CUDA graph cannot select two weight/collective layouts"
+                )
 
         if self.use_async_spec_decode:
             # GPU tensors are authoritative in async mode.
@@ -4239,6 +4248,18 @@ class GPUModelRunner(
                     deferred_state_corrections_fn()
                     deferred_state_corrections_fn = None
                 mamba_bufs = self._get_mamba_bufs()
+                self.gdn_checkpoint_store.zero_cold_from_output(
+                    scheduler_output,
+                    self.kv_cache_config,
+                    self.requests,
+                    self.compilation_config.static_forward_context,
+                )
+                self.gdn_checkpoint_store.restore_from_output(
+                    scheduler_output,
+                    self.kv_cache_config,
+                    self.requests,
+                    self.compilation_config.static_forward_context,
+                )
                 mamba_utils.preprocess_mamba(
                     scheduler_output,
                     self.kv_cache_config,
@@ -4501,6 +4522,13 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+
+        self.gdn_checkpoint_store.save_from_output(
+            scheduler_output,
+            self.kv_cache_config,
+            self.requests,
+            self.compilation_config.static_forward_context,
+        )
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output

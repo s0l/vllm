@@ -108,6 +108,36 @@ def test_schedule(enable_prefix_caching: bool, prompt_logprobs: int | None):
         assert scheduler.running[i] == request
 
 
+def test_dual_view_scheduler_separates_prefill_and_decode(monkeypatch):
+    monkeypatch.setenv("VLLM_EXPERIMENTAL_DUAL_VIEW_PHASE_SEPARATION", "1")
+    monkeypatch.setenv("VLLM_EXPERIMENTAL_DUAL_VIEW_PREFILL_CADENCE", "2")
+    scheduler = create_scheduler()
+    first, second = create_requests(num_requests=2, num_tokens=8)
+    scheduler.add_request(first)
+
+    initial = scheduler.schedule()
+    scheduler.update_from_output(
+        initial,
+        ModelRunnerOutput(
+            req_ids=[first.request_id],
+            req_id_to_index={first.request_id: 0},
+            sampled_token_ids=[[101]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    scheduler.add_request(second)
+
+    # Step 2 is the configured prefill cadence: the new prompt runs alone.
+    prefill = scheduler.schedule()
+    assert set(prefill.num_scheduled_tokens) == {second.request_id}
+
+    # Step 3 returns to decode, while the uncommitted prefill remains separate.
+    decode = scheduler.schedule()
+    assert set(decode.num_scheduled_tokens) == {first.request_id}
+
+
 def test_schedule_multimodal_requests():
     scheduler = create_scheduler(model="llava-hf/llava-1.5-7b-hf")
     mm_positions = [[PlaceholderRange(offset=i, length=100)] for i in range(10)]

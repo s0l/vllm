@@ -147,6 +147,15 @@ class Qwen2MoeMLP(nn.Module):
         self.expert_gate = expert_gate
 
     def forward(self, x):
+        if hasattr(self, "dual_view_operator"):
+            from vllm.experimental.dual_view_nvfp4 import (
+                apply_materialized_dual_view_mlp,
+            )
+
+            out = apply_materialized_dual_view_mlp(self, x)
+            if self.expert_gate is not None:
+                out = F.sigmoid(self.expert_gate(x)[0]) * out
+            return out
         gate_up, _ = self.gate_up_proj(x)
         out = self.act_fn(gate_up)
         out, _ = self.down_proj(out)
