@@ -1250,12 +1250,11 @@ class MambaManager(SingleTypeKVCacheManager):
         assert isinstance(kv_cache_spec, MambaSpec), (
             "MambaManager can only be used for mamba groups"
         )
-        assert dcp_world_size == 1, "DCP not support mamba now."
-        assert pcp_world_size == 1, "PCP not support mamba now."
+        block_size = kv_cache_spec.block_size * dcp_world_size * pcp_world_size
         block_hashes = resolve_block_hashes(
             block_hashes,
             block_pool.hash_block_size,
-            kv_cache_spec.block_size,
+            block_size,
             supports_fine_grained_hash_lookup=cls.supports_fine_grained_hash_lookup,
             alignment_tokens=alignment_tokens,
         )
@@ -1264,7 +1263,6 @@ class MambaManager(SingleTypeKVCacheManager):
         )
         hit_length = 0
 
-        block_size = kv_cache_spec.block_size
         if alignment_tokens < block_size and block_size % alignment_tokens == 0:
             assert isinstance(block_hashes, list)
             hash_block_size = alignment_tokens
@@ -1285,7 +1283,6 @@ class MambaManager(SingleTypeKVCacheManager):
                     hit_length = num_tokens
                     break
             return computed_blocks, hit_length
-
         max_num_blocks = max_length // block_size
         # Search from right to left and early stop when a match is found.
         for i in range(max_num_blocks - 1, -1, -1):
