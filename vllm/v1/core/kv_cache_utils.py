@@ -84,6 +84,10 @@ def maybe_convert_block_hash(hash_bytes: BlockHash) -> ExternalBlockHash:
 
 logger = init_logger(__name__)
 
+
+def _use_separate_gdn_pool(vllm_config: VllmConfig) -> bool:
+    return bool(vllm_config.additional_config.get("gdn_separate_pool", False))
+
 # The hash seed for the first block of any prefix block sequence.
 #
 # We use a random value to avoid hash collisions or PYTHONHASHSEED environment
@@ -935,6 +939,17 @@ def get_max_concurrency_for_kv_cache_config(
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
+    if _use_separate_gdn_pool(vllm_config):
+        blocks_per_request = sum(
+            cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            )
+            for group in kv_cache_config.kv_cache_groups
+            if not isinstance(group.kv_cache_spec, MambaSpec)
+        )
+        return kv_cache_config.num_blocks / blocks_per_request
+
     num_layer_per_group = max(
         len(group.layer_names) for group in kv_cache_config.kv_cache_groups
     )
@@ -1361,6 +1376,64 @@ def get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
         )
 
+    if _use_separate_gdn_pool(vllm_config):
+        mamba_groups = [
+            g for g in kv_cache_groups if isinstance(g.kv_cache_spec, MambaSpec)
+        ]
+        attention_groups = [
+            g for g in kv_cache_groups if not isinstance(g.kv_cache_spec, MambaSpec)
+        ]
+        if mamba_groups and attention_groups:
+            mamba_num_blocks = int(
+                vllm_config.additional_config.get("gdn_pool_blocks", 25)
+            )
+            mamba_buckets = _bucket_layers_by_page_size(mamba_groups)
+            mamba_tensors: list[KVCacheTensor] = []
+            mamba_bytes = 0
+            for page_size, slots in mamba_buckets.items():
+                for slot in slots:
+                    size = page_size * mamba_num_blocks
+                    mamba_tensors.append(KVCacheTensor(size=size, shared_by=slot))
+                    mamba_bytes += size
+
+            attention_buckets = _bucket_layers_by_page_size(attention_groups)
+            attention_bytes_per_block = sum(
+                page_size * len(slots)
+                for page_size, slots in attention_buckets.items()
+            )
+            override = vllm_config.cache_config.num_gpu_blocks_override
+            if override is not None:
+                # CUDA-graph profiling deliberately calls this planner with
+                # available_memory=0 and a small explicit block override.
+                num_blocks = override
+            else:
+                attention_memory = available_memory - mamba_bytes
+                if attention_memory <= 0:
+                    raise ValueError(
+                        "Separate GDN pool leaves no attention KV memory: "
+                        f"available={available_memory}, gdn={mamba_bytes}, "
+                        f"blocks={mamba_num_blocks}, buckets="
+                        f"{[(ps, len(slots)) for ps, slots in mamba_buckets.items()]}"
+                    )
+                num_blocks = attention_memory // attention_bytes_per_block
+            attention_tensors = [
+                KVCacheTensor(size=page_size * num_blocks, shared_by=slot)
+                for page_size, slots in attention_buckets.items()
+                for slot in slots
+            ]
+            logger.info_once(
+                "Experimental separate GDN pool: attention_blocks=%d, "
+                "gdn_blocks=%d, gdn_memory=%s GiB",
+                num_blocks,
+                mamba_num_blocks,
+                format_gib(mamba_bytes),
+            )
+            return KVCacheConfig(
+                num_blocks=num_blocks,
+                kv_cache_tensors=attention_tensors + mamba_tensors,
+                kv_cache_groups=kv_cache_groups,
+            )
+
     # Determine how model runners should initialize the KV cache tensors.
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
@@ -1733,6 +1806,18 @@ def get_kv_cache_groups(
     Returns:
         The generated KVCacheGroups
     """
+    if _use_separate_gdn_pool(vllm_config):
+        pool_blocks = int(vllm_config.additional_config.get("gdn_pool_blocks", 25))
+        if pool_blocks < 2:
+            raise ValueError("gdn_pool_blocks must include at least one usable block")
+        for layer_name, spec in list(kv_cache_spec.items()):
+            if isinstance(spec, MambaSpec):
+                kv_cache_spec[layer_name] = replace(
+                    spec,
+                    separate_pool=True,
+                    separate_pool_num_blocks=pool_blocks,
+                )
+
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         unify_hybrid_kv_cache_specs(kv_cache_spec)
 
@@ -1774,7 +1859,8 @@ def get_kv_cache_groups(
     # As KVCacheManager can only allocate memory of one size, we need to unify
     # the page size of the layers. For cases cannot be unified, this function
     # will raise an error.
-    filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
+    if not _use_separate_gdn_pool(vllm_config):
+        filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
     groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
 
     # Add hidden-state layers back with page aligned to the common page.
@@ -1837,6 +1923,13 @@ def _max_memory_usage_bytes_from_groups(
     """
     if not kv_cache_groups:
         return 0
+
+    if _use_separate_gdn_pool(vllm_config):
+        return sum(
+            len(group.layer_names)
+            * group.kv_cache_spec.max_memory_usage_bytes(vllm_config)
+            for group in kv_cache_groups
+        )
 
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
@@ -2155,9 +2248,20 @@ def get_kv_cache_configs(
         kv_cache_config.num_blocks = min_num_blocks
 
         # Shrink tensor size proportionally
-        for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
+        if num_blocks_old != min_num_blocks:
+            mamba_layers = {
+                name
+                for group in kv_cache_config.kv_cache_groups
+                if isinstance(group.kv_cache_spec, MambaSpec)
+                for name in group.layer_names
+            }
+            for tensor in kv_cache_config.kv_cache_tensors:
+                if _use_separate_gdn_pool(vllm_config) and all(
+                    name in mamba_layers for name in tensor.shared_by
+                ):
+                    continue
+                assert tensor.size % num_blocks_old == 0
+                tensor.size = tensor.size // num_blocks_old * min_num_blocks
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             max_model_len = vllm_config.model_config.max_model_len

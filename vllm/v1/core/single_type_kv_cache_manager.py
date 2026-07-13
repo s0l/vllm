@@ -1227,6 +1227,11 @@ class MambaManager(SingleTypeKVCacheManager):
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+        self.one_slot_align = kv_cache_spec.separate_pool
+        if self.one_slot_align and self.num_speculative_blocks:
+            raise ValueError(
+                "Separate-pool GDN does not support speculative blocks"
+            )
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step
@@ -1371,6 +1376,15 @@ class MambaManager(SingleTypeKVCacheManager):
     ) -> None:
         assert isinstance(self.kv_cache_spec, MambaSpec)
 
+        if self.mamba_cache_mode == "align" and self.one_slot_align:
+            # The sole live state stays in constant table column 0 for the
+            # request's entire lifetime. Positional cleanup would interpret
+            # that column as an old sequence block, return it to the shared
+            # pool, and let another active request alias the same recurrent
+            # state. It is freed only by the normal request finish/preemption
+            # lifecycle.
+            return
+
         super().remove_skipped_blocks(
             request_id, processed_computed_tokens, num_prompt_tokens
         )
@@ -1392,6 +1406,32 @@ class MambaManager(SingleTypeKVCacheManager):
                 if blocks[last_state_block_idx] != self._null_block:
                     self.block_pool.free_blocks([blocks[last_state_block_idx]])
                     blocks[last_state_block_idx] = self._null_block
+
+    def add_local_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        if (
+            isinstance(self.kv_cache_spec, MambaSpec)
+            and self.kv_cache_spec.separate_pool
+        ):
+            # The scheduler's null entries encode only the exact hit length.
+            # Recurrent bytes are restored from the worker host checkpoint into
+            # a freshly allocated one-slot block, so no cached GPU block is touched.
+            assert all(block.is_null for block in new_computed_blocks)
+            self.num_cached_block[request_id] = cdiv(
+                num_local_computed_tokens, self.block_size
+            )
+            return
+        super().add_local_computed_blocks(
+            request_id,
+            new_computed_blocks,
+            num_local_computed_tokens,
+            num_external_computed_tokens,
+        )
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
@@ -1442,6 +1482,9 @@ class MambaManager(SingleTypeKVCacheManager):
             # We can ignore lookahead tokens because current draft models don't have
             # mamba layers.
             num_tokens = num_tokens_main_model
+            if self.one_slot_align:
+                allocated = request_id in self._allocated_block_reqs
+                return 0 if allocated else 1
 
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
@@ -1499,6 +1542,23 @@ class MambaManager(SingleTypeKVCacheManager):
             # mamba layers.
             num_tokens = num_tokens_main_model
             req_blocks: list[KVCacheBlock] = self.req_to_blocks[request_id]
+            if self.one_slot_align:
+                if request_id in self._allocated_block_reqs:
+                    return []
+                if req_blocks:
+                    # Exact prefix hit: collapse the sparse positional view
+                    # returned by find_longest_cache_hit into constant column 0.
+                    state_block = req_blocks[-1]
+                    assert state_block != self._null_block
+                    req_blocks[:] = [state_block]
+                    self.last_state_block_idx[request_id] = 0
+                    self._allocated_block_reqs.add(request_id)
+                    return []
+                new_blocks = self.block_pool.get_new_blocks(1)
+                req_blocks.extend(new_blocks)
+                self.last_state_block_idx[request_id] = 0
+                self._allocated_block_reqs.add(request_id)
+                return new_blocks
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
             num_required_blocks = (
@@ -1513,6 +1573,24 @@ class MambaManager(SingleTypeKVCacheManager):
             else:
                 prev_block_len = len(req_blocks)
                 blocks_allocated = request_id in self._allocated_block_reqs
+                if self.one_slot_align and blocks_allocated:
+                    state_idx = self.last_state_block_idx.get(
+                        request_id, prev_block_len - 1
+                    )
+                    state_block = req_blocks[state_idx]
+                    assert state_block != self._null_block
+                    req_blocks[state_idx] = self._null_block
+                    num_skipped_blocks = num_required_blocks - 1
+                    if len(req_blocks) < num_skipped_blocks:
+                        req_blocks.extend(
+                            self._null_block
+                            for _ in range(len(req_blocks), num_skipped_blocks)
+                        )
+                    req_blocks.append(state_block)
+                    self.last_state_block_idx[request_id] = num_required_blocks - 1
+                    # Relocation is not a fresh allocation. Returning this block
+                    # would cause the scheduler to zero live recurrent state.
+                    return []
                 # Record the last state block
                 if blocks_allocated:
                     # We always save the running state at the last
@@ -1605,6 +1683,11 @@ class MambaManager(SingleTypeKVCacheManager):
         num_tokens: int,
         retention_interval: int | None = None,
     ) -> None:
+        if (
+            isinstance(self.kv_cache_spec, MambaSpec)
+            and self.kv_cache_spec.separate_pool
+        ):
+            return
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
         super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
