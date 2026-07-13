@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -369,6 +370,11 @@ class Scheduler(SchedulerInterface):
             return num_new_tokens
 
         block_size = self.cache_config.block_size
+        if self.dcp_world_size > 1:
+            block_size = math.lcm(
+                block_size,
+                self.cache_config.block_size * self.dcp_world_size,
+            )
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
