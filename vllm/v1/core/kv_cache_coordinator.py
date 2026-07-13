@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from collections.abc import Sequence
 from typing import NamedTuple
 
@@ -10,10 +11,12 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    BlockHashListWithBlockSize,
     KVCacheBlock,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    MambaManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -103,12 +106,48 @@ class KVCacheCoordinator(ABC):
         if use_eagle and not self.eagle_group_ids:
             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
 
-        self.single_type_managers = tuple(
-            get_manager_for_kv_cache_spec(
+        separate_mamba_specs = [
+            group.kv_cache_spec
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+            and group.kv_cache_spec.separate_pool
+        ]
+        separate_gdn_pool = bool(separate_mamba_specs)
+        self.mamba_block_pool: BlockPool | None = None
+        self.gdn_checkpoint_keys: OrderedDict[BlockHash, None] | None = None
+        self.gdn_checkpoint_limit = 8
+        if separate_gdn_pool:
+            pool_sizes = {
+                spec.separate_pool_num_blocks for spec in separate_mamba_specs
+            }
+            if len(pool_sizes) != 1 or 0 in pool_sizes:
+                raise ValueError(
+                    "Separate GDN cache groups must use one positive pool size"
+                )
+            self.mamba_block_pool = BlockPool(
+                num_gpu_blocks=pool_sizes.pop(),
+                enable_caching=enable_caching,
+                hash_block_size=hash_block_size,
+                enable_kv_cache_events=enable_kv_cache_events,
+                metrics_collector=metrics_collector,
+            )
+            # This mirrors the pinned-host LRU in every worker. It contains
+            # content identities only; recurrent bytes never live in EngineCore.
+            self.gdn_checkpoint_keys = OrderedDict()
+
+        managers: list[SingleTypeKVCacheManager] = []
+        for i, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+            manager_pool = (
+                self.mamba_block_pool
+                if self.mamba_block_pool is not None
+                and isinstance(kv_cache_group.kv_cache_spec, MambaSpec)
+                else self.block_pool
+            )
+            manager = get_manager_for_kv_cache_spec(
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
                 max_in_flight_tokens=max_in_flight_tokens,
                 max_model_len=max_model_len,
-                block_pool=self.block_pool,
+                block_pool=manager_pool,
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
                 dcp_world_size=dcp_world_size,
@@ -116,8 +155,12 @@ class KVCacheCoordinator(ABC):
                 scheduler_block_size=self.scheduler_block_size,
                 needs_kv_cache_zeroing=self.kv_cache_config.needs_kv_cache_zeroing,
             )
-            for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
-        )
+            if manager_pool is self.mamba_block_pool and isinstance(
+                manager, MambaManager
+            ):
+                manager.one_slot_align = True
+            managers.append(manager)
+        self.single_type_managers = tuple(managers)
 
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
@@ -126,6 +169,57 @@ class KVCacheCoordinator(ABC):
         _validate_prefix_cache_retention_interval(
             self.retention_interval, self.scheduler_block_size, kv_cache_config
         )
+
+    def register_gdn_checkpoint(self, key: bytes) -> None:
+        if self.gdn_checkpoint_keys is None:
+            return
+        block_hash = BlockHash(key)
+        self.gdn_checkpoint_keys[block_hash] = None
+        self.gdn_checkpoint_keys.move_to_end(block_hash)
+        while len(self.gdn_checkpoint_keys) > self.gdn_checkpoint_limit:
+            self.gdn_checkpoint_keys.popitem(last=False)
+
+    def sync_gdn_checkpoints(self, keys: tuple[bytes, ...]) -> None:
+        """Replace scheduler membership with the authoritative worker LRU."""
+        if self.gdn_checkpoint_keys is None:
+            return
+        if len(keys) > self.gdn_checkpoint_limit or len(set(keys)) != len(keys):
+            raise RuntimeError("Invalid worker GDN checkpoint snapshot")
+        self.gdn_checkpoint_keys = OrderedDict((BlockHash(key), None) for key in keys)
+
+    def has_gdn_checkpoint(self, key: BlockHash, *, touch: bool = True) -> bool:
+        if self.gdn_checkpoint_keys is None or key not in self.gdn_checkpoint_keys:
+            return False
+        if touch:
+            self.gdn_checkpoint_keys.move_to_end(key)
+        return True
+
+    def find_gdn_checkpoint_boundary(
+        self,
+        block_hashes: list[BlockHash],
+        max_length: int,
+        spec: MambaSpec,
+    ) -> int:
+        """Return the newest exact recurrent checkpoint boundary in tokens."""
+        checkpoint_block_size = (
+            spec.block_size * self.dcp_world_size * self.pcp_world_size
+        )
+        spec_hashes = BlockHashListWithBlockSize(
+            block_hashes,
+            self.hash_block_size,
+            checkpoint_block_size,
+        )
+        num_blocks = min(max_length // checkpoint_block_size, len(spec_hashes))
+        while num_blocks > 0 and not self.has_gdn_checkpoint(
+            spec_hashes[num_blocks - 1], touch=False
+        ):
+            num_blocks -= 1
+        # Lookup can run for a waiting request that is not admitted in this
+        # scheduler step. Touching the scheduler-side LRU here would then have
+        # no matching restore in the workers and can make their eviction order
+        # diverge. The scheduler touches the key only when it emits the actual
+        # restore command.
+        return num_blocks * checkpoint_block_size
 
     def get_num_blocks_to_allocate(
         self,
@@ -751,17 +845,33 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     _max_length = min(
                         curr_hit_length + eagle_margin, max_cache_hit_length
                     )
-                hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(
-                    block_hashes=block_hashes,
-                    max_length=_max_length,
-                    kv_cache_group_ids=group_ids,
-                    block_pool=self.block_pool,
-                    kv_cache_spec=spec,
-                    drop_eagle_block=drop_eagle_block,
-                    alignment_tokens=self._cache_hit_alignment_tokens,
-                    dcp_world_size=self.dcp_world_size,
-                    pcp_world_size=self.pcp_world_size,
-                )
+                if isinstance(spec, MambaSpec) and spec.separate_pool:
+                    # The exact recurrent bytes live in the worker host LRU,
+                    # not in a GPU KV block. Search exact DCP/PCP-aligned
+                    # boundaries newest-first and represent a verified hit with
+                    # positional nulls. Allocation later creates one live slot.
+                    checkpoint_block_size = (
+                        spec.block_size * self.dcp_world_size * self.pcp_world_size
+                    )
+                    _new_hit_length = self.find_gdn_checkpoint_boundary(
+                        block_hashes, _max_length, spec
+                    )
+                    num_blocks = _new_hit_length // checkpoint_block_size
+                    hit_blocks = tuple(
+                        [self.block_pool.null_block] * num_blocks for _ in group_ids
+                    )
+                else:
+                    hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(
+                        block_hashes=block_hashes,
+                        max_length=_max_length,
+                        kv_cache_group_ids=group_ids,
+                        block_pool=self.block_pool,
+                        kv_cache_spec=spec,
+                        drop_eagle_block=drop_eagle_block,
+                        alignment_tokens=self._cache_hit_alignment_tokens,
+                        dcp_world_size=self.dcp_world_size,
+                        pcp_world_size=self.pcp_world_size,
+                    )
                 if drop_eagle_block:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:

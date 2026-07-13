@@ -698,6 +698,8 @@ class MambaSpec(KVCacheSpec):
     mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
     mamba_cache_mode: str = "none"
     num_speculative_blocks: int = 0
+    separate_pool: bool = False
+    separate_pool_num_blocks: int = 0
 
     @property
     def page_size_bytes(self) -> int:
@@ -717,6 +719,8 @@ class MambaSpec(KVCacheSpec):
                 cdiv(max_model_len, self.block_size) + self.num_speculative_blocks
             ) * self.page_size_bytes
         elif vllm_config.cache_config.mamba_cache_mode == "align":
+            if self.separate_pool:
+                return self.page_size_bytes
             return self.page_size_bytes * (2 + self.num_speculative_blocks)
         else:
             return self.page_size_bytes * (1 + self.num_speculative_blocks)
@@ -725,6 +729,8 @@ class MambaSpec(KVCacheSpec):
         # Mamba state is replicated across DCP/PCP ranks, never sharded, so
         # no CP scaling applies.
         if vllm_config.cache_config.mamba_cache_mode == "align":
+            if self.separate_pool:
+                return 1
             # Block table rows are position-indexed over the full sequence
             # even though only 2 + num_speculative_blocks state blocks are
             # resident at a time (earlier states are nulled out by
