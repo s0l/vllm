@@ -371,9 +371,7 @@ class Qwen2_5_VisionAttention(nn.Module):
         )
         padded_num_heads = _pad_to_tp(num_heads, self.tp_size)
         self.num_attention_heads_per_partition = padded_num_heads // self.tp_size
-        padded_projection_size = (
-            padded_num_heads * self.hidden_size_per_attention_head
-        )
+        padded_projection_size = padded_num_heads * self.hidden_size_per_attention_head
 
         if padded_num_heads == num_heads:
             self.qkv = QKVParallelLinear(

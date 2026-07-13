@@ -129,8 +129,9 @@ def test_explicit_merged_loader_uses_logical_offsets_for_fused_checkpoint(monkey
         quant_config=None,
         prefix="test.gdn_qkvz",
     )
-    loaded = torch.arange((2048 + 2048 + 6144 + 6144) * 2,
-                          dtype=torch.float32).view(-1, 2)
+    loaded = torch.arange((2048 + 2048 + 6144 + 6144) * 2, dtype=torch.float32).view(
+        -1, 2
+    )
 
     layer.weight_loader(layer.weight, loaded, None)
 
@@ -138,8 +139,9 @@ def test_explicit_merged_loader_uses_logical_offsets_for_fused_checkpoint(monkey
     sizes = [640, 640, 1920, 1920]
     source_offsets = [1408, 2048 + 1408, 4096 + 4224, 10240 + 4224]
     for dest, size, source in zip(offsets, sizes, source_offsets):
-        torch.testing.assert_close(layer.weight[dest : dest + size],
-                                   loaded[source : source + size])
+        torch.testing.assert_close(
+            layer.weight[dest : dest + size], loaded[source : source + size]
+        )
 
 
 def test_explicit_merged_loader_adjusts_packed_output_fused_checkpoint(monkeypatch):
@@ -183,8 +185,9 @@ def test_explicit_merged_loader_adjusts_packed_output_fused_checkpoint(monkeypat
         dest //= packed_factor
         size //= packed_factor
         source //= packed_factor
-        torch.testing.assert_close(param[dest : dest + size],
-                                   loaded[source : source + size])
+        torch.testing.assert_close(
+            param[dest : dest + size], loaded[source : source + size]
+        )
 
     assert torch.count_nonzero(param[80:96]) == 0
     assert torch.count_nonzero(param[176:192]) == 0
@@ -217,18 +220,22 @@ def test_explicit_merged_loader_reconstructs_wna16_quant_params_tp3(monkeypatch)
     logical_total = sum(logical_sizes)
     padded_local_total = sum(padded_sizes) // 3
 
-    loaded_zp = torch.arange(logical_total // packed_factor * groups,
-                             dtype=torch.int32).view(-1, groups)
-    loaded_scales = torch.arange(logical_total * groups,
-                                 dtype=torch.float32).view(-1, groups)
+    loaded_zp = torch.arange(
+        logical_total // packed_factor * groups, dtype=torch.int32
+    ).view(-1, groups)
+    loaded_scales = torch.arange(logical_total * groups, dtype=torch.float32).view(
+        -1, groups
+    )
 
     for rank in range(3):
         monkeypatch.setattr(linear, "get_tensor_model_parallel_world_size", lambda: 3)
         monkeypatch.setattr(linear, "get_tensor_model_parallel_rank", lambda r=rank: r)
-        monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank",
-                            lambda r=rank: r)
-        monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size",
-                            lambda: 3)
+        monkeypatch.setattr(
+            parameter, "get_tensor_model_parallel_rank", lambda r=rank: r
+        )
+        monkeypatch.setattr(
+            parameter, "get_tensor_model_parallel_world_size", lambda: 3
+        )
 
         layer = ExplicitPaddedMergedColumnParallelLinear(
             input_size=5120,
@@ -241,9 +248,9 @@ def test_explicit_merged_loader_reconstructs_wna16_quant_params_tp3(monkeypatch)
             prefix="test.gdn_qkvz",
         )
         qzeros = PackedvLLMParameter(
-            data=torch.full((padded_local_total // packed_factor, groups),
-                            -1,
-                            dtype=torch.int32),
+            data=torch.full(
+                (padded_local_total // packed_factor, groups), -1, dtype=torch.int32
+            ),
             weight_loader=lambda *args, **kwargs: None,
             input_dim=1,
             output_dim=0,
@@ -270,17 +277,25 @@ def test_explicit_merged_loader_reconstructs_wna16_quant_params_tp3(monkeypatch)
                 zp_dst = dst // packed_factor
                 zp_src = (src_base + local_start) // packed_factor
                 zp_size = local_size // packed_factor
-                torch.testing.assert_close(qzeros[zp_dst : zp_dst + zp_size],
-                                           loaded_zp[zp_src : zp_src + zp_size])
-                torch.testing.assert_close(scales[dst : dst + local_size],
-                                           loaded_scales[
-                                               src_base
-                                               + local_start : src_base
-                                               + local_start
-                                               + local_size])
-            assert torch.count_nonzero(qzeros[
-                (dst + local_size) // packed_factor : (dst + padded)
-                // packed_factor]) == 0
+                torch.testing.assert_close(
+                    qzeros[zp_dst : zp_dst + zp_size],
+                    loaded_zp[zp_src : zp_src + zp_size],
+                )
+                torch.testing.assert_close(
+                    scales[dst : dst + local_size],
+                    loaded_scales[
+                        src_base + local_start : src_base + local_start + local_size
+                    ],
+                )
+            assert (
+                torch.count_nonzero(
+                    qzeros[
+                        (dst + local_size) // packed_factor : (dst + padded)
+                        // packed_factor
+                    ]
+                )
+                == 0
+            )
             assert torch.count_nonzero(scales[dst + local_size : dst + padded]) == 0
             dst += padded
             src_base += logical_size
@@ -317,9 +332,7 @@ def test_explicit_merged_loader_handles_qwen35_awq_qkv_tuple_then_z(monkeypatch)
     )
     local_total = sum(layer.output_sizes) // layer.tp_size
     qzeros = PackedvLLMParameter(
-        data=torch.full((local_total // packed_factor, groups),
-                        -1,
-                        dtype=torch.int32),
+        data=torch.full((local_total // packed_factor, groups), -1, dtype=torch.int32),
         weight_loader=lambda *args, **kwargs: None,
         input_dim=1,
         output_dim=0,
@@ -335,14 +348,22 @@ def test_explicit_merged_loader_handles_qwen35_awq_qkv_tuple_then_z(monkeypatch)
 
     qkv_logical = sum(logical_sizes[:3])
     z_logical = logical_sizes[3]
-    qkv_zp = torch.arange((qkv_logical // packed_factor) * groups,
-                          dtype=torch.int32).view(-1, groups)
-    qkv_scales = torch.arange(qkv_logical * groups,
-                              dtype=torch.float32).view(-1, groups)
-    z_zp = torch.arange((z_logical // packed_factor) * groups,
-                        dtype=torch.int32).view(-1, groups) + 10_000_000
-    z_scales = torch.arange(z_logical * groups,
-                            dtype=torch.float32).view(-1, groups) + 10_000_000
+    qkv_zp = torch.arange(
+        (qkv_logical // packed_factor) * groups, dtype=torch.int32
+    ).view(-1, groups)
+    qkv_scales = torch.arange(qkv_logical * groups, dtype=torch.float32).view(
+        -1, groups
+    )
+    z_zp = (
+        torch.arange((z_logical // packed_factor) * groups, dtype=torch.int32).view(
+            -1, groups
+        )
+        + 10_000_000
+    )
+    z_scales = (
+        torch.arange(z_logical * groups, dtype=torch.float32).view(-1, groups)
+        + 10_000_000
+    )
 
     layer.weight_loader_v2(qzeros, qkv_zp, (0, 1, 2))
     layer.weight_loader_v2(scales, qkv_scales, (0, 1, 2))
@@ -357,9 +378,12 @@ def test_explicit_merged_loader_handles_qwen35_awq_qkv_tuple_then_z(monkeypatch)
         local_size = local_sizes[shard]
         torch.testing.assert_close(
             qzeros[dst // packed_factor : (dst + local_size) // packed_factor],
-            qkv_zp[(src_base + local_start) // packed_factor : (
-                src_base + local_start + local_size
-            ) // packed_factor],
+            qkv_zp[
+                (src_base + local_start) // packed_factor : (
+                    src_base + local_start + local_size
+                )
+                // packed_factor
+            ],
         )
         torch.testing.assert_close(
             scales[dst : dst + local_size],
@@ -371,9 +395,10 @@ def test_explicit_merged_loader_handles_qwen35_awq_qkv_tuple_then_z(monkeypatch)
     z_local_size = local_sizes[3]
     torch.testing.assert_close(
         qzeros[z_dst // packed_factor : (z_dst + z_local_size) // packed_factor],
-        z_zp[z_local_start // packed_factor : (
-            z_local_start + z_local_size
-        ) // packed_factor],
+        z_zp[
+            z_local_start // packed_factor : (z_local_start + z_local_size)
+            // packed_factor
+        ],
     )
     torch.testing.assert_close(
         scales[z_dst : z_dst + z_local_size],
@@ -408,9 +433,7 @@ def test_padded_mlp_loader_reconstructs_wna16_gate_up_tp3_rank2(monkeypatch):
     )
     local_total = sum(layer.output_sizes) // layer.tp_size
     qzeros = PackedvLLMParameter(
-        data=torch.full((local_total // packed_factor, groups),
-                        -1,
-                        dtype=torch.int32),
+        data=torch.full((local_total // packed_factor, groups), -1, dtype=torch.int32),
         weight_loader=lambda *args, **kwargs: None,
         input_dim=1,
         output_dim=0,
@@ -423,10 +446,12 @@ def test_padded_mlp_loader_reconstructs_wna16_gate_up_tp3_rank2(monkeypatch):
         input_dim=1,
         output_dim=0,
     )
-    loaded_zp = torch.arange((logical * 2 // packed_factor) * groups,
-                             dtype=torch.int32).view(-1, groups)
-    loaded_scales = torch.arange(logical * 2 * groups,
-                                 dtype=torch.float32).view(-1, groups)
+    loaded_zp = torch.arange(
+        (logical * 2 // packed_factor) * groups, dtype=torch.int32
+    ).view(-1, groups)
+    loaded_scales = torch.arange(logical * 2 * groups, dtype=torch.float32).view(
+        -1, groups
+    )
 
     layer.weight_loader_v2(qzeros, loaded_zp, None)
     layer.weight_loader_v2(scales, loaded_scales, None)
@@ -438,17 +463,21 @@ def test_padded_mlp_loader_reconstructs_wna16_gate_up_tp3_rank2(monkeypatch):
         dst = idx * shard
         torch.testing.assert_close(
             qzeros[dst // packed_factor : (dst + copy) // packed_factor],
-            loaded_zp[(src_base + 2 * shard) // packed_factor : (
-                src_base + 2 * shard + copy
-            ) // packed_factor],
+            loaded_zp[
+                (src_base + 2 * shard) // packed_factor : (src_base + 2 * shard + copy)
+                // packed_factor
+            ],
         )
         torch.testing.assert_close(
             scales[dst : dst + copy],
             loaded_scales[src_base + 2 * shard : src_base + 2 * shard + copy],
         )
-        assert torch.count_nonzero(qzeros[(dst + copy) // packed_factor : (
-            dst + shard
-        ) // packed_factor]) == 0
+        assert (
+            torch.count_nonzero(
+                qzeros[(dst + copy) // packed_factor : (dst + shard) // packed_factor]
+            )
+            == 0
+        )
         assert torch.count_nonzero(scales[dst + copy : dst + shard]) == 0
 
 
@@ -478,9 +507,11 @@ def test_padded_row_loader_reconstructs_wna16_down_proj_tp3_rank2(monkeypatch):
         prefix="test.mlp.down_proj",
     )
     qweight = PackedvLLMParameter(
-        data=torch.full((output, layer.input_size_per_partition // packed_factor),
-                        -1,
-                        dtype=torch.int32),
+        data=torch.full(
+            (output, layer.input_size_per_partition // packed_factor),
+            -1,
+            dtype=torch.int32,
+        ),
         weight_loader=lambda *args, **kwargs: None,
         input_dim=1,
         output_dim=0,
@@ -494,22 +525,26 @@ def test_padded_row_loader_reconstructs_wna16_down_proj_tp3_rank2(monkeypatch):
         output_dim=0,
     )
     qzeros = PackedvLLMParameter(
-        data=torch.full((output // packed_factor,
-                         layer.input_size_per_partition // 32),
-                        -1,
-                        dtype=torch.int32),
+        data=torch.full(
+            (output // packed_factor, layer.input_size_per_partition // 32),
+            -1,
+            dtype=torch.int32,
+        ),
         weight_loader=lambda *args, **kwargs: None,
         input_dim=1,
         output_dim=0,
         packed_dim=0,
         packed_factor=packed_factor,
     )
-    loaded_qweight = torch.arange(output * (logical // packed_factor),
-                                  dtype=torch.int32).view(output, -1)
-    loaded_scales = torch.arange(output * (logical // 32),
-                                 dtype=torch.float32).view(output, -1)
-    loaded_qzeros = torch.arange((output // packed_factor) * (logical // 32),
-                                 dtype=torch.int32).view(output // packed_factor, -1)
+    loaded_qweight = torch.arange(
+        output * (logical // packed_factor), dtype=torch.int32
+    ).view(output, -1)
+    loaded_scales = torch.arange(output * (logical // 32), dtype=torch.float32).view(
+        output, -1
+    )
+    loaded_qzeros = torch.arange(
+        (output // packed_factor) * (logical // 32), dtype=torch.int32
+    ).view(output // packed_factor, -1)
 
     layer.weight_loader_v2(qweight, loaded_qweight)
     layer.weight_loader_v2(scales, loaded_scales)
@@ -518,18 +553,16 @@ def test_padded_row_loader_reconstructs_wna16_down_proj_tp3_rank2(monkeypatch):
     start = 2 * layer.input_size_per_partition
     copy = logical - start
     assert copy == 5760
-    torch.testing.assert_close(qweight[:, : copy // packed_factor],
-                               loaded_qweight[:, start // packed_factor : (
-                                   start + copy
-                               ) // packed_factor])
-    torch.testing.assert_close(scales[:, : copy // 32],
-                               loaded_scales[:, start // 32 : (
-                                   start + copy
-                               ) // 32])
-    torch.testing.assert_close(qzeros[:, : copy // 32],
-                               loaded_qzeros[:, start // 32 : (
-                                   start + copy
-                               ) // 32])
+    torch.testing.assert_close(
+        qweight[:, : copy // packed_factor],
+        loaded_qweight[:, start // packed_factor : (start + copy) // packed_factor],
+    )
+    torch.testing.assert_close(
+        scales[:, : copy // 32], loaded_scales[:, start // 32 : (start + copy) // 32]
+    )
+    torch.testing.assert_close(
+        qzeros[:, : copy // 32], loaded_qzeros[:, start // 32 : (start + copy) // 32]
+    )
     assert torch.count_nonzero(qweight[:, copy // packed_factor :]) == 0
     assert torch.count_nonzero(scales[:, copy // 32 :]) == 0
     assert torch.count_nonzero(qzeros[:, copy // 32 :]) == 0

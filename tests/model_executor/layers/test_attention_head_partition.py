@@ -162,8 +162,6 @@ def test_qwen35_tp3_dcp_full_kv_layout_matches_full_gqa_attention():
         local_v = full_v[:, q_start:q_end, :]
         local_scores = torch.einsum("qhd,khd->hqk", local_q, local_k) * scale
         local_probs = torch.softmax(local_scores, dim=-1)
-        local_outputs.append(
-            torch.einsum("hqk,khd->qhd", local_probs, local_v)
-        )
+        local_outputs.append(torch.einsum("hqk,khd->qhd", local_probs, local_v))
 
     torch.testing.assert_close(torch.cat(local_outputs, dim=1), full_out)

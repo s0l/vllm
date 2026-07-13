@@ -964,8 +964,10 @@ class PaddedMergedColumnParallelLinear(MergedColumnParallelLinear):
     ):
         if len(output_sizes) != len(padded_output_sizes):
             raise ValueError("Logical and padded output size lists must match.")
-        if any(padded < logical for logical, padded in zip(output_sizes,
-                                                           padded_output_sizes)):
+        if any(
+            padded < logical
+            for logical, padded in zip(output_sizes, padded_output_sizes)
+        ):
             raise ValueError("Padded output sizes must be >= logical output sizes.")
         self.logical_output_sizes = output_sizes
         super().__init__(
@@ -1022,9 +1024,7 @@ class PaddedMergedColumnParallelLinear(MergedColumnParallelLinear):
         padded_shard_size, local_offset = self._maybe_adjust_output_span_for_packing(
             param, padded_shard_size, local_offset
         )
-        param_data = param.data.narrow(
-            output_dim, local_offset, padded_shard_size
-        )
+        param_data = param.data.narrow(output_dim, local_offset, padded_shard_size)
         param_data.zero_()
         if copy_size == 0:
             return True
@@ -1035,8 +1035,7 @@ class PaddedMergedColumnParallelLinear(MergedColumnParallelLinear):
         param_data = param_data.narrow(output_dim, 0, copy_size)
         loaded_weight = loaded_weight.narrow(output_dim, global_start, copy_size)
         assert param_data.shape == loaded_weight.shape, (
-            f"Tried to load padded shard {loaded_weight.shape} into "
-            f"{param_data.shape}"
+            f"Tried to load padded shard {loaded_weight.shape} into {param_data.shape}"
         )
         param_data.copy_(loaded_weight)
         return True
@@ -1070,9 +1069,7 @@ class PaddedMergedColumnParallelLinear(MergedColumnParallelLinear):
             loaded_weight_shard = loaded_weight.narrow(
                 output_dim, packed_source_offset, source_size
             )
-            if not self._copy_padded_output_shard(
-                param, loaded_weight_shard, shard_id
-            ):
+            if not self._copy_padded_output_shard(param, loaded_weight_shard, shard_id):
                 return False
             source_offset += logical_size
         return True
@@ -1090,15 +1087,11 @@ class PaddedMergedColumnParallelLinear(MergedColumnParallelLinear):
                     shard_id=loaded_shard_id,
                 )
                 return
-            if self._copy_padded_output_shard(
-                param, loaded_weight, loaded_shard_id
-            ):
+            if self._copy_padded_output_shard(param, loaded_weight, loaded_shard_id):
                 return
         if loaded_shard_id is None or isinstance(loaded_shard_id, tuple):
             if isinstance(param, PerTensorScaleParameter):
-                return super().weight_loader(
-                    param, loaded_weight, loaded_shard_id
-                )
+                return super().weight_loader(param, loaded_weight, loaded_shard_id)
             if self._copy_fused_checkpoint_weight(
                 param, loaded_weight, loaded_shard_id
             ):
@@ -1122,15 +1115,11 @@ class PaddedMergedColumnParallelLinear(MergedColumnParallelLinear):
                     shard_id=loaded_shard_id,
                 )
                 return
-            if self._copy_padded_output_shard(
-                param, loaded_weight, loaded_shard_id
-            ):
+            if self._copy_padded_output_shard(param, loaded_weight, loaded_shard_id):
                 return
         if loaded_shard_id is None or isinstance(loaded_shard_id, tuple):
             if isinstance(param, PerTensorScaleParameter):
-                return super().weight_loader_v2(
-                    param, loaded_weight, loaded_shard_id
-                )
+                return super().weight_loader_v2(param, loaded_weight, loaded_shard_id)
             if self._copy_fused_checkpoint_weight(
                 param, loaded_weight, loaded_shard_id
             ):
@@ -1202,8 +1191,7 @@ class ExplicitPaddedMergedColumnParallelLinear(PaddedMergedColumnParallelLinear)
         padded_shard_size, local_offset = self._maybe_adjust_output_span_for_packing(
             param, padded_shard_size, local_offset
         )
-        param_data = param.data.narrow(output_dim, local_offset,
-                                       padded_shard_size)
+        param_data = param.data.narrow(output_dim, local_offset, padded_shard_size)
         param_data.zero_()
         if copy_size == 0:
             return True
@@ -1212,8 +1200,7 @@ class ExplicitPaddedMergedColumnParallelLinear(PaddedMergedColumnParallelLinear)
             param, copy_size, global_start
         )
         param_data = param_data.narrow(output_dim, 0, copy_size)
-        loaded_weight = loaded_weight.narrow(output_dim, global_start,
-                                             copy_size)
+        loaded_weight = loaded_weight.narrow(output_dim, global_start, copy_size)
         assert param_data.shape == loaded_weight.shape, (
             f"Tried to load explicit padded shard {loaded_weight.shape} into "
             f"{param_data.shape}"
@@ -1250,9 +1237,7 @@ class ExplicitPaddedMergedColumnParallelLinear(PaddedMergedColumnParallelLinear)
             loaded_weight_shard = loaded_weight.narrow(
                 output_dim, packed_source_offset, source_size
             )
-            if not self._copy_padded_output_shard(
-                param, loaded_weight_shard, shard_id
-            ):
+            if not self._copy_padded_output_shard(param, loaded_weight_shard, shard_id):
                 return False
             source_offset += logical_size
         return True
@@ -1265,9 +1250,7 @@ class ExplicitPaddedMergedColumnParallelLinear(PaddedMergedColumnParallelLinear)
     ):
         if (
             loaded_shard_id is None or isinstance(loaded_shard_id, tuple)
-        ) and self._copy_fused_checkpoint_weight(
-            param, loaded_weight, loaded_shard_id
-        ):
+        ) and self._copy_fused_checkpoint_weight(param, loaded_weight, loaded_shard_id):
             return
         super().weight_loader(param, loaded_weight, loaded_shard_id)
 
@@ -1283,9 +1266,7 @@ class ExplicitPaddedMergedColumnParallelLinear(PaddedMergedColumnParallelLinear)
 
         if loaded_shard_id is None or isinstance(loaded_shard_id, tuple):
             if isinstance(param, PerTensorScaleParameter):
-                return super().weight_loader_v2(
-                    param, loaded_weight, loaded_shard_id
-                )
+                return super().weight_loader_v2(param, loaded_weight, loaded_shard_id)
             if self._copy_fused_checkpoint_weight(
                 param, loaded_weight, loaded_shard_id
             ):
@@ -1808,18 +1789,14 @@ class QKVParallelLinearOverlappingGQA(QKVParallelLinear):
             return False
 
         param_data = param.data
-        local_head_size = (
-            self.head_size if loaded_shard_id == "k" else self.v_head_size
-        )
+        local_head_size = self.head_size if loaded_shard_id == "k" else self.v_head_size
         shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
         assert shard_offset is not None
         shard_size = self.num_kv_heads * local_head_size
         shard_size, shard_offset = self._maybe_adjust_output_span_for_packing(
             param, shard_size, shard_offset
         )
-        param_data = param_data.narrow(
-            output_dim, shard_offset, shard_size
-        )
+        param_data = param_data.narrow(output_dim, shard_offset, shard_size)
 
         for slot_idx, global_kv_idx in enumerate(self.kv_head_indices):
             local_span_size, dst_offset = self._maybe_adjust_output_span_for_packing(
@@ -1828,12 +1805,8 @@ class QKVParallelLinearOverlappingGQA(QKVParallelLinear):
             _, src_offset = self._maybe_adjust_output_span_for_packing(
                 param, local_head_size, global_kv_idx * local_head_size
             )
-            dst = param_data.narrow(
-                output_dim, dst_offset, local_span_size
-            )
-            src = loaded_weight.narrow(
-                output_dim, src_offset, local_span_size
-            )
+            dst = param_data.narrow(output_dim, dst_offset, local_span_size)
+            src = loaded_weight.narrow(output_dim, src_offset, local_span_size)
             assert dst.shape == src.shape
             dst.copy_(src)
         return True
@@ -2270,8 +2243,9 @@ class PaddedRowParallelLinear(RowParallelLinear):
 
         padded_shard_size = self.input_size_per_partition
         global_start = self.tp_rank * padded_shard_size
-        copy_size = max(0, min(padded_shard_size,
-                               self.logical_input_size - global_start))
+        copy_size = max(
+            0, min(padded_shard_size, self.logical_input_size - global_start)
+        )
 
         param_data = param.data
         param_data.zero_()
@@ -2279,9 +2253,7 @@ class PaddedRowParallelLinear(RowParallelLinear):
             return True
 
         packed_dim = getattr(param, "packed_dim", None)
-        pack_factor = getattr(
-            param, "packed_factor", getattr(param, "pack_factor", 1)
-        )
+        pack_factor = getattr(param, "packed_factor", getattr(param, "pack_factor", 1))
         if packed_dim != input_dim and copy_size > param_data.shape[input_dim]:
             if padded_shard_size % param_data.shape[input_dim] != 0:
                 raise ValueError(
@@ -2290,9 +2262,7 @@ class PaddedRowParallelLinear(RowParallelLinear):
                     f"param_shape={tuple(param_data.shape)}, "
                     f"input_dim={input_dim}"
                 )
-            inferred_pack_factor = (
-                padded_shard_size // param_data.shape[input_dim]
-            )
+            inferred_pack_factor = padded_shard_size // param_data.shape[input_dim]
             if (
                 loaded_weight.shape[input_dim] * inferred_pack_factor
                 == self.logical_input_size
@@ -2311,8 +2281,7 @@ class PaddedRowParallelLinear(RowParallelLinear):
             copy_size //= pack_factor
 
         param_data = param_data.narrow(input_dim, 0, copy_size)
-        loaded_weight = loaded_weight.narrow(input_dim, global_start,
-                                             copy_size)
+        loaded_weight = loaded_weight.narrow(input_dim, global_start, copy_size)
         assert param_data.shape == loaded_weight.shape, (
             f"Tried to load padded row shard {loaded_weight.shape} into "
             f"{param_data.shape}"
@@ -2325,8 +2294,7 @@ class PaddedRowParallelLinear(RowParallelLinear):
             return
         super().weight_loader(param, loaded_weight)
 
-    def weight_loader_v2(self, param: BasevLLMParameter,
-                         loaded_weight: torch.Tensor):
+    def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
         if len(loaded_weight.shape) == 0:
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
@@ -2391,9 +2359,7 @@ class ExplicitPaddedRowParallelLinear(PaddedRowParallelLinear):
         local_start = self.local_start
         local_size = self.local_size
         packed_dim = getattr(param, "packed_dim", None)
-        pack_factor = getattr(
-            param, "packed_factor", getattr(param, "pack_factor", 1)
-        )
+        pack_factor = getattr(param, "packed_factor", getattr(param, "pack_factor", 1))
         if packed_dim != input_dim and local_size > param_data.shape[input_dim]:
             if self.logical_input_size % loaded_weight.shape[input_dim] != 0:
                 raise ValueError(

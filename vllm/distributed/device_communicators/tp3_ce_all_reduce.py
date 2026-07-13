@@ -12,24 +12,20 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
-from vllm.triton_utils import tl, triton
 
+from vllm.triton_utils import tl, triton
 
 _WORKSPACE: dict[str, object] | None = None
 
 
 @triton.jit
-def _quantize_i8_block(
-    x_ptr, q_ptr, s_ptr, n_cols: tl.constexpr, block: tl.constexpr
-):
+def _quantize_i8_block(x_ptr, q_ptr, s_ptr, n_cols: tl.constexpr, block: tl.constexpr):
     row = tl.program_id(0)
     block_id = tl.program_id(1)
     offs = tl.arange(0, block)
     cols = block_id * block + offs
     mask = cols < n_cols
-    values = tl.load(x_ptr + row * n_cols + cols, mask=mask, other=0.0).to(
-        tl.float32
-    )
+    values = tl.load(x_ptr + row * n_cols + cols, mask=mask, other=0.0).to(tl.float32)
     scale = tl.maximum(tl.max(tl.abs(values), axis=0) / 127.0, 1.0e-8)
     quantized = tl.floor(values / scale + 0.5)
     quantized = tl.minimum(tl.maximum(quantized, -127.0), 127.0) + 128.0
@@ -40,8 +36,15 @@ def _quantize_i8_block(
 
 @triton.jit
 def _dequant_sum_i8_block(
-    q0_ptr, q1_ptr, q2_ptr, s0_ptr, s1_ptr, s2_ptr, out_ptr,
-    n_cols: tl.constexpr, block: tl.constexpr,
+    q0_ptr,
+    q1_ptr,
+    q2_ptr,
+    s0_ptr,
+    s1_ptr,
+    s2_ptr,
+    out_ptr,
+    n_cols: tl.constexpr,
+    block: tl.constexpr,
 ):
     row = tl.program_id(0)
     block_id = tl.program_id(1)
@@ -53,24 +56,32 @@ def _dequant_sum_i8_block(
     q2 = tl.load(q2_ptr + row * n_cols + cols, mask=mask, other=128).to(tl.float32)
     n_blocks = tl.cdiv(n_cols, block)
     scale_idx = row * n_blocks + block_id
-    values = ((q0 - 128.0) * tl.load(s0_ptr + scale_idx)
-              + (q1 - 128.0) * tl.load(s1_ptr + scale_idx)
-              + (q2 - 128.0) * tl.load(s2_ptr + scale_idx))
+    values = (
+        (q0 - 128.0) * tl.load(s0_ptr + scale_idx)
+        + (q1 - 128.0) * tl.load(s1_ptr + scale_idx)
+        + (q2 - 128.0) * tl.load(s2_ptr + scale_idx)
+    )
     tl.store(out_ptr + row * n_cols + cols, values, mask=mask)
 
 
-def _wait_flags(mapping: mmap.mmap, offset: int, world_size: int, generation: int) -> None:
+def _wait_flags(
+    mapping: mmap.mmap, offset: int, world_size: int, generation: int
+) -> None:
     deadline = time.monotonic() + float(os.environ.get("VLLM_TP3_CE_TIMEOUT_S", "120"))
     while True:
-        if all(struct.unpack_from("i", mapping, offset + rank * 4)[0] == generation
-               for rank in range(world_size)):
+        if all(
+            struct.unpack_from("i", mapping, offset + rank * 4)[0] == generation
+            for rank in range(world_size)
+        ):
             return
         if time.monotonic() >= deadline:
             raise TimeoutError(f"TP3 CE barrier timed out at generation {generation}")
         time.sleep(0)
 
 
-def _workspace(group: ProcessGroup, device: torch.device, cols: int) -> dict[str, object]:
+def _workspace(
+    group: ProcessGroup, device: torch.device, cols: int
+) -> dict[str, object]:
     global _WORKSPACE
     if _WORKSPACE is not None:
         return _WORKSPACE
@@ -90,7 +101,9 @@ def _workspace(group: ProcessGroup, device: torch.device, cols: int) -> dict[str
     handle = path.open("r+b", buffering=0)
     mapping = mmap.mmap(handle.fileno(), total_bytes)
     host_storage = torch.frombuffer(mapping, dtype=torch.uint8)
-    status = torch.cuda.cudart().cudaHostRegister(host_storage.data_ptr(), host_storage.numel(), 1)
+    status = torch.cuda.cudart().cudaHostRegister(
+        host_storage.data_ptr(), host_storage.numel(), 1
+    )
     if status.value != 0:
         raise RuntimeError(f"cudaHostRegister failed: {status}")
     _WORKSPACE = {
@@ -103,7 +116,9 @@ def _workspace(group: ProcessGroup, device: torch.device, cols: int) -> dict[str
         "num_blocks": num_blocks,
         "generation": 0,
         "send": torch.empty(max_payload, device=device, dtype=torch.uint8),
-        "remote": torch.empty((world_size - 1, max_payload), device=device, dtype=torch.uint8),
+        "remote": torch.empty(
+            (world_size - 1, max_payload), device=device, dtype=torch.uint8
+        ),
         "stream": torch.cuda.Stream(device=device),
     }
     return _WORKSPACE
@@ -156,13 +171,20 @@ def tp3_ce_all_reduce(input_: torch.Tensor, group: ProcessGroup) -> torch.Tensor
     struct.pack_into("i", mapping, 64 + rank * 4, generation)
     _wait_flags(mapping, 64, world_size, generation)
     current.wait_stream(stream)
-    buffers = [send[:total] if peer == rank else remote[peers.index(peer), :total]
-               for peer in range(world_size)]
+    buffers = [
+        send[:total] if peer == rank else remote[peers.index(peer), :total]
+        for peer in range(world_size)
+    ]
     output = torch.empty_like(input_)
     _dequant_sum_i8_block[(rows, num_blocks)](
-        buffers[0][:q_bytes], buffers[1][:q_bytes], buffers[2][:q_bytes],
+        buffers[0][:q_bytes],
+        buffers[1][:q_bytes],
+        buffers[2][:q_bytes],
         buffers[0][q_bytes:].view(torch.float32),
         buffers[1][q_bytes:].view(torch.float32),
-        buffers[2][q_bytes:].view(torch.float32), output, cols, quant_block,
+        buffers[2][q_bytes:].view(torch.float32),
+        output,
+        cols,
+        quant_block,
     )
     return output
