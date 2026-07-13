@@ -249,6 +249,12 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # Experimental separate-pool GDN prefix checkpoint commands. Keys are the
+    # exact chained content hashes of scheduler-block boundaries. Workers save
+    # after a successful forward and restore before preprocess_mamba.
+    gdn_checkpoint_save: dict[str, bytes] | None = None
+    gdn_checkpoint_restore: dict[str, bytes] | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

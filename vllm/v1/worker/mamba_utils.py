@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import itertools
+from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any
 
@@ -21,6 +22,160 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
+
+
+class GDNPrefixCheckpointStore:
+    """Per-rank pinned-host LRU for exact separate-pool GDN boundaries."""
+
+    def __init__(self, limit: int = 8, advertised_limit: int | None = None) -> None:
+        self.limit = limit
+        self.advertised_limit = limit if advertised_limit is None else advertised_limit
+        if not 0 < self.advertised_limit <= self.limit:
+            raise ValueError(
+                "advertised_limit must be positive and no larger than limit"
+            )
+        self._checkpoints: OrderedDict[bytes, tuple[torch.Tensor, ...]] = OrderedDict()
+        self.saves = 0
+        self.restores = 0
+
+    def __len__(self) -> int:
+        return len(self._checkpoints)
+
+    def contains(self, key: bytes) -> bool:
+        return key in self._checkpoints
+
+    def snapshot_keys(self) -> tuple[bytes, ...]:
+        """Return the safe oldest-to-newest scheduler-visible LRU suffix.
+
+        The worker retains an additional reserve because async scheduling can
+        enqueue a restore from a completed output snapshot while later model
+        steps are already saving checkpoints. Only the newest advertised
+        suffix is eligible for new hits; the older reserve keeps queued hits
+        alive until their restore command executes.
+        """
+        keys = tuple(self._checkpoints)
+        return keys[-self.advertised_limit :]
+
+    def _state_tensors(
+        self,
+        req_id: str,
+        kv_cache_config: KVCacheConfig,
+        requests: dict[str, CachedRequestState],
+        forward_context: dict[str, Any],
+    ):
+        req_state = requests[req_id]
+        mamba_group_ids, mamba_spec = get_mamba_groups(kv_cache_config)
+        assert mamba_spec.separate_pool
+        for group_id in mamba_group_ids:
+            block_ids = req_state.block_ids[group_id]
+            assert len(block_ids) == 1 and block_ids[0] != 0
+            block_id = block_ids[0]
+            for layer_name in kv_cache_config.kv_cache_groups[group_id].layer_names:
+                attention = forward_context[layer_name]
+                for state in attention.kv_cache:
+                    yield state[block_id]
+
+    def save(
+        self,
+        key: bytes,
+        req_id: str,
+        kv_cache_config: KVCacheConfig,
+        requests: dict[str, CachedRequestState],
+        forward_context: dict[str, Any],
+    ) -> None:
+        host_states: list[torch.Tensor] = []
+        for state in self._state_tensors(
+            req_id, kv_cache_config, requests, forward_context
+        ):
+            host = torch.empty_like(
+                state,
+                device="cpu",
+                pin_memory=state.is_cuda,
+            )
+            host.copy_(state, non_blocking=state.is_cuda)
+            host_states.append(host)
+        if host_states and host_states[0].is_pinned():
+            torch.cuda.current_stream().synchronize()
+        self._checkpoints[key] = tuple(host_states)
+        self._checkpoints.move_to_end(key)
+        while len(self._checkpoints) > self.limit:
+            self._checkpoints.popitem(last=False)
+        self.saves += 1
+
+    def restore(
+        self,
+        key: bytes,
+        req_id: str,
+        kv_cache_config: KVCacheConfig,
+        requests: dict[str, CachedRequestState],
+        forward_context: dict[str, Any],
+    ) -> None:
+        host_states = self._checkpoints.get(key)
+        if host_states is None:
+            raise RuntimeError(
+                "Exact GDN prefix checkpoint missing in worker for scheduler hit"
+            )
+        device_states = tuple(
+            self._state_tensors(req_id, kv_cache_config, requests, forward_context)
+        )
+        if len(device_states) != len(host_states):
+            raise RuntimeError("GDN prefix checkpoint tensor-count mismatch")
+        for device, host in zip(device_states, host_states):
+            if device.shape != host.shape or device.dtype != host.dtype:
+                raise RuntimeError("GDN prefix checkpoint tensor metadata mismatch")
+            device.copy_(host, non_blocking=host.is_pinned())
+        self._checkpoints.move_to_end(key)
+        self.restores += 1
+
+    def save_from_output(
+        self,
+        scheduler_output: SchedulerOutput,
+        kv_cache_config: KVCacheConfig,
+        requests: dict[str, CachedRequestState],
+        forward_context: dict[str, Any],
+    ) -> None:
+        for req_id, key in (scheduler_output.gdn_checkpoint_save or {}).items():
+            self.save(key, req_id, kv_cache_config, requests, forward_context)
+
+    def restore_from_output(
+        self,
+        scheduler_output: SchedulerOutput,
+        kv_cache_config: KVCacheConfig,
+        requests: dict[str, CachedRequestState],
+        forward_context: dict[str, Any],
+    ) -> None:
+        for req_id, key in (scheduler_output.gdn_checkpoint_restore or {}).items():
+            self.restore(key, req_id, kv_cache_config, requests, forward_context)
+
+    def zero_cold_from_output(
+        self,
+        scheduler_output: SchedulerOutput,
+        kv_cache_config: KVCacheConfig,
+        requests: dict[str, CachedRequestState],
+        forward_context: dict[str, Any],
+    ) -> None:
+        """Clear recycled one-slot GDN blocks before a truly cold request.
+
+        The generic KV zeroer intentionally visits attention tensors only.
+        A private GDN BlockPool therefore needs its own allocation-time clear;
+        otherwise a block reused after request completion starts from another
+        request's recurrent state. Exact checkpoint restores overwrite their
+        destination and must not be cleared here.
+        """
+        restored_req_ids = set((scheduler_output.gdn_checkpoint_restore or {}).keys())
+        for req_id in scheduler_output.num_scheduled_tokens:
+            req_state = requests[req_id]
+            if req_id in restored_req_ids or req_state.num_computed_tokens != 0:
+                continue
+            seen: set[int] = set()
+            for state in self._state_tensors(
+                req_id, kv_cache_config, requests, forward_context
+            ):
+                ptr = state.data_ptr()
+                if ptr in seen:
+                    continue
+                seen.add(ptr)
+                state.zero_()
 
 
 @triton.jit
@@ -1000,6 +1155,19 @@ def preprocess_mamba(
         # Block 3: speculative block
         # And use block 1 to save the running state.
         curr_state_idx = num_blocks - 1 - num_speculative_blocks
+        if mamba_spec.separate_pool:
+            curr_state_idx = 0
+            # Logical state positions advance every Mamba block, but the
+            # separate allocator exposes exactly one physical table column.
+            # A restored or continuing state is already in that column.
+            if prev_state_idx != -1:
+                prev_state_idx = 0
+        elif prev_state_idx is not None and prev_state_idx != curr_state_idx:
+            # A separate one-slot manager relocates the same physical block:
+            # the old logical entry is null and the current one is live.
+            group_blocks = req_state.block_ids[mamba_group_ids[0]]
+            if group_blocks[prev_state_idx] == 0 and group_blocks[curr_state_idx] != 0:
+                prev_state_idx = curr_state_idx
         mamba_state_idx[req_id] = curr_state_idx
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
             collect_mamba_copy_meta(

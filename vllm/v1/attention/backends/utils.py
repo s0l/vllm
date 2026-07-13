@@ -948,6 +948,8 @@ def mamba_get_block_table_tensor(
         return block_table
     else:
         assert isinstance(kv_cache_spec, MambaSpec)
+        if kv_cache_spec.separate_pool:
+            return block_table[:, :1]
         # NOTE: For 0-length requests in CUDA graph, use a start_index of 0
         # to handle the invalid block table.
         start_indices = torch.clamp(
