@@ -1229,9 +1229,7 @@ class MambaManager(SingleTypeKVCacheManager):
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
         self.one_slot_align = kv_cache_spec.separate_pool
         if self.one_slot_align and self.num_speculative_blocks:
-            raise ValueError(
-                "Separate-pool GDN does not support speculative blocks"
-            )
+            raise ValueError("Separate-pool GDN does not support speculative blocks")
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step

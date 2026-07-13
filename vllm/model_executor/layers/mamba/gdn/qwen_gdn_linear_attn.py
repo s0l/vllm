@@ -86,6 +86,7 @@ if GDN_AITER_TRITON_AVAILABLE:
 
 logger = init_logger(__name__)
 
+
 # TODO(arpera): remove ``_is_libs_cu13_install_intact`` and its caller in
 # ``_resolve_gdn_prefill_backend`` once the upstream packaging bug is
 # fixed and the broken wheels are yanked / superseded on PyPI:
@@ -469,8 +470,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.gqa_interleaved_layout = gqa_interleaved_layout
         incompatible_gdn_tp = (
-            self.num_k_heads % self.tp_size != 0
-            or self.num_v_heads % self.tp_size != 0
+            self.num_k_heads % self.tp_size != 0 or self.num_v_heads % self.tp_size != 0
         )
         self.gdn_explicit_partition = incompatible_gdn_tp and (
             not self.gqa_interleaved_layout

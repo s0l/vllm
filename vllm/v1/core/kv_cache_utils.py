@@ -88,6 +88,7 @@ logger = init_logger(__name__)
 def _use_separate_gdn_pool(vllm_config: VllmConfig) -> bool:
     return bool(vllm_config.additional_config.get("gdn_separate_pool", False))
 
+
 # The hash seed for the first block of any prefix block sequence.
 #
 # We use a random value to avoid hash collisions or PYTHONHASHSEED environment
@@ -1398,8 +1399,7 @@ def get_kv_cache_config_from_groups(
 
             attention_buckets = _bucket_layers_by_page_size(attention_groups)
             attention_bytes_per_block = sum(
-                page_size * len(slots)
-                for page_size, slots in attention_buckets.items()
+                page_size * len(slots) for page_size, slots in attention_buckets.items()
             )
             override = vllm_config.cache_config.num_gpu_blocks_override
             if override is not None:
