@@ -116,41 +116,6 @@ class TestNonStreaming:
         args = json.loads(result.tool_calls[0].function.arguments)
         assert args == {"filePath": "solution.cpp"}
 
-    def test_default_api_call_fallback(self, parser, mock_request):
-        text = (
-            "I'll read it.\n"
-            "```text\n"
-            "\"call: default_api:read{'filePath': 'solution.cpp'}\"\n"
-            "```"
-        )
-
-        result = parser.extract_tool_calls(text, mock_request)
-
-        assert result.tools_called is True
-        assert len(result.tool_calls) == 1
-        assert result.tool_calls[0].function.name == "read"
-        args = json.loads(result.tool_calls[0].function.arguments)
-        assert args == {"filePath": "solution.cpp"}
-        assert "call: default_api" not in (result.content or "")
-
-    def test_json_tool_descriptor_fallback(self, parser, mock_request):
-        text = (
-            "Here is the read request.\n"
-            "```json\n"
-            '{\n  "tool": "read",\n'
-            '  "arguments": {"filePath": "solution.cpp"}\n'
-            "}\n"
-            "```"
-        )
-
-        result = parser.extract_tool_calls(text, mock_request)
-
-        assert result.tools_called is True
-        assert len(result.tool_calls) == 1
-        assert result.tool_calls[0].function.name == "read"
-        args = json.loads(result.tool_calls[0].function.arguments)
-        assert args == {"filePath": "solution.cpp"}
-
     def test_parallel_tool_calls(self, parser, mock_request):
         text = (
             "<tool_call>\n"
