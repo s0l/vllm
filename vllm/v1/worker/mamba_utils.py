@@ -27,8 +27,13 @@ from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
 class GDNPrefixCheckpointStore:
     """Per-rank pinned-host LRU for exact separate-pool GDN boundaries."""
 
-    def __init__(self, limit: int = 8) -> None:
+    def __init__(self, limit: int = 8, advertised_limit: int | None = None) -> None:
         self.limit = limit
+        self.advertised_limit = limit if advertised_limit is None else advertised_limit
+        if not 0 < self.advertised_limit <= self.limit:
+            raise ValueError(
+                "advertised_limit must be positive and no larger than limit"
+            )
         self._checkpoints: OrderedDict[bytes, tuple[torch.Tensor, ...]] = OrderedDict()
         self.saves = 0
         self.restores = 0
@@ -38,6 +43,18 @@ class GDNPrefixCheckpointStore:
 
     def contains(self, key: bytes) -> bool:
         return key in self._checkpoints
+
+    def snapshot_keys(self) -> tuple[bytes, ...]:
+        """Return the safe oldest-to-newest scheduler-visible LRU suffix.
+
+        The worker retains an additional reserve because async scheduling can
+        enqueue a restore from a completed output snapshot while later model
+        steps are already saving checkpoints. Only the newest advertised
+        suffix is eligible for new hits; the older reserve keeps queued hits
+        alive until their restore command executes.
+        """
+        keys = tuple(self._checkpoints)
+        return keys[-self.advertised_limit :]
 
     def _state_tensors(
         self,

@@ -117,7 +117,9 @@ class KVCacheCoordinator(ABC):
         self.gdn_checkpoint_keys: OrderedDict[BlockHash, None] | None = None
         self.gdn_checkpoint_limit = 8
         if separate_gdn_pool:
-            pool_sizes = {spec.separate_pool_num_blocks for spec in separate_mamba_specs}
+            pool_sizes = {
+                spec.separate_pool_num_blocks for spec in separate_mamba_specs
+            }
             if len(pool_sizes) != 1 or 0 in pool_sizes:
                 raise ValueError(
                     "Separate GDN cache groups must use one positive pool size"
@@ -177,6 +179,14 @@ class KVCacheCoordinator(ABC):
         while len(self.gdn_checkpoint_keys) > self.gdn_checkpoint_limit:
             self.gdn_checkpoint_keys.popitem(last=False)
 
+    def sync_gdn_checkpoints(self, keys: tuple[bytes, ...]) -> None:
+        """Replace scheduler membership with the authoritative worker LRU."""
+        if self.gdn_checkpoint_keys is None:
+            return
+        if len(keys) > self.gdn_checkpoint_limit or len(set(keys)) != len(keys):
+            raise RuntimeError("Invalid worker GDN checkpoint snapshot")
+        self.gdn_checkpoint_keys = OrderedDict((BlockHash(key), None) for key in keys)
+
     def has_gdn_checkpoint(self, key: BlockHash, *, touch: bool = True) -> bool:
         if self.gdn_checkpoint_keys is None or key not in self.gdn_checkpoint_keys:
             return False
@@ -204,8 +214,11 @@ class KVCacheCoordinator(ABC):
             spec_hashes[num_blocks - 1], touch=False
         ):
             num_blocks -= 1
-        if num_blocks:
-            self.has_gdn_checkpoint(spec_hashes[num_blocks - 1])
+        # Lookup can run for a waiting request that is not admitted in this
+        # scheduler step. Touching the scheduler-side LRU here would then have
+        # no matching restore in the workers and can make their eviction order
+        # diverge. The scheduler touches the key only when it emits the actual
+        # restore command.
         return num_blocks * checkpoint_block_size
 
     def get_num_blocks_to_allocate(
@@ -845,8 +858,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     )
                     num_blocks = _new_hit_length // checkpoint_block_size
                     hit_blocks = tuple(
-                        [self.block_pool.null_block] * num_blocks
-                        for _ in group_ids
+                        [self.block_pool.null_block] * num_blocks for _ in group_ids
                     )
                 else:
                     hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(

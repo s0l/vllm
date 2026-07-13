@@ -934,7 +934,11 @@ class GPUModelRunner(
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
-        self.gdn_checkpoint_store = mamba_utils.GDNPrefixCheckpointStore(limit=8)
+        # Scheduler advertises eight keys, while the worker retains three
+        # additional max-num-seqs=8 save waves for async run-ahead restores.
+        self.gdn_checkpoint_store = mamba_utils.GDNPrefixCheckpointStore(
+            limit=32, advertised_limit=8
+        )
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
         self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
         if self.cache_config.mamba_cache_mode == "all" and self.num_spec_tokens > 0:
@@ -4538,6 +4542,7 @@ class GPUModelRunner(
             self.requests,
             self.compilation_config.static_forward_context,
         )
+        gdn_checkpoint_keys = self.gdn_checkpoint_store.snapshot_keys()
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -4727,6 +4732,7 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                gdn_checkpoint_keys=gdn_checkpoint_keys,
                 routed_experts=None,
             )
 
@@ -5654,9 +5660,7 @@ class GPUModelRunner(
                     logprobs, num_prompt_logprobs, tgt_token_ids
                 )
 
-                chunk_slice = slice(
-                    start_idx + local_start, start_idx + local_end
-                )
+                chunk_slice = slice(start_idx + local_start, start_idx + local_end)
                 logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
                     token_ids, non_blocking=True
                 )

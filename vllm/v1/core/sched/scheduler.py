@@ -1049,9 +1049,7 @@ class Scheduler(SchedulerInterface):
                     if (
                         checkpoint_key is not None
                         and coordinator is not None
-                        and coordinator.has_gdn_checkpoint(
-                            checkpoint_key, touch=False
-                        )
+                        and coordinator.has_gdn_checkpoint(checkpoint_key, touch=True)
                     ):
                         gdn_checkpoint_restore[request_id] = checkpoint_key
                         logger.info(
@@ -1631,11 +1629,14 @@ class Scheduler(SchedulerInterface):
         cudagraph_stats = model_runner_output.cudagraph_stats
 
         coordinator = self._gdn_checkpoint_coordinator
-        if coordinator is not None and scheduler_output.gdn_checkpoint_save:
-            # Reaching update_from_output proves the worker forward completed;
-            # only now may a boundary become eligible for future prefix hits.
-            for key in scheduler_output.gdn_checkpoint_save.values():
-                coordinator.register_gdn_checkpoint(key)
+        if (
+            coordinator is not None
+            and model_runner_output.gdn_checkpoint_keys is not None
+        ):
+            # Reaching update_from_output proves the worker forward completed.
+            # Mirror the actual worker membership instead of maintaining an
+            # independently inferred LRU that can diverge on waiting/admission.
+            coordinator.sync_gdn_checkpoints(model_runner_output.gdn_checkpoint_keys)
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
