@@ -43,7 +43,12 @@ THINK_END = "</think>"
 TOOL_CALL_START = "<tool_call>"
 TOOL_CALL_END = "</tool_call>"
 FUNC_PREFIX = "<function="
+FUNC_PREFIX_IMSTART_QUOTED = '<|im_start|>="'
+FUNC_PREFIX_IMSTART_FUNCTION = "<|im_start|>function="
+FUNC_PREFIX_BARE_EQ = "="
 FUNC_END = "</function>"
+FUNC_NAME_QUOTE_END = '"'
+FUNC_NAME_NEWLINE_END = "\n"
 PARAM_START = "<parameter="
 PARAM_END = "</parameter>"
 
@@ -54,24 +59,34 @@ _PARAM_RE = re.compile(
     re.DOTALL,
 )
 _PARTIAL_PARAM_RE = re.compile(r"<\s*parameter\s*=\s*([^>]+)>(.*)$", re.DOTALL)
+def _strip_wrapping_quotes(value: str, *, partial: bool = False) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    if partial and value:
+        if value[0] in ("'", '"'):
+            value = value[1:]
+        if value and value[-1] in ("'", '"'):
+            value = value[:-1]
+    return value
 
 
 def _qwen3_arg_converter(raw_args: str, partial: bool) -> str:
     params: dict[str, object] = {}
 
     for match in _PARAM_RE.finditer(raw_args):
-        name = match.group(1)
-        value = match.group(2)
-        params[name] = value.strip()
+        name = _strip_wrapping_quotes(match.group(1))
+        value = _strip_wrapping_quotes(match.group(2), partial=partial)
+        params[name] = value
 
     if partial:
         remaining = _PARAM_RE.sub("", raw_args)
         m = _PARTIAL_PARAM_RE.search(remaining)
         if m:
-            name = m.group(1)
-            value = m.group(2)
+            name = _strip_wrapping_quotes(m.group(1))
+            value = _strip_wrapping_quotes(m.group(2), partial=partial)
             if name:
-                params[name] = value.strip()
+                params[name] = value
 
     return json.dumps(params, ensure_ascii=False)
 
@@ -97,7 +112,12 @@ def qwen3_config(
             "TOOL_START": tool_start,
             "TOOL_END": tool_end,
             "FUNC_PREFIX": FUNC_PREFIX,
+            "FUNC_PREFIX_IMSTART_QUOTED": FUNC_PREFIX_IMSTART_QUOTED,
+            "FUNC_PREFIX_IMSTART_FUNCTION": FUNC_PREFIX_IMSTART_FUNCTION,
+            "FUNC_PREFIX_BARE_EQ": FUNC_PREFIX_BARE_EQ,
             "FUNC_END": FUNC_END,
+            "FUNC_NAME_QUOTE_END": FUNC_NAME_QUOTE_END,
+            "FUNC_NAME_NEWLINE_END": FUNC_NAME_NEWLINE_END,
             "PARAM_START": PARAM_START,
             "PARAM_END": PARAM_END,
             "CLOSE_ANGLE": ">",
@@ -108,6 +128,7 @@ def qwen3_config(
             "TOOL_START": tool_start,
             "TOOL_END": tool_end,
         },
+        preserve_tokens=frozenset({"<|im_start|>"}),
         transitions={
             # -- Reasoning transitions --
             (ParserState.REASONING, "THINK_START"): Transition(
@@ -147,9 +168,36 @@ def qwen3_config(
                 ParserState.TOOL_NAME,
                 (),
             ),
+            # Some Qwen3.6 checkpoints occasionally emit malformed auto
+            # tool-call function openers while still producing valid parameter
+            # XML. Accept the observed variants only after <tool_call>.
+            (ParserState.TOOL_PREAMBLE, "FUNC_PREFIX_IMSTART_QUOTED"): Transition(
+                ParserState.TOOL_NAME,
+                (),
+            ),
+            (ParserState.TOOL_PREAMBLE, "FUNC_PREFIX_IMSTART_FUNCTION"): Transition(
+                ParserState.TOOL_NAME,
+                (),
+            ),
+            (ParserState.TOOL_PREAMBLE, "FUNC_PREFIX_BARE_EQ"): Transition(
+                ParserState.TOOL_NAME,
+                (),
+            ),
             (ParserState.TOOL_NAME, "CLOSE_ANGLE"): Transition(
                 ParserState.TOOL_ARGS,
                 (),
+            ),
+            (ParserState.TOOL_NAME, "FUNC_NAME_QUOTE_END"): Transition(
+                ParserState.TOOL_ARGS,
+                (),
+            ),
+            (ParserState.TOOL_NAME, "FUNC_NAME_NEWLINE_END"): Transition(
+                ParserState.TOOL_ARGS,
+                (),
+            ),
+            (ParserState.TOOL_NAME, "PARAM_START"): Transition(
+                ParserState.TOOL_ARGS,
+                (EventType.ARG_VALUE_CHUNK,),
             ),
             # Malformed: </function> while still in TOOL_NAME (no closing >)
             (ParserState.TOOL_NAME, "FUNC_END"): Transition(
