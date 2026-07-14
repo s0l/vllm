@@ -61,9 +61,14 @@ _PARAM_RE = re.compile(
 _PARTIAL_PARAM_RE = re.compile(r"<\s*parameter\s*=\s*([^>]+)>(.*)$", re.DOTALL)
 
 
+def _has_wrapping_quotes(value: str) -> bool:
+    value = value.strip()
+    return len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"')
+
+
 def _strip_wrapping_quotes(value: str, *, partial: bool = False) -> str:
     value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+    if _has_wrapping_quotes(value):
         return value[1:-1]
     if partial and value:
         if value[0] in ("'", '"'):
@@ -77,16 +82,22 @@ def _qwen3_arg_converter(raw_args: str, partial: bool) -> str:
     params: dict[str, object] = {}
 
     for match in _PARAM_RE.finditer(raw_args):
-        name = _strip_wrapping_quotes(match.group(1))
-        value = _strip_wrapping_quotes(match.group(2), partial=partial)
+        raw_name = match.group(1)
+        name = _strip_wrapping_quotes(raw_name)
+        value = match.group(2).strip()
+        if _has_wrapping_quotes(raw_name):
+            value = _strip_wrapping_quotes(value)
         params[name] = value
 
     if partial:
         remaining = _PARAM_RE.sub("", raw_args)
         m = _PARTIAL_PARAM_RE.search(remaining)
         if m:
-            name = _strip_wrapping_quotes(m.group(1))
-            value = _strip_wrapping_quotes(m.group(2), partial=partial)
+            raw_name = m.group(1)
+            name = _strip_wrapping_quotes(raw_name)
+            value = m.group(2).strip()
+            if _has_wrapping_quotes(raw_name):
+                value = _strip_wrapping_quotes(value, partial=True)
             if name:
                 params[name] = value
 

@@ -619,7 +619,7 @@ class TestStreaming:
         chunks = [
             "<tool_call>\n",
             "<function=read>\n",
-            '<parameter=filePath>"s',
+            '<parameter="filePath">"s',
             "olution.cpp",
             '"</parameter>\n',
             "</function>\n",
@@ -632,6 +632,39 @@ class TestStreaming:
         assert args_text
         parsed = json.loads(args_text)
         assert parsed["filePath"] == "solution.cpp"
+
+    @pytest.mark.parametrize(
+        ("value_chunks", "expected"),
+        [
+            (['"nv', "Dock", '" parameters size'], '"nvDock" parameters size'),
+            (
+                ['"nvDock" OR ', '"CWIP-1.0', '" parameters size'],
+                '"nvDock" OR "CWIP-1.0" parameters size',
+            ),
+            (['"nvDock', '"'], '"nvDock"'),
+        ],
+    )
+    def test_streaming_preserves_content_quotes(
+        self,
+        parser,
+        mock_request,
+        value_chunks,
+        expected,
+    ):
+        chunks = [
+            "<tool_call>\n",
+            "<function=search>\n",
+            "<parameter=query>",
+            *value_chunks,
+            "</parameter>\n",
+            "</function>\n",
+            "</tool_call>",
+        ]
+
+        results = simulate_tool_streaming(parser, mock_request, chunks)
+
+        args_text = collect_tool_arguments(results)
+        assert json.loads(args_text) == {"query": expected}
 
     def test_char_by_char_streaming(self, mock_request):
         """Feed text character-by-character to test lexer robustness.
@@ -787,6 +820,35 @@ class TestArgConverter:
         raw = "<parameter=city>Tokyo</parameter>\n<parameter=expr>x<5"
         result = json.loads(_qwen3_arg_converter(raw, partial=True))
         assert result == {"city": "Tokyo", "expr": "x<5"}
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            '"nvDock" parameters size',
+            '"nvDock" OR "CWIP-1.0" parameters size',
+            '"nvDock"',
+            "'nvDock'",
+        ],
+    )
+    def test_preserves_quotes_in_ordinary_parameter_values(self, value):
+        from vllm.parser.qwen3 import _qwen3_arg_converter
+
+        raw = f"<parameter=query>{value}</parameter>"
+
+        assert json.loads(_qwen3_arg_converter(raw, partial=False)) == {"query": value}
+        assert json.loads(_qwen3_arg_converter(raw, partial=True)) == {"query": value}
+
+    def test_quoted_parameter_dialect_strips_value_wrappers(self):
+        from vllm.parser.qwen3 import _qwen3_arg_converter
+
+        raw = '<parameter="filePath">"solution.cpp"</parameter>'
+
+        assert json.loads(_qwen3_arg_converter(raw, partial=False)) == {
+            "filePath": "solution.cpp"
+        }
+        assert json.loads(_qwen3_arg_converter(raw, partial=True)) == {
+            "filePath": "solution.cpp"
+        }
 
 
 class TestSchemaAwareTypeCoercion:
