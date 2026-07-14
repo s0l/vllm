@@ -395,12 +395,11 @@ class Scheduler(SchedulerInterface):
         if start >= max(request.num_prompt_tokens, request.num_tokens - 1):
             return num_new_tokens
 
-        block_size = self.cache_config.block_size
-        if self.dcp_world_size > 1:
-            block_size = math.lcm(
-                block_size,
-                self.cache_config.block_size * self.dcp_world_size,
-            )
+        # ``self.block_size`` is already the global scheduler alignment from
+        # resolve_kv_cache_block_sizes(), including hybrid-group LCM and CP.
+        block_size = self.block_size
+        if num_new_tokens < block_size:
+            return num_new_tokens
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.

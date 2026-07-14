@@ -22,12 +22,14 @@ def test_mamba_align_chunk_split_uses_dcp_effective_block_size():
         num_computed_tokens=0,
         num_prompt_tokens=1000,
         num_tokens=1000,
+        shared_prefix_boundary=0,
     )
     scheduler = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=16),
-        block_size=16,
+        block_size=48,
         dcp_world_size=3,
         use_eagle=False,
+        mamba_partial_cache_hit=False,
     )
 
     adjusted = Scheduler._mamba_block_aligned_split(
@@ -49,12 +51,14 @@ def test_mamba_align_split_keeps_small_chunks_when_dcp_alignment_exceeds_budget(
         num_computed_tokens=0,
         num_prompt_tokens=835,
         num_tokens=835,
+        shared_prefix_boundary=0,
     )
     scheduler = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=16),
-        block_size=208,
+        block_size=624,
         dcp_world_size=3,
         use_eagle=False,
+        mamba_partial_cache_hit=False,
     )
 
     adjusted = Scheduler._mamba_block_aligned_split(
@@ -98,6 +102,7 @@ def test_hybrid_dcp_resolves_global_scheduler_block_and_fine_hash_block():
             block_size=block_size,
             enable_prefix_caching=True,
             hash_block_size=None,
+            prefix_match_unit=None,
         ),
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=3,
