@@ -939,6 +939,11 @@ class GPUModelRunner(
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
+        # Scheduler advertises eight keys, while the worker retains three
+        # additional max-num-seqs=8 save waves for async run-ahead restores.
+        self.gdn_checkpoint_store = mamba_utils.GDNPrefixCheckpointStore(
+            limit=32, advertised_limit=8
+        )
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
         self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
         if self.cache_config.mamba_cache_mode == "all" and self.num_spec_tokens > 0:
@@ -2349,7 +2354,6 @@ class GPUModelRunner(
         # Zero out padded rows so stale data from condense() doesn't
         # misclassify padding as prefill in CUDA graph mode.
         is_prefilling[num_reqs:] = False
-
         if self.use_async_spec_decode:
             # GPU tensors are authoritative in async mode.
             seq_lens_cpu = None
@@ -4269,6 +4273,18 @@ class GPUModelRunner(
                     deferred_state_corrections_fn()
                     deferred_state_corrections_fn = None
                 mamba_bufs = self._get_mamba_bufs()
+                self.gdn_checkpoint_store.zero_cold_from_output(
+                    scheduler_output,
+                    self.kv_cache_config,
+                    self.requests,
+                    self.compilation_config.static_forward_context,
+                )
+                self.gdn_checkpoint_store.restore_from_output(
+                    scheduler_output,
+                    self.kv_cache_config,
+                    self.requests,
+                    self.compilation_config.static_forward_context,
+                )
                 mamba_utils.preprocess_mamba(
                     scheduler_output,
                     self.kv_cache_config,
@@ -4383,6 +4399,7 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
+                num_tokens_unpadded=num_tokens_unpadded,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -4530,6 +4547,14 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+
+        self.gdn_checkpoint_store.save_from_output(
+            scheduler_output,
+            self.kv_cache_config,
+            self.requests,
+            self.compilation_config.static_forward_context,
+        )
+        gdn_checkpoint_keys = self.gdn_checkpoint_store.snapshot_keys()
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -4719,6 +4744,7 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                gdn_checkpoint_keys=gdn_checkpoint_keys,
                 routed_experts=None,
             )
 
@@ -5626,34 +5652,44 @@ class GPUModelRunner(
             # then there is prompt logprob generated for each index.
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
-            prompt_hidden_states = hidden_states[offset : offset + num_logits]
-            logits = self.model.compute_logits(prompt_hidden_states)
+            # Logits and FP32 log-softmax are [tokens, vocab]. Bound their peak
+            # memory independently of the scheduler's prefill chunk size.
+            max_logits_per_chunk = 64
+            for local_start in range(0, num_logits, max_logits_per_chunk):
+                local_end = min(local_start + max_logits_per_chunk, num_logits)
+                prompt_hidden_states = hidden_states[
+                    offset + local_start : offset + local_end
+                ]
+                logits = self.model.compute_logits(prompt_hidden_states)
 
-            # Get the "target" tokens for each index. For prompt at index i,
-            # the token at prompt index i+1 is the "sampled" token we want
-            # to gather the logprob for.
-            tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
+                # For prompt index i, i+1 is the target token whose logprob and
+                # rank are returned.
+                tgt_token_ids = prompt_token_ids[
+                    start_tok + local_start : start_tok + local_end
+                ]
+                # Prompt tokens skip sampling processors, so processed_* and
+                # raw_* yield the same scores here.
+                if self.model_config.logprobs_mode in (
+                    "raw_logits",
+                    "processed_logits",
+                ):
+                    scores = logits.to(torch.float32)
+                else:
+                    scores = self.sampler.compute_logprobs(logits)
+                token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
+                    scores, num_prompt_logprobs, tgt_token_ids
+                )
 
-            # Compute prompt scores respecting logprobs_mode.
-            # NOTE: prompt tokens skip sampling processors, so
-            # processed_* and raw_* yield the same scores here.
-            if self.model_config.logprobs_mode in ("raw_logits", "processed_logits"):
-                scores = logits.to(torch.float32)
-            else:
-                scores = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
-                scores, num_prompt_logprobs, tgt_token_ids
-            )
-
-            # Transfer GPU->CPU async.
-            chunk_slice = slice(start_idx, start_idx + num_logits)
-            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
-                token_ids, non_blocking=True
-            )
-            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
-            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
-                ranks, non_blocking=True
-            )
+                chunk_slice = slice(start_idx + local_start, start_idx + local_end)
+                logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
+                    token_ids, non_blocking=True
+                )
+                logprobs_tensors.logprobs[chunk_slice].copy_(
+                    logprobs, non_blocking=True
+                )
+                logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
+                    ranks, non_blocking=True
+                )
 
         # Remove requests that have completed prefill from the batch
         # num_prompt_logprobs_dict.
@@ -6435,6 +6471,31 @@ class GPUModelRunner(
         self.encoder_cache.clear()
         gc.collect()
 
+    @staticmethod
+    def _get_minimal_kv_cache_blocks_for_cudagraph_profiling(
+        kv_cache_groups: list[KVCacheGroupSpec],
+        max_capture_tokens: int | None,
+        max_num_reqs: int,
+        cp_size: int,
+    ) -> tuple[int, bool]:
+        if max_capture_tokens is None:
+            return 1, False
+
+        block_requirements: list[int] = []
+        has_mamba_cache = False
+        for group in kv_cache_groups:
+            kv_cache_spec = group.kv_cache_spec
+            if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
+                continue
+            if isinstance(kv_cache_spec, MambaSpec):
+                has_mamba_cache = True
+                block_requirements.append(max_num_reqs)
+            else:
+                block_requirements.append(
+                    cdiv(max_capture_tokens, kv_cache_spec.block_size * cp_size)
+                )
+        return max(1, *block_requirements), has_mamba_cache
+
     def _init_minimal_kv_cache_for_profiling(self) -> None:
         from vllm.v1.core.kv_cache_utils import (
             get_kv_cache_config_from_groups,
@@ -6444,11 +6505,29 @@ class GPUModelRunner(
         kv_cache_spec = self.get_kv_cache_spec()
         KVCacheSpecRegistry.check_kv_cache_spec_registry(kv_cache_spec)
         kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
-        # the minimum number of blocks required is 1 block *per sequence*
-        min_blocks = (
-            min(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
-            or 1
+        max_capture_tokens = self.compilation_config.max_cudagraph_capture_size
+        parallel_config = self.vllm_config.parallel_config
+        cp_size = (
+            parallel_config.prefill_context_parallel_size
+            * parallel_config.decode_context_parallel_size
         )
+        min_blocks, has_mamba_cache = (
+            self._get_minimal_kv_cache_blocks_for_cudagraph_profiling(
+                kv_cache_groups,
+                max_capture_tokens,
+                self.max_num_reqs,
+                cp_size,
+            )
+        )
+        if max_capture_tokens is not None:
+            logger.info(
+                "Using %d KV blocks for CUDA graph profiling "
+                "(max_capture_tokens=%d, cp_size=%d, has_mamba_cache=%s)",
+                min_blocks,
+                max_capture_tokens,
+                cp_size,
+                has_mamba_cache,
+            )
 
         # Temporarily change num_gpu_blocks_override to allocate a minimal KV cache
         saved_override = self.cache_config.num_gpu_blocks_override

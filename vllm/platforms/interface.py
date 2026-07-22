@@ -771,6 +771,26 @@ class Platform:
         For hybrid attention/mamba models, ensure that the attention page
         size is >= the mamba page size, and pad the mamba page size to match.
         """
+        if vllm_config.additional_config.get("gdn_separate_pool", False):
+            # The experimental allocator gives recurrent state its own page
+            # geometry and block-id namespace. Keep the scheduler granularity
+            # shared, but do not inflate attention pages to the GDN state size.
+            requested_block = int(
+                vllm_config.additional_config.get("gdn_attention_block_size", 2352)
+            )
+            base_block = vllm_config.cache_config.block_size
+            dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+            if requested_block % base_block or requested_block % dcp_size:
+                raise ValueError(
+                    "gdn_attention_block_size must be divisible by the base "
+                    "attention block and DCP size"
+                )
+            vllm_config.cache_config.block_size = requested_block
+            vllm_config.cache_config.mamba_block_size = (
+                vllm_config.cache_config.block_size
+            )
+            return
+
         from math import lcm
 
         from vllm.config.vllm import set_current_vllm_config

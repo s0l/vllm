@@ -32,10 +32,11 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         logger.warning_once(
-            "Your GPU does not have native support for FP4 computation but "
-            "FP4 quantization is being used. Weight-only FP4 compression "
-            "will be used leveraging the Marlin kernel. This may degrade "
-            "performance for compute-heavy workloads."
+            "Selected the Marlin NVFP4 weight-only (W4A16) kernel. This does "
+            "not imply that the GPU lacks native FP4 support: W4A16 layers "
+            "use BF16/FP16 activations, while the available native NVFP4 "
+            "kernels require FP4 activations (W4A4). Marlin may be slower "
+            "for compute-heavy workloads."
         )
         prepare_fp4_layer_for_marlin(layer)
 

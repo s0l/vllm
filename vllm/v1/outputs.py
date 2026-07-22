@@ -269,6 +269,11 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
+    # Authoritative worker-side membership/order for exact GDN prefix
+    # checkpoints. The scheduler must not infer this from a parallel LRU:
+    # candidate lookups and admission can differ from actual worker restores.
+    gdn_checkpoint_keys: tuple[bytes, ...] | None = None
+
     # Per-step routed experts data captured by the worker.
     # ``routing_data`` shape: (num_scheduled_tokens, num_layers,
     #                         num_experts_per_tok); expert IDs as uint8/uint16.
