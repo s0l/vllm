@@ -70,6 +70,52 @@ class TestNonStreaming:
         args = json.loads(result.tool_calls[0].function.arguments)
         assert args == {"city": "Tokyo"}
 
+    @pytest.mark.parametrize(
+        ("function_opener", "function_closer"),
+        [
+            ('<|im_start|>="', '"'),
+            ("<|im_start|>function=", ">"),
+            ("=", "\n"),
+        ],
+    )
+    def test_malformed_auto_function_openers(
+        self,
+        parser,
+        mock_request,
+        function_opener,
+        function_closer,
+    ):
+        text = (
+            "<tool_call>\n"
+            f"{function_opener}read{function_closer}\n"
+            "<parameter=filePath>solution.cpp</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].function.name == "read"
+        args = json.loads(result.tool_calls[0].function.arguments)
+        assert args == {"filePath": "solution.cpp"}
+
+    def test_quoted_xml_parameter_name_and_value(self, parser, mock_request):
+        text = (
+            "<tool_call>\n"
+            "<function=read>\n"
+            '<parameter="filePath">"solution.cpp"</parameter>\n'
+            "</function>\n"
+            "</tool_call>"
+        )
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is True
+        args = json.loads(result.tool_calls[0].function.arguments)
+        assert args == {"filePath": "solution.cpp"}
+
     def test_parallel_tool_calls(self, parser, mock_request):
         text = (
             "<tool_call>\n"
@@ -542,6 +588,84 @@ class TestStreaming:
         parsed = json.loads(args_text)
         assert parsed["x"] == "1"
 
+    def test_streaming_malformed_auto_imstart_function_opener(
+        self,
+        parser,
+        mock_request,
+    ):
+        chunks = [
+            "<tool_call>\n",
+            '<|im_start|>="read"\n',
+            "<parameter=filePath>solution.cpp</parameter>\n",
+            "</function>\n",
+            "</tool_call>",
+        ]
+
+        results = simulate_tool_streaming(parser, mock_request, chunks)
+
+        name = collect_function_name(results)
+        assert name == "read"
+
+        args_text = collect_tool_arguments(results)
+        assert args_text
+        parsed = json.loads(args_text)
+        assert parsed["filePath"] == "solution.cpp"
+
+    def test_streaming_quoted_xml_parameter_value(
+        self,
+        parser,
+        mock_request,
+    ):
+        chunks = [
+            "<tool_call>\n",
+            "<function=read>\n",
+            '<parameter="filePath">"s',
+            "olution.cpp",
+            '"</parameter>\n',
+            "</function>\n",
+            "</tool_call>",
+        ]
+
+        results = simulate_tool_streaming(parser, mock_request, chunks)
+
+        args_text = collect_tool_arguments(results)
+        assert args_text
+        parsed = json.loads(args_text)
+        assert parsed["filePath"] == "solution.cpp"
+
+    @pytest.mark.parametrize(
+        ("value_chunks", "expected"),
+        [
+            (['"nv', "Dock", '" parameters size'], '"nvDock" parameters size'),
+            (
+                ['"nvDock" OR ', '"CWIP-1.0', '" parameters size'],
+                '"nvDock" OR "CWIP-1.0" parameters size',
+            ),
+            (['"nvDock', '"'], '"nvDock"'),
+        ],
+    )
+    def test_streaming_preserves_content_quotes(
+        self,
+        parser,
+        mock_request,
+        value_chunks,
+        expected,
+    ):
+        chunks = [
+            "<tool_call>\n",
+            "<function=search>\n",
+            "<parameter=query>",
+            *value_chunks,
+            "</parameter>\n",
+            "</function>\n",
+            "</tool_call>",
+        ]
+
+        results = simulate_tool_streaming(parser, mock_request, chunks)
+
+        args_text = collect_tool_arguments(results)
+        assert json.loads(args_text) == {"query": expected}
+
     def test_char_by_char_streaming(self, mock_request):
         """Feed text character-by-character to test lexer robustness.
 
@@ -696,6 +820,35 @@ class TestArgConverter:
         raw = "<parameter=city>Tokyo</parameter>\n<parameter=expr>x<5"
         result = json.loads(_qwen3_arg_converter(raw, partial=True))
         assert result == {"city": "Tokyo", "expr": "x<5"}
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            '"nvDock" parameters size',
+            '"nvDock" OR "CWIP-1.0" parameters size',
+            '"nvDock"',
+            "'nvDock'",
+        ],
+    )
+    def test_preserves_quotes_in_ordinary_parameter_values(self, value):
+        from vllm.parser.qwen3 import _qwen3_arg_converter
+
+        raw = f"<parameter=query>{value}</parameter>"
+
+        assert json.loads(_qwen3_arg_converter(raw, partial=False)) == {"query": value}
+        assert json.loads(_qwen3_arg_converter(raw, partial=True)) == {"query": value}
+
+    def test_quoted_parameter_dialect_strips_value_wrappers(self):
+        from vllm.parser.qwen3 import _qwen3_arg_converter
+
+        raw = '<parameter="filePath">"solution.cpp"</parameter>'
+
+        assert json.loads(_qwen3_arg_converter(raw, partial=False)) == {
+            "filePath": "solution.cpp"
+        }
+        assert json.loads(_qwen3_arg_converter(raw, partial=True)) == {
+            "filePath": "solution.cpp"
+        }
 
 
 class TestSchemaAwareTypeCoercion:

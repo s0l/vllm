@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
+    VLLM_TP3_CE_REDUCE: bool = False
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -844,6 +845,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if "VLLM_USE_FLASHINFER_SAMPLER" in os.environ
         else True
     ),
+    "VLLM_TP3_CE_REDUCE": lambda: os.environ.get("VLLM_TP3_CE_REDUCE", "0") == "1",
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
     # (CPU backend only) CPU key-value cache space.
