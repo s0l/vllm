@@ -8,7 +8,6 @@ reserved virtual address.  Callers must fence all users before resizing.
 
 from __future__ import annotations
 
-import atexit
 from dataclasses import dataclass
 
 import torch
@@ -61,7 +60,6 @@ class ElasticCuMemBacking:
         with torch.cuda.memory.use_mem_pool(self._pool):
             # Do not zero: touching the reserved but unmapped tail is invalid.
             self.tensor = torch.empty(reserved_bytes, dtype=torch.uint8, device=device)
-        self._closed = False
         info = self.info
         if info.base != self.tensor.data_ptr() or info.committed != committed_bytes:
             raise RuntimeError(
@@ -87,11 +85,6 @@ class ElasticCuMemBacking:
         assert resize_elastic is not None
         resize_elastic(self.tensor.data_ptr(), committed_bytes, True)
 
-    def close(self) -> None:
-        # Actual VA teardown is driven by the tensor/MemPool lifetime. Keep this
-        # hook for deterministic owner shutdown and future graph bookkeeping.
-        self._closed = True
-
 
 _live_backings: list[ElasticCuMemBacking] = []
 
@@ -105,15 +98,7 @@ def allocate_elastic_backing(
     backing = ElasticCuMemBacking(
         reserved_bytes, committed_bytes, quantum_bytes, device
     )
-    # Keep allocator wrappers alive longer than tensors/graphs, matching the
-    # defensive lifetime ordering used by CuMemAllocator.
+    # KV arenas are process-lifetime objects. Keep allocator wrappers alive
+    # longer than tensors/graphs, matching CuMemAllocator's lifetime ordering.
     _live_backings.append(backing)
     return backing
-
-
-def _shutdown_backings() -> None:
-    for backing in _live_backings:
-        backing.close()
-
-
-atexit.register(_shutdown_backings)

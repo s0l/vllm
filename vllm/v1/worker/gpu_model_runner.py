@@ -1170,9 +1170,7 @@ class GPUModelRunner(
             self.async_output_copy_stream = stream
         return stream
 
-    def _apply_elastic_kv_transition(
-        self, transition: tuple[int, int] | None
-    ) -> None:
+    def _apply_elastic_kv_transition(self, transition: tuple[int, int] | None) -> None:
         """Prepare/commit one stable-VA resize on every distributed rank."""
         if transition is None:
             return
@@ -1224,7 +1222,11 @@ class GPUModelRunner(
             0 if local_error else 1, dtype=torch.int32, device=self.device
         )
         if torch.distributed.is_initialized():
-            torch.distributed.all_reduce(vote, op=torch.distributed.ReduceOp.MIN)
+            torch.distributed.all_reduce(
+                vote,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_tp_group().device_group,
+            )
         if not bool(vote.item()):
             if local_error is None:
                 rollback = torch.cuda.Event()
