@@ -123,7 +123,6 @@ from .qwen2_5_vl import (
     Qwen2_5_VLVideoEmbeddingInputs,
     Qwen2_5_VLVideoInputs,
     Qwen2_5_VLVideoPixelInputs,
-    _pad_to_tp,
 )
 from .qwen2_vl import (
     Qwen2VLMultiModalDataParser,
@@ -136,6 +135,7 @@ from .utils import (
     PPMissingLayer,
     WeightsMapper,
     _merge_multimodal_embeddings,
+    ceil_to_multiple,
     maybe_prefix,
 )
 from .vision import (
@@ -393,7 +393,7 @@ class Qwen3_VisionMLP(nn.Module):
             if use_data_parallel
             else parallel_state.get_tensor_model_parallel_world_size()
         )
-        padded_hidden_features = _pad_to_tp(hidden_features, tp_size)
+        padded_hidden_features = ceil_to_multiple(hidden_features, tp_size)
         if padded_hidden_features == hidden_features:
             self.linear_fc1 = ColumnParallelLinear(
                 in_features,

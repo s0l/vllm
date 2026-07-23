@@ -110,6 +110,7 @@ from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
     cast_overflow_tensors,
+    ceil_to_multiple,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -306,10 +307,6 @@ Qwen2_5_VLVideoInputs: TypeAlias = (
 # === Vision Encoder === #
 
 
-def _pad_to_tp(value: int, tp_size: int) -> int:
-    return ((value + tp_size - 1) // tp_size) * tp_size
-
-
 class Qwen2_5_VisionMLP(nn.Module):
     def __init__(
         self,
@@ -369,7 +366,7 @@ class Qwen2_5_VisionAttention(nn.Module):
         self.hidden_size_per_attention_head = dist_utils.divide(
             projection_size, num_heads
         )
-        padded_num_heads = _pad_to_tp(num_heads, self.tp_size)
+        padded_num_heads = ceil_to_multiple(num_heads, self.tp_size)
         self.num_attention_heads_per_partition = padded_num_heads // self.tp_size
         padded_projection_size = padded_num_heads * self.hidden_size_per_attention_head
 

@@ -25,7 +25,6 @@
 # limitations under the License.
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
-import math
 from collections.abc import Iterable
 from itertools import islice
 from typing import Any
@@ -81,7 +80,7 @@ def _ceil_to_multiple(value: int, multiple: int) -> int:
 
 def _dense_mlp_padded_intermediate_multiple(tp_size: int) -> int:
     # Keep the rank-local K dimension aligned for grouped W4A16/AWQ kernels.
-    return math.lcm(tp_size * 32, 16)
+    return tp_size * 32
 
 
 class Qwen2MoeMLP(nn.Module):
