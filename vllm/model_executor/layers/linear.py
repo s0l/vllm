@@ -29,6 +29,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.shard_layout import ShardLayout
 from vllm.model_executor.layers.utils import (
     dispatch_unquantized_gemm,
 )
@@ -1061,6 +1062,22 @@ class PaddedMergedColumnParallelLinear(MergedColumnParallelLinear):
             return_bias=return_bias,
             disable_tp=disable_tp,
         )
+        self.output_shard_layouts = tuple(
+            ShardLayout.contiguous_padded(
+                logical_size=logical_size,
+                padded_size=padded_size,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+                destination_start=sum(self.output_sizes[:shard_id]) // self.tp_size,
+            )
+            for shard_id, (logical_size, padded_size) in enumerate(
+                zip(self.logical_output_sizes, self.output_sizes)
+            )
+        )
+        # Quantization methods may attach direct scale/metadata parameters
+        # whose loader does not expose an output dimension. Preserve their
+        # deterministic zero initialization until loaded-coverage accounting
+        # can prove every such parameter is overwritten.
         for param in self.parameters(recurse=False):
             param.data.zero_()
 
@@ -1093,26 +1110,25 @@ class PaddedMergedColumnParallelLinear(MergedColumnParallelLinear):
         if output_dim is None:
             return False
 
-        logical_size = self.logical_output_sizes[loaded_shard_id]
-        padded_size = self.output_sizes[loaded_shard_id]
-        padded_shard_size = padded_size // self.tp_size
-        global_start = self.tp_rank * padded_shard_size
-        copy_size = max(0, min(padded_shard_size, logical_size - global_start))
-
-        local_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
-        padded_shard_size, local_offset = self._maybe_adjust_output_span_for_packing(
-            param, padded_shard_size, local_offset
+        layout = self.output_shard_layouts[loaded_shard_id]
+        destination_size, destination_start = (
+            self._maybe_adjust_output_span_for_packing(
+                param,
+                layout.destination_size,
+                layout.destination_start,
+            )
         )
-        param_data = param.data.narrow(output_dim, local_offset, padded_shard_size)
+        param_data = param.data.narrow(output_dim, destination_start, destination_size)
         param_data.zero_()
-        if copy_size == 0:
+        if not layout.spans:
             return True
+        span = layout.spans[0]
 
-        copy_size, global_start = self._maybe_adjust_output_span_for_packing(
-            param, copy_size, global_start
+        copy_size, source_start = self._maybe_adjust_output_span_for_packing(
+            param, span.size, span.source_start
         )
         param_data = param_data.narrow(output_dim, 0, copy_size)
-        loaded_weight = loaded_weight.narrow(output_dim, global_start, copy_size)
+        loaded_weight = loaded_weight.narrow(output_dim, source_start, copy_size)
         assert param_data.shape == loaded_weight.shape, (
             f"Tried to load padded shard {loaded_weight.shape} into {param_data.shape}"
         )
@@ -1250,76 +1266,18 @@ class ExplicitPaddedMergedColumnParallelLinear(PaddedMergedColumnParallelLinear)
             return_bias=return_bias,
             disable_tp=disable_tp,
         )
-
-    def _copy_padded_output_shard(
-        self,
-        param: Parameter,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: int,
-    ) -> bool:
-        output_dim = getattr(param, "output_dim", None)
-        if output_dim is None:
-            return False
-
-        padded_size = self.output_sizes[loaded_shard_id]
-        padded_shard_size = padded_size // self.tp_size
-        copy_size = self.local_sizes[loaded_shard_id]
-        global_start = self.local_starts[loaded_shard_id]
-
-        local_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
-        padded_shard_size, local_offset = self._maybe_adjust_output_span_for_packing(
-            param, padded_shard_size, local_offset
-        )
-        param_data = param.data.narrow(output_dim, local_offset, padded_shard_size)
-        param_data.zero_()
-        if copy_size == 0:
-            return True
-
-        copy_size, global_start = self._maybe_adjust_output_span_for_packing(
-            param, copy_size, global_start
-        )
-        param_data = param_data.narrow(output_dim, 0, copy_size)
-        loaded_weight = loaded_weight.narrow(output_dim, global_start, copy_size)
-        assert param_data.shape == loaded_weight.shape, (
-            f"Tried to load explicit padded shard {loaded_weight.shape} into "
-            f"{param_data.shape}"
-        )
-        param_data.copy_(loaded_weight)
-        return True
-
-    def _copy_fused_checkpoint_weight(
-        self,
-        param: Parameter,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: tuple[int, ...] | None,
-    ) -> bool:
-        output_dim = getattr(param, "output_dim", None)
-        if output_dim is None:
-            return False
-
-        shard_ids = (
-            list(loaded_shard_id)
-            if loaded_shard_id is not None
-            else list(range(len(self.logical_output_sizes)))
-        )
-        source_offset = 0
-        if loaded_shard_id is not None:
-            source_offset = sum(self.logical_output_sizes[: loaded_shard_id[0]])
-
-        for shard_id in shard_ids:
-            logical_size = self.logical_output_sizes[shard_id]
-            source_size, packed_source_offset = (
-                self._maybe_adjust_output_span_for_packing(
-                    param, logical_size, source_offset
-                )
+        self.output_shard_layouts = tuple(
+            ShardLayout.explicit(
+                logical_size=logical_size,
+                destination_start=sum(self.output_sizes[:shard_id]) // self.tp_size,
+                destination_size=padded_size // self.tp_size,
+                source_start=self.local_starts[shard_id],
+                source_size=self.local_sizes[shard_id],
             )
-            loaded_weight_shard = loaded_weight.narrow(
-                output_dim, packed_source_offset, source_size
+            for shard_id, (logical_size, padded_size) in enumerate(
+                zip(self.logical_output_sizes, self.output_sizes)
             )
-            if not self._copy_padded_output_shard(param, loaded_weight_shard, shard_id):
-                return False
-            source_offset += logical_size
-        return True
+        )
 
     def weight_loader(
         self,
@@ -2304,8 +2262,34 @@ class PaddedRowParallelLinear(RowParallelLinear):
             return_bias=return_bias,
             disable_tp=disable_tp,
         )
+        self.input_shard_layout = ShardLayout.contiguous_padded(
+            logical_size=self.logical_input_size,
+            padded_size=self.input_size,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+        )
+        # See the merged-column counterpart: dimensionless quant metadata is
+        # not yet covered by the span loader contract.
         for param in self.parameters(recurse=False):
             param.data.zero_()
+
+    def _infer_input_pack_factor(
+        self,
+        param_data: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        input_dim: int,
+    ) -> int | None:
+        destination_size = self.input_shard_layout.destination_size
+        if destination_size % param_data.shape[input_dim] != 0:
+            raise ValueError(
+                "Cannot infer packing for padded row shard: "
+                f"padded_shard_size={destination_size}, "
+                f"param_shape={tuple(param_data.shape)}, input_dim={input_dim}"
+            )
+        inferred = destination_size // param_data.shape[input_dim]
+        if loaded_weight.shape[input_dim] * inferred == self.logical_input_size:
+            return inferred
+        return None
 
     def _copy_padded_input_shard(
         self,
@@ -2316,47 +2300,37 @@ class PaddedRowParallelLinear(RowParallelLinear):
         if input_dim is None:
             return False
 
-        padded_shard_size = self.input_size_per_partition
-        global_start = self.tp_rank * padded_shard_size
-        copy_size = max(
-            0, min(padded_shard_size, self.logical_input_size - global_start)
-        )
-
+        layout = self.input_shard_layout
         param_data = param.data
         param_data.zero_()
-        if copy_size == 0:
+        if not layout.spans:
             return True
+        span = layout.spans[0]
+        source_start = span.source_start
+        copy_size = span.size
 
         packed_dim = getattr(param, "packed_dim", None)
         pack_factor = getattr(param, "packed_factor", getattr(param, "pack_factor", 1))
         if packed_dim != input_dim and copy_size > param_data.shape[input_dim]:
-            if padded_shard_size % param_data.shape[input_dim] != 0:
-                raise ValueError(
-                    "Cannot infer packing for padded row shard: "
-                    f"padded_shard_size={padded_shard_size}, "
-                    f"param_shape={tuple(param_data.shape)}, "
-                    f"input_dim={input_dim}"
-                )
-            inferred_pack_factor = padded_shard_size // param_data.shape[input_dim]
-            if (
-                loaded_weight.shape[input_dim] * inferred_pack_factor
-                == self.logical_input_size
-            ):
+            inferred_pack_factor = self._infer_input_pack_factor(
+                param_data, loaded_weight, input_dim
+            )
+            if inferred_pack_factor is not None:
                 pack_factor = inferred_pack_factor
                 packed_dim = input_dim
 
         if packed_dim == input_dim and pack_factor > 1:
-            if global_start % pack_factor != 0 or copy_size % pack_factor != 0:
+            if source_start % pack_factor != 0 or copy_size % pack_factor != 0:
                 raise ValueError(
                     "Cannot load padded packed row shard with unaligned "
-                    f"span: global_start={global_start}, copy_size={copy_size}, "
+                    f"span: global_start={source_start}, copy_size={copy_size}, "
                     f"pack_factor={pack_factor}"
                 )
-            global_start //= pack_factor
+            source_start //= pack_factor
             copy_size //= pack_factor
 
         param_data = param_data.narrow(input_dim, 0, copy_size)
-        loaded_weight = loaded_weight.narrow(input_dim, global_start, copy_size)
+        loaded_weight = loaded_weight.narrow(input_dim, source_start, copy_size)
         assert param_data.shape == loaded_weight.shape, (
             f"Tried to load padded row shard {loaded_weight.shape} into "
             f"{param_data.shape}"
@@ -2416,55 +2390,25 @@ class ExplicitPaddedRowParallelLinear(PaddedRowParallelLinear):
             return_bias=return_bias,
             disable_tp=disable_tp,
         )
-
-    def _copy_padded_input_shard(
-        self,
-        param: Parameter,
-        loaded_weight: torch.Tensor,
-    ) -> bool:
-        input_dim = getattr(param, "input_dim", None)
-        if input_dim is None:
-            return False
-
-        param_data = param.data
-        param_data.zero_()
-        if self.local_size == 0:
-            return True
-
-        local_start = self.local_start
-        local_size = self.local_size
-        packed_dim = getattr(param, "packed_dim", None)
-        pack_factor = getattr(param, "packed_factor", getattr(param, "pack_factor", 1))
-        if packed_dim != input_dim and local_size > param_data.shape[input_dim]:
-            if self.logical_input_size % loaded_weight.shape[input_dim] != 0:
-                raise ValueError(
-                    "Cannot infer packing for explicit padded row shard: "
-                    f"logical_input_size={self.logical_input_size}, "
-                    f"loaded_shape={tuple(loaded_weight.shape)}, "
-                    f"input_dim={input_dim}"
-                )
-            inferred_pack_factor = (
-                self.logical_input_size // loaded_weight.shape[input_dim]
-            )
-            if inferred_pack_factor > 1:
-                pack_factor = inferred_pack_factor
-                packed_dim = input_dim
-
-        if packed_dim == input_dim and pack_factor > 1:
-            if local_start % pack_factor != 0 or local_size % pack_factor != 0:
-                raise ValueError(
-                    "Cannot load explicit padded packed row shard with "
-                    f"unaligned span: local_start={local_start}, "
-                    f"local_size={local_size}, pack_factor={pack_factor}"
-                )
-            local_start //= pack_factor
-            local_size //= pack_factor
-
-        param_data = param_data.narrow(input_dim, 0, local_size)
-        loaded_weight = loaded_weight.narrow(input_dim, local_start, local_size)
-        assert param_data.shape == loaded_weight.shape, (
-            f"Tried to load explicit padded row shard {loaded_weight.shape} "
-            f"into {param_data.shape}"
+        self.input_shard_layout = ShardLayout.explicit(
+            logical_size=self.logical_input_size,
+            destination_start=0,
+            destination_size=self.input_size_per_partition,
+            source_start=self.local_start,
+            source_size=self.local_size,
         )
-        param_data.copy_(loaded_weight)
-        return True
+
+    def _infer_input_pack_factor(
+        self,
+        param_data: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        input_dim: int,
+    ) -> int | None:
+        if self.logical_input_size % loaded_weight.shape[input_dim] != 0:
+            raise ValueError(
+                "Cannot infer packing for explicit padded row shard: "
+                f"logical_input_size={self.logical_input_size}, "
+                f"loaded_shape={tuple(loaded_weight.shape)}, input_dim={input_dim}"
+            )
+        inferred = self.logical_input_size // loaded_weight.shape[input_dim]
+        return inferred if inferred > 1 else None
