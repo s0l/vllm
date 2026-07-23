@@ -173,6 +173,35 @@ class TestGDNPrefixCheckpoint(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "advertised_limit"):
             _TensorStore(tensors, limit=8, advertised_limit=0)
 
+    def test_worker_reports_exact_host_bytes_and_evictions(self):
+        tensors = {
+            "a": [
+                torch.zeros(3, dtype=torch.float32),
+                torch.zeros(2, dtype=torch.int16),
+            ],
+            "b": [torch.zeros(4, dtype=torch.float32)],
+            "wrong": [torch.zeros(5, dtype=torch.float32)],
+        }
+        store = _TensorStore(tensors, limit=1)
+
+        store.save(b"a", "a", None, None, None)
+        self.assertEqual(store.checkpoint_bytes, 16)
+        self.assertEqual(store.peak_checkpoint_bytes, 16)
+        self.assertEqual(store.evictions, 0)
+
+        store.save(b"b", "b", None, None, None)
+        self.assertEqual(store.checkpoint_bytes, 16)
+        self.assertEqual(store.peak_checkpoint_bytes, 32)
+        self.assertEqual(store.evictions, 1)
+
+        # Replacing an existing key must not double-count retained bytes.
+        store.save(b"b", "b", None, None, None)
+        self.assertEqual(store.checkpoint_bytes, 16)
+        self.assertEqual(store.evictions, 1)
+
+        with self.assertRaisesRegex(RuntimeError, "byte size changed"):
+            store.save(b"wrong", "wrong", None, None, None)
+
     def test_cold_reused_state_is_zeroed_but_restore_destination_is_not(self):
         tensors = {
             "cold": [torch.tensor([4.0, 5.0])],

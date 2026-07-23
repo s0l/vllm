@@ -7,6 +7,8 @@ import torch
 from vllm.model_executor.layers.attention.head_partition import (
     make_attention_head_partition,
 )
+from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.attention.backends.flashinfer import FlashInferBackend
 
 
 def _parts(total_q: int, total_kv: int, tp: int):
@@ -165,3 +167,8 @@ def test_qwen35_tp3_dcp_full_kv_layout_matches_full_gqa_attention():
         local_outputs.append(torch.einsum("hqk,khd->qhd", local_probs, local_v))
 
     torch.testing.assert_close(torch.cat(local_outputs, dim=1), full_out)
+
+
+def test_dcp_full_kv_backend_capability_is_fail_closed():
+    assert not AttentionBackend.supports_dcp_full_kv_attention_heads
+    assert FlashInferBackend.supports_dcp_full_kv_attention_heads

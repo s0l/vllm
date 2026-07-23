@@ -9,6 +9,7 @@ from typing import Any
 import torch
 
 from vllm.config import CacheConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     get_conv_copy_spec,
@@ -22,6 +23,8 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
+
+logger = init_logger(__name__)
 
 
 class GDNPrefixCheckpointStore:
@@ -37,6 +40,10 @@ class GDNPrefixCheckpointStore:
         self._checkpoints: OrderedDict[bytes, tuple[torch.Tensor, ...]] = OrderedDict()
         self.saves = 0
         self.restores = 0
+        self.evictions = 0
+        self.bytes_per_checkpoint: int | None = None
+        self.checkpoint_bytes = 0
+        self.peak_checkpoint_bytes = 0
 
     def __len__(self) -> int:
         return len(self._checkpoints)
@@ -96,10 +103,34 @@ class GDNPrefixCheckpointStore:
             host_states.append(host)
         if host_states and host_states[0].is_pinned():
             torch.cuda.current_stream().synchronize()
-        self._checkpoints[key] = tuple(host_states)
+        checkpoint = tuple(host_states)
+        checkpoint_size = sum(state.nbytes for state in checkpoint)
+        if self.bytes_per_checkpoint is None:
+            self.bytes_per_checkpoint = checkpoint_size
+            logger.info(
+                "Exact GDN checkpoint host store: bytes_per_checkpoint=%d, "
+                "physical_limit=%d, advertised_limit=%d, "
+                "upper_bound_bytes_per_rank=%d",
+                checkpoint_size,
+                self.limit,
+                self.advertised_limit,
+                checkpoint_size * self.limit,
+            )
+        elif checkpoint_size != self.bytes_per_checkpoint:
+            raise RuntimeError("GDN checkpoint byte size changed at runtime")
+        previous = self._checkpoints.get(key)
+        if previous is not None:
+            self.checkpoint_bytes -= checkpoint_size
+        self._checkpoints[key] = checkpoint
+        self.checkpoint_bytes += checkpoint_size
+        self.peak_checkpoint_bytes = max(
+            self.peak_checkpoint_bytes, self.checkpoint_bytes
+        )
         self._checkpoints.move_to_end(key)
         while len(self._checkpoints) > self.limit:
             self._checkpoints.popitem(last=False)
+            self.checkpoint_bytes -= checkpoint_size
+            self.evictions += 1
         self.saves += 1
 
     def restore(

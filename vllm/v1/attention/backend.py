@@ -62,6 +62,12 @@ class AttentionBackend(ABC):
         "float16",
         "bfloat16",
     ]
+    # Whether this backend implements the special DCP layout where every rank
+    # stores all global KV heads and selects the rank-local GQA mapping only
+    # for the new-token attention path. This is stricter than generic DCP
+    # support: a backend must opt in after implementing both context combine
+    # and local KV-head selection.
+    supports_dcp_full_kv_attention_heads: ClassVar[bool] = False
 
     # Does attention's forward() include kv cache update?
     forward_includes_kv_cache_update: bool = True

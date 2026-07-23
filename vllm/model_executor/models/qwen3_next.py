@@ -377,6 +377,15 @@ class Qwen3NextAttention(nn.Module):
             if self.dual_chunk_attention_config
             else {},
         )
+        if (
+            self.dcp_full_kv_attention_heads
+            and not self.attn.attn_backend.supports_dcp_full_kv_attention_heads
+        ):
+            raise NotImplementedError(
+                "The selected attention backend does not support DCP with "
+                "full global KV heads. Use a backend that explicitly "
+                "implements rank-local KV-head selection."
+            )
         self.attn.dcp_full_kv_attention_heads = self.dcp_full_kv_attention_heads
         if self.dcp_full_kv_attention_heads:
             assert self.attn_head_partition is not None
