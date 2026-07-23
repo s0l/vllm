@@ -21,6 +21,7 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.utils.mem_constants import GiB_bytes
+from vllm.v1.core.kv_cache_capacity import PhysicalPoolCapacityPlanner
 from vllm.v1.core.kv_cache_coordinator import KVCacheBlockPoolRequirements
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
@@ -1787,6 +1788,59 @@ def test_elastic_gdn_capacity_transaction_and_rebalance():
     assert coordinator.take_elastic_transition() == (10, 4)
     coordinator._record_elastic_transition()
     assert coordinator.take_elastic_transition() is None
+
+
+def test_physical_pool_capacity_planner_matches_legacy_formula():
+    primary_block_sizes = (17, 31, 64)
+    secondary_stride = 29
+    quantum = 100
+    budget = 5000
+    planner = PhysicalPoolCapacityPlanner(
+        primary_block_sizes=primary_block_sizes,
+        secondary_block_stride=secondary_stride,
+        mapping_quantum=quantum,
+        budget_bytes=budget,
+    )
+
+    def mapped(logical_bytes: int) -> int:
+        return ((logical_bytes + quantum - 1) // quantum) * quantum
+
+    for secondary_blocks in range(0, 41):
+        legacy = 0
+        secondary_mapped = mapped(secondary_blocks * secondary_stride)
+        for primary_blocks in range(60, -1, -1):
+            primary_mapped = sum(
+                mapped(primary_blocks * block_size)
+                for block_size in primary_block_sizes
+            )
+            if primary_mapped + secondary_mapped <= budget:
+                legacy = primary_blocks
+                break
+        assert (
+            planner.max_primary_blocks(secondary_blocks, upper_bound=60)
+            == legacy
+        )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"primary_block_sizes": ()}, "primary block sizes"),
+        ({"secondary_block_stride": 0}, "secondary block stride"),
+        ({"mapping_quantum": 0}, "mapping quantum"),
+        ({"budget_bytes": 0}, "physical pool budget"),
+    ],
+)
+def test_physical_pool_capacity_planner_rejects_invalid_geometry(kwargs, message):
+    geometry = {
+        "primary_block_sizes": (1,),
+        "secondary_block_stride": 1,
+        "mapping_quantum": 1,
+        "budget_bytes": 1,
+    }
+    geometry.update(kwargs)
+    with pytest.raises(ValueError, match=message):
+        PhysicalPoolCapacityPlanner(**geometry)
 
 
 def test_get_kv_cache_config_one_worker():

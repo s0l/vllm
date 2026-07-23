@@ -8,6 +8,7 @@ from typing import NamedTuple
 from vllm import envs
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_capacity import PhysicalPoolCapacityPlanner
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -134,6 +135,7 @@ class KVCacheCoordinator(ABC):
         self.gdn_checkpoint_limit = 8
         self._elastic_transition: tuple[int, int] | None = None
         self._last_emitted_elastic_transition: tuple[int, int] | None = None
+        self._physical_pool_planner: PhysicalPoolCapacityPlanner | None = None
         if separate_gdn_pool:
             pool_sizes = {
                 spec.separate_pool_num_blocks for spec in separate_mamba_specs
@@ -157,6 +159,17 @@ class KVCacheCoordinator(ABC):
             self.gdn_checkpoint_keys = OrderedDict()
 
         if kv_cache_config.elastic_mapping_quantum and self.mamba_block_pool:
+            attention_block_sizes = tuple(
+                tensor.logical_block_size
+                for tensor in kv_cache_config.kv_cache_tensors
+                if tensor.backing_id.startswith("elastic-attention-")
+            ) or (kv_cache_config.elastic_attention_stride,)
+            self._physical_pool_planner = PhysicalPoolCapacityPlanner(
+                primary_block_sizes=attention_block_sizes,
+                secondary_block_stride=kv_cache_config.elastic_gdn_stride,
+                mapping_quantum=kv_cache_config.elastic_mapping_quantum,
+                budget_bytes=kv_cache_config.elastic_budget_bytes,
+            )
             self._last_emitted_elastic_transition = (
                 self.block_pool.active_num_gpu_blocks,
                 self.mamba_block_pool.active_num_gpu_blocks,
@@ -193,36 +206,12 @@ class KVCacheCoordinator(ABC):
             self.retention_interval, self.scheduler_block_size, kv_cache_config
         )
 
-    def _elastic_mapped_bytes(self, logical_bytes: int) -> int:
-        quantum = self.kv_cache_config.elastic_mapping_quantum
-        return ((logical_bytes + quantum - 1) // quantum) * quantum
-
     def _elastic_attention_capacity(self, gdn_blocks: int) -> int:
-        config = self.kv_cache_config
-        gdn_mapped = self._elastic_mapped_bytes(
-            gdn_blocks * config.elastic_gdn_stride
+        assert self._physical_pool_planner is not None
+        return self._physical_pool_planner.max_primary_blocks(
+            gdn_blocks,
+            upper_bound=self.block_pool.num_gpu_blocks,
         )
-        attention_tensors = [
-            tensor
-            for tensor in config.kv_cache_tensors
-            if tensor.backing_id.startswith("elastic-attention-")
-        ]
-        for blocks in range(self.block_pool.num_gpu_blocks, 0, -1):
-            attention_mapped = (
-                sum(
-                    self._elastic_mapped_bytes(
-                        blocks * tensor.logical_block_size
-                    )
-                    for tensor in attention_tensors
-                )
-                if attention_tensors
-                else self._elastic_mapped_bytes(
-                    blocks * config.elastic_attention_stride
-                )
-            )
-            if attention_mapped + gdn_mapped <= config.elastic_budget_bytes:
-                return blocks
-        return 0
 
     def _record_elastic_transition(self) -> None:
         assert self.mamba_block_pool is not None

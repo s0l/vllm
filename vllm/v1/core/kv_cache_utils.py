@@ -19,6 +19,7 @@ from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
+from vllm.v1.core.kv_cache_capacity import PhysicalPoolCapacityPlanner
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
@@ -1468,32 +1469,29 @@ def get_kv_cache_config_from_groups(
                 ]
                 attention_stride = sum(attention_pages)
                 initial_mamba_blocks = 1 + min_seqs * blocks_per_seq
-                mamba_committed = cdiv(
-                    initial_mamba_blocks * mamba_stride, quantum
-                ) * quantum
-                num_blocks = max(
+                planner = PhysicalPoolCapacityPlanner(
+                    primary_block_sizes=tuple(attention_pages),
+                    secondary_block_stride=mamba_stride,
+                    mapping_quantum=quantum,
+                    budget_bytes=elastic_budget,
+                )
+                mamba_committed = planner.secondary_mapped_bytes(
+                    initial_mamba_blocks
+                )
+                primary_upper_bound = max(
                     (elastic_budget - mamba_committed) // attention_stride, 0
                 )
-                while num_blocks > 0:
-                    attention_committed = sum(
-                        cdiv(num_blocks * page_size, quantum) * quantum
-                        for page_size in attention_pages
-                    )
-                    if attention_committed + mamba_committed <= elastic_budget:
-                        break
-                    num_blocks -= 1
+                num_blocks = planner.max_primary_blocks(
+                    initial_mamba_blocks,
+                    upper_bound=primary_upper_bound,
+                )
                 if num_blocks < 2:
                     raise ValueError(
                         "elastic GDN backing leaves no usable attention KV"
                     )
 
-                attention_reserved = sum(
-                    cdiv(num_blocks * page_size, quantum) * quantum
-                    for page_size in attention_pages
-                )
-                mamba_reserved = (
-                    cdiv(mamba_num_blocks * mamba_stride, quantum) * quantum
-                )
+                attention_reserved = planner.primary_mapped_bytes(num_blocks)
+                mamba_reserved = planner.secondary_mapped_bytes(mamba_num_blocks)
                 attention_tensors: list[KVCacheTensor] = []
                 backing_index = 0
                 for page_size, slots in attention_buckets.items():
