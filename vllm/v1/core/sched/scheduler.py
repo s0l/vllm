@@ -35,7 +35,10 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
 )
-from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
+from vllm.v1.core.kv_cache_coordinator import (
+    HybridKVCacheCoordinator,
+    KVCacheBlockPoolRequirements,
+)
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import BlockHashListWithBlockSize, KVCacheBlock
@@ -948,7 +951,7 @@ class Scheduler(SchedulerInterface):
                         for i in encoder_inputs_to_schedule
                     )
 
-                reserved_blocks = 0
+                reserved_blocks: int | KVCacheBlockPoolRequirements = 0
                 if load_kv_async:
                     # An async load holds its blocks for the whole transfer with
                     # no forward progress and isn't preemptible here. Admit it
@@ -1204,6 +1207,11 @@ class Scheduler(SchedulerInterface):
                     if checkpoint_key is not None:
                         gdn_checkpoint_save[req_id] = checkpoint_key
 
+        self.kv_cache_manager.coordinator.rebalance_elastic_capacity()
+        elastic_kv_transition = (
+            self.kv_cache_manager.coordinator.take_elastic_transition()
+        )
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1225,6 +1233,7 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             gdn_checkpoint_save=gdn_checkpoint_save or None,
             gdn_checkpoint_restore=gdn_checkpoint_restore or None,
+            elastic_kv_transition=elastic_kv_transition,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -2585,10 +2594,12 @@ class Scheduler(SchedulerInterface):
 
         return self.connector.request_finished_all_groups(request, block_ids)
 
-    def _request_remaining_blocks(self, request: Request) -> int:
+    def _request_remaining_blocks(
+        self, request: Request
+    ) -> KVCacheBlockPoolRequirements:
         """Blocks `request` still needs to allocate to hold its full sequence."""
         full_num_tokens = min(request.num_tokens, self.max_model_len)
-        return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+        return self.kv_cache_manager.coordinator.get_block_pool_requirements(
             request_id=request.request_id,
             num_tokens=full_num_tokens,
             new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
@@ -2599,12 +2610,12 @@ class Scheduler(SchedulerInterface):
             apply_admission_cap=True,
         )
 
-    def _inflight_prefill_reserved_blocks(self) -> int:
+    def _inflight_prefill_reserved_blocks(self) -> KVCacheBlockPoolRequirements:
         """Num blocks in-flight prefills still need to finish (their reservation)."""
-
-        return sum(
-            self._request_remaining_blocks(req) for req in self._inflight_prefills
-        )
+        reserved = KVCacheBlockPoolRequirements()
+        for request in self._inflight_prefills:
+            reserved += self._request_remaining_blocks(request)
+        return reserved
 
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
         """

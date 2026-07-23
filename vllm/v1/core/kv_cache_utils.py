@@ -89,6 +89,20 @@ def _use_separate_gdn_pool(vllm_config: VllmConfig) -> bool:
     return bool(vllm_config.additional_config.get("gdn_separate_pool", False))
 
 
+def _use_elastic_gdn_backing(vllm_config: VllmConfig) -> bool:
+    return bool(vllm_config.additional_config.get("elastic_gdn_backing", False))
+
+
+def _elastic_gdn_pool_blocks(vllm_config: VllmConfig) -> int:
+    max_seqs = int(vllm_config.additional_config.get("elastic_gdn_max_seqs", 64))
+    blocks_per_seq = int(
+        vllm_config.additional_config.get("elastic_gdn_blocks_per_seq", 3)
+    )
+    if max_seqs < 1 or blocks_per_seq < 1:
+        raise ValueError("elastic GDN max_seqs and blocks_per_seq must be positive")
+    return 1 + max_seqs * blocks_per_seq
+
+
 # The hash seed for the first block of any prefix block sequence.
 #
 # We use a random value to avoid hash collisions or PYTHONHASHSEED environment
@@ -1389,10 +1403,162 @@ def get_kv_cache_config_from_groups(
             g for g in kv_cache_groups if not isinstance(g.kv_cache_spec, MambaSpec)
         ]
         if mamba_groups and attention_groups:
-            mamba_num_blocks = int(
-                vllm_config.additional_config.get("gdn_pool_blocks", 25)
+            requested_elastic = _use_elastic_gdn_backing(vllm_config)
+            override = vllm_config.cache_config.num_gpu_blocks_override
+            # Memory/CUDA-graph profiling uses a tiny explicit override and is
+            # not the published cache. Keep that transient allocation fixed.
+            elastic = requested_elastic and override is None
+            mamba_num_blocks = (
+                _elastic_gdn_pool_blocks(vllm_config)
+                if elastic
+                else (
+                    vllm_config.scheduler_config.max_num_seqs
+                    if requested_elastic
+                    else int(
+                        vllm_config.additional_config.get("gdn_pool_blocks", 25)
+                    )
+                )
             )
             mamba_buckets = _bucket_layers_by_page_size(mamba_groups)
+            attention_buckets = _bucket_layers_by_page_size(attention_groups)
+
+            if elastic:
+                quantum = (
+                    int(
+                        vllm_config.additional_config.get(
+                            "elastic_gdn_vmm_quantum_mb", 2
+                        )
+                    )
+                    * 1024**2
+                )
+                runtime_reserve = (
+                    int(
+                        vllm_config.additional_config.get(
+                            "elastic_runtime_reserve_mb", 0
+                        )
+                    )
+                    * 1024**2
+                )
+                min_seqs = int(
+                    vllm_config.additional_config.get("elastic_gdn_min_seqs", 1)
+                )
+                blocks_per_seq = int(
+                    vllm_config.additional_config.get(
+                        "elastic_gdn_blocks_per_seq", 3
+                    )
+                )
+                if quantum <= 0 or min_seqs < 1 or runtime_reserve < 0:
+                    raise ValueError("invalid elastic GDN geometry")
+                elastic_budget = available_memory - runtime_reserve
+                if elastic_budget <= 0:
+                    raise ValueError(
+                        "elastic runtime reserve leaves no memory for KV cache: "
+                        f"available={format_gib(available_memory)} GiB, "
+                        f"reserve={format_gib(runtime_reserve)} GiB"
+                    )
+
+                mamba_stride = sum(
+                    page_size * len(slots)
+                    for page_size, slots in mamba_buckets.items()
+                )
+                attention_pages = [
+                    page_size
+                    for page_size, slots in attention_buckets.items()
+                    for _ in slots
+                ]
+                attention_stride = sum(attention_pages)
+                initial_mamba_blocks = 1 + min_seqs * blocks_per_seq
+                mamba_committed = cdiv(
+                    initial_mamba_blocks * mamba_stride, quantum
+                ) * quantum
+                num_blocks = max(
+                    (elastic_budget - mamba_committed) // attention_stride, 0
+                )
+                while num_blocks > 0:
+                    attention_committed = sum(
+                        cdiv(num_blocks * page_size, quantum) * quantum
+                        for page_size in attention_pages
+                    )
+                    if attention_committed + mamba_committed <= elastic_budget:
+                        break
+                    num_blocks -= 1
+                if num_blocks < 2:
+                    raise ValueError(
+                        "elastic GDN backing leaves no usable attention KV"
+                    )
+
+                attention_reserved = sum(
+                    cdiv(num_blocks * page_size, quantum) * quantum
+                    for page_size in attention_pages
+                )
+                mamba_reserved = (
+                    cdiv(mamba_num_blocks * mamba_stride, quantum) * quantum
+                )
+                attention_tensors: list[KVCacheTensor] = []
+                backing_index = 0
+                for page_size, slots in attention_buckets.items():
+                    for slot in slots:
+                        layer_reserved = (
+                            cdiv(num_blocks * page_size, quantum) * quantum
+                        )
+                        attention_tensors.append(
+                            KVCacheTensor(
+                                size=layer_reserved,
+                                shared_by=slot,
+                                backing_id=f"elastic-attention-{backing_index}",
+                                committed_size=layer_reserved,
+                                mapping_quantum=quantum,
+                                num_blocks=num_blocks,
+                                logical_block_size=page_size,
+                            )
+                        )
+                        backing_index += 1
+
+                mamba_tensors: list[KVCacheTensor] = []
+                byte_offset = 0
+                for page_size, slots in mamba_buckets.items():
+                    for slot in slots:
+                        mamba_tensors.append(
+                            KVCacheTensor(
+                                size=mamba_reserved,
+                                shared_by=slot,
+                                offset=byte_offset,
+                                block_stride=mamba_stride,
+                                backing_id="elastic-gdn",
+                                committed_size=mamba_committed,
+                                mapping_quantum=quantum,
+                                num_blocks=mamba_num_blocks,
+                                logical_block_size=mamba_stride,
+                            )
+                        )
+                        byte_offset += page_size
+
+                logger.info_once(
+                    "Experimental elastic GDN backing: attention_blocks=%d, "
+                    "gdn_virtual_blocks=%d, gdn_initial_blocks=%d, "
+                    "attention_mapped=%s GiB, gdn_mapped=%s GiB, "
+                    "runtime_reserve=%s GiB, profiled_available=%s GiB, "
+                    "quantum=%d MiB",
+                    num_blocks,
+                    mamba_num_blocks,
+                    initial_mamba_blocks,
+                    format_gib(attention_reserved),
+                    format_gib(mamba_committed),
+                    format_gib(runtime_reserve),
+                    format_gib(available_memory),
+                    quantum // 1024**2,
+                )
+                return KVCacheConfig(
+                    num_blocks=num_blocks,
+                    kv_cache_tensors=attention_tensors + mamba_tensors,
+                    kv_cache_groups=kv_cache_groups,
+                    elastic_attention_stride=attention_stride,
+                    elastic_gdn_stride=mamba_stride,
+                    elastic_mapping_quantum=quantum,
+                    elastic_gdn_initial_blocks=initial_mamba_blocks,
+                    elastic_budget_bytes=elastic_budget,
+                )
+
             mamba_tensors: list[KVCacheTensor] = []
             mamba_bytes = 0
             for page_size, slots in mamba_buckets.items():
@@ -1401,11 +1567,9 @@ def get_kv_cache_config_from_groups(
                     mamba_tensors.append(KVCacheTensor(size=size, shared_by=slot))
                     mamba_bytes += size
 
-            attention_buckets = _bucket_layers_by_page_size(attention_groups)
             attention_bytes_per_block = sum(
                 page_size * len(slots) for page_size, slots in attention_buckets.items()
             )
-            override = vllm_config.cache_config.num_gpu_blocks_override
             if override is not None:
                 # CUDA-graph profiling deliberately calls this planner with
                 # available_memory=0 and a small explicit block override.
@@ -1811,7 +1975,11 @@ def get_kv_cache_groups(
         The generated KVCacheGroups
     """
     if _use_separate_gdn_pool(vllm_config):
-        pool_blocks = int(vllm_config.additional_config.get("gdn_pool_blocks", 25))
+        pool_blocks = (
+            _elastic_gdn_pool_blocks(vllm_config)
+            if _use_elastic_gdn_backing(vllm_config)
+            else int(vllm_config.additional_config.get("gdn_pool_blocks", 25))
+        )
         if pool_blocks < 2:
             raise ValueError("gdn_pool_blocks must include at least one usable block")
         for layer_name, spec in list(kv_cache_spec.items()):

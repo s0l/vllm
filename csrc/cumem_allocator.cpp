@@ -2,6 +2,9 @@
 // Important: allocation size, CUdeviceptr and CUmemGenericAllocationHandle*
 // need to be unsigned long long
 #include <iostream>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 #include "cumem_allocator_compat.h"
 
@@ -102,6 +105,79 @@ CUresult error_code = no_error;  // store error code
 // This brings the limitation that the allocator needs to be singleton.
 static PyObject* g_python_malloc_callback = nullptr;
 static PyObject* g_python_free_callback = nullptr;
+
+#ifndef USE_ROCM
+struct ElasticAllocation {
+  unsigned long long device;
+  CUdeviceptr base;
+  size_t reserved;
+  size_t committed;
+  size_t granularity;
+  size_t quantum;
+  std::vector<CUmemGenericAllocationHandle> handles;
+};
+
+// Elastic allocations deliberately use a different pluggable allocator from
+// sleep-mode CuMemAllocator.  The next-allocation configuration is consumed by
+// elastic_malloc; in the KV path each MemPool owns exactly one large backing.
+static std::mutex g_elastic_mutex;
+static std::unordered_map<CUdeviceptr, ElasticAllocation> g_elastic_allocations;
+static size_t g_elastic_next_initial = 0;
+static size_t g_elastic_next_quantum = 0;
+
+static size_t round_up_size(size_t value, size_t alignment) {
+  return ((value + alignment - 1) / alignment) * alignment;
+}
+
+static CUmemAllocationProp elastic_prop(int device) {
+  CUmemAllocationProp prop = {};
+  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  prop.location.id = device;
+  prop.allocFlags.compressionType = CU_MEM_ALLOCATION_COMP_NONE;
+  return prop;
+}
+
+static CUresult elastic_map_one(ElasticAllocation& allocation) {
+  CUmemAllocationProp prop = elastic_prop(allocation.device);
+  CUmemGenericAllocationHandle handle = 0;
+  CUresult result = cuMemCreate(&handle, allocation.quantum, &prop, 0);
+  if (result != CUDA_SUCCESS) return result;
+  CUdeviceptr address = allocation.base + allocation.committed;
+  result = cuMemMap(address, allocation.quantum, 0, handle, 0);
+  if (result != CUDA_SUCCESS) {
+    cuMemRelease(handle);
+    return result;
+  }
+  CUmemAccessDesc access = {};
+  access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  access.location.id = allocation.device;
+  access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  result = cuMemSetAccess(address, allocation.quantum, &access, 1);
+  if (result != CUDA_SUCCESS) {
+    cuMemUnmap(address, allocation.quantum);
+    cuMemRelease(handle);
+    return result;
+  }
+  allocation.handles.push_back(handle);
+  allocation.committed += allocation.quantum;
+  return CUDA_SUCCESS;
+}
+
+static CUresult elastic_unmap_one(ElasticAllocation& allocation) {
+  if (allocation.handles.empty()) return CUDA_ERROR_INVALID_VALUE;
+  CUdeviceptr address =
+      allocation.base + allocation.committed - allocation.quantum;
+  CUresult result = cuMemUnmap(address, allocation.quantum);
+  if (result != CUDA_SUCCESS) return result;
+  CUmemGenericAllocationHandle handle = allocation.handles.back();
+  result = cuMemRelease(handle);
+  if (result != CUDA_SUCCESS) return result;
+  allocation.handles.pop_back();
+  allocation.committed -= allocation.quantum;
+  return CUDA_SUCCESS;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Helper functions:
@@ -570,8 +646,168 @@ void my_free(void* ptr, ssize_t size, int device, CUstream stream) {
 #endif
 }
 
+// A stable-VA allocator whose physical prefix can be resized independently.
+// The Python controller must configure the initial prefix and mapping quantum
+// before creating the single backing tensor in a MemPool.
+void* elastic_malloc(ssize_t size, int device, CUstream stream) {
+#ifdef USE_ROCM
+  std::cerr << "elastic_malloc is currently CUDA-only" << std::endl;
+  return nullptr;
+#else
+  ensure_context(device);
+  std::lock_guard<std::mutex> lock(g_elastic_mutex);
+  if (g_elastic_next_quantum == 0) {
+    std::cerr << "elastic allocator was not configured" << std::endl;
+    return nullptr;
+  }
+
+  CUmemAllocationProp prop = elastic_prop(device);
+  size_t granularity = 0;
+  CUresult result = cuMemGetAllocationGranularity(
+      &granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+  if (result != CUDA_SUCCESS) return nullptr;
+  size_t quantum = round_up_size(g_elastic_next_quantum, granularity);
+  size_t reserved = round_up_size((size_t)size, granularity);
+  size_t initial = round_up_size(g_elastic_next_initial, quantum);
+  if (initial > reserved || reserved < quantum) {
+    std::cerr << "invalid elastic allocation geometry" << std::endl;
+    return nullptr;
+  }
+
+  CUdeviceptr base = 0;
+  result = cuMemAddressReserve(&base, reserved, granularity, 0, 0);
+  if (result != CUDA_SUCCESS) return nullptr;
+  ElasticAllocation allocation = {(unsigned long long)device,
+                                    base,
+                                    reserved,
+                                    0,
+                                    granularity,
+                                    quantum,
+                                    {}};
+  while (allocation.committed < initial) {
+    result = elastic_map_one(allocation);
+    if (result != CUDA_SUCCESS) {
+      while (!allocation.handles.empty()) elastic_unmap_one(allocation);
+      cuMemAddressFree(base, reserved);
+      return nullptr;
+    }
+  }
+  g_elastic_allocations.emplace(base, std::move(allocation));
+  g_elastic_next_initial = 0;
+  g_elastic_next_quantum = 0;
+  return reinterpret_cast<void*>(base);
+#endif
+}
+
+void elastic_free(void* ptr, ssize_t size, int device, CUstream stream) {
+#ifndef USE_ROCM
+  ensure_context(device);
+  std::lock_guard<std::mutex> lock(g_elastic_mutex);
+  CUdeviceptr base = reinterpret_cast<CUdeviceptr>(ptr);
+  auto it = g_elastic_allocations.find(base);
+  if (it == g_elastic_allocations.end()) return;
+  ElasticAllocation& allocation = it->second;
+  // PyTorch only releases this backing during teardown; synchronize because
+  // graph/kernel lifetimes are outside the pluggable allocator's knowledge.
+  cuCtxSynchronize();
+  while (!allocation.handles.empty()) {
+    if (elastic_unmap_one(allocation) != CUDA_SUCCESS) return;
+  }
+  cuMemAddressFree(allocation.base, allocation.reserved);
+  g_elastic_allocations.erase(it);
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // Python extension boilerplate:
+
+static PyObject* python_configure_elastic(PyObject* self, PyObject* args) {
+#ifdef USE_ROCM
+  PyErr_SetString(PyExc_NotImplementedError, "elastic backing is CUDA-only");
+  return nullptr;
+#else
+  unsigned long long initial, quantum;
+  if (!PyArg_ParseTuple(args, "KK", &initial, &quantum)) return nullptr;
+  if (quantum == 0) {
+    PyErr_SetString(PyExc_ValueError, "quantum must be positive");
+    return nullptr;
+  }
+  std::lock_guard<std::mutex> lock(g_elastic_mutex);
+  if (g_elastic_next_quantum != 0) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "previous elastic configuration was not consumed");
+    return nullptr;
+  }
+  g_elastic_next_initial = (size_t)initial;
+  g_elastic_next_quantum = (size_t)quantum;
+  Py_RETURN_NONE;
+#endif
+}
+
+static PyObject* python_resize_elastic(PyObject* self, PyObject* args) {
+#ifdef USE_ROCM
+  PyErr_SetString(PyExc_NotImplementedError, "elastic backing is CUDA-only");
+  return nullptr;
+#else
+  unsigned long long ptr, requested;
+  int fence_complete;
+  if (!PyArg_ParseTuple(args, "KKp", &ptr, &requested, &fence_complete))
+    return nullptr;
+  if (!fence_complete) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "elastic resize requires a completed CUDA fence");
+    return nullptr;
+  }
+  std::lock_guard<std::mutex> lock(g_elastic_mutex);
+  auto it = g_elastic_allocations.find((CUdeviceptr)ptr);
+  if (it == g_elastic_allocations.end()) {
+    PyErr_SetString(PyExc_KeyError, "unknown elastic allocation");
+    return nullptr;
+  }
+  ElasticAllocation& allocation = it->second;
+  if (requested > allocation.reserved || requested % allocation.quantum != 0) {
+    PyErr_SetString(PyExc_ValueError,
+                    "size must be quantum-aligned and within reserved VA");
+    return nullptr;
+  }
+  CUresult result = CUDA_SUCCESS;
+  while (allocation.committed < requested && result == CUDA_SUCCESS)
+    result = elastic_map_one(allocation);
+  while (allocation.committed > requested && result == CUDA_SUCCESS)
+    result = elastic_unmap_one(allocation);
+  if (result != CUDA_SUCCESS) {
+    const char* message = nullptr;
+    cuGetErrorString(result, &message);
+    PyErr_Format(PyExc_RuntimeError, "elastic resize failed: %s", message);
+    return nullptr;
+  }
+  return Py_BuildValue("KKKK", (unsigned long long)allocation.base,
+                       (unsigned long long)allocation.reserved,
+                       (unsigned long long)allocation.committed,
+                       (unsigned long long)allocation.quantum);
+#endif
+}
+
+static PyObject* python_elastic_info(PyObject* self, PyObject* args) {
+#ifdef USE_ROCM
+  PyErr_SetString(PyExc_NotImplementedError, "elastic backing is CUDA-only");
+  return nullptr;
+#else
+  unsigned long long ptr;
+  if (!PyArg_ParseTuple(args, "K", &ptr)) return nullptr;
+  std::lock_guard<std::mutex> lock(g_elastic_mutex);
+  auto it = g_elastic_allocations.find((CUdeviceptr)ptr);
+  if (it == g_elastic_allocations.end()) {
+    PyErr_SetString(PyExc_KeyError, "unknown elastic allocation");
+    return nullptr;
+  }
+  const ElasticAllocation& allocation = it->second;
+  return Py_BuildValue("KKKK", (unsigned long long)allocation.base,
+                       (unsigned long long)allocation.reserved,
+                       (unsigned long long)allocation.committed,
+                       (unsigned long long)allocation.quantum);
+#endif
+}
 
 // Python-exposed function: init_module(python_malloc, python_free)
 static PyObject* py_init_module(PyObject* self, PyObject* args) {
@@ -792,6 +1028,12 @@ static PyMethodDef module_methods[] = {
      "Create and map memory on the device."},
     {"python_unmap_and_release", (PyCFunction)python_unmap_and_release,
      METH_VARARGS, "Unmap and release memory on the device."},
+    {"configure_elastic", (PyCFunction)python_configure_elastic, METH_VARARGS,
+     "Configure the next stable-VA elastic allocation."},
+    {"resize_elastic", (PyCFunction)python_resize_elastic, METH_VARARGS,
+     "Resize the mapped prefix of an elastic allocation."},
+    {"elastic_info", (PyCFunction)python_elastic_info, METH_VARARGS,
+     "Return base, reserved, committed and quantum for an elastic allocation."},
     {NULL, NULL, 0, NULL}  // sentinel
 };
 

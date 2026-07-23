@@ -166,9 +166,15 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        active_num_gpu_blocks: int | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
+        self.active_num_gpu_blocks = (
+            num_gpu_blocks if active_num_gpu_blocks is None else active_num_gpu_blocks
+        )
+        if not 1 <= self.active_num_gpu_blocks <= num_gpu_blocks:
+            raise ValueError("active_num_gpu_blocks must include the null block")
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
         # All kv-cache blocks.
@@ -178,7 +184,9 @@ class BlockPool:
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        self.free_block_queue = FreeKVCacheBlockQueue(
+            self.blocks[: self.active_num_gpu_blocks]
+        )
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -802,6 +810,31 @@ class BlockPool:
         """
         return self.free_block_queue.num_free_blocks
 
+    def activate_tail_blocks(self, new_active_num_blocks: int) -> None:
+        """Publish a newly mapped tail to allocation."""
+        if not (
+            self.active_num_gpu_blocks
+            <= new_active_num_blocks
+            <= self.num_gpu_blocks
+        ):
+            raise ValueError("invalid active block growth")
+        blocks = self.blocks[self.active_num_gpu_blocks : new_active_num_blocks]
+        self.free_block_queue.append_n(blocks)
+        self.active_num_gpu_blocks = new_active_num_blocks
+
+    def deactivate_tail_blocks(self, new_active_num_blocks: int) -> bool:
+        """Remove a free/cached tail before its physical pages are unmapped."""
+        if not 1 <= new_active_num_blocks <= self.active_num_gpu_blocks:
+            raise ValueError("invalid active block shrink")
+        blocks = self.blocks[new_active_num_blocks : self.active_num_gpu_blocks]
+        if any(block.ref_cnt != 0 for block in blocks):
+            return False
+        for block in reversed(blocks):
+            self._maybe_evict_cached_block(block)
+            self.free_block_queue.remove(block)
+        self.active_num_gpu_blocks = new_active_num_blocks
+        return True
+
     def get_usage(self) -> float:
         """Get the KV cache usage.
 
@@ -810,7 +843,7 @@ class BlockPool:
         """
 
         # Subtract 1 to account for null block.
-        total_gpu_blocks = self.num_gpu_blocks - 1
+        total_gpu_blocks = self.active_num_gpu_blocks - 1
         if not total_gpu_blocks:
             return 0
         return 1.0 - (self.get_num_free_blocks() / total_gpu_blocks)

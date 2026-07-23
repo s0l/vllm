@@ -938,6 +938,11 @@ class KVCacheTensor:
     shared_by: list[str]  # layer names that share the same KV cache tensor
     offset: int = 0  # byte offset of this layer within a contiguous block
     block_stride: int = 0  # total bytes per block in a packed layout (0 = not packed)
+    backing_id: str = ""  # tensors with the same id alias one backing allocation
+    committed_size: int = 0  # initially mapped bytes (0 = fully committed)
+    mapping_quantum: int = 0  # CUDA-VMM resize quantum in bytes
+    num_blocks: int = 0  # logical blocks when reserved size includes tail padding
+    logical_block_size: int = 0  # mapped bytes contributed by one logical block
 
 
 @dataclass
@@ -973,6 +978,11 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    elastic_attention_stride: int = 0
+    elastic_gdn_stride: int = 0
+    elastic_mapping_quantum: int = 0
+    elastic_gdn_initial_blocks: int = 0
+    elastic_budget_bytes: int = 0
 
     @property
     def has_mamba_layers(self) -> bool:

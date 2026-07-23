@@ -21,6 +21,7 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.utils.mem_constants import GiB_bytes
+from vllm.v1.core.kv_cache_coordinator import KVCacheBlockPoolRequirements
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -1665,6 +1666,127 @@ def test_allocate_with_lookahead():
         num_lookahead_tokens=4,
     )
     assert len(blocks.get_block_ids()[0]) == 2
+
+
+@pytest.mark.parametrize(("pool_blocks", "admitted"), [(3, False), (4, True)])
+def test_separate_gdn_pool_admission_is_pool_aware(pool_blocks, admitted):
+    """Admission checks the GDN pool instead of charging it to attention."""
+    block_size = 4
+    mamba_spec = MambaSpec(
+        block_size=block_size,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        separate_pool=True,
+        separate_pool_num_blocks=pool_blocks,
+    )
+    config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            *(KVCacheGroupSpec([f"gdn-{i}"], mamba_spec) for i in range(3)),
+        ],
+    )
+    manager = KVCacheManager(
+        kv_cache_config=config,
+        max_model_len=32,
+        scheduler_block_size=block_size,
+        hash_block_size=block_size,
+    )
+    request = make_request("gdn-exhaustion", [1], block_size)
+
+    requirements = manager.coordinator.get_block_pool_requirements(
+        request_id=request.request_id,
+        num_tokens=1,
+        new_computed_blocks=manager.empty_kv_cache_blocks.blocks,
+        num_encoder_tokens=0,
+        total_computed_tokens=0,
+        num_local_computed_tokens=0,
+        num_tokens_main_model=1,
+    )
+
+    assert requirements.primary == 1
+    assert requirements.mamba == 3
+    assert manager.block_pool.get_num_free_blocks() == 9
+    assert manager.coordinator.mamba_block_pool is not None
+    assert manager.coordinator.mamba_block_pool.get_num_free_blocks() == pool_blocks - 1
+    assert manager.coordinator.can_allocate(requirements) is admitted
+    assert not manager.coordinator.can_allocate(
+        requirements,
+        reserved=KVCacheBlockPoolRequirements(mamba=1),
+    )
+    blocks = manager.allocate_slots(request, num_new_tokens=1)
+    assert (blocks is not None) is admitted
+
+
+def test_elastic_gdn_capacity_transaction_and_rebalance():
+    block_size = 4
+    mamba_spec = MambaSpec(
+        block_size=block_size,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        separate_pool=True,
+        separate_pool_num_blocks=10,
+    )
+    config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            *(KVCacheGroupSpec([f"gdn-{i}"], mamba_spec) for i in range(3)),
+        ],
+        elastic_attention_stride=100,
+        elastic_gdn_stride=20,
+        elastic_mapping_quantum=100,
+        elastic_gdn_initial_blocks=4,
+        elastic_budget_bytes=1100,
+    )
+    manager = KVCacheManager(
+        kv_cache_config=config,
+        max_model_len=32,
+        scheduler_block_size=block_size,
+        hash_block_size=block_size,
+    )
+    coordinator = manager.coordinator
+    assert coordinator.mamba_block_pool is not None
+    gdn_pool = coordinator.mamba_block_pool
+    assert gdn_pool.active_num_gpu_blocks == 4
+    leases = gdn_pool.get_new_blocks(3)
+
+    assert coordinator.ensure_elastic_capacity(
+        KVCacheBlockPoolRequirements(mamba=3)
+    )
+    assert gdn_pool.active_num_gpu_blocks == 7
+    assert coordinator.block_pool.active_num_gpu_blocks == 9
+    assert coordinator.take_elastic_transition() == (9, 7)
+    coordinator._record_elastic_transition()
+    assert coordinator.take_elastic_transition() is None
+
+    gdn_pool.free_blocks(reversed(leases))
+    coordinator.rebalance_elastic_capacity()
+    assert gdn_pool.active_num_gpu_blocks == 4
+    assert coordinator.block_pool.active_num_gpu_blocks == 10
+    assert coordinator.take_elastic_transition() == (10, 4)
+    coordinator._record_elastic_transition()
+    assert coordinator.take_elastic_transition() is None
 
 
 def test_get_kv_cache_config_one_worker():

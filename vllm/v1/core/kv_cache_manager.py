@@ -9,7 +9,10 @@ from typing import Literal, overload
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
-from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
+from vllm.v1.core.kv_cache_coordinator import (
+    KVCacheBlockPoolRequirements,
+    get_kv_cache_coordinator,
+)
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
@@ -298,7 +301,7 @@ class KVCacheManager:
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
         full_sequence_must_fit: bool = False,
-        reserved_blocks: int = 0,
+        reserved_blocks: int | KVCacheBlockPoolRequirements = 0,
         has_scheduled_reqs: bool = True,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
@@ -325,11 +328,9 @@ class KVCacheManager:
                 free blocks to hold the full sequence, accounting for prefix cache hits
                 and sliding window. Used as an admission gate to prevent over-admitting
                 requests when chunked prefill would otherwise only check the first chunk
-            reserved_blocks: Number of free blocks that must be left available for
-                other in-flight sequences to complete. The actual allocation is only
-                made if it fits within (free blocks - reserved_blocks). Used to gate
-                async KV-connector loads so their initial allocation cannot consume
-                blocks an already in-flight (prefilling) sequence is relying on.
+            reserved_blocks: Per-pool free blocks that must be left available for
+                other in-flight sequences to complete. An integer reserves primary
+                pool blocks for backward compatibility.
             has_scheduled_reqs: Whether any requests are already scheduled to run
                 this step, controls whether watermark is applied.
 
@@ -419,7 +420,7 @@ class KVCacheManager:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
 
-            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+            requirements = self.coordinator.get_block_pool_requirements(
                 request_id=request.request_id,
                 num_tokens=full_num_tokens,
                 new_computed_blocks=new_computed_block_list,
@@ -429,8 +430,12 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
-            required_blocks = num_blocks_to_allocate + watermark_blocks
-            if required_blocks > self.block_pool.get_num_free_blocks():
+            if not self.coordinator.ensure_elastic_capacity(requirements):
+                return None
+            if not self.coordinator.can_allocate(
+                requirements,
+                primary_watermark_blocks=watermark_blocks,
+            ):
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -453,7 +458,7 @@ class KVCacheManager:
             num_prompt_tokens=request.num_prompt_tokens,
         )
 
-        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+        requirements = self.coordinator.get_block_pool_requirements(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
@@ -464,11 +469,23 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
-        # Keep `reserved_blocks` free for other in-flight sequences, and an
-        # additional watermark of headroom for waiting/preempted admissions.
-        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
-        required_blocks = num_blocks_to_allocate + watermark_blocks
-        if required_blocks > available_blocks:
+        # Check every physical pool before any allocation mutates block state.
+        reserved = (
+            KVCacheBlockPoolRequirements(primary=reserved_blocks)
+            if isinstance(reserved_blocks, int)
+            else reserved_blocks
+        )
+        elastic_requirements = KVCacheBlockPoolRequirements(
+            primary=requirements.primary + reserved.primary,
+            mamba=requirements.mamba + reserved.mamba,
+        )
+        if not self.coordinator.ensure_elastic_capacity(elastic_requirements):
+            return None
+        if not self.coordinator.can_allocate(
+            requirements,
+            reserved=reserved,
+            primary_watermark_blocks=watermark_blocks,
+        ):
             # Cannot allocate new blocks
             return None
 

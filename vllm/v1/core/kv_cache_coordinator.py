@@ -60,6 +60,23 @@ def _validate_prefix_cache_retention_interval(
         )
 
 
+class KVCacheBlockPoolRequirements(NamedTuple):
+    primary: int = 0
+    mamba: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.primary + self.mamba
+
+    def __add__(
+        self, other: "KVCacheBlockPoolRequirements"
+    ) -> "KVCacheBlockPoolRequirements":
+        return KVCacheBlockPoolRequirements(
+            self.primary + other.primary,
+            self.mamba + other.mamba,
+        )
+
+
 class KVCacheCoordinator(ABC):
     """
     Coordinate the KV cache of different KV cache groups.
@@ -116,6 +133,8 @@ class KVCacheCoordinator(ABC):
         self.mamba_block_pool: BlockPool | None = None
         self.gdn_checkpoint_keys: OrderedDict[BlockHash, None] | None = None
         self.gdn_checkpoint_limit = 8
+        self._elastic_transition: tuple[int, int] | None = None
+        self._last_emitted_elastic_transition: tuple[int, int] | None = None
         if separate_gdn_pool:
             pool_sizes = {
                 spec.separate_pool_num_blocks for spec in separate_mamba_specs
@@ -130,10 +149,19 @@ class KVCacheCoordinator(ABC):
                 hash_block_size=hash_block_size,
                 enable_kv_cache_events=enable_kv_cache_events,
                 metrics_collector=metrics_collector,
+                active_num_gpu_blocks=(
+                    kv_cache_config.elastic_gdn_initial_blocks or None
+                ),
             )
             # This mirrors the pinned-host LRU in every worker. It contains
             # content identities only; recurrent bytes never live in EngineCore.
             self.gdn_checkpoint_keys = OrderedDict()
+
+        if kv_cache_config.elastic_mapping_quantum and self.mamba_block_pool:
+            self._last_emitted_elastic_transition = (
+                self.block_pool.active_num_gpu_blocks,
+                self.mamba_block_pool.active_num_gpu_blocks,
+            )
 
         managers: list[SingleTypeKVCacheManager] = []
         for i, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
@@ -169,6 +197,97 @@ class KVCacheCoordinator(ABC):
         _validate_prefix_cache_retention_interval(
             self.retention_interval, self.scheduler_block_size, kv_cache_config
         )
+
+    def _elastic_mapped_bytes(self, logical_bytes: int) -> int:
+        quantum = self.kv_cache_config.elastic_mapping_quantum
+        return ((logical_bytes + quantum - 1) // quantum) * quantum
+
+    def _elastic_attention_capacity(self, gdn_blocks: int) -> int:
+        config = self.kv_cache_config
+        gdn_mapped = self._elastic_mapped_bytes(
+            gdn_blocks * config.elastic_gdn_stride
+        )
+        attention_tensors = [
+            tensor
+            for tensor in config.kv_cache_tensors
+            if tensor.backing_id.startswith("elastic-attention-")
+        ]
+        for blocks in range(self.block_pool.num_gpu_blocks, 0, -1):
+            attention_mapped = (
+                sum(
+                    self._elastic_mapped_bytes(
+                        blocks * tensor.logical_block_size
+                    )
+                    for tensor in attention_tensors
+                )
+                if attention_tensors
+                else self._elastic_mapped_bytes(
+                    blocks * config.elastic_attention_stride
+                )
+            )
+            if attention_mapped + gdn_mapped <= config.elastic_budget_bytes:
+                return blocks
+        return 0
+
+    def _record_elastic_transition(self) -> None:
+        assert self.mamba_block_pool is not None
+        self._elastic_transition = (
+            self.block_pool.active_num_gpu_blocks,
+            self.mamba_block_pool.active_num_gpu_blocks,
+        )
+
+    def ensure_elastic_capacity(
+        self, requirements: "KVCacheBlockPoolRequirements"
+    ) -> bool:
+        """Prepare enough mapped logical capacity before block allocation."""
+        config = self.kv_cache_config
+        pool = self.mamba_block_pool
+        if not config.elastic_mapping_quantum or pool is None:
+            return True
+        missing = max(requirements.mamba - pool.get_num_free_blocks(), 0)
+        if missing == 0:
+            return True
+        new_gdn_blocks = pool.active_num_gpu_blocks + missing
+        if new_gdn_blocks > pool.num_gpu_blocks:
+            return False
+        new_attention_blocks = self._elastic_attention_capacity(new_gdn_blocks)
+        if new_attention_blocks < 1:
+            return False
+        if not self.block_pool.deactivate_tail_blocks(new_attention_blocks):
+            return False
+        pool.activate_tail_blocks(new_gdn_blocks)
+        self._record_elastic_transition()
+        return True
+
+    def rebalance_elastic_capacity(self) -> None:
+        """Return unused GDN tail mappings to the attention arena."""
+        config = self.kv_cache_config
+        pool = self.mamba_block_pool
+        if not config.elastic_mapping_quantum or pool is None:
+            return
+        highest_used = max(
+            (block.block_id for block in pool.blocks if block.ref_cnt > 0),
+            default=0,
+        )
+        desired_gdn = max(config.elastic_gdn_initial_blocks, highest_used + 1)
+        changed = desired_gdn != pool.active_num_gpu_blocks
+        if desired_gdn < pool.active_num_gpu_blocks:
+            assert pool.deactivate_tail_blocks(desired_gdn)
+        desired_attention = self._elastic_attention_capacity(desired_gdn)
+        if desired_attention > self.block_pool.active_num_gpu_blocks:
+            self.block_pool.activate_tail_blocks(desired_attention)
+            changed = True
+        if changed:
+            self._record_elastic_transition()
+
+    def take_elastic_transition(self) -> tuple[int, int] | None:
+        transition = self._elastic_transition
+        self._elastic_transition = None
+        if transition == self._last_emitted_elastic_transition:
+            return None
+        if transition is not None:
+            self._last_emitted_elastic_transition = transition
+        return transition
 
     def register_gdn_checkpoint(self, key: bytes) -> None:
         if self.gdn_checkpoint_keys is None:
@@ -257,12 +376,36 @@ class KVCacheCoordinator(ABC):
         Returns:
             The number of blocks to allocate.
         """
-        num_blocks_to_allocate = 0
+        requirements = self.get_block_pool_requirements(
+            request_id=request_id,
+            num_tokens=num_tokens,
+            new_computed_blocks=new_computed_blocks,
+            num_encoder_tokens=num_encoder_tokens,
+            total_computed_tokens=total_computed_tokens,
+            num_local_computed_tokens=num_local_computed_tokens,
+            num_tokens_main_model=num_tokens_main_model,
+            apply_admission_cap=apply_admission_cap,
+        )
+        return requirements.total
+
+    def get_block_pool_requirements(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> "KVCacheBlockPoolRequirements":
+        primary_blocks = 0
+        mamba_blocks = 0
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                manager_blocks = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_encoder_tokens,
                     [],
@@ -272,7 +415,7 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                manager_blocks = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_tokens,
                     new_computed_blocks[i],
@@ -281,7 +424,31 @@ class KVCacheCoordinator(ABC):
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
                 )
-        return num_blocks_to_allocate
+            if manager.block_pool is self.mamba_block_pool:
+                mamba_blocks += manager_blocks
+            else:
+                primary_blocks += manager_blocks
+        return KVCacheBlockPoolRequirements(primary_blocks, mamba_blocks)
+
+    def can_allocate(
+        self,
+        requirements: "KVCacheBlockPoolRequirements",
+        reserved: "KVCacheBlockPoolRequirements | None" = None,
+        primary_watermark_blocks: int = 0,
+    ) -> bool:
+        reserved = reserved or KVCacheBlockPoolRequirements()
+        if (
+            requirements.primary + reserved.primary + primary_watermark_blocks
+            > self.block_pool.get_num_free_blocks()
+        ):
+            return False
+        mamba_required = requirements.mamba + reserved.mamba
+        if mamba_required == 0:
+            return True
+        return (
+            self.mamba_block_pool is not None
+            and mamba_required <= self.mamba_block_pool.get_num_free_blocks()
+        )
 
     def allocate_new_computed_blocks(
         self,

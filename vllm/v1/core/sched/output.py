@@ -265,6 +265,9 @@ class SchedulerOutput:
     gdn_checkpoint_save: dict[str, bytes] | None = None
     gdn_checkpoint_restore: dict[str, bytes] | None = None
 
+    # Physical mapped-prefix sizes for (attention, GDN) stable-VA arenas.
+    elastic_kv_transition: tuple[int, int] | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

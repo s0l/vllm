@@ -1170,6 +1170,77 @@ class GPUModelRunner(
             self.async_output_copy_stream = stream
         return stream
 
+    def _apply_elastic_kv_transition(
+        self, transition: tuple[int, int] | None
+    ) -> None:
+        """Prepare/commit one stable-VA resize on every distributed rank."""
+        if transition is None:
+            return
+        owners = getattr(self, "elastic_kv_backings", None)
+        if not owners:
+            raise RuntimeError("elastic KV transition without elastic backings")
+        gdn = owners["elastic-gdn"]
+        attention_ids = sorted(
+            key for key in owners if key.startswith("elastic-attention-")
+        )
+        old_sizes = {key: owner.info.committed for key, owner in owners.items()}
+        attention_blocks, gdn_blocks = transition
+        targets = {}
+        for key, owner in owners.items():
+            block_bytes = self.elastic_kv_geometry[key]
+            blocks = gdn_blocks if key == "elastic-gdn" else attention_blocks
+            targets[key] = (
+                (blocks * block_bytes + owner.info.quantum - 1)
+                // owner.info.quantum
+                * owner.info.quantum
+            )
+        if targets == old_sizes:
+            return
+        fence = torch.cuda.Event()
+        fence.record(torch.cuda.current_stream())
+        local_error: Exception | None = None
+        try:
+            if targets["elastic-gdn"] > old_sizes["elastic-gdn"]:
+                for key in attention_ids:
+                    owners[key].resize(targets[key], fence)
+                gdn.resize(targets["elastic-gdn"], fence)
+            else:
+                gdn.resize(targets["elastic-gdn"], fence)
+                for key in attention_ids:
+                    owners[key].resize(targets[key], fence)
+        except Exception as exc:  # every rank must still enter the vote
+            local_error = exc
+            rollback = torch.cuda.Event()
+            rollback.record(torch.cuda.current_stream())
+            try:
+                for key, owner in owners.items():
+                    owner.resize(old_sizes[key], rollback)
+            except Exception as rollback_exc:
+                raise RuntimeError(
+                    "elastic KV resize and rollback failed"
+                ) from rollback_exc
+
+        vote = torch.tensor(
+            0 if local_error else 1, dtype=torch.int32, device=self.device
+        )
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(vote, op=torch.distributed.ReduceOp.MIN)
+        if not bool(vote.item()):
+            if local_error is None:
+                rollback = torch.cuda.Event()
+                rollback.record(torch.cuda.current_stream())
+                for key, owner in owners.items():
+                    owner.resize(old_sizes[key], rollback)
+            raise RuntimeError(
+                "elastic KV transition aborted on at least one rank"
+            ) from local_error
+
+        logger.info(
+            "Elastic KV transition committed: attention=%.3f GiB GDN=%.3f GiB",
+            sum(targets[key] for key in attention_ids) / 1024**3,
+            targets["elastic-gdn"] / 1024**3,
+        )
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -4148,6 +4219,7 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        self._apply_elastic_kv_transition(scheduler_output.elastic_kv_transition)
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
@@ -7327,17 +7399,38 @@ class GPUModelRunner(
             corresponding memory buffer for KV cache.
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
-        packed_backing: torch.Tensor | None = None
+        packed_backings: dict[str, torch.Tensor] = {}
+        self.elastic_kv_backings = {}
+        self.elastic_kv_geometry: dict[str, int] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            if kv_cache_tensor.block_stride > 0:
-                # Allocate once; all packed tensors alias the same backing.
-                if packed_backing is None:
-                    packed_backing = torch.zeros(
+            if kv_cache_tensor.mapping_quantum:
+                from vllm.device_allocator.elastic_cumem import (
+                    allocate_elastic_backing,
+                )
+
+                backing_id = kv_cache_tensor.backing_id
+                owner = self.elastic_kv_backings.get(backing_id)
+                if owner is None:
+                    owner = allocate_elastic_backing(
+                        reserved_bytes=kv_cache_tensor.size,
+                        committed_bytes=kv_cache_tensor.committed_size,
+                        quantum_bytes=kv_cache_tensor.mapping_quantum,
+                        device=self.device,
+                    )
+                    self.elastic_kv_backings[backing_id] = owner
+                    self.elastic_kv_geometry[backing_id] = (
+                        kv_cache_tensor.logical_block_size
+                    )
+                tensor = owner.tensor.view(torch.int8)
+            elif kv_cache_tensor.block_stride > 0:
+                backing_id = kv_cache_tensor.backing_id or "packed"
+                if backing_id not in packed_backings:
+                    packed_backings[backing_id] = torch.zeros(
                         kv_cache_tensor.size,
                         dtype=torch.int8,
                         device=self.device,
                     )
-                tensor = packed_backing
+                tensor = packed_backings[backing_id]
             else:
                 tensor = torch.zeros(
                     kv_cache_tensor.size, dtype=torch.int8, device=self.device
@@ -7386,11 +7479,18 @@ class GPUModelRunner(
 
         # Map layer names to (offset, block_stride) within the packed
         # backing tensor so we can create strided views per layer.
-        layer_packing: dict[str, tuple[int, int]] = {}
+        layer_packing: dict[str, tuple[int, int, int]] = {}
+        layer_tensor_config = {}
         for kv_tensor in self.kv_cache_config.kv_cache_tensors:
+            for ln in kv_tensor.shared_by:
+                layer_tensor_config[ln] = kv_tensor
             if kv_tensor.block_stride > 0:
                 for ln in kv_tensor.shared_by:
-                    layer_packing[ln] = (kv_tensor.offset, kv_tensor.block_stride)
+                    layer_packing[ln] = (
+                        kv_tensor.offset,
+                        kv_tensor.block_stride,
+                        kv_tensor.num_blocks,
+                    )
         for group in self._kv_cache_spec_attn_group_iterator():
             kv_cache_spec = group.kv_cache_spec
             attn_backend = group.backend
@@ -7403,12 +7503,16 @@ class GPUModelRunner(
                     continue
                 raw_tensor = kv_cache_raw_tensors[layer_name]
                 packing = layer_packing.get(layer_name)
+                tensor_config = layer_tensor_config[layer_name]
                 if packing is not None:
-                    _, blk_stride = packing
-                    num_blocks = raw_tensor.numel() // blk_stride
+                    _, blk_stride, configured_num_blocks = packing
+                    num_blocks = (
+                        configured_num_blocks or raw_tensor.numel() // blk_stride
+                    )
                 else:
-                    assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-                    num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                    num_blocks = tensor_config.num_blocks or (
+                        raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                    )
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
                     num_blocks_per_kv_block = (
@@ -7447,6 +7551,10 @@ class GPUModelRunner(
                     except (AttributeError, NotImplementedError):
                         kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
                     raw_tensor = kv_cache_raw_tensors[layer_name]
+                    if tensor_config.logical_block_size:
+                        raw_tensor = raw_tensor[
+                            : num_blocks * tensor_config.logical_block_size
+                        ]
                     kv_caches[layer_name] = _reshape_attention_kv_cache(
                         raw_tensor,
                         kv_cache_spec,
@@ -7465,9 +7573,23 @@ class GPUModelRunner(
                     # each block's bytes into its conv/ssm state views. Keeping
                     # one tensor per layer lets the KV connector register it
                     # without special-casing Mamba.
-                    kv_caches[layer_name] = raw_tensor[
-                        : num_blocks * page_size_bytes
-                    ].view(num_blocks, 1, 1, page_size_bytes)
+                    if packing is not None:
+                        offset, block_stride, _ = packing
+                        kv_caches[layer_name] = torch.as_strided(
+                            raw_tensor,
+                            size=(num_blocks, 1, 1, page_size_bytes),
+                            stride=(
+                                block_stride,
+                                page_size_bytes,
+                                page_size_bytes,
+                                1,
+                            ),
+                            storage_offset=offset,
+                        )
+                    else:
+                        kv_caches[layer_name] = raw_tensor[
+                            : num_blocks * page_size_bytes
+                        ].view(num_blocks, 1, 1, page_size_bytes)
                 else:
                     raise NotImplementedError
 
