@@ -16,7 +16,6 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
-    MambaManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -183,10 +182,6 @@ class KVCacheCoordinator(ABC):
                 scheduler_block_size=self.scheduler_block_size,
                 needs_kv_cache_zeroing=self.kv_cache_config.needs_kv_cache_zeroing,
             )
-            if manager_pool is self.mamba_block_pool and isinstance(
-                manager, MambaManager
-            ):
-                manager.one_slot_align = True
             managers.append(manager)
         self.single_type_managers = tuple(managers)
 

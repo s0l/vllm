@@ -1586,24 +1586,6 @@ class MambaManager(SingleTypeKVCacheManager):
             else:
                 prev_block_len = len(req_blocks)
                 blocks_allocated = request_id in self._allocated_block_reqs
-                if self.one_slot_align and blocks_allocated:
-                    state_idx = self.last_state_block_idx.get(
-                        request_id, prev_block_len - 1
-                    )
-                    state_block = req_blocks[state_idx]
-                    assert state_block != self._null_block
-                    req_blocks[state_idx] = self._null_block
-                    num_skipped_blocks = num_required_blocks - 1
-                    if len(req_blocks) < num_skipped_blocks:
-                        req_blocks.extend(
-                            self._null_block
-                            for _ in range(len(req_blocks), num_skipped_blocks)
-                        )
-                    req_blocks.append(state_block)
-                    self.last_state_block_idx[request_id] = num_required_blocks - 1
-                    # Relocation is not a fresh allocation. Returning this block
-                    # would cause the scheduler to zero live recurrent state.
-                    return []
                 # Record the last state block
                 if blocks_allocated:
                     # We always save the running state at the last
