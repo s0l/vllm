@@ -84,6 +84,24 @@ class FunctionalModel(nn.Module):
         return x_normed2, residual_out1, residual_out2
 
 
+class NativeInductorDonationModel(nn.Module):
+    """Gemma-style FP32 weight path with both activation inputs donated."""
+
+    def __init__(self, hidden_size=16, *, donate=True):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=torch.bfloat16))
+        self.donate = donate
+
+    def forward(self, x: torch.Tensor, residual: torch.Tensor):
+        weight = self.weight.float() + 1.0
+        op = (
+            ops.fused_add_rms_norm.maybe_inplace
+            if self.donate
+            else ops.fused_add_rms_norm
+        )
+        return op(x, residual, weight, 1e-6)
+
+
 class MixedModel(nn.Module):
     """Model mixing maybe_inplace and functional variants."""
 
@@ -280,6 +298,51 @@ def test_donated_buffer_context_propagation(default_vllm_config):
     # All donated ids should be valid non-negative integers
     for idx in donated_ids_seen[0]:
         assert isinstance(idx, int) and idx >= 0, f"Invalid donated index: {idx}"
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="Native Inductor donated-buffer provider is CUDA-alike only",
+)
+def test_native_inductor_inplace_is_bit_exact(default_vllm_config):
+    torch.set_default_device(current_platform.device_type)
+
+    functionalization_pass = VllmIRInplaceFunctionalizationPass(default_vllm_config)
+    lowering_pass = VllmIRLoweringPass(default_vllm_config)
+    cleanup_pass = UnsafeCloneEliminationPass(default_vllm_config)
+    backend = TestBackend(lowering_pass, cleanup_pass)
+    backend.inductor_config["pre_grad_custom_pass"] = functionalization_pass
+
+    baseline_lowering = VllmIRLoweringPass(default_vllm_config)
+    baseline_cleanup = UnsafeCloneEliminationPass(default_vllm_config)
+    baseline_backend = TestBackend(baseline_lowering, baseline_cleanup)
+
+    model = NativeInductorDonationModel(hidden_size=5120)
+    baseline_model = NativeInductorDonationModel(
+        hidden_size=5120, donate=False
+    )
+    x = torch.randn(128, 5120, dtype=torch.bfloat16)
+    residual = torch.randn_like(x)
+
+    with ops.fused_add_rms_norm.set_priority(["native"]):
+        baseline = torch.compile(
+            baseline_model, backend=baseline_backend, fullgraph=True
+        )
+        reference = baseline(x.clone(), residual.clone())
+    with ops.fused_add_rms_norm.set_priority(
+        ["native_inductor_inplace", "native"]
+    ):
+        compiled = torch.compile(model, backend=backend, fullgraph=True)
+        output = compiled(x, residual)
+
+    torch.testing.assert_close(output[0], reference[0], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(output[1], reference[1], rtol=0.0, atol=0.0)
+    assert output[0].data_ptr() == x.data_ptr()
+    assert output[1].data_ptr() == residual.data_ptr()
+    assert backend.op_count(torch.ops.aten.clone.default, before=False) == 0
+    assert set(lowering_pass.selected_impls["fused_add_rms_norm"].values()) == {
+        "native_inductor_inplace"
+    }
 
 
 @pytest.mark.skipif(

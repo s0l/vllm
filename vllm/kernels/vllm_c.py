@@ -82,3 +82,40 @@ def fused_add_rms_norm(
 
     torch.ops._C.fused_add_rms_norm(x, x_residual, weight, epsilon)
     return x, x_residual
+
+
+native_inductor_inplace_args = (
+    lambda x, x_residual, weight, epsilon, variance_size=None: (
+        variance_size is None
+        and weight is not None
+        and weight.dtype == torch.float32
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and x_residual.dtype == x.dtype
+    )
+)
+"""Native Inductor RMS math with donated activation storage.
+
+This covers Gemma/Qwen's ``weight.float() + 1`` path, which the CUDA RMS
+kernel cannot represent without changing its numerical behavior.
+"""
+
+
+@ir.ops.fused_add_rms_norm.register_impl(
+    "native_inductor_inplace",
+    supports_args=native_inductor_inplace_args,
+    supported=CUDA_ALIKE,
+    inplace=True,
+)
+def fused_add_rms_norm_native_inductor_inplace(
+    x: Tensor,
+    x_residual: Tensor,
+    weight: Tensor | None,
+    epsilon: float,
+    variance_size: int | None = None,
+) -> tuple[Tensor, Tensor]:
+    output, residual = ir.ops.fused_add_rms_norm.impls["native"].impl_fn(
+        x, x_residual, weight, epsilon, variance_size
+    )
+    x.copy_(output)
+    x_residual.copy_(residual)
+    return x, x_residual

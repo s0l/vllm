@@ -27,6 +27,7 @@ def test_rms_norm_registration():
     expected = {
         "native": True,
         "vllm_c": current_platform.is_cuda_alike(),
+        "native_inductor_inplace": current_platform.is_cuda_alike(),
         "aiter": current_platform.is_rocm(),
         "oink": current_platform.has_device_capability(100)
         and hasattr(torch.ops, "oink")
