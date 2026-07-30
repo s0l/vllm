@@ -171,7 +171,11 @@ def init_attn_backend(
 
 
 def _allocate_kv_cache(
-    kv_cache_config: KVCacheConfig, shared_layers: dict[str, str], device: torch.device
+    kv_cache_config: KVCacheConfig,
+    shared_layers: dict[str, str],
+    device: torch.device,
+    elastic_backings: dict[str, Any] | None = None,
+    elastic_geometry: dict[str, int] | None = None,
 ):
     kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
     packed_backings: dict[str, torch.Tensor] = {}
@@ -181,12 +185,24 @@ def _allocate_kv_cache(
 
             backing_id = kv_cache_tensor.backing_id
             if backing_id not in packed_backings:
-                owner = allocate_elastic_backing(
-                    reserved_bytes=kv_cache_tensor.size,
-                    committed_bytes=kv_cache_tensor.committed_size,
-                    quantum_bytes=kv_cache_tensor.mapping_quantum,
-                    device=device,
+                owner = (
+                    elastic_backings.get(backing_id)
+                    if elastic_backings is not None
+                    else None
                 )
+                if owner is None:
+                    owner = allocate_elastic_backing(
+                        reserved_bytes=kv_cache_tensor.size,
+                        committed_bytes=kv_cache_tensor.committed_size,
+                        quantum_bytes=kv_cache_tensor.mapping_quantum,
+                        device=device,
+                    )
+                    if elastic_backings is not None:
+                        elastic_backings[backing_id] = owner
+                        assert elastic_geometry is not None
+                        elastic_geometry[backing_id] = (
+                            kv_cache_tensor.logical_block_size
+                        )
                 packed_backings[backing_id] = owner.tensor.view(torch.int8)
             tensor = packed_backings[backing_id]
         elif kv_cache_tensor.block_stride > 0:
@@ -503,10 +519,16 @@ def init_kv_cache(
     cache_dtype: str,
     kernel_block_sizes: list[int],
     vllm_config: VllmConfig,
+    elastic_backings: dict[str, Any] | None = None,
+    elastic_geometry: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     shared_kv_cache_layers = get_shared_kv_cache_layers(vllm_config)
     kv_cache_raw_tensors = _allocate_kv_cache(
-        kv_cache_config, shared_kv_cache_layers, device
+        kv_cache_config,
+        shared_kv_cache_layers,
+        device,
+        elastic_backings,
+        elastic_geometry,
     )
     flattened_attn_groups = list(group for groups in attn_groups for group in groups)
     kv_caches = _reshape_kv_cache(

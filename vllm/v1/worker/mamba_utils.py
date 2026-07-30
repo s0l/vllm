@@ -71,29 +71,48 @@ class GDNPrefixCheckpointStore:
         forward_context: dict[str, Any],
     ):
         req_state = requests[req_id]
+        yield from self._state_tensors_for_block_ids(
+            req_state.block_ids, kv_cache_config, forward_context
+        )
+
+    def _state_tensors_for_block_ids(
+        self,
+        block_ids_by_group: tuple[list[int], ...],
+        kv_cache_config: KVCacheConfig,
+        forward_context: dict[str, Any],
+        *,
+        include_speculative: bool = False,
+    ):
         mamba_group_ids, mamba_spec = get_mamba_groups(kv_cache_config)
         assert mamba_spec.separate_pool
         for group_id in mamba_group_ids:
-            block_ids = req_state.block_ids[group_id]
-            assert len(block_ids) == 1 and block_ids[0] != 0
-            block_id = block_ids[0]
-            for layer_name in kv_cache_config.kv_cache_groups[group_id].layer_names:
-                attention = forward_context[layer_name]
-                for state in attention.kv_cache:
-                    yield state[block_id]
+            block_ids = block_ids_by_group[group_id]
+            expected = 1 + mamba_spec.num_speculative_blocks
+            assert len(block_ids) == expected and all(block_id != 0 for block_id in block_ids)
+            selected_block_ids = block_ids if include_speculative else block_ids[:1]
+            for block_id in selected_block_ids:
+                for layer_name in kv_cache_config.kv_cache_groups[group_id].layer_names:
+                    attention = forward_context[layer_name]
+                    for state in attention.kv_cache:
+                        yield state[block_id]
 
-    def save(
+    def save_blocks(
         self,
         key: bytes,
-        req_id: str,
+        block_ids_by_group: tuple[list[int], ...],
         kv_cache_config: KVCacheConfig,
-        requests: dict[str, CachedRequestState],
         forward_context: dict[str, Any],
     ) -> None:
+        self._save_state_tensors(
+            key,
+            self._state_tensors_for_block_ids(
+                block_ids_by_group, kv_cache_config, forward_context
+            ),
+        )
+
+    def _save_state_tensors(self, key: bytes, state_tensors) -> None:
         host_states: list[torch.Tensor] = []
-        for state in self._state_tensors(
-            req_id, kv_cache_config, requests, forward_context
-        ):
+        for state in state_tensors:
             host = torch.empty_like(
                 state,
                 device="cpu",
@@ -133,7 +152,7 @@ class GDNPrefixCheckpointStore:
             self.evictions += 1
         self.saves += 1
 
-    def restore(
+    def save(
         self,
         key: bytes,
         req_id: str,
@@ -141,14 +160,34 @@ class GDNPrefixCheckpointStore:
         requests: dict[str, CachedRequestState],
         forward_context: dict[str, Any],
     ) -> None:
+        self._save_state_tensors(
+            key,
+            self._state_tensors(
+                req_id, kv_cache_config, requests, forward_context
+            ),
+        )
+
+    def restore_blocks(
+        self,
+        key: bytes,
+        block_ids_by_group: tuple[list[int], ...],
+        kv_cache_config: KVCacheConfig,
+        forward_context: dict[str, Any],
+    ) -> None:
+        self._restore_state_tensors(
+            key,
+            self._state_tensors_for_block_ids(
+                block_ids_by_group, kv_cache_config, forward_context
+            ),
+        )
+
+    def _restore_state_tensors(self, key: bytes, state_tensors) -> None:
         host_states = self._checkpoints.get(key)
         if host_states is None:
             raise RuntimeError(
                 "Exact GDN prefix checkpoint missing in worker for scheduler hit"
             )
-        device_states = tuple(
-            self._state_tensors(req_id, kv_cache_config, requests, forward_context)
-        )
+        device_states = tuple(state_tensors)
         if len(device_states) != len(host_states):
             raise RuntimeError("GDN prefix checkpoint tensor-count mismatch")
         for device, host in zip(device_states, host_states):
@@ -157,6 +196,40 @@ class GDNPrefixCheckpointStore:
             device.copy_(host, non_blocking=host.is_pinned())
         self._checkpoints.move_to_end(key)
         self.restores += 1
+
+    def restore(
+        self,
+        key: bytes,
+        req_id: str,
+        kv_cache_config: KVCacheConfig,
+        requests: dict[str, CachedRequestState],
+        forward_context: dict[str, Any],
+    ) -> None:
+        self._restore_state_tensors(
+            key,
+            self._state_tensors(
+                req_id, kv_cache_config, requests, forward_context
+            ),
+        )
+
+    def zero_blocks(
+        self,
+        block_ids_by_group: tuple[list[int], ...],
+        kv_cache_config: KVCacheConfig,
+        forward_context: dict[str, Any],
+    ) -> None:
+        seen: set[int] = set()
+        for state in self._state_tensors_for_block_ids(
+            block_ids_by_group,
+            kv_cache_config,
+            forward_context,
+            include_speculative=True,
+        ):
+            ptr = state.data_ptr()
+            if ptr in seen:
+                continue
+            seen.add(ptr)
+            state.zero_()
 
     def save_from_output(
         self,
@@ -267,23 +340,31 @@ def _copy_mamba_state_block(
     is_conv_state = conv_width > 0
 
     if CONV_STATE_DIM_FIRST and is_conv_state:
-        # DS conv layout: state_len is the slide axis; copy per dim row.
+        # DS conv layout: state_len is the slide axis. Flatten the strided
+        # (dim_row, byte_in_row) copy so rows execute in parallel; a serial
+        # loop over hidden-size rows makes this kernel take seconds or hang
+        # under speculative batches.
         src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
         dim_rows = tl.load(state_dim_row_count_ptr + state_idx)
         row_stride = tl.load(state_dim_row_stride_ptr + state_idx)
         per_row_bytes = (conv_width - token_bias).to(tl.int64) * state_elem_size
         bias_bytes = token_bias.to(tl.int64) * state_elem_size
         src_block_addr = state_base_addr + src_block_id * state_block_stride
+        total_bytes = dim_rows.to(tl.int64) * per_row_bytes
         offsets = tl.arange(0, COPY_BLOCK_SIZE)
-        for d in range(0, dim_rows):
-            row_src = src_block_addr + d * row_stride + bias_bytes
-            row_dst = dst_addr + d * row_stride
-            for i in range(0, per_row_bytes, COPY_BLOCK_SIZE):
-                mask = (i + offsets) < per_row_bytes
-                curr_src = (row_src + i + offsets).to(tl.pointer_type(tl.uint8))
-                curr_dst = (row_dst + i + offsets).to(tl.pointer_type(tl.uint8))
-                data = tl.load(curr_src, mask=mask)
-                tl.store(curr_dst, data, mask=mask)
+        for i in range(0, total_bytes, COPY_BLOCK_SIZE):
+            flat = i + offsets
+            mask = flat < total_bytes
+            row = flat // per_row_bytes
+            byte_in_row = flat % per_row_bytes
+            curr_src = (
+                src_block_addr + row * row_stride + bias_bytes + byte_in_row
+            ).to(tl.pointer_type(tl.uint8))
+            curr_dst = (dst_addr + row * row_stride + byte_in_row).to(
+                tl.pointer_type(tl.uint8)
+            )
+            data = tl.load(curr_src, mask=mask)
+            tl.store(curr_dst, data, mask=mask)
         return
 
     if is_conv_state:
@@ -380,6 +461,7 @@ def postprocess_mamba_fused_kernel(
     # PRECOMPUTED_NEW_COMPUTED: when True, num_computed_tokens_ptr already holds
     # the post-step new_num_computed value (V2 supplies the advanced count).
     PRECOMPUTED_NEW_COMPUTED: tl.constexpr = False,
+    SEPARATE_POOL: tl.constexpr = False,
 ):
     """
     Fused GPU kernel for postprocess_mamba that computes decisions AND performs
@@ -409,6 +491,37 @@ def postprocess_mamba_fused_kernel(
 
     # Compute decision logic (mirrors postprocess_mamba Python reference)
     num_accepted = tl.load(num_accepted_tokens_ptr + req_idx)
+    if SEPARATE_POOL:
+        # Constant separate-pool topology:
+        #   column 0 = committed/running state
+        #   columns 1..K = states after speculative tokens 1..K
+        # Commit the accepted state back into column 0 before the next step.
+        # Do not reset num_accepted here: programs for different state_idx
+        # have no grid-wide barrier and must all observe the same value.
+        accept_token_bias = tl.maximum(num_accepted - 1, 0)
+        if accept_token_bias == 0:
+            return
+        bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
+        _copy_mamba_state_block(
+            state_idx,
+            bt_row_idx,
+            0,
+            0,
+            accept_token_bias,
+            block_table_ptrs_ptr,
+            block_table_stride_req,
+            state_base_addrs_ptr,
+            state_block_strides_ptr,
+            state_elem_sizes_ptr,
+            state_inner_sizes_ptr,
+            state_conv_widths_ptr,
+            state_group_indices_ptr,
+            state_dim_row_count_ptr,
+            state_dim_row_stride_ptr,
+            COPY_BLOCK_SIZE,
+            CONV_STATE_DIM_FIRST,
+        )
+        return
     src_block_idx = tl.load(mamba_state_idx_ptr + req_idx)
 
     if PRECOMPUTED_NEW_COMPUTED:
@@ -464,6 +577,20 @@ def postprocess_mamba_fused_kernel(
         COPY_BLOCK_SIZE,
         CONV_STATE_DIM_FIRST,
     )
+
+
+@triton.jit
+def _reset_num_accepted_kernel(
+    idx_mapping_ptr,
+    num_accepted_tokens_ptr,
+    num_reqs,
+):
+    batch_idx = tl.program_id(0)
+    if batch_idx >= num_reqs:
+        return
+    req_idx = tl.load(idx_mapping_ptr + batch_idx)
+    if req_idx >= 0:
+        tl.store(num_accepted_tokens_ptr + req_idx, 1)
 
 
 @triton.jit
@@ -1063,6 +1190,55 @@ class MambaSpecDecodeGPUContext:
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             HAS_IDX_MAPPING=True,
             PRECOMPUTED_NEW_COMPUTED=True,
+        )
+
+    def run_fused_postprocess_separate(
+        self,
+        num_reqs: int,
+        num_accepted_tokens_gpu: torch.Tensor,
+        idx_mapping: torch.Tensor,
+    ) -> None:
+        """Commit an accepted speculative GDN state into constant column 0."""
+        if num_reqs == 0 or not self.is_initialized:
+            return
+        total_states = self.num_layers * self.num_state_types
+        # Triton type-checks pointer expressions in the generic kernel even
+        # when SEPARATE_POOL makes those branches unreachable. Supply a real
+        # int32 pointer for every unused decision/output argument.
+        unused_i32_ptr = num_accepted_tokens_gpu
+        postprocess_mamba_fused_kernel[(num_reqs, total_states)](
+            num_accepted_tokens_gpu,
+            unused_i32_ptr,
+            unused_i32_ptr,
+            unused_i32_ptr,
+            unused_i32_ptr,
+            self.block_table_ptrs,
+            self.block_table_stride_req,
+            self.state_base_addrs,
+            self.state_block_strides,
+            self.state_elem_sizes,
+            self.state_inner_sizes,
+            self.state_conv_widths,
+            self.state_group_indices,
+            self.state_dim_row_count,
+            self.state_dim_row_stride,
+            unused_i32_ptr,
+            idx_mapping,
+            num_reqs,
+            block_size=self.block_size,
+            COPY_BLOCK_SIZE=1024,
+            CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
+            HAS_IDX_MAPPING=True,
+            PRECOMPUTED_NEW_COMPUTED=True,
+            SEPARATE_POOL=True,
+        )
+        # This second launch is the grid-wide ordering point. Every state
+        # program above must finish reading the accepted count before it is
+        # reset for the next model step.
+        _reset_num_accepted_kernel[(num_reqs,)](
+            idx_mapping,
+            num_accepted_tokens_gpu,
+            num_reqs,
         )
 
 

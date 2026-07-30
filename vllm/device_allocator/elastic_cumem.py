@@ -19,9 +19,10 @@ try:
         configure_elastic,
         elastic_info,
         resize_elastic,
+        transfer_elastic,
     )
 except ModuleNotFoundError:
-    configure_elastic = elastic_info = resize_elastic = None
+    configure_elastic = elastic_info = resize_elastic = transfer_elastic = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,24 @@ class ElasticCuMemBacking:
             raise RuntimeError("resizing a published backing requires a CUDA event")
         assert resize_elastic is not None
         resize_elastic(self.tensor.data_ptr(), committed_bytes, True)
+
+    def transfer_to(
+        self,
+        destination: ElasticCuMemBacking,
+        bytes_: int,
+        event: torch.cuda.Event,
+    ) -> None:
+        """Move physical quanta to another stable-VA backing after a fence."""
+        if event is None:
+            raise RuntimeError("elastic transfer requires a CUDA event")
+        event.synchronize()
+        assert transfer_elastic is not None
+        transfer_elastic(
+            self.tensor.data_ptr(),
+            destination.tensor.data_ptr(),
+            bytes_,
+            True,
+        )
 
 
 _live_backings: list[ElasticCuMemBacking] = []

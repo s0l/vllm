@@ -767,30 +767,30 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
     ) -> None:
-        """Cache the prompt tail when it ends inside a cache block.
-
-        Only the final prompt hash boundary is registered as a partial
-        prefix-cache entry; intermediate hash boundaries inside the same cache
-        block are intentionally skipped.
-        """
+        """Cache requested partial boundaries inside an attention block."""
         hash_block_size = self.block_pool.hash_block_size
-        boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size
-        if boundary_tokens == 0 or boundary_tokens > num_tokens:
-            return
-        if boundary_tokens % self.block_size == 0:
-            return
-
-        blocks = self.req_to_blocks[request.request_id]
-        block_idx = boundary_tokens // self.block_size
-        if block_idx >= len(blocks):
-            return
-        self.block_pool.cache_partial_block(
-            request=request,
-            block=blocks[block_idx],
-            num_tokens=boundary_tokens,
-            kv_cache_group_id=self.kv_cache_group_id,
-            block_size=self.block_size,
+        prompt_tail = (
+            request.num_prompt_tokens // hash_block_size * hash_block_size
         )
+        boundaries = {prompt_tail}
+        if request.shared_prefix_boundary:
+            boundaries.add(request.shared_prefix_boundary)
+        blocks = self.req_to_blocks[request.request_id]
+        for boundary_tokens in sorted(boundaries):
+            if boundary_tokens == 0 or boundary_tokens > num_tokens:
+                continue
+            if boundary_tokens % self.block_size == 0:
+                continue
+            block_idx = boundary_tokens // self.block_size
+            if block_idx >= len(blocks):
+                continue
+            self.block_pool.cache_partial_block(
+                request=request,
+                block=blocks[block_idx],
+                num_tokens=boundary_tokens,
+                kv_cache_group_id=self.kv_cache_group_id,
+                block_size=self.block_size,
+            )
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         blocks = self.req_to_blocks[running_request_id]
@@ -1239,8 +1239,6 @@ class MambaManager(SingleTypeKVCacheManager):
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
         self.one_slot_align = kv_cache_spec.separate_pool
-        if self.one_slot_align and self.num_speculative_blocks:
-            raise ValueError("Separate-pool GDN does not support speculative blocks")
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step
@@ -1497,7 +1495,9 @@ class MambaManager(SingleTypeKVCacheManager):
             num_tokens = num_tokens_main_model
             if self.one_slot_align:
                 allocated = request_id in self._allocated_block_reqs
-                return 0 if allocated else 1
+                return (
+                    0 if allocated else 1 + self.num_speculative_blocks
+                )
 
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
@@ -1558,16 +1558,8 @@ class MambaManager(SingleTypeKVCacheManager):
             if self.one_slot_align:
                 if request_id in self._allocated_block_reqs:
                     return []
-                if req_blocks:
-                    # Exact prefix hit: collapse the sparse positional view
-                    # returned by find_longest_cache_hit into constant column 0.
-                    state_block = req_blocks[-1]
-                    assert state_block != self._null_block
-                    req_blocks[:] = [state_block]
-                    self.last_state_block_idx[request_id] = 0
-                    self._allocated_block_reqs.add(request_id)
-                    return []
-                new_blocks = self.block_pool.get_new_blocks(1)
+                num_state_blocks = 1 + self.num_speculative_blocks
+                new_blocks = self.block_pool.get_new_blocks(num_state_blocks)
                 req_blocks.extend(new_blocks)
                 self.last_state_block_idx[request_id] = 0
                 self._allocated_block_reqs.add(request_id)

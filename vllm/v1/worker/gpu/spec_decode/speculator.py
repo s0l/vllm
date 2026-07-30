@@ -154,6 +154,8 @@ class DraftModelSpeculator(BaseSpeculator):
 
         self.model = self.load_draft_model(target_model, target_attn_layer_names)
         self._validate_local_argmax_reduction()
+        if hasattr(self.model, "ag2_init_fp8_head"):
+            self.model.ag2_init_fp8_head()
 
         all_attn_layers = set[str](
             get_layers_from_vllm_config(

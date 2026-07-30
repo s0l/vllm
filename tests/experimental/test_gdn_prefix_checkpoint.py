@@ -1,17 +1,21 @@
+import os
 import unittest
 from collections import OrderedDict
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import (
+    FullAttentionManager,
     MambaManager,
     SingleTypeKVCacheManager,
 )
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec
+from vllm.v1.request import _parse_prefix_cache_hint_tokens
 from vllm.v1.worker.mamba_utils import GDNPrefixCheckpointStore
 
 
@@ -99,6 +103,170 @@ class TestGDNPrefixCheckpoint(unittest.TestCase):
         self.assertEqual(
             coordinator.find_gdn_checkpoint_boundary(block_hashes, 18, spec), 12
         )
+
+    def test_dcp_fine_checkpoint_lookup_uses_hash_boundary(self):
+        coordinator = object.__new__(HybridKVCacheCoordinator)
+        coordinator.gdn_checkpoint_keys = OrderedDict()
+        coordinator.gdn_checkpoint_limit = 8
+        coordinator.hash_block_size = 2
+        coordinator.dcp_world_size = 3
+        coordinator.pcp_world_size = 1
+        coordinator.enable_dcp_fine_prefix = True
+        spec = MambaSpec(
+            block_size=4,
+            shapes=((1,),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+            separate_pool=True,
+        )
+        block_hashes = [BlockHash(bytes([i])) for i in range(18)]
+        coordinator.register_gdn_checkpoint(block_hashes[4])
+
+        self.assertEqual(
+            coordinator.find_gdn_checkpoint_boundary(block_hashes, 18, spec), 10
+        )
+        self.assertEqual(
+            coordinator.find_gdn_checkpoint_boundary(block_hashes, 8, spec), 0
+        )
+
+    def test_prefix_hint_is_server_bounded_and_fail_closed(self):
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            self.assertRaisesRegex(ValueError, "requires"),
+        ):
+            _parse_prefix_cache_hint_tokens(
+                {"ag2_prefix_cache_hint_tokens": 336}
+            )
+
+        env = {
+            "AG2_VLLM_DCP_FINE_PREFIX": "1",
+            "AG2_VLLM_DCP_FINE_PREFIX_HINT_TOKENS": "336",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(
+                _parse_prefix_cache_hint_tokens(
+                    {"ag2_prefix_cache_hint_tokens": 336}
+                ),
+                336,
+            )
+            with self.assertRaisesRegex(ValueError, "server-configured"):
+                _parse_prefix_cache_hint_tokens(
+                    {"ag2_prefix_cache_hint_tokens": 168}
+                )
+            with self.assertRaisesRegex(ValueError, "must be an integer"):
+                _parse_prefix_cache_hint_tokens(
+                    {"ag2_prefix_cache_hint_tokens": True}
+                )
+
+    def test_prefix_hint_uses_only_an_opted_in_server_default(self):
+        env = {
+            "AG2_VLLM_DCP_FINE_PREFIX": "1",
+            "AG2_VLLM_DCP_FINE_PREFIX_HINT_TOKENS": "336",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(_parse_prefix_cache_hint_tokens(None), 0)
+        env["AG2_VLLM_DCP_FINE_PREFIX_DEFAULT"] = "1"
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(_parse_prefix_cache_hint_tokens(None), 336)
+
+    def test_fine_hint_is_an_exact_scheduler_stop(self):
+        coordinator = object.__new__(HybridKVCacheCoordinator)
+        coordinator.gdn_checkpoint_keys = OrderedDict()
+        coordinator.enable_dcp_fine_prefix = True
+        scheduler = object.__new__(Scheduler)
+        scheduler.kv_cache_manager = SimpleNamespace(coordinator=coordinator)
+        scheduler.hash_block_size = 2
+        scheduler.block_size = 12
+        scheduler.use_eagle = False
+        scheduler.mamba_partial_cache_hit = True
+        request = SimpleNamespace(
+            num_computed_tokens=0,
+            num_prompt_tokens=10,
+            num_tokens=10,
+            shared_prefix_boundary=2,
+            prefix_cache_hint_tokens=2,
+        )
+
+        self.assertEqual(scheduler._mamba_block_aligned_split(request, 10), 2)
+
+    def test_eagle_fine_hint_materializes_resume_then_match_boundaries(self):
+        coordinator = object.__new__(HybridKVCacheCoordinator)
+        coordinator.gdn_checkpoint_keys = OrderedDict()
+        coordinator.enable_dcp_fine_prefix = True
+        scheduler = object.__new__(Scheduler)
+        scheduler.kv_cache_manager = SimpleNamespace(coordinator=coordinator)
+        scheduler.hash_block_size = 2
+        scheduler.block_size = 12
+        scheduler.use_eagle = True
+        scheduler.mamba_partial_cache_hit = True
+        request = SimpleNamespace(
+            num_computed_tokens=0,
+            num_prompt_tokens=10,
+            num_tokens=10,
+            shared_prefix_boundary=4,
+            prefix_cache_hint_tokens=4,
+        )
+
+        self.assertEqual(scheduler._fine_prefix_resume_boundary(request), 2)
+        self.assertEqual(scheduler._mamba_block_aligned_split(request, 10), 2)
+        request.num_computed_tokens = 2
+        self.assertEqual(scheduler._mamba_block_aligned_split(request, 8), 2)
+
+    def test_attention_registers_shared_partial_boundary(self):
+        manager = object.__new__(FullAttentionManager)
+        manager.block_size = 12
+        manager.kv_cache_group_id = 0
+        manager.block_pool = MagicMock(hash_block_size=2)
+        block = SimpleNamespace()
+        manager.req_to_blocks = {"req": [block]}
+        request = SimpleNamespace(
+            request_id="req",
+            num_prompt_tokens=9,
+            shared_prefix_boundary=2,
+        )
+
+        manager._cache_partial_tail_block(request, num_tokens=2)
+
+        manager.block_pool.cache_partial_block.assert_called_once_with(
+            request=request,
+            block=block,
+            num_tokens=2,
+            kv_cache_group_id=0,
+            block_size=12,
+        )
+
+    def test_fine_checkpoint_save_filter_preserves_coarse_and_named_boundaries(self):
+        spec = MambaSpec(
+            block_size=4,
+            shapes=((1,),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+            separate_pool=True,
+        )
+        coordinator = object.__new__(HybridKVCacheCoordinator)
+        coordinator.gdn_checkpoint_keys = OrderedDict()
+        coordinator.enable_dcp_fine_prefix = True
+        coordinator.hash_block_size = 2
+        coordinator.dcp_world_size = 3
+        coordinator.pcp_world_size = 1
+        coordinator.kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[KVCacheGroupSpec(["gdn"], spec)]
+        )
+        scheduler = object.__new__(Scheduler)
+        scheduler.kv_cache_manager = SimpleNamespace(coordinator=coordinator)
+        scheduler.hash_block_size = 2
+        scheduler.use_eagle = True
+        request = SimpleNamespace(
+            num_prompt_tokens=19,
+            shared_prefix_boundary=4,
+            prefix_cache_hint_tokens=4,
+        )
+
+        self.assertTrue(scheduler._should_save_gdn_checkpoint(request, 2))
+        self.assertTrue(scheduler._should_save_gdn_checkpoint(request, 4))
+        self.assertTrue(scheduler._should_save_gdn_checkpoint(request, 12))
+        self.assertTrue(scheduler._should_save_gdn_checkpoint(request, 18))
+        self.assertFalse(scheduler._should_save_gdn_checkpoint(request, 6))
 
     def test_lookup_does_not_touch_lru_until_restore_is_dispatched(self):
         coordinator = object.__new__(HybridKVCacheCoordinator)

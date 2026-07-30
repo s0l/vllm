@@ -24,6 +24,7 @@ from vllm.v1.worker.gpu.sample.logprob import (
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
+from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 from vllm.v1.worker.gpu.states import RequestState
 
 
@@ -37,6 +38,7 @@ class Sampler:
         logprobs_mode: LogprobsMode = "raw_logprobs",
         num_speculative_tokens: int = 1,
         use_fp64_gumbel: bool = False,
+        reasoning_config=None,
     ):
         self.logprobs_mode = logprobs_mode
         self.compute_nans = envs.VLLM_COMPUTE_NANS_IN_LOGITS  # False by default.
@@ -50,15 +52,32 @@ class Sampler:
         self.logprob_token_ids_state = LogprobTokenIdsState(max_num_reqs, device)
         self.num_speculative_tokens = num_speculative_tokens
         self.use_flashinfer = flashinfer_sampler_supported()
+        self.thinking_budget_state = ThinkingBudgetState(
+            reasoning_config=reasoning_config,
+            max_num_reqs=max_num_reqs,
+            max_num_logits=max_num_reqs * num_speculative_tokens,
+            max_committed_tokens=num_speculative_tokens,
+            device=device,
+        )
 
     def add_request(
-        self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
+        self,
+        req_idx: int,
+        prompt_len: int,
+        sampling_params: SamplingParams,
+        token_ids: list[int] | None = None,
     ) -> None:
         self.sampling_states.add_request(req_idx, sampling_params)
         self.penalties_state.add_request(req_idx, sampling_params)
         self.logit_bias_state.add_request(req_idx, prompt_len, sampling_params)
         self.bad_words_state.add_request(req_idx, sampling_params)
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
+        self.thinking_budget_state.add_request(
+            req_idx, sampling_params, token_ids or []
+        )
+
+    def remove_request(self, req_idx: int) -> None:
+        self.thinking_budget_state.remove_request(req_idx)
 
     def apply_staged_writes(self) -> None:
         self.sampling_states.apply_staged_writes()
@@ -66,6 +85,7 @@ class Sampler:
         self.logit_bias_state.apply_staged_writes()
         self.bad_words_state.apply_staged_writes()
         self.logprob_token_ids_state.apply_staged_writes()
+        self.thinking_budget_state.apply_staged_writes()
 
     def __call__(
         self,
@@ -212,6 +232,12 @@ class Sampler:
             input_ids,
             expanded_local_pos,
             skip_top_k_top_p=True,
+        )
+        self.thinking_budget_state.apply_to_logits(
+            processed_logits,
+            input_ids,
+            expanded_idx_mapping,
+            expanded_local_pos,
         )
         top_k, top_p = self.sampling_states.get_top_k_top_p(
             expanded_idx_mapping, idx_mapping_np

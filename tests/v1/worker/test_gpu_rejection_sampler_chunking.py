@@ -10,6 +10,8 @@ import torch
 
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.platforms import current_platform
+from vllm.sampling_params import SamplingParams
+from vllm.v1.worker.gpu.sample.logprob import LogprobTokenIdsState
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
     _iter_request_chunks,
@@ -49,7 +51,12 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
         ).to(device),
     )
     rejection_sampler = object.__new__(RejectionSampler)
-    rejection_sampler.sampler = SimpleNamespace(logprobs_mode=logprobs_mode)
+    token_id_state = LogprobTokenIdsState(max_num_reqs=10, device=device)
+    token_id_state.apply_staged_writes()
+    rejection_sampler.sampler = SimpleNamespace(
+        logprobs_mode=logprobs_mode,
+        logprob_token_ids_state=token_id_state,
+    )
     rejection_sampler.num_speculative_steps = 3
 
     def fake_verify(
@@ -88,6 +95,8 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
         input_batch.cu_num_logits,
         input_batch.cu_num_logits_np,
         max_num_logprobs=2,
+        expanded_idx_mapping=input_batch.expanded_idx_mapping,
+        idx_mapping_np=input_batch.idx_mapping_np,
     )
 
     assert sampled[:, 0].tolist() == idx_mapping_np.tolist()
@@ -107,3 +116,46 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
         chunked_logprobs.cu_num_generated_tokens
         == full_logprobs.cu_num_generated_tokens
     )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+def test_spec_decode_logprob_token_ids_cover_every_accepted_position():
+    device = torch.device("cuda")
+    req_state_idx = 2
+    requested_token_id = 11
+    token_id_state = LogprobTokenIdsState(max_num_reqs=4, device=device)
+    token_id_state.add_request(
+        req_state_idx,
+        SamplingParams(logprob_token_ids=[requested_token_id]),
+    )
+    token_id_state.apply_staged_writes()
+
+    rejection_sampler = object.__new__(RejectionSampler)
+    rejection_sampler.sampler = SimpleNamespace(
+        logprobs_mode="raw_logprobs",
+        logprob_token_ids_state=token_id_state,
+    )
+    sampled = torch.tensor([[5, 6, 7]], device=device, dtype=torch.int64)
+    num_sampled = torch.tensor([3], device=device, dtype=torch.int32)
+    logits = torch.randn(3, 17, device=device)
+    cu_num_logits_np = np.array([0, 3], dtype=np.int32)
+    cu_num_logits = torch.from_numpy(cu_num_logits_np).to(device)
+    expanded_idx_mapping = torch.full(
+        (3,), req_state_idx, device=device, dtype=torch.int64
+    )
+
+    result = rejection_sampler._get_logprobs_tensors(
+        sampled,
+        num_sampled,
+        logits,
+        cu_num_logits,
+        cu_num_logits_np,
+        max_num_logprobs=1,
+        expanded_idx_mapping=expanded_idx_mapping,
+        idx_mapping_np=np.array([req_state_idx], dtype=np.int32),
+    )
+
+    assert result is not None
+    assert result.logprob_token_ids[:, 0].tolist() == [5, 6, 7]
+    assert result.logprob_token_ids[:, 1].tolist() == [requested_token_id] * 3
+    assert result.logprobs.shape == (3, 2)

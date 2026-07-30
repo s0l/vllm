@@ -467,6 +467,12 @@ class CommonAttentionMetadata:
     (num_computed_tokens < num_prompt_tokens). Used by some backends to
     distinguish actual decodes from short extends."""
 
+    num_decode_draft_tokens_cpu: torch.Tensor | None = None
+    """(batch_size,) number of valid speculative draft tokens for each decode
+    row, or -1 for rows that are not exact speculative-decode verification.
+    This is a semantic execution marker; a matching physical query length alone
+    does not imply that a row belongs to the speculative-decode path."""
+
     seq_lens_cpu_upper_bound: torch.Tensor | None = None
     """(batch_size,) CPU upper bound on seq_lens. Precise for prefill rows
     and for all rows outside async spec decode; optimistic for async-spec

@@ -2224,12 +2224,6 @@ class VllmConfig:
                 f"Model Runner V2 does not yet support: {', '.join(unsupported)}"
             )
 
-        if self.reasoning_config is not None:
-            logger.warning_once(
-                "Model Runner V2 does not yet support the thinking_token_budget "
-                "request parameter. Set VLLM_USE_V2_MODEL_RUNNER=0 if this is required."
-            )
-
     def validate_block_size(self) -> None:
         """Validate block_size against DCP and mamba constraints.
 
@@ -2237,6 +2231,9 @@ class VllmConfig:
         finalised block_size.
         """
         block_size = self.cache_config.block_size
+        logger.info_once(
+            "Validated scheduler/cache block size: %d tokens.", block_size
+        )
 
         # DCP interleave-size compatibility
         if self.parallel_config.decode_context_parallel_size > 1:

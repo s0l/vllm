@@ -56,6 +56,12 @@ class BatchDescriptor:
     (like fused_moe_lora) whose grid size depends on num_active_loras
     to be properly captured.
     """
+    tp3_sd_phase_reduce: bool = False
+    """
+    Whether this graph belongs to the target-model pure-decode lane that uses
+    the fixed TP3 speculative-decoding reduction. This is part of graph
+    identity: a short prefill can have the same tensor shape as decode.
+    """
 
 
 def _compute_sp_num_tokens(
@@ -152,6 +158,17 @@ class ForwardContext:
     # must use this instead of tensor shapes for quality-sensitive dispatch.
     num_tokens_unpadded: int | None = None
 
+    # Serialized runtime authority for the TP3 compressed all-reduce path.
+    # Frontend-only environment variables are not a reliable contract across
+    # the spawned EngineCore/worker boundary.
+    tp3_ce_reduce: bool = False
+
+    # Explicit scheduler-owned target pure-decode lane. This must not be
+    # inferred from tensor shape or cudagraph runtime mode: FULL graph capture
+    # invokes the model with runtime mode NONE, and short prefill can alias the
+    # same physical shape as K0/K2 decode.
+    tp3_sd_phase_reduce: bool = False
+
     ubatch_slices: UBatchSlices | None = None
 
     # Boolean mask over the token axis: True for padding rows that are not real
@@ -225,6 +242,7 @@ def create_forward_context(
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
     num_tokens_unpadded: int | None = None,
+    tp3_sd_phase_reduce: bool = False,
 ):
     if vllm_config.compilation_config.fast_moe_cold_start:
         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
@@ -244,6 +262,11 @@ def create_forward_context(
         additional_kwargs=additional_kwargs or {},
         is_padding=is_padding,
         num_tokens_unpadded=num_tokens_unpadded,
+        tp3_ce_reduce=bool(
+            vllm_config.additional_config
+            and vllm_config.additional_config.get("tp3_ce_reduce", False)
+        ),
+        tp3_sd_phase_reduce=tp3_sd_phase_reduce,
     )
 
 
@@ -275,6 +298,7 @@ def set_forward_context(
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
     num_tokens_unpadded: int | None = None,
+    tp3_sd_phase_reduce: bool = False,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -345,6 +369,7 @@ def set_forward_context(
         skip_compiled,
         is_padding=is_padding,
         num_tokens_unpadded=num_tokens_unpadded,
+        tp3_sd_phase_reduce=tp3_sd_phase_reduce,
     )
 
     try:

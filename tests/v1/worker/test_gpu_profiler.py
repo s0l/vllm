@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -298,3 +298,39 @@ def test_profiler_entered_during_capture():
 
     mock_profiler.__enter__.assert_called_once()
     mock_profiler.__exit__.assert_called_once()
+
+
+def test_worker_profile_recreates_torch_profiler_after_stop(
+    default_profiler_config,
+):
+    worker = MagicMock()
+    worker.profiler_config = default_profiler_config
+    worker.profiler = None
+    worker.rank = 0
+    worker.local_rank = 0
+    first_profiler = MagicMock()
+    second_profiler = MagicMock()
+
+    with (
+        patch(
+            "vllm.distributed.utils.get_worker_rank_suffix",
+            return_value="rank0",
+        ),
+        patch(
+            "vllm.v1.worker.gpu_worker.TorchProfilerWrapper",
+            side_effect=[first_profiler, second_profiler],
+        ) as wrapper_cls,
+    ):
+        Worker.profile(worker, is_start=True, profile_prefix="k0")
+        first_profiler.start.assert_called_once_with()
+
+        Worker.profile(worker, is_start=False)
+        first_profiler.stop.assert_called_once_with()
+        assert worker.profiler is None
+
+        Worker.profile(worker, is_start=True, profile_prefix="k2")
+        second_profiler.start.assert_called_once_with()
+
+    assert wrapper_cls.call_count == 2
+    assert wrapper_cls.call_args_list[0].kwargs["worker_name"] == "k0_rank0"
+    assert wrapper_cls.call_args_list[1].kwargs["worker_name"] == "k2_rank0"

@@ -10,9 +10,18 @@ from torch import nn
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.communication_op import tensor_model_parallel_all_gather
+from vllm.distributed.parallel_state import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+)
+from vllm.model_executor.models.ag2_fp8_draft_head import (
+    Fp8DraftHead,
+    install_shared_fp8_lm_head,
+    shared_fp8_head_enabled,
+)
 from vllm.logger import init_logger
-from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.model_executor.layers.linear import PaddedMergedColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -48,6 +57,16 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _mtp_fc_padded_output_size(
+    hidden_size: int, tp_size: int, local_alignment: int = 64
+) -> int:
+    """Pad the MTP projection so every TP rank owns an aligned output shard."""
+    global_alignment = tp_size * local_alignment
+    return (
+        (hidden_size + global_alignment - 1) // global_alignment
+    ) * global_alignment
 
 
 @support_torch_compile(
@@ -93,9 +112,26 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             if (quant_config and quant_config.get_name() == "modelopt_fp4")
             else quant_config
         )
-        self.fc = ColumnParallelLinear(
+        # The following draft layer needs the full hidden vector. Pad the
+        # projection output to aligned TP shards, all-gather it, then discard
+        # the zero-padded tail. This avoids replicating the 100 MiB BF16 matrix
+        # when hidden_size is not divisible by TP.
+        tp_size = get_tensor_model_parallel_world_size()
+        self.fc_padded_output_size = _mtp_fc_padded_output_size(
+            self.config.hidden_size, tp_size
+        )
+        if self.fc_padded_output_size != self.config.hidden_size:
+            logger.warning_once(
+                "Padding Qwen3.5 MTP fc output from %d to %d for "
+                "tensor_parallel_size=%d.",
+                self.config.hidden_size,
+                self.fc_padded_output_size,
+                tp_size,
+            )
+        self.fc = PaddedMergedColumnParallelLinear(
             self.config.hidden_size * 2,
-            self.config.hidden_size,
+            output_sizes=[self.config.hidden_size],
+            padded_output_sizes=[self.fc_padded_output_size],
             gather_output=True,
             bias=False,
             return_bias=False,
@@ -153,6 +189,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             hidden_states = self.pre_fc_norm_hidden(hidden_states)
             hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
             hidden_states = self.fc(hidden_states)
+            hidden_states = hidden_states[..., : self.config.hidden_size]
             residual = None
         else:
             assert intermediate_tensors is not None
@@ -180,8 +217,11 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
                 self.config.hidden_size,
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        # The predictor returns only normalized hidden states. Avoid the
+        # two-output fused op here: its residual result is dead but otherwise
+        # materializes a full BF16 [tokens, hidden] tensor in compiled prefill.
+        assert residual is not None
+        return self.norm.forward_native_output_only(hidden_states, residual)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = maybe_fuse_shared_experts(
@@ -251,6 +291,76 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self._ag2_fp8_head: Fp8DraftHead | None = None
+
+    def ag2_init_fp8_head(self) -> None:
+        """Build the FP8 draft-head copy after lm_head sharing, before capture."""
+        if shared_fp8_head_enabled():
+            if Fp8DraftHead.enabled():
+                raise ValueError(
+                    "AG2 shared and additive FP8 lm_head modes are mutually exclusive"
+                )
+            if self.config.tie_word_embeddings:
+                raise ValueError(
+                    "AG2 shared FP8 lm_head cannot replace tied input embeddings"
+                )
+            source_bytes, installed_bytes = install_shared_fp8_lm_head(self.lm_head)
+            if source_bytes:
+                logger.warning(
+                    "AG2 shared target/draft FP8 lm_head POC enabled: shard %s, "
+                    "%.1f -> %.1f MiB",
+                    tuple(self.lm_head.weight.shape),
+                    source_bytes / 1024**2,
+                    installed_bytes / 1024**2,
+                )
+            return
+        if not Fp8DraftHead.enabled() or self._ag2_fp8_head is not None:
+            return
+        self._ag2_fp8_head = Fp8DraftHead(self.lm_head.weight)
+        logger.info(
+            "AG2 FP8 draft lm_head enabled: shard %s, +%.0f MiB",
+            tuple(self.lm_head.weight.shape),
+            self._ag2_fp8_head.w8.nbytes / 1024**2,
+        )
+
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        head = self._ag2_fp8_head
+        # The FP8 GEMV kernel re-reads the weight shard per row of M, so it
+        # only wins for latency-bound small batches; BF16 cuBLAS reads the
+        # shard once for the whole batch.
+        if head is None or hidden_states.shape[0] > 2:
+            return super().get_top_tokens(hidden_states)
+        lp = self.logits_processor
+        assert lp.scale == 1.0 and getattr(lp, "soft_cap", None) is None
+        logits = head.logits(hidden_states)
+        num_pad = self.lm_head.shard_indices.num_org_vocab_padding
+        if num_pad > 0:
+            logits[..., -num_pad:] = -float("inf")
+        local_max_vals, local_max_indices = logits.max(dim=-1)
+        global_indices = (
+            local_max_indices + self.lm_head.shard_indices.org_vocab_start_index
+        )
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size == 1:
+            top = global_indices
+        else:
+            local_pair = torch.stack(
+                [local_max_vals.float(), global_indices.float()], dim=-1
+            )
+            gathered = tensor_model_parallel_all_gather(local_pair, dim=-1).view(
+                hidden_states.shape[0], tp_size, 2
+            )
+            max_rank_idx = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
+            top = (
+                gathered[:, :, 1]
+                .gather(dim=-1, index=max_rank_idx)
+                .squeeze(-1)
+                .to(torch.int64)
+            )
+        d2t = getattr(self, "draft_id_to_target_id", None)
+        if d2t is not None:
+            top = top + d2t[top]
+        return top
 
     def embed_input_ids(
         self,

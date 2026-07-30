@@ -177,6 +177,81 @@ static CUresult elastic_unmap_one(ElasticAllocation& allocation) {
   allocation.committed -= allocation.quantum;
   return CUDA_SUCCESS;
 }
+
+static CUresult elastic_map_existing_one(
+    ElasticAllocation& allocation, CUmemGenericAllocationHandle handle) {
+  CUdeviceptr address = allocation.base + allocation.committed;
+  CUresult result = cuMemMap(address, allocation.quantum, 0, handle, 0);
+  if (result != CUDA_SUCCESS) return result;
+  CUmemAccessDesc access = {};
+  access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  access.location.id = allocation.device;
+  access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  result = cuMemSetAccess(address, allocation.quantum, &access, 1);
+  if (result != CUDA_SUCCESS) {
+    cuMemUnmap(address, allocation.quantum);
+    return result;
+  }
+  allocation.handles.push_back(handle);
+  allocation.committed += allocation.quantum;
+  return CUDA_SUCCESS;
+}
+
+// Move one physical quantum between two stable virtual reservations without
+// releasing and recreating its allocation handle.
+static CUresult elastic_transfer_one(ElasticAllocation& source,
+                                     ElasticAllocation& destination) {
+  if (source.handles.empty() || source.device != destination.device ||
+      source.quantum != destination.quantum ||
+      destination.committed + destination.quantum > destination.reserved)
+    return CUDA_ERROR_INVALID_VALUE;
+
+  CUdeviceptr source_address =
+      source.base + source.committed - source.quantum;
+  CUmemGenericAllocationHandle handle = source.handles.back();
+  CUresult result = cuMemUnmap(source_address, source.quantum);
+  if (result != CUDA_SUCCESS) return result;
+
+  result = elastic_map_existing_one(destination, handle);
+  if (result != CUDA_SUCCESS) {
+    // The source metadata was not changed yet, so restore the mapping in
+    // place. Returning the restore error is safer than hiding corrupted state.
+    CUresult restore = cuMemMap(source_address, source.quantum, 0, handle, 0);
+    if (restore == CUDA_SUCCESS) {
+      CUmemAccessDesc access = {};
+      access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+      access.location.id = source.device;
+      access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+      restore = cuMemSetAccess(source_address, source.quantum, &access, 1);
+    }
+    return restore == CUDA_SUCCESS ? result : restore;
+  }
+
+  source.handles.pop_back();
+  source.committed -= source.quantum;
+  return CUDA_SUCCESS;
+}
+
+static CUresult elastic_transfer(ElasticAllocation& source,
+                                 ElasticAllocation& destination,
+                                 size_t bytes) {
+  if (bytes % source.quantum != 0) return CUDA_ERROR_INVALID_VALUE;
+  size_t moved = 0;
+  CUresult result = CUDA_SUCCESS;
+  while (moved < bytes && result == CUDA_SUCCESS) {
+    result = elastic_transfer_one(source, destination);
+    if (result == CUDA_SUCCESS) moved += source.quantum;
+  }
+  if (result == CUDA_SUCCESS) return result;
+
+  // A multi-quantum transfer is transactional within this process.
+  while (moved > 0) {
+    CUresult rollback = elastic_transfer_one(destination, source);
+    if (rollback != CUDA_SUCCESS) return rollback;
+    moved -= source.quantum;
+  }
+  return result;
+}
 #endif
 
 // ---------------------------------------------------------------------------
@@ -809,6 +884,60 @@ static PyObject* python_elastic_info(PyObject* self, PyObject* args) {
 #endif
 }
 
+static PyObject* python_transfer_elastic(PyObject* self, PyObject* args) {
+#ifdef USE_ROCM
+  PyErr_SetString(PyExc_NotImplementedError, "elastic backing is CUDA-only");
+  return nullptr;
+#else
+  unsigned long long source_ptr, destination_ptr, bytes;
+  int fence_complete;
+  if (!PyArg_ParseTuple(args, "KKKp", &source_ptr, &destination_ptr, &bytes,
+                        &fence_complete))
+    return nullptr;
+  if (!fence_complete) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "elastic transfer requires a completed CUDA fence");
+    return nullptr;
+  }
+  if (source_ptr == destination_ptr) {
+    PyErr_SetString(PyExc_ValueError,
+                    "elastic transfer requires distinct allocations");
+    return nullptr;
+  }
+
+  std::lock_guard<std::mutex> lock(g_elastic_mutex);
+  auto source_it = g_elastic_allocations.find((CUdeviceptr)source_ptr);
+  auto destination_it =
+      g_elastic_allocations.find((CUdeviceptr)destination_ptr);
+  if (source_it == g_elastic_allocations.end() ||
+      destination_it == g_elastic_allocations.end()) {
+    PyErr_SetString(PyExc_KeyError, "unknown elastic allocation");
+    return nullptr;
+  }
+  ElasticAllocation& source = source_it->second;
+  ElasticAllocation& destination = destination_it->second;
+  if (source.device != destination.device ||
+      source.quantum != destination.quantum || bytes > source.committed ||
+      destination.committed + bytes > destination.reserved ||
+      bytes % source.quantum != 0) {
+    PyErr_SetString(
+        PyExc_ValueError,
+        "incompatible elastic transfer geometry or out-of-range size");
+    return nullptr;
+  }
+
+  CUresult result = elastic_transfer(source, destination, (size_t)bytes);
+  if (result != CUDA_SUCCESS) {
+    const char* message = nullptr;
+    cuGetErrorString(result, &message);
+    PyErr_Format(PyExc_RuntimeError, "elastic transfer failed: %s", message);
+    return nullptr;
+  }
+  return Py_BuildValue("KK", (unsigned long long)source.committed,
+                       (unsigned long long)destination.committed);
+#endif
+}
+
 // Python-exposed function: init_module(python_malloc, python_free)
 static PyObject* py_init_module(PyObject* self, PyObject* args) {
   PyObject* malloc_callback = nullptr;
@@ -1032,6 +1161,8 @@ static PyMethodDef module_methods[] = {
      "Configure the next stable-VA elastic allocation."},
     {"resize_elastic", (PyCFunction)python_resize_elastic, METH_VARARGS,
      "Resize the mapped prefix of an elastic allocation."},
+    {"transfer_elastic", (PyCFunction)python_transfer_elastic, METH_VARARGS,
+     "Transfer physical quanta between elastic stable-VA allocations."},
     {"elastic_info", (PyCFunction)python_elastic_info, METH_VARARGS,
      "Return base, reserved, committed and quantum for an elastic allocation."},
     {NULL, NULL, 0, NULL}  // sentinel

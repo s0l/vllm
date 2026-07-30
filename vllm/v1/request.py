@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import enum
+import os
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
@@ -21,12 +22,54 @@ from vllm.v1.engine import (
     FinishReason,
 )
 from vllm.v1.metrics.stats import PrefillStats
+from vllm.v1.spec_decode.dynamic.utils import parse_force_non_speculative_xarg
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
 
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+
+
+def _parse_prefix_cache_hint_tokens(extra_args: dict[str, Any] | None) -> int:
+    """Parse the bounded DCP fine-prefix research hint."""
+    value = (extra_args or {}).get("ag2_prefix_cache_hint_tokens")
+    if value is None:
+        if os.environ.get("AG2_VLLM_DCP_FINE_PREFIX_DEFAULT", "0") != "1":
+            return 0
+        value = os.environ.get("AG2_VLLM_DCP_FINE_PREFIX_HINT_TOKENS")
+    if os.environ.get("AG2_VLLM_DCP_FINE_PREFIX", "0") != "1":
+        raise ValueError(
+            "ag2_prefix_cache_hint_tokens requires "
+            "AG2_VLLM_DCP_FINE_PREFIX=1"
+        )
+    configured = os.environ.get("AG2_VLLM_DCP_FINE_PREFIX_HINT_TOKENS")
+    if configured is None:
+        raise ValueError(
+            "AG2_VLLM_DCP_FINE_PREFIX_HINT_TOKENS must be configured"
+        )
+    try:
+        configured_tokens = int(configured)
+    except ValueError as exc:
+        raise ValueError(
+            "AG2_VLLM_DCP_FINE_PREFIX_HINT_TOKENS must be a positive integer"
+        ) from exc
+    if configured_tokens <= 0:
+        raise ValueError(
+            "AG2_VLLM_DCP_FINE_PREFIX_HINT_TOKENS must be a positive integer"
+        )
+    if isinstance(value, bool):
+        raise ValueError("ag2_prefix_cache_hint_tokens must be an integer")
+    try:
+        value_tokens = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("ag2_prefix_cache_hint_tokens must be an integer") from exc
+    if value_tokens != configured_tokens:
+        raise ValueError(
+            "ag2_prefix_cache_hint_tokens must equal the server-configured "
+            f"boundary ({configured_tokens})"
+        )
+    return value_tokens
 
 
 @dataclass
@@ -83,6 +126,9 @@ class Request:
         self.priority = priority
         self.sampling_params = sampling_params
         self.pooling_params = pooling_params
+        self.force_non_speculative = False
+        self.prefix_cache_hint_tokens = 0
+        self.prefix_cache_hint_is_default = False
         self.lora_request = lora_request
         self.structured_output_request = StructuredOutputRequest.from_sampling_params(
             sampling_params
@@ -114,6 +160,21 @@ class Request:
                 self.status = RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
 
             if sampling_params.extra_args is not None:
+                self.force_non_speculative = parse_force_non_speculative_xarg(
+                    sampling_params.extra_args,
+                    enabled=os.environ.get(
+                        "AG2_VLLM_ALLOW_FORCE_NON_SPECULATIVE"
+                    )
+                    == "1",
+                )
+                self.prefix_cache_hint_tokens = _parse_prefix_cache_hint_tokens(
+                    sampling_params.extra_args
+                )
+                self.prefix_cache_hint_is_default = (
+                    self.prefix_cache_hint_tokens > 0
+                    and "ag2_prefix_cache_hint_tokens"
+                    not in sampling_params.extra_args
+                )
                 self.kv_transfer_params = sampling_params.extra_args.get(
                     "kv_transfer_params"
                 )
@@ -124,6 +185,10 @@ class Request:
                     "kv_cache_report_mode", "incremental"
                 )
             else:
+                self.prefix_cache_hint_tokens = _parse_prefix_cache_hint_tokens(None)
+                self.prefix_cache_hint_is_default = (
+                    self.prefix_cache_hint_tokens > 0
+                )
                 self.kv_cache_report_mode = "incremental"
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
@@ -140,6 +205,14 @@ class Request:
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             prompt_token_ids, prompt_embeds
         )
+        if self.prefix_cache_hint_tokens >= self.num_prompt_tokens:
+            if self.prefix_cache_hint_is_default:
+                self.prefix_cache_hint_tokens = 0
+                self.prefix_cache_hint_is_default = False
+            else:
+                raise ValueError(
+                    "ag2_prefix_cache_hint_tokens must be smaller than the prompt"
+                )
         self._output_token_ids: list[int] = []
         self._all_token_ids: list[int] = (
             self.prompt_token_ids.copy()

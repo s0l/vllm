@@ -1760,6 +1760,7 @@ def test_elastic_gdn_capacity_transaction_and_rebalance():
         elastic_gdn_stride=20,
         elastic_mapping_quantum=100,
         elastic_gdn_initial_blocks=4,
+        elastic_gdn_blocks_per_request=3,
         elastic_budget_bytes=1100,
     )
     manager = KVCacheManager(
@@ -1774,9 +1775,7 @@ def test_elastic_gdn_capacity_transaction_and_rebalance():
     assert gdn_pool.active_num_gpu_blocks == 4
     leases = gdn_pool.get_new_blocks(3)
 
-    assert coordinator.ensure_elastic_capacity(
-        KVCacheBlockPoolRequirements(mamba=3)
-    )
+    assert coordinator.ensure_elastic_capacity(KVCacheBlockPoolRequirements(mamba=3))
     assert gdn_pool.active_num_gpu_blocks == 7
     assert coordinator.block_pool.active_num_gpu_blocks == 9
     assert coordinator.take_elastic_transition() == (9, 7)
@@ -1790,6 +1789,44 @@ def test_elastic_gdn_capacity_transaction_and_rebalance():
     assert coordinator.take_elastic_transition() == (10, 4)
     coordinator._record_elastic_transition()
     assert coordinator.take_elastic_transition() is None
+    assert coordinator.last_elastic_rejection is None
+
+    # Reserve before allocating primary blocks so the wave cannot occupy the
+    # logical attention tail needed by its later GDN leases.
+    assert coordinator.reserve_elastic_admission_wave((1, 1)) == 2
+    assert coordinator.block_pool.active_num_gpu_blocks == 9
+    assert gdn_pool.active_num_gpu_blocks == 7
+    wave_attention = coordinator.block_pool.get_new_blocks(2)
+    wave_gdn = gdn_pool.get_new_blocks(6)
+    assert [block.block_id for block in wave_attention] == [1, 2]
+    coordinator.block_pool.free_blocks(reversed(wave_attention))
+    gdn_pool.free_blocks(reversed(wave_gdn))
+    coordinator.rebalance_elastic_capacity()
+    assert coordinator.block_pool.active_num_gpu_blocks == 10
+    assert gdn_pool.active_num_gpu_blocks == 4
+
+    # An unused reservation must collapse to the last emitted initial layout.
+    assert coordinator.reserve_elastic_admission_wave((1, 1)) == 2
+    coordinator.rebalance_elastic_capacity()
+    assert coordinator.take_elastic_transition() is None
+
+    # A referenced logical tail must fail closed and expose the exact reason.
+    attention_leases = coordinator.block_pool.get_new_blocks(9)
+    assert attention_leases[-1].block_id == 9
+    assert not coordinator.ensure_elastic_capacity(
+        KVCacheBlockPoolRequirements(mamba=8)
+    )
+    assert coordinator.last_elastic_rejection == {
+        "reason": "attention_tail_pinned",
+        "requirements": KVCacheBlockPoolRequirements(mamba=8),
+        "attention_active": 10,
+        "attention_free": 0,
+        "gdn_active": 4,
+        "gdn_free": 3,
+        "desired_gdn": 9,
+        "desired_attention": 9,
+        "pinned_attention_tail": ((9, 1),),
+    }
 
 
 def test_physical_pool_capacity_planner_matches_legacy_formula():
@@ -1818,10 +1855,7 @@ def test_physical_pool_capacity_planner_matches_legacy_formula():
             if primary_mapped + secondary_mapped <= budget:
                 legacy = primary_blocks
                 break
-        assert (
-            planner.max_primary_blocks(secondary_blocks, upper_bound=60)
-            == legacy
-        )
+        assert planner.max_primary_blocks(secondary_blocks, upper_bound=60) == legacy
 
 
 @pytest.mark.parametrize(
@@ -2243,6 +2277,62 @@ def test_generate_scheduler_kv_cache_config():
         kv_cache_tensors=[],
         kv_cache_groups=[KVCacheGroupSpec(["layer_1", "layer_2"], new_kv_cache_spec())],
     )
+
+
+def test_generate_scheduler_elastic_capacity_uses_worst_rank_geometry():
+    def make_config(attention_block_size: int, budget: int) -> KVCacheConfig:
+        return KVCacheConfig(
+            num_blocks=10,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=80,
+                    shared_by=["attention"],
+                    backing_id="elastic-attention-0",
+                    mapping_quantum=4,
+                    num_blocks=10,
+                    logical_block_size=attention_block_size,
+                ),
+                KVCacheTensor(
+                    size=40,
+                    shared_by=["gdn"],
+                    backing_id="elastic-gdn",
+                    mapping_quantum=4,
+                    num_blocks=8,
+                    logical_block_size=5,
+                ),
+            ],
+            kv_cache_groups=[],
+            elastic_attention_stride=attention_block_size,
+            elastic_gdn_stride=5,
+            elastic_mapping_quantum=4,
+            elastic_gdn_initial_blocks=2,
+            elastic_gdn_blocks_per_request=3,
+            elastic_budget_bytes=budget,
+        )
+
+    scheduler_config = generate_scheduler_kv_cache_config(
+        [
+            make_config(attention_block_size=5, budget=64),
+            make_config(attention_block_size=7, budget=60),
+        ]
+    )
+
+    # At three GDN blocks the first rank can map nine attention blocks, but
+    # the second can map only six. A common scheduler transition must use six.
+    assert scheduler_config.elastic_attention_capacity_by_gdn_blocks[3] == 6
+    assert scheduler_config.elastic_gdn_blocks_per_request == 3
+
+    mismatched = make_config(attention_block_size=7, budget=60)
+    mismatched.elastic_gdn_blocks_per_request = 4
+    with pytest.raises(
+        ValueError, match="elastic GDN blocks per request differs across workers"
+    ):
+        generate_scheduler_kv_cache_config(
+            [
+                make_config(attention_block_size=5, budget=64),
+                mismatched,
+            ]
+        )
 
 
 def new_mla_spec(cache_dtype_str=None, block_size=16):

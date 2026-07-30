@@ -262,6 +262,12 @@ class DeviceCommunicatorBase:
         # Reshape before returning
         return output_tensor.movedim(0, dim).contiguous()
 
+    def reduce_scatter_chunked(
+        self, input_: torch.Tensor, dim: int = -1
+    ) -> torch.Tensor:
+        """Memory-bounded reduce-scatter fallback."""
+        return self.reduce_scatter(input_, dim)
+
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
     ) -> torch.Tensor:

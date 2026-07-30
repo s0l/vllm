@@ -982,7 +982,11 @@ class KVCacheConfig:
     elastic_gdn_stride: int = 0
     elastic_mapping_quantum: int = 0
     elastic_gdn_initial_blocks: int = 0
+    elastic_gdn_blocks_per_request: int = 0
     elastic_budget_bytes: int = 0
+    elastic_attention_capacity_by_gdn_blocks: tuple[int, ...] = ()
+    effective_max_resident_seqs: int = 0
+    """Post-profile hard residency cap for elastic KV; 0 leaves it disabled."""
 
     @property
     def has_mamba_layers(self) -> bool:

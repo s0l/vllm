@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -57,12 +58,15 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
-from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+from vllm.v1.spec_decode.dynamic.utils import (
+    apply_force_non_speculative_override,
+    build_dynamic_sd_schedule_lookup,
+)
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -111,6 +115,18 @@ class Scheduler(SchedulerInterface):
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
+        effective_max_resident_seqs = kv_cache_config.effective_max_resident_seqs
+        if effective_max_resident_seqs:
+            self.max_num_running_reqs = min(
+                self.max_num_running_reqs,
+                effective_max_resident_seqs,
+            )
+            logger.info(
+                "Elastic scheduler resident cap enabled: configured=%d, "
+                "effective=%d",
+                self.scheduler_config.max_num_seqs,
+                self.max_num_running_reqs,
+            )
         self.max_num_scheduled_tokens = (
             self.scheduler_config.max_num_scheduled_tokens
             if self.scheduler_config.max_num_scheduled_tokens is not None
@@ -301,6 +317,44 @@ class Scheduler(SchedulerInterface):
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
+        self.max_concurrent_partial_prefills = max(
+            1,
+            min(
+                int(os.environ.get("AG2_VLLM_MAX_CONCURRENT_PARTIAL_PREFILLS", "1")),
+                self.max_num_running_reqs,
+            ),
+        )
+        self.prefill_admission_delay_s = max(
+            0.0,
+            float(os.environ.get("AG2_VLLM_PREFILL_ADMISSION_DELAY_MS", "0")) / 1000.0,
+        )
+        admission_max_delay_ms = os.environ.get(
+            "AG2_VLLM_PREFILL_ADMISSION_MAX_DELAY_MS"
+        )
+        if not admission_max_delay_ms:
+            admission_max_delay_ms = str(int(self.prefill_admission_delay_s * 4000))
+        self.prefill_admission_max_delay_s = max(
+            self.prefill_admission_delay_s,
+            float(admission_max_delay_ms) / 1000.0,
+        )
+        if self.max_concurrent_partial_prefills > 1:
+            logger.info(
+                "Concurrent partial prefill POC enabled: max_prefills=%d, "
+                "admission_delay_ms=%.1f, max_delay_ms=%.1f",
+                self.max_concurrent_partial_prefills,
+                self.prefill_admission_delay_s * 1000,
+                self.prefill_admission_max_delay_s * 1000,
+            )
+        self.kv_tail_handoff_enabled = (
+            os.environ.get("AG2_VLLM_KV_TAIL_HANDOFF", "0") == "1"
+        )
+        self.num_kv_tail_deferrals_since_last_stats = 0
+        if self.kv_tail_handoff_enabled:
+            logger.info(
+                "KV tail handoff POC enabled: retain an in-progress prompt's "
+                "KV on transient FCFS pressure while another running request "
+                "can make progress."
+            )
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
@@ -366,20 +420,82 @@ class Scheduler(SchedulerInterface):
         return None
 
     def _gdn_boundary_key(self, request: Request, boundary: int) -> bytes | None:
-        if boundary <= 0 or boundary % self.block_size != 0:
-            return None
-        coordinator = self._gdn_checkpoint_coordinator
+        coordinator = getattr(self, "_gdn_checkpoint_coordinator", None)
         if coordinator is None:
+            return None
+        key_block_size = (
+            coordinator.hash_block_size
+            if getattr(coordinator, "enable_dcp_fine_prefix", False)
+            else self.block_size
+        )
+        if boundary <= 0 or boundary % key_block_size != 0:
             return None
         block_hashes = BlockHashListWithBlockSize(
             request.block_hashes,
             coordinator.hash_block_size,
-            self.block_size,
+            key_block_size,
         )
-        block_idx = boundary // self.block_size - 1
+        block_idx = boundary // key_block_size - 1
         if block_idx >= len(block_hashes):
             return None
         return bytes(block_hashes[block_idx])
+
+    def _should_save_gdn_checkpoint(
+        self, request: Request, boundary: int
+    ) -> bool:
+        coordinator = getattr(self, "_gdn_checkpoint_coordinator", None)
+        if coordinator is None or not getattr(
+            coordinator, "enable_dcp_fine_prefix", False
+        ):
+            return True
+        if boundary == request.shared_prefix_boundary:
+            return True
+        if boundary == self._fine_prefix_resume_boundary(request):
+            return True
+        prompt_tail = (
+            request.num_prompt_tokens
+            // coordinator.hash_block_size
+            * coordinator.hash_block_size
+        )
+        if boundary == prompt_tail:
+            return True
+        return any(
+            isinstance(group.kv_cache_spec, MambaSpec)
+            and group.kv_cache_spec.separate_pool
+            and boundary
+            % (
+                group.kv_cache_spec.block_size
+                * coordinator.dcp_world_size
+                * coordinator.pcp_world_size
+            )
+            == 0
+            for group in coordinator.kv_cache_config.kv_cache_groups
+        )
+
+    def _fine_prefix_resume_boundary(self, request: Request) -> int:
+        """Return the recurrent-state boundary after the EAGLE overlap.
+
+        EAGLE/MTP must recompute one hash unit before generation. Attention
+        therefore matches the explicitly hinted boundary, while GDN restores
+        the state immediately before that overlap.
+        """
+        coordinator = getattr(self, "_gdn_checkpoint_coordinator", None)
+        match_boundary = getattr(request, "prefix_cache_hint_tokens", 0)
+        if (
+            coordinator is None
+            or not getattr(coordinator, "enable_dcp_fine_prefix", False)
+            or match_boundary == 0
+        ):
+            return 0
+        resume_boundary = match_boundary - (
+            self.hash_block_size if self.use_eagle else 0
+        )
+        if resume_boundary <= 0:
+            raise RuntimeError(
+                "Fine-prefix hint must exceed the EAGLE/MTP overlap "
+                f"({self.hash_block_size} tokens)"
+            )
+        return resume_boundary
 
     def _mamba_block_aligned_split(
         self,
@@ -405,11 +521,16 @@ class Scheduler(SchedulerInterface):
         if start >= max(request.num_prompt_tokens, request.num_tokens - 1):
             return num_new_tokens
 
-        # ``self.block_size`` is already the global scheduler alignment from
-        # resolve_kv_cache_block_sizes(), including hybrid-group LCM and CP.
+        coordinator = getattr(self, "_gdn_checkpoint_coordinator", None)
+        # Keep ordinary chunking on the proven global scheduler geometry.
+        # Only the explicit shared junction may use the finer hash boundary.
         block_size = self.block_size
-        if num_new_tokens < block_size:
-            return num_new_tokens
+        shared_boundary_alignment = (
+            self.hash_block_size
+            if coordinator is not None
+            and getattr(coordinator, "enable_dcp_fine_prefix", False)
+            else self.block_size
+        )
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
@@ -430,6 +551,7 @@ class Scheduler(SchedulerInterface):
             if self.mamba_partial_cache_hit
             else 0
         )
+        fine_resume_boundary = Scheduler._fine_prefix_resume_boundary(self, request)
         stops = (
             # Resumed mid-block (fine-grained partial hash hit): re-align to
             # the block grid before running on, so the crossed boundary's
@@ -444,16 +566,116 @@ class Scheduler(SchedulerInterface):
             tail_boundary
             if last_cache_position < tail_boundary < request.num_prompt_tokens
             else 0,
-            # Marconi shared-prefix junction, block-floored (a sub-block
-            # junction's state is not separately cacheable): cache its state
-            # so sibling requests sharing the prefix can reuse it.
-            start + (request.shared_prefix_boundary - start) // block_size * block_size
+            # EAGLE/MTP consumes one matching hash unit as recompute overlap.
+            # Materialize exact recurrent state there before continuing to the
+            # attention match boundary.
+            fine_resume_boundary
+            if start < fine_resume_boundary < end
+            else 0,
+            # Cache the proven shared-prefix junction. The DCP fine-prefix POC
+            # pairs this partial attention boundary with an exact host GDN
+            # checkpoint; the default path remains block-floored.
+            start
+            + (request.shared_prefix_boundary - start)
+            // shared_boundary_alignment
+            * shared_boundary_alignment
             if start < request.shared_prefix_boundary < end
             else 0,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
+
+    @staticmethod
+    def _is_prefill_request(request: Request) -> bool:
+        return request.num_computed_tokens < request.num_prompt_tokens
+
+    def _partial_prefill_target_count(self) -> int:
+        """Return the number of visible prefills to share this step's budget."""
+        if self.max_concurrent_partial_prefills <= 1:
+            return 1
+
+        prefills = sum(self._is_prefill_request(request) for request in self.running)
+        remaining_slots = min(
+            self.max_concurrent_partial_prefills - prefills,
+            max(0, self.max_num_running_reqs - len(self.running)),
+        )
+        if remaining_slots > 0:
+            for request in self.waiting:
+                if not self._is_prefill_request(request):
+                    continue
+                prefills += 1
+                remaining_slots -= 1
+                if remaining_slots == 0:
+                    break
+        return max(prefills, 1)
+
+    def _partial_prefill_chunk_cap(self, target_count: int) -> int:
+        if self.max_concurrent_partial_prefills <= 1 or target_count <= 1:
+            return 0
+        return max(1, self.max_num_scheduled_tokens // target_count)
+
+    def _cap_prefill_chunk(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        prefill_chunk_cap: int,
+    ) -> int:
+        if (
+            prefill_chunk_cap > 0
+            and self._is_prefill_request(request)
+            and num_new_tokens > prefill_chunk_cap
+        ):
+            return prefill_chunk_cap
+        return num_new_tokens
+
+    def _should_delay_waiting_prefill_admission(self) -> bool:
+        """Briefly wait for an initial burst without delaying it indefinitely."""
+        if (
+            self.prefill_admission_delay_s <= 0
+            or self.max_concurrent_partial_prefills <= 1
+            or self.running
+            or self.num_waiting_for_streaming_input > 0
+        ):
+            return False
+
+        target_count = min(
+            self.max_concurrent_partial_prefills,
+            self.max_num_running_reqs,
+        )
+        waiting_prefills = 0
+        oldest_arrival_time: float | None = None
+        newest_arrival_time: float | None = None
+        for request in self.waiting:
+            if not self._is_prefill_request(request):
+                continue
+            waiting_prefills += 1
+            oldest_arrival_time = (
+                request.arrival_time
+                if oldest_arrival_time is None
+                else min(oldest_arrival_time, request.arrival_time)
+            )
+            newest_arrival_time = (
+                request.arrival_time
+                if newest_arrival_time is None
+                else max(newest_arrival_time, request.arrival_time)
+            )
+            if waiting_prefills >= target_count:
+                return False
+
+        if (
+            waiting_prefills == 0
+            or oldest_arrival_time is None
+            or newest_arrival_time is None
+        ):
+            return False
+
+        now = time.time()
+        if now - oldest_arrival_time >= self.prefill_admission_max_delay_s:
+            return False
+        if waiting_prefills < target_count:
+            return True
+        return now - newest_arrival_time < self.prefill_admission_delay_s
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
@@ -480,6 +702,8 @@ class Scheduler(SchedulerInterface):
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
+        prefill_target_count = self._partial_prefill_target_count()
+        prefill_chunk_cap = self._partial_prefill_chunk_cap(prefill_target_count)
 
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -536,6 +760,9 @@ class Scheduler(SchedulerInterface):
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
                 - request.num_computed_tokens
+            )
+            num_new_tokens = self._cap_prefill_chunk(
+                request, num_new_tokens, prefill_chunk_cap
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
@@ -605,6 +832,24 @@ class Scheduler(SchedulerInterface):
                         break
 
                     # The request cannot be scheduled.
+                    # Under FCFS tail pressure, first try another already-running
+                    # prompt instead of immediately destroying this request's KV.
+                    # This is safe only while this step has made progress already,
+                    # or there is another running request left to try. If every
+                    # request is blocked, the last one reaches the normal
+                    # preemption path below and preserves the existing liveness
+                    # fallback.
+                    can_try_running_peer = req_index + 1 < len(self.running)
+                    if (
+                        self.kv_tail_handoff_enabled
+                        and self.policy == SchedulingPolicy.FCFS
+                        and self._is_prefill_request(request)
+                        and (scheduled_running_reqs or can_try_running_peer)
+                    ):
+                        self.num_kv_tail_deferrals_since_last_stats += 1
+                        req_index += 1
+                        break
+
                     # Preempt the lowest-priority request.
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
@@ -640,7 +885,11 @@ class Scheduler(SchedulerInterface):
                         break
 
             if new_blocks is None:
-                # Cannot schedule this request.
+                if req_index < len(self.running) and request in self.running:
+                    # Tail handoff retained this request's KV and advanced to
+                    # another running peer. Continue scanning the running set.
+                    continue
+                # Cannot schedule this request after the liveness fallback.
                 break
 
             # Schedule the request.
@@ -698,8 +947,14 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
+            self._reserve_elastic_waiting_wave(token_budget)
+            delay_waiting_prefills = self._should_delay_waiting_prefill_admission()
 
-            while (self.waiting or self.skipped_waiting) and token_budget > 0:
+            while (
+                not delay_waiting_prefills
+                and (self.waiting or self.skipped_waiting)
+                and token_budget > 0
+            ):
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
@@ -768,6 +1023,20 @@ class Scheduler(SchedulerInterface):
                             # Marconi shared-prefix junction to pin; 0 if none.
                             request.shared_prefix_boundary,
                         ) = self.kv_cache_manager.get_computed_blocks(request)
+
+                    if request.prefix_cache_hint_tokens:
+                        if (
+                            request.prefix_cache_hint_tokens
+                            % self.hash_block_size
+                            != 0
+                        ):
+                            raise RuntimeError(
+                                "Validated prefix-cache hint is not hash aligned"
+                            )
+                        request.shared_prefix_boundary = max(
+                            request.shared_prefix_boundary,
+                            request.prefix_cache_hint_tokens,
+                        )
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -874,6 +1143,9 @@ class Scheduler(SchedulerInterface):
                         pad_spec_decode = True
 
                     threshold = self.scheduler_config.long_prefill_token_threshold
+                    num_new_tokens = self._cap_prefill_chunk(
+                        request, num_new_tokens, prefill_chunk_cap
+                    )
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
 
@@ -1167,12 +1439,32 @@ class Scheduler(SchedulerInterface):
             self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
         pending_kv_cache_block_copies = kv_cache_block_copies or None
 
+        # Compute the execution phase once, before policy/request overrides.
+        # K=0 target decode and K>0 target verification must share this lane.
+        is_pure_decode_step = self._is_pure_decode_step(
+            num_scheduled_tokens, scheduled_spec_decode_tokens
+        )
+
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
         if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
+            speculative_config = self.vllm_config.speculative_config
+            assert speculative_config is not None
+            if (
+                speculative_config.disable_speculation_on_non_decode
+                and not is_pure_decode_step
+            ):
+                num_spec_tokens_to_schedule = 0
+        num_spec_tokens_to_schedule = apply_force_non_speculative_override(
+            num_spec_tokens_to_schedule,
+            [
+                self.requests[request_id].force_non_speculative
+                for request_id in num_scheduled_tokens
+            ],
+        )
 
         scheduled_encoder_input_stats = None
         if (
@@ -1185,17 +1477,26 @@ class Scheduler(SchedulerInterface):
 
         gdn_checkpoint_save: dict[str, bytes] = {}
         if self._gdn_checkpoint_coordinator is not None:
+            checkpoint_keys_to_save: set[bytes] = set()
             for req_id, scheduled_tokens in num_scheduled_tokens.items():
                 request = self.requests[req_id]
                 boundary = request.num_computed_tokens + scheduled_tokens
                 # The hash covers only finalized input tokens. A sampled token
                 # is not part of this state until it is scheduled next step.
-                if boundary <= request.num_tokens:
+                if (
+                    boundary <= request.num_tokens
+                    and self._should_save_gdn_checkpoint(request, boundary)
+                ):
                     checkpoint_key = self._gdn_boundary_key(request, boundary)
-                    if checkpoint_key is not None:
+                    if (
+                        checkpoint_key is not None
+                        and checkpoint_key not in checkpoint_keys_to_save
+                    ):
                         gdn_checkpoint_save[req_id] = checkpoint_key
+                        checkpoint_keys_to_save.add(checkpoint_key)
 
         self.kv_cache_manager.coordinator.rebalance_elastic_capacity()
+        self._reserve_elastic_incremental_headroom()
         elastic_kv_transition = (
             self.kv_cache_manager.coordinator.take_elastic_transition()
         )
@@ -1219,6 +1520,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             kv_cache_block_copies=pending_kv_cache_block_copies,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+            is_pure_decode_step=is_pure_decode_step,
             gdn_checkpoint_save=gdn_checkpoint_save or None,
             gdn_checkpoint_restore=gdn_checkpoint_restore or None,
             elastic_kv_transition=elastic_kv_transition,
@@ -1247,6 +1549,30 @@ class Scheduler(SchedulerInterface):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def _is_pure_decode_step(
+        self,
+        num_scheduled_tokens: dict[str, int],
+        scheduled_spec_decode_tokens: dict[str, list[int]],
+    ) -> bool:
+        """Return whether every scheduled row is an autoregressive decode row.
+
+        A request is in pure decode only after its prompt has already been
+        computed and the current target query consists solely of the normal
+        sampled-token positions plus previously drafted positions. Resumed
+        output replay and chunked prefill therefore remain non-decode even
+        when their computed position is already past the original prompt.
+        """
+        if not num_scheduled_tokens:
+            return False
+        for req_id, num_tokens in num_scheduled_tokens.items():
+            request = self.requests[req_id]
+            if request.num_computed_tokens < request.num_prompt_tokens:
+                return False
+            num_draft_tokens = len(scheduled_spec_decode_tokens.get(req_id, ()))
+            if num_tokens != self.num_sampled_tokens_per_step + num_draft_tokens:
+                return False
+        return True
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
@@ -2037,6 +2363,85 @@ class Scheduler(SchedulerInterface):
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
 
+    def _reserve_elastic_waiting_wave(self, token_budget: int) -> int:
+        """Reserve schedulable and imminently grammar-ready requests.
+
+        Grammar compilation is asynchronous, but excluding its pending requests
+        lets the first ready subset pin the logical tail needed by the rest of
+        the same burst. Remote/streaming waits have no similarly bounded
+        readiness contract and are excluded until they can be promoted.
+        """
+        if (
+            token_budget <= 0
+            or not self.kv_cache_manager.kv_cache_config.elastic_mapping_quantum
+        ):
+            return 0
+
+        candidate_skipped = []
+        for request in self.skipped_waiting:
+            if self._is_blocked_waiting_status(request.status):
+                self._try_promote_blocked_waiting_request(request)
+            if not self._is_blocked_waiting_status(request.status):
+                candidate_skipped.append(request)
+                continue
+            if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
+                structured = request.structured_output_request
+                if structured is not None and structured.grammar is None:
+                    candidate_skipped.append(request)
+
+        available_request_slots = max(
+            self.max_num_running_reqs
+            - len(self.running)
+            - self.num_waiting_for_streaming_input,
+            0,
+        )
+        if self.policy == SchedulingPolicy.FCFS:
+            ready_requests = candidate_skipped + list(self.waiting)
+        else:
+            ready_requests = sorted((*candidate_skipped, *self.waiting))
+        # Every admitted request consumes at least one scheduled token.
+        candidate_count = min(
+            len(ready_requests),
+            available_request_slots,
+            token_budget,
+        )
+        primary_requirements = [
+            self.kv_cache_manager.estimate_uncached_full_sequence_requirements(
+                request
+            ).primary
+            for request in ready_requests[:candidate_count]
+        ]
+        # Keep one admission slot ahead of the currently visible burst. Requests
+        # can arrive between scheduler iterations. Without this lookahead, the
+        # first wave may reference a cached attention block in the exact tail
+        # that the next request must hand to GDN, making a physically feasible
+        # incremental admission fail with ``attention_tail_pinned``.
+        if candidate_count < available_request_slots:
+            primary_requirements.append(1)
+        if primary_requirements and self.running:
+            primary_requirements[0] += self.kv_cache_manager.watermark_blocks
+        return self.kv_cache_manager.coordinator.reserve_elastic_admission_wave(
+            tuple(primary_requirements)
+        )
+
+    def _reserve_elastic_incremental_headroom(self) -> int:
+        """Keep one GDN lease available across scheduler iterations.
+
+        The ordinary end-of-step rebalance intentionally releases unused GDN
+        mappings. While a request is still running, fully releasing them lets
+        decode or a prefix-cache hit pin the newly exposed attention tail before
+        the next request arrives. One request of lookahead is sufficient:
+        requests already visible are reserved as a wave, and every later
+        scheduler iteration advances the frontier by one more admission.
+        """
+        if (
+            not self.running
+            or len(self.running) >= self.max_num_running_reqs
+            or not self.kv_cache_manager.kv_cache_config.elastic_mapping_quantum
+        ):
+            return 0
+        return self.kv_cache_manager.coordinator.reserve_elastic_admission_wave((1,))
+
     def _enqueue_waiting_request(self, request: Request) -> None:
         if self._is_blocked_waiting_status(request.status):
             self.skipped_waiting.add_request(request)
@@ -2497,10 +2902,13 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
+        num_kv_tail_deferrals = self.num_kv_tail_deferrals_since_last_stats
+        self.num_kv_tail_deferrals_since_last_stats = 0
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
+            num_kv_tail_deferrals=num_kv_tail_deferrals,
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,

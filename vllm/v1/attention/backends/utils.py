@@ -951,7 +951,7 @@ def mamba_get_block_table_tensor(
     else:
         assert isinstance(kv_cache_spec, MambaSpec)
         if kv_cache_spec.separate_pool:
-            return block_table[:, :1]
+            return block_table[:, : 1 + kv_cache_spec.num_speculative_blocks]
         # NOTE: For 0-length requests in CUDA graph, use a start_index of 0
         # to handle the invalid block table.
         start_indices = (seq_lens - 1) // kv_cache_spec.block_size

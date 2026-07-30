@@ -42,7 +42,12 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
         kv_cache_group_id: int,
         num_reqs: int,
     ) -> dict[str, Any]:
-        return {"is_prefilling": self.is_prefilling[:num_reqs]}
+        return {
+            "is_prefilling": self.is_prefilling[:num_reqs],
+            "num_decode_draft_tokens_cpu": None
+            if self.num_decode_draft_tokens_cpu is None
+            else self.num_decode_draft_tokens_cpu[:num_reqs],
+        }
 
     def get_extra_attn_kwargs(
         self,
@@ -84,6 +89,7 @@ class MambaHybridModelState(DefaultModelState):
         # kernel reusing the postprocess copy machinery, so the per-step src
         # columns and the running state_idx are kept GPU-resident.
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
+        self._separate_mamba_pool = False
         if self._align_mode:
             self._mamba_state_idx_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=self.device
@@ -103,10 +109,13 @@ class MambaHybridModelState(DefaultModelState):
         # Must reset the speculative acceptance count in this idx which could be stale.
         self.num_accepted_tokens_gpu[req_index] = 1
         if self._align_mode:
-            # Seed the running state block from the resumed/prefilled position.
+            # A separate pool always keeps the committed state in column 0.
             self._mamba_state_idx_gpu[req_index] = (
-                new_req_data.num_computed_tokens - 1
-            ) // self.cache_config.block_size
+                0
+                if self._separate_mamba_pool
+                else (new_req_data.num_computed_tokens - 1)
+                // self.cache_config.block_size
+            )
 
     def _get_mamba_group_info(
         self, kv_cache_config: KVCacheConfig
@@ -123,6 +132,7 @@ class MambaHybridModelState(DefaultModelState):
             assert all(specs[0] == s for s in specs)
             self._mamba_group_ids = group_ids
             self._mamba_spec = specs[0]
+            self._separate_mamba_pool = self._mamba_spec.separate_pool
         return self._mamba_group_ids, self._mamba_spec
 
     def _ensure_align_ctx(
@@ -184,6 +194,10 @@ class MambaHybridModelState(DefaultModelState):
             return
         mamba_group_ids, mamba_spec = self._get_mamba_group_info(kv_cache_config)
         ctx = self._ensure_align_ctx(kv_cache_config, mamba_group_ids, block_tables)
+        if mamba_spec.separate_pool:
+            # The committed state never changes physical column. Speculative
+            # scratch states are committed by postprocess_state.
+            return
 
         # The state-advance + pre-copy kernels run every step; they fast-exit per
         # request when src_col < 0 or src_col == dst_col, so no copy happens on
@@ -326,13 +340,20 @@ class MambaHybridModelState(DefaultModelState):
         ):
             num_reqs = idx_mapping.shape[0]
             if num_reqs:
-                self._mamba_ctx.run_fused_postprocess_align(
-                    num_reqs,
-                    self.num_accepted_tokens_gpu,
-                    self._mamba_state_idx_gpu,
-                    num_computed_tokens,
-                    idx_mapping,
-                )
+                if self._separate_mamba_pool:
+                    self._mamba_ctx.run_fused_postprocess_separate(
+                        num_reqs,
+                        self.num_accepted_tokens_gpu,
+                        idx_mapping,
+                    )
+                else:
+                    self._mamba_ctx.run_fused_postprocess_align(
+                        num_reqs,
+                        self.num_accepted_tokens_gpu,
+                        self._mamba_state_idx_gpu,
+                        num_computed_tokens,
+                        idx_mapping,
+                    )
 
 
 @triton.jit

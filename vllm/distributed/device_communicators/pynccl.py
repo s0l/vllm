@@ -282,6 +282,33 @@ class PyNcclCommunicator:
             cudaStream_t(stream.cuda_stream),
         )
 
+    def reduce(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+        root: int,
+        op: ReduceOp = ReduceOp.SUM,
+        stream=None,
+    ):
+        if self.disabled:
+            return
+        assert input_tensor.device == self.device, (
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the input tensor is on {input_tensor.device}"
+        )
+        if stream is None:
+            stream = current_stream()
+        self.nccl.ncclReduce(
+            buffer_type(input_tensor.data_ptr()),
+            buffer_type(output_tensor.data_ptr()),
+            input_tensor.numel(),
+            ncclDataTypeEnum.from_torch(input_tensor.dtype),
+            ncclRedOpTypeEnum.from_torch(op),
+            root,
+            self.comm,
+            cudaStream_t(stream.cuda_stream),
+        )
+
     def reduce_scatterv(
         self,
         output_tensor: torch.Tensor,

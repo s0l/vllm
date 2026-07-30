@@ -667,6 +667,18 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             counter_num_preempted_reqs, per_engine_labelvalues
         )
 
+        counter_num_kv_tail_deferrals = self._counter_cls(
+            name="vllm:num_kv_tail_deferrals",
+            documentation=(
+                "Cumulative number of scheduler steps where a running prompt "
+                "retained its KV under transient tail pressure."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_num_kv_tail_deferrals = create_metric_per_engine(
+            counter_num_kv_tail_deferrals, per_engine_labelvalues
+        )
+
         counter_prompt_tokens = self._counter_cls(
             name="vllm:prompt_tokens",
             documentation="Number of prefill tokens processed.",
@@ -1121,6 +1133,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+            self.counter_num_kv_tail_deferrals[engine_idx].inc(
+                scheduler_stats.num_kv_tail_deferrals
+            )
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

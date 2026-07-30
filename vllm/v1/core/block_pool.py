@@ -167,6 +167,7 @@ class BlockPool:
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
         active_num_gpu_blocks: int | None = None,
+        prefer_low_id_allocations: bool = False,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -177,6 +178,7 @@ class BlockPool:
             raise ValueError("active_num_gpu_blocks must include the null block")
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
+        self.prefer_low_id_allocations = prefer_low_id_allocations
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
@@ -666,7 +668,45 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if self.prefer_low_id_allocations:
+            if self.active_num_gpu_blocks == self.num_gpu_blocks:
+                # At the fully expanded attention mapping, unused capacity can
+                # preserve prefix-cache entries without constraining an
+                # elastic shrink. Prefer lowest-ID uncached blocks first and
+                # evict cached blocks only after unused capacity is exhausted.
+                uncached: list[KVCacheBlock] = []
+                cached: list[KVCacheBlock] = []
+                for block in self.blocks[1 : self.active_num_gpu_blocks]:
+                    if block.ref_cnt != 0:
+                        continue
+                    has_cached_hash = (
+                        block.block_hash is not None
+                        or block.block_id in self.cached_block_hashes_by_block
+                    )
+                    (cached if has_cached_hash else uncached).append(block)
+                ret = uncached[:num_blocks]
+                if len(ret) < num_blocks:
+                    ret.extend(cached[: num_blocks - len(ret)])
+            else:
+                # Once elastic GDN growth has reduced the attention mapping,
+                # live blocks must remain a compact low-ID prefix. A
+                # cache-preserving hole can otherwise push a live allocation
+                # into the tail and make the next attention->GDN handoff
+                # impossible. Under that real memory pressure, evict the
+                # lowest cached hole rather than pinning the tail.
+                ret = [
+                    block
+                    for block in self.blocks[1 : self.active_num_gpu_blocks]
+                    if block.ref_cnt == 0
+                ][:num_blocks]
+            if len(ret) != num_blocks:
+                raise RuntimeError(
+                    "active/free block accounting diverged during low-ID allocation"
+                )
+            for block in ret:
+                self.free_block_queue.remove(block)
+        else:
+            ret = self.free_block_queue.popleft_n(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:

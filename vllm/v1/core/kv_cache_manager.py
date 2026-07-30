@@ -165,6 +165,7 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+        self.last_allocation_rejection: dict[str, object] | None = None
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -186,6 +187,36 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+
+    def _record_allocation_rejection(
+        self,
+        *,
+        stage: str,
+        request_id: str,
+        requirements: KVCacheBlockPoolRequirements,
+        reserved: KVCacheBlockPoolRequirements | None = None,
+        primary_watermark_blocks: int = 0,
+    ) -> None:
+        mamba_pool = self.coordinator.mamba_block_pool
+        rejection: dict[str, object] = {
+            "stage": stage,
+            "request_id": request_id,
+            "requirements": requirements,
+            "reserved": reserved or KVCacheBlockPoolRequirements(),
+            "primary_watermark": primary_watermark_blocks,
+            "primary_active": self.block_pool.active_num_gpu_blocks,
+            "primary_free": self.block_pool.get_num_free_blocks(),
+            "mamba_active": (
+                mamba_pool.active_num_gpu_blocks if mamba_pool is not None else None
+            ),
+            "mamba_free": (
+                mamba_pool.get_num_free_blocks() if mamba_pool is not None else None
+            ),
+            "elastic": self.coordinator.last_elastic_rejection,
+        }
+        if rejection != self.last_allocation_rejection:
+            logger.warning("KV slot allocation rejected: %s", rejection)
+        self.last_allocation_rejection = rejection
 
     @property
     def usage(self) -> float:
@@ -479,11 +510,23 @@ class KVCacheManager:
                 apply_admission_cap=True,
             )
             if not self.coordinator.ensure_elastic_capacity(requirements):
+                self._record_allocation_rejection(
+                    stage="full_sequence_elastic",
+                    request_id=request.request_id,
+                    requirements=requirements,
+                    primary_watermark_blocks=watermark_blocks,
+                )
                 return None
             if not self.coordinator.can_allocate(
                 requirements,
                 primary_watermark_blocks=watermark_blocks,
             ):
+                self._record_allocation_rejection(
+                    stage="full_sequence_capacity",
+                    request_id=request.request_id,
+                    requirements=requirements,
+                    primary_watermark_blocks=watermark_blocks,
+                )
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -528,6 +571,13 @@ class KVCacheManager:
             mamba=requirements.mamba + reserved.mamba,
         )
         if not self.coordinator.ensure_elastic_capacity(elastic_requirements):
+            self._record_allocation_rejection(
+                stage="step_elastic",
+                request_id=request.request_id,
+                requirements=elastic_requirements,
+                reserved=reserved,
+                primary_watermark_blocks=watermark_blocks,
+            )
             return None
         if not self.coordinator.can_allocate(
             requirements,
@@ -535,7 +585,15 @@ class KVCacheManager:
             primary_watermark_blocks=watermark_blocks,
         ):
             # Cannot allocate new blocks
+            self._record_allocation_rejection(
+                stage="step_capacity",
+                request_id=request.request_id,
+                requirements=requirements,
+                reserved=reserved,
+                primary_watermark_blocks=watermark_blocks,
+            )
             return None
+        self.last_allocation_rejection = None
 
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
@@ -574,6 +632,27 @@ class KVCacheManager:
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
+
+    def estimate_uncached_full_sequence_requirements(
+        self, request: Request
+    ) -> KVCacheBlockPoolRequirements:
+        """Conservatively size admission before prefix-cache lookup.
+
+        Elastic wave planning may evict free cached tail blocks, so a cache hit
+        observed before the layout transition is not a safe sizing input.
+        """
+        full_num_tokens = min(request.num_tokens, self.max_model_len)
+        total_computed_tokens = min(request.num_computed_tokens, full_num_tokens)
+        return self.coordinator.get_block_pool_requirements(
+            request_id=request.request_id,
+            num_tokens=full_num_tokens,
+            new_computed_blocks=self.empty_kv_cache_blocks.blocks,
+            num_encoder_tokens=0,
+            total_computed_tokens=total_computed_tokens,
+            num_local_computed_tokens=total_computed_tokens,
+            num_tokens_main_model=full_num_tokens,
+            apply_admission_cap=True,
+        )
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.

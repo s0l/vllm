@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -2318,6 +2319,34 @@ class GPUModelRunner(
             self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
             self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
             self.num_decode_draft_tokens.copy_to_gpu()
+
+            if (
+                os.environ.get(
+                    "AG2_VLLM_FLASHINFER_DCP_PREFILL_CUDAGRAPH", "0"
+                )
+                == "1"
+                and num_reqs > 1
+            ):
+                accepted = self.num_accepted_tokens.np[:num_reqs].copy()
+                spec_rows = num_decode_draft_tokens >= 0
+                logger.warning(
+                    "P3 mixed-MTP metadata before target replay: "
+                    "scheduled=%s draft=%s accepted=%s spec_rows=%s",
+                    num_scheduled_tokens.tolist(),
+                    num_decode_draft_tokens.tolist(),
+                    accepted.tolist(),
+                    spec_rows.tolist(),
+                )
+                invalid_spec_rows = spec_rows & (
+                    (accepted < 1) | (accepted > self.num_spec_tokens + 1)
+                )
+                if invalid_spec_rows.any():
+                    raise RuntimeError(
+                        "Invalid accepted-token count before P3 target replay: "
+                        f"rows={np.flatnonzero(invalid_spec_rows).tolist()} "
+                        f"accepted={accepted.tolist()} "
+                        f"draft={num_decode_draft_tokens.tolist()}"
+                    )
 
         # Hot-Swap lora model
         if self.lora_config:

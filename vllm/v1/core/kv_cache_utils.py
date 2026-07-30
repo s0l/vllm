@@ -94,14 +94,84 @@ def _use_elastic_gdn_backing(vllm_config: VllmConfig) -> bool:
     return bool(vllm_config.additional_config.get("elastic_gdn_backing", False))
 
 
-def _elastic_gdn_pool_blocks(vllm_config: VllmConfig) -> int:
-    max_seqs = int(vllm_config.additional_config.get("elastic_gdn_max_seqs", 64))
-    blocks_per_seq = int(
-        vllm_config.additional_config.get("elastic_gdn_blocks_per_seq", 3)
+def _elastic_gdn_blocks_per_seq(vllm_config: VllmConfig, num_mamba_groups: int) -> int:
+    if num_mamba_groups < 1:
+        raise ValueError("elastic GDN requires at least one Mamba cache group")
+
+    # Every Mamba cache group owns one base recurrent-state block plus one
+    # scratch block per speculative token. All groups allocate from the same
+    # separate pool, so the per-request capacity must include every group.
+    required_per_group = 1 + max(vllm_config.num_speculative_tokens, 0)
+    configured_per_group = int(
+        vllm_config.additional_config.get(
+            "elastic_gdn_blocks_per_seq", required_per_group
+        )
     )
-    if max_seqs < 1 or blocks_per_seq < 1:
-        raise ValueError("elastic GDN max_seqs and blocks_per_seq must be positive")
+    if configured_per_group < required_per_group:
+        raise ValueError(
+            "elastic_gdn_blocks_per_seq is smaller than the MTP topology "
+            f"requires: configured={configured_per_group}, "
+            f"required={required_per_group}"
+        )
+    return num_mamba_groups * configured_per_group
+
+
+def _elastic_gdn_pool_blocks(vllm_config: VllmConfig, num_mamba_groups: int) -> int:
+    max_seqs = int(vllm_config.additional_config.get("elastic_gdn_max_seqs", 64))
+    blocks_per_seq = _elastic_gdn_blocks_per_seq(vllm_config, num_mamba_groups)
+    if max_seqs < 1:
+        raise ValueError("elastic GDN max_seqs must be positive")
     return 1 + max_seqs * blocks_per_seq
+
+
+def _finalize_separate_gdn_pool_specs(
+    vllm_config: VllmConfig, groups: list[KVCacheGroupSpec]
+) -> list[KVCacheGroupSpec]:
+    if not _use_separate_gdn_pool(vllm_config):
+        return groups
+
+    num_mamba_groups = sum(
+        isinstance(group.kv_cache_spec, MambaSpec) for group in groups
+    )
+    if not num_mamba_groups:
+        return groups
+    pool_blocks = (
+        _elastic_gdn_pool_blocks(vllm_config, num_mamba_groups)
+        if _use_elastic_gdn_backing(vllm_config)
+        else int(vllm_config.additional_config.get("gdn_pool_blocks", 25))
+    )
+    if pool_blocks < 2:
+        raise ValueError("gdn_pool_blocks must include at least one usable block")
+    for group in groups:
+        if isinstance(group.kv_cache_spec, MambaSpec):
+            group.kv_cache_spec = replace(
+                group.kv_cache_spec,
+                separate_pool=True,
+                separate_pool_num_blocks=pool_blocks,
+            )
+    return groups
+
+
+def _shrink_kv_cache_tensor_blocks(
+    tensor: KVCacheTensor,
+    old_num_blocks: int,
+    new_num_blocks: int,
+) -> None:
+    """Shrink a rank-local KV tensor while preserving its allocation contract."""
+    if tensor.logical_block_size and tensor.num_blocks == old_num_blocks:
+        logical_size = tensor.logical_block_size * new_num_blocks
+        tensor.size = (
+            cdiv(logical_size, tensor.mapping_quantum) * tensor.mapping_quantum
+            if tensor.mapping_quantum
+            else logical_size
+        )
+        tensor.num_blocks = new_num_blocks
+        if tensor.committed_size:
+            tensor.committed_size = min(tensor.committed_size, tensor.size)
+        return
+
+    assert tensor.size % old_num_blocks == 0
+    tensor.size = tensor.size // old_num_blocks * new_num_blocks
 
 
 # The hash seed for the first block of any prefix block sequence.
@@ -1429,7 +1499,7 @@ def get_kv_cache_config_from_groups(
             # not the published cache. Keep that transient allocation fixed.
             elastic = requested_elastic and override is None
             mamba_num_blocks = (
-                _elastic_gdn_pool_blocks(vllm_config)
+                _elastic_gdn_pool_blocks(vllm_config, len(mamba_groups))
                 if elastic
                 else (
                     vllm_config.scheduler_config.max_num_seqs
@@ -1462,8 +1532,8 @@ def get_kv_cache_config_from_groups(
                 min_seqs = int(
                     vllm_config.additional_config.get("elastic_gdn_min_seqs", 1)
                 )
-                blocks_per_seq = int(
-                    vllm_config.additional_config.get("elastic_gdn_blocks_per_seq", 3)
+                blocks_per_seq = _elastic_gdn_blocks_per_seq(
+                    vllm_config, len(mamba_groups)
                 )
                 if quantum <= 0 or min_seqs < 1 or runtime_reserve < 0:
                     raise ValueError("invalid elastic GDN geometry")
@@ -1566,6 +1636,7 @@ def get_kv_cache_config_from_groups(
                     elastic_gdn_stride=mamba_stride,
                     elastic_mapping_quantum=quantum,
                     elastic_gdn_initial_blocks=initial_mamba_blocks,
+                    elastic_gdn_blocks_per_request=blocks_per_seq,
                     elastic_budget_bytes=elastic_budget,
                 )
 
@@ -2021,19 +2092,15 @@ def get_kv_cache_groups(
         The generated KVCacheGroups
     """
     if _use_separate_gdn_pool(vllm_config):
-        pool_blocks = (
-            _elastic_gdn_pool_blocks(vllm_config)
-            if _use_elastic_gdn_backing(vllm_config)
-            else int(vllm_config.additional_config.get("gdn_pool_blocks", 25))
-        )
-        if pool_blocks < 2:
-            raise ValueError("gdn_pool_blocks must include at least one usable block")
+        # Grouping must happen before elastic pool capacity can be derived:
+        # multiple Mamba groups share one physical block pool. Mark the specs
+        # now and install the topology-derived pool size after grouping.
         for layer_name, spec in list(kv_cache_spec.items()):
             if isinstance(spec, MambaSpec):
                 kv_cache_spec[layer_name] = replace(
                     spec,
                     separate_pool=True,
-                    separate_pool_num_blocks=pool_blocks,
+                    separate_pool_num_blocks=1,
                 )
 
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
@@ -2048,12 +2115,16 @@ def get_kv_cache_groups(
         # KV cache of all layers are the same, which is true for
         # most models. Allocate the same amount of memory for
         # each layer.
-        return _get_kv_cache_groups_uniform_spec(kv_cache_spec)
+        return _finalize_separate_gdn_pool_specs(
+            vllm_config, _get_kv_cache_groups_uniform_spec(kv_cache_spec)
+        )
     elif uniform_spec := UniformTypeKVCacheSpecs.from_specs(kv_cache_spec):
         # All layers need the same number of token slots (e.g., all layers are
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
-        return _get_kv_cache_groups_uniform_type(uniform_spec)
+        return _finalize_separate_gdn_pool_specs(
+            vllm_config, _get_kv_cache_groups_uniform_type(uniform_spec)
+        )
     elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
         # DeepseekV4 case: All layers need the same number of token slots,
         # yet some layers are full attention while others are sliding window
@@ -2061,7 +2132,7 @@ def get_kv_cache_groups(
         # UniformTypeKVCacheSpecs.
         kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
         _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
-        return kv_cache_groups
+        return _finalize_separate_gdn_pool_specs(vllm_config, kv_cache_groups)
 
     # Pull HiddenStateCacheSpec layers out before the general multi-group
     # path so they don't affect page-size unification or grouping.
@@ -2084,7 +2155,7 @@ def get_kv_cache_groups(
             fallback_groups = _try_get_full_allocation_fallback_groups(kv_cache_spec)
             if fallback_groups is None:
                 raise
-            return fallback_groups
+            return _finalize_separate_gdn_pool_specs(vllm_config, fallback_groups)
     groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
 
     # Add hidden-state layers back with page aligned to the common page.
@@ -2096,11 +2167,13 @@ def get_kv_cache_groups(
             aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
             groups.append(KVCacheGroupSpec([name], aligned))
 
-    return groups
+    return _finalize_separate_gdn_pool_specs(vllm_config, groups)
 
 
 def generate_scheduler_kv_cache_config(
     kv_cache_configs: list[KVCacheConfig],
+    configured_max_num_seqs: int | None = None,
+    enable_auto_resident_cap: bool = False,
 ) -> KVCacheConfig:
     """
     Generate the KV cache configuration for the scheduler.
@@ -2111,6 +2184,98 @@ def generate_scheduler_kv_cache_config(
     # All workers have the same kv_cache_config except layer names, so use
     # an arbitrary one to initialize the scheduler.
     cfg = copy.deepcopy(kv_cache_configs[0])
+    elastic_configs = [
+        worker_cfg
+        for worker_cfg in kv_cache_configs
+        if worker_cfg.elastic_mapping_quantum
+    ]
+    if elastic_configs:
+        if len(elastic_configs) != len(kv_cache_configs):
+            raise ValueError("elastic KV must be enabled on every worker")
+        quanta = {worker_cfg.elastic_mapping_quantum for worker_cfg in elastic_configs}
+        if len(quanta) != 1:
+            raise ValueError("elastic KV mapping quantum differs across workers")
+        blocks_per_request = {
+            worker_cfg.elastic_gdn_blocks_per_request
+            for worker_cfg in elastic_configs
+        }
+        if len(blocks_per_request) != 1:
+            raise ValueError(
+                "elastic GDN blocks per request differs across workers"
+            )
+        scheduler_blocks_per_request = blocks_per_request.pop()
+        if scheduler_blocks_per_request <= 0:
+            raise ValueError("elastic GDN blocks per request must be positive")
+        cfg.elastic_gdn_blocks_per_request = scheduler_blocks_per_request
+        max_gdn_blocks = {
+            tensor.num_blocks
+            for worker_cfg in elastic_configs
+            for tensor in worker_cfg.kv_cache_tensors
+            if tensor.backing_id == "elastic-gdn"
+        }
+        if len(max_gdn_blocks) != 1:
+            raise ValueError("elastic GDN virtual capacity differs across workers")
+        rank_planners = []
+        for worker_cfg in elastic_configs:
+            attention_block_sizes = tuple(
+                tensor.logical_block_size
+                for tensor in worker_cfg.kv_cache_tensors
+                if tensor.backing_id.startswith("elastic-attention-")
+            )
+            rank_planners.append(
+                PhysicalPoolCapacityPlanner(
+                    primary_block_sizes=attention_block_sizes,
+                    secondary_block_stride=worker_cfg.elastic_gdn_stride,
+                    mapping_quantum=worker_cfg.elastic_mapping_quantum,
+                    budget_bytes=worker_cfg.elastic_budget_bytes,
+                )
+            )
+        cfg.elastic_attention_capacity_by_gdn_blocks = tuple(
+            min(
+                planner.max_primary_blocks(
+                    gdn_blocks,
+                    upper_bound=cfg.num_blocks,
+                )
+                for planner in rank_planners
+            )
+            for gdn_blocks in range(max_gdn_blocks.pop() + 1)
+        )
+        if enable_auto_resident_cap:
+            if configured_max_num_seqs is None:
+                raise ValueError(
+                    "elastic auto resident cap requires configured max_num_seqs"
+                )
+            effective_max = get_elastic_max_resident_seqs(
+                cfg,
+                configured_max_num_seqs,
+            )
+            cfg.effective_max_resident_seqs = effective_max
+            for worker_cfg in kv_cache_configs:
+                worker_cfg.effective_max_resident_seqs = effective_max
+            logger.info_once(
+                "Elastic auto resident cap: effective_max_resident_seqs=%d, "
+                "gdn_initial_blocks=%d, gdn_blocks_per_request=%d",
+                effective_max,
+                cfg.elastic_gdn_initial_blocks,
+                cfg.elastic_gdn_blocks_per_request,
+            )
+        logger.info_once(
+            "Rank-safe elastic KV geometry: worker_budgets=%s, "
+            "attention_block_bytes=%s, gdn_block_bytes=%s, quantum=%d, "
+            "virtual_gdn_blocks=%d",
+            tuple(worker_cfg.elastic_budget_bytes for worker_cfg in elastic_configs),
+            tuple(
+                sum(
+                    tensor.logical_block_size
+                    for tensor in worker_cfg.kv_cache_tensors
+                    if tensor.backing_id.startswith("elastic-attention-")
+                )
+                for worker_cfg in elastic_configs
+            ),
+            tuple(worker_cfg.elastic_gdn_stride for worker_cfg in elastic_configs),
+            elastic_configs[0].elastic_mapping_quantum,
+            len(cfg.elastic_attention_capacity_by_gdn_blocks) - 1,
+        )
     for group in cfg.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
             # All layers in the UniformTypeKVCacheSpecs have the same type,
@@ -2119,6 +2284,46 @@ def generate_scheduler_kv_cache_config(
                 iter(group.kv_cache_spec.kv_cache_specs.values())
             )
     return cfg
+
+
+def get_elastic_max_resident_seqs(
+    kv_cache_config: KVCacheConfig,
+    configured_max_num_seqs: int,
+) -> int:
+    """Return the rank-safe hard residency ceiling for elastic decode.
+
+    Each simultaneously decoding request needs its GDN state blocks and at
+    least one distinct writable attention-tail block. Both pools also reserve
+    block zero as a null block. Longer or unshared requests can require more
+    attention blocks, so normal admission may choose a lower runtime count.
+    """
+    if configured_max_num_seqs < 1:
+        raise ValueError("configured max_num_seqs must be positive")
+
+    capacities = kv_cache_config.elastic_attention_capacity_by_gdn_blocks
+    blocks_per_request = kv_cache_config.elastic_gdn_blocks_per_request
+    if not capacities or blocks_per_request <= 0:
+        return configured_max_num_seqs
+
+    effective_max = 0
+    for num_reqs in range(1, configured_max_num_seqs + 1):
+        required_gdn_blocks = max(
+            kv_cache_config.elastic_gdn_initial_blocks,
+            1 + num_reqs * blocks_per_request,
+        )
+        if required_gdn_blocks >= len(capacities):
+            break
+        required_attention_blocks = 1 + num_reqs
+        if capacities[required_gdn_blocks] < required_attention_blocks:
+            break
+        effective_max = num_reqs
+
+    if effective_max < 1:
+        raise ValueError(
+            "elastic KV cannot host one decode request: "
+            f"{blocks_per_request=}, capacities={len(capacities)}"
+        )
+    return effective_max
 
 
 def get_kv_cache_capacity(
@@ -2484,8 +2689,7 @@ def get_kv_cache_configs(
                     name in mamba_layers for name in tensor.shared_by
                 ):
                     continue
-                assert tensor.size % num_blocks_old == 0
-                tensor.size = tensor.size // num_blocks_old * min_num_blocks
+                _shrink_kv_cache_tensor_blocks(tensor, num_blocks_old, min_num_blocks)
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             max_model_len = vllm_config.model_config.max_model_len

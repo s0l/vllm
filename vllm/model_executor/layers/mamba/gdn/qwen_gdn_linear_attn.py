@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
+import os
 from typing import Literal
 
 import torch
@@ -296,6 +297,11 @@ class ChunkGatedDeltaRule(CustomOp):
             chunk_offsets=chunk_offsets,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             core_attn_out=core_attn_out,
+            # Native FLA has finished reading the original value tensor before
+            # its recurrent kernel produces v_new. Reuse that dead storage for
+            # the equally shaped result. This is explicit and inference-only;
+            # the FlashInfer and CuteDSL backends remain unchanged.
+            value_out=v if core_attn_out is not None else None,
         )
 
     def forward_cutedsl(
@@ -545,6 +551,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             activation=output_gate_type,
             device=current_platform.current_device(),
         )
+        self._ag2_aux_boundaries_enabled = (
+            os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_GDN_BOUNDARIES", "0")
+            == "1"
+            and prefix.endswith(".layers.0.linear_attn")
+        )
 
         if self.gdn_explicit_partition:
             self.out_proj = ExplicitPaddedRowParallelLinear(
@@ -570,10 +581,82 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 prefix=f"{prefix}.out_proj",
                 disable_tp=self.disable_tp_for_gdn,
             )
+        self.out_proj._ag2_aux_output_parallel_enabled = (
+            self._ag2_aux_boundaries_enabled
+        )
 
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
         self._prefill_kernels_warmed_up = False
+        self._ag2_layer0_trace_enabled = bool(
+            os.environ.get("AG2_VLLM_LAYER0_TRACE_OUTPUT")
+        ) and prefix.endswith(".layers.0.linear_attn")
+        self._ag2_mtp_gdn_row0_reference = (
+            os.environ.get("AG2_VLLM_MTP_GDN_ROW0_REFERENCE", "0") == "1"
+        )
+        if self._ag2_layer0_trace_enabled:
+            trace_rows = 3
+            self.out_proj.register_buffer(
+                "_ag2_trace_output_parallel",
+                torch.zeros(
+                    (trace_rows, self.hidden_size),
+                    dtype=vllm_config.model_config.dtype,
+                ),
+                persistent=False,
+            )
+            trace_buffers = {
+                "qkvz": (
+                    trace_rows,
+                    2 * self.padded_local_key_dim + 2 * self.padded_local_value_dim,
+                ),
+                "ba": (trace_rows, 2 * self.padded_local_num_v_heads),
+                "post_conv_qkv": (trace_rows, self.local_conv_dim),
+                "core": (trace_rows, self.padded_local_value_dim),
+                "z": (trace_rows, self.padded_local_value_dim),
+                "gated_norm": (trace_rows, self.padded_local_value_dim),
+                "attention_output": (trace_rows, self.hidden_size),
+            }
+            for name, shape in trace_buffers.items():
+                self.register_buffer(
+                    f"_ag2_trace_{name}",
+                    torch.zeros(shape, dtype=vllm_config.model_config.dtype),
+                    persistent=False,
+                )
+            self.register_buffer(
+                "_ag2_trace_ssm_state",
+                torch.zeros(
+                    (
+                        trace_rows,
+                        self.local_num_v_heads,
+                        self.head_v_dim,
+                        self.head_k_dim,
+                    ),
+                    dtype=torch.float32,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_ag2_trace_conv_state",
+                torch.zeros(
+                    (
+                        trace_rows,
+                        self.padded_local_conv_dim,
+                        self.conv_kernel_size - 1 + self.num_spec,
+                    ),
+                    dtype=vllm_config.model_config.dtype,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_ag2_trace_state_indices",
+                torch.full((trace_rows,), -1, dtype=torch.int32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_ag2_trace_num_accepted_tokens",
+                torch.full((trace_rows,), -1, dtype=torch.int32),
+                persistent=False,
+            )
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
             and not self.gdn_explicit_partition
@@ -970,7 +1053,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         core_attn_out = self._pad_local_value_flat(core_attn_out)
+        if self._ag2_aux_boundaries_enabled:
+            self._ag2_aux_gated_norm = core_attn_out
+        if self._ag2_layer0_trace_enabled:
+            trace = core_attn_out[:3]
+            self._ag2_trace_gated_norm[: trace.shape[0]].copy_(trace)
         output, _ = self.out_proj(core_attn_out)
+        if self._ag2_aux_boundaries_enabled:
+            self._ag2_aux_output_parallel = self.out_proj._ag2_aux_output_parallel
+        if self._ag2_layer0_trace_enabled:
+            trace = output[:3]
+            self._ag2_trace_attention_output[: trace.shape[0]].copy_(trace)
         return output
 
     def forward_hip(
@@ -1025,6 +1118,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
         ba, _ = self.in_proj_ba(hidden_states)
+        if self._ag2_aux_boundaries_enabled:
+            self._ag2_aux_qkvz = mixed_qkvz
+            self._ag2_aux_ba = ba
+        if self._ag2_layer0_trace_enabled:
+            qkvz_trace = mixed_qkvz[:3]
+            ba_trace = ba[:3]
+            self._ag2_trace_qkvz[: qkvz_trace.shape[0]].copy_(qkvz_trace)
+            self._ag2_trace_ba[: ba_trace.shape[0]].copy_(ba_trace)
 
         if self.gqa_interleaved_layout:
             # Qwen3-Next: unpack the interleaved GQA layout
@@ -1060,6 +1161,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out,
             layer_name=_encode_layer_name(self.prefix),
         )
+        if self._ag2_aux_boundaries_enabled:
+            self._ag2_aux_core = self._pad_local_value_flat(
+                core_attn_out.flatten(-2)
+            )
+        if self._ag2_layer0_trace_enabled:
+            core_flat = self._pad_local_value_flat(core_attn_out.flatten(-2))[:3]
+            z_flat = self._pad_local_value_flat(z.flatten(-2))[:3]
+            self._ag2_trace_core[: core_flat.shape[0]].copy_(core_flat)
+            self._ag2_trace_z[: z_flat.shape[0]].copy_(z_flat)
 
         # ============================================================
         # Part 3: Output Projection
@@ -1422,6 +1532,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             if self.gdn_explicit_partition
             else ssm_state
         )
+        if self._ag2_layer0_trace_enabled:
+            traced_indices = (
+                spec_state_indices_tensor.reshape(-1)
+                if spec_sequence_masks is not None
+                else non_spec_state_indices_tensor.reshape(-1)
+            )[:3]
+            traced_conv_state = conv_state.index_select(
+                0, traced_indices.to(dtype=torch.long)
+            )
+            self._ag2_trace_conv_state[: traced_conv_state.shape[0]].copy_(
+                traced_conv_state
+            )
         A_log = self.A_log[: self.local_num_v_heads]
         dt_bias = self.dt_bias[: self.local_num_v_heads]
         num_actual_tokens = attn_metadata.num_actual_tokens
@@ -1448,9 +1570,33 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkv_non_spec = mixed_qkv
 
         # 1.1: Process the multi-query part
+        row0_reference_conv = None
+        row0_reference_ssm = None
         if spec_sequence_masks is not None:
             # spec_state_indices_tensor is always set when spec_sequence_masks is set
             assert spec_state_indices_tensor is not None
+            if self._ag2_mtp_gdn_row0_reference and forward_context.tp3_sd_phase_reduce:
+                if attn_metadata.num_spec_decodes != 1:
+                    raise RuntimeError("MTP GDN row-zero reference POC admits x1 only")
+                committed_index = spec_state_indices_tensor[:1, 0].long()
+                reference_conv_state = conv_state.index_select(
+                    0, committed_index
+                ).clone()
+                reference_state_index = torch.zeros(
+                    1,
+                    dtype=torch.int32,
+                    device=mixed_qkv_spec.device,
+                )
+                row0_reference_conv = causal_conv1d_update(
+                    mixed_qkv_spec[:1].clone(),
+                    reference_conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=reference_state_index,
+                    validate_data=True,
+                )
+                row0_reference_ssm = ssm_state.index_select(0, committed_index).clone()
             mixed_qkv_spec = causal_conv1d_update(
                 mixed_qkv_spec,
                 conv_state,
@@ -1499,8 +1645,48 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
+        # The packed projection input has been consumed by the convolution
+        # paths above. Drop this reference before recurrent prefill; the
+        # convolution outputs are separate tensors (or retain the storage
+        # through their own alias in the spec-only path).
+        del mixed_qkv
+        # Spec/decode tensors are tiny and retain the existing compact layout.
+        # Prefill goes directly from padded TP3 conv output into
+        # fused_post_conv_prep, whose input offsets distinguish padded input
+        # heads from real output heads. Avoid materializing a 42-50 MiB
+        # compacting torch.cat at the 6656-token production chunk boundary.
         mixed_qkv_spec = self._strip_padded_mixed_qkv(mixed_qkv_spec)
-        mixed_qkv_non_spec = self._strip_padded_mixed_qkv(mixed_qkv_non_spec)
+        if attn_metadata.num_prefills == 0:
+            mixed_qkv_non_spec = self._strip_padded_mixed_qkv(mixed_qkv_non_spec)
+        if self._ag2_layer0_trace_enabled:
+            traced_conv = (
+                mixed_qkv_spec
+                if spec_sequence_masks is not None
+                else mixed_qkv_non_spec
+            )
+            assert traced_conv is not None
+            traced_conv = self._strip_padded_mixed_qkv(traced_conv[:3])
+            self._ag2_trace_post_conv_qkv[: traced_conv.shape[0]].copy_(traced_conv)
+
+            traced_indices = (
+                spec_state_indices_tensor.reshape(-1)
+                if spec_sequence_masks is not None
+                else non_spec_state_indices_tensor.reshape(-1)
+            )[:3]
+            self._ag2_trace_state_indices.fill_(-1)
+            self._ag2_trace_state_indices[: traced_indices.shape[0]].copy_(
+                traced_indices
+            )
+            traced_state = ssm_state.index_select(
+                0, traced_indices.to(dtype=torch.long)
+            )
+            self._ag2_trace_ssm_state[: traced_state.shape[0]].copy_(traced_state)
+            self._ag2_trace_num_accepted_tokens.fill_(-1)
+            if num_accepted_tokens is not None:
+                traced_accepted = num_accepted_tokens.reshape(-1)[:3]
+                self._ag2_trace_num_accepted_tokens[: traced_accepted.shape[0]].copy_(
+                    traced_accepted
+                )
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
 
         # Split mixed non-spec-decode+prefill to process independently
@@ -1522,7 +1708,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 a_non_spec = a
                 b_non_spec = b
 
+            mixed_qkv_decode = None
             if split_non_spec:
+                # Only this tiny decode prefix is read after prefill prep.
+                # Copy it so the full packed convolution output can be released
+                # before the large recurrent-state allocation.
+                mixed_qkv_decode = self._strip_padded_mixed_qkv(
+                    mixed_qkv_non_spec[:num_decode_tokens].clone()
+                )
                 conv_output_prefill = mixed_qkv_non_spec[num_decode_tokens:]
                 a_prefill = a_non_spec[num_decode_tokens:]
                 b_prefill = b_non_spec[num_decode_tokens:]
@@ -1548,7 +1741,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 head_v_dim=self.head_v_dim,
                 apply_l2norm=True,
                 output_g_exp=False,
+                input_num_k_heads=(
+                    self.padded_local_num_k_heads
+                    if self.gdn_explicit_partition
+                    else self.local_num_k_heads
+                ),
+                input_num_v_heads=(
+                    self.padded_local_num_v_heads
+                    if self.gdn_explicit_partition
+                    else self.local_num_v_heads
+                ),
             )
+            del conv_output_prefill, mixed_qkv_non_spec
             query_non_spec = query_non_spec.unsqueeze(0)
             key_non_spec = key_non_spec.unsqueeze(0)
             value_non_spec = value_non_spec.unsqueeze(0)
@@ -1565,6 +1769,37 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
+            row0_reference_core = None
+            if row0_reference_conv is not None:
+                assert row0_reference_ssm is not None
+                reference_q, reference_k, reference_v = self.rearrange_mixed_qkv(
+                    self._strip_padded_mixed_qkv(row0_reference_conv)
+                )
+                reference_state_index = torch.zeros(
+                    1,
+                    dtype=torch.int32,
+                    device=reference_q.device,
+                )
+                reference_cu = torch.tensor(
+                    [0, 1],
+                    dtype=torch.int32,
+                    device=reference_q.device,
+                )
+                reference_token_index = spec_token_indx[:1]
+                row0_reference_core, _ = fused_sigmoid_gating_delta_rule_update(
+                    A_log=A_log,
+                    a=a.index_select(0, reference_token_index),
+                    b=b.index_select(0, reference_token_index),
+                    dt_bias=dt_bias,
+                    q=reference_q,
+                    k=reference_k,
+                    v=reference_v,
+                    initial_state=row0_reference_ssm,
+                    inplace_final_state=True,
+                    cu_seqlens=reference_cu,
+                    ssm_state_indices=reference_state_index,
+                    use_qk_l2norm_in_kernel=True,
+                )
             core_attn_out_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=A_log,
@@ -1585,13 +1820,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     use_qk_l2norm_in_kernel=True,
                 )
             )
+            if row0_reference_core is not None:
+                core_attn_out_spec[:, :1].copy_(row0_reference_core)
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
         # 2.2: Process non-spec-decode part
         if split_non_spec:
+            assert mixed_qkv_decode is not None
             query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
-                mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
+                mixed_qkv_decode
             )
             core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
                 A_log=A_log,
@@ -1624,6 +1862,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert prefill_has_initial_state is not None
             initial_state = ssm_state[prefill_state_indices]
             initial_state[~prefill_has_initial_state, ...] = 0
+            # The outer custom op already owns the final core-attention output.
+            # Write the prefill result directly into its decode-first slice
+            # instead of allocating another value-sized tensor in chunk_fwd_o.
+            # This is especially important at the 8K-token prefill boundary,
+            # where the redundant BF16 output is 32 MiB per rank.
+            prefill_output_start = num_decode_tokens if split_non_spec else 0
+            prefill_num_tokens = query_non_spec.shape[1]
+            prefill_output = core_attn_out[
+                prefill_output_start : prefill_output_start + prefill_num_tokens
+            ].unsqueeze(0)
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -1639,16 +1887,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_indices=attn_metadata.chunk_indices,
                 chunk_offsets=attn_metadata.chunk_offsets,
                 use_qk_l2norm_in_kernel=False,
+                core_attn_out=prefill_output,
             )
             # Init cache
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
 
             if split_non_spec:
-                # Stitch the peeled decode outputs in front of the prefill
-                # outputs (decode-first order).
-                core_attn_out_non_spec = torch.cat(
-                    [core_attn_out_decode, core_attn_out_non_spec], dim=1
-                )
+                # The prefill tail is already in its final destination. Fill
+                # only the small peeled-decode prefix; avoid a second full
+                # output allocation from torch.cat.
+                core_attn_out[:num_decode_tokens].copy_(core_attn_out_decode.squeeze(0))
         elif attn_metadata.num_decodes > 0:
             core_attn_out_non_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
@@ -1684,6 +1932,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+        elif attn_metadata.num_prefills > 0:
+            # Pure/mixed non-spec prefill was produced directly in
+            # core_attn_out above.
+            pass
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 

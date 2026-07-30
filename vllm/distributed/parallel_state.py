@@ -122,39 +122,211 @@ def _get_unique_name(name: str) -> str:
 
 
 _groups: dict[str, Callable[[], "GroupCoordinator | None"]] = {}
+_tp3_ce_runtime_enabled = False
+_tp3_ce_first_context_logged = False
+_tp3_ce_large_shapes_logged: set[tuple[int, bool]] = set()
+_tp3_ce_first_known_dispatch_logged = False
+_tp3_ce_first_active_dispatch_logged = False
 
 
 def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
 
 
+def set_tp3_ce_runtime_enabled(enabled: bool) -> None:
+    """Enable CE only after model profiling, compilation and graph capture."""
+    global _tp3_ce_runtime_enabled
+    _tp3_ce_runtime_enabled = enabled
+    logger.info(
+        "TP3 compressed all-reduce runtime gate is %s after warmup",
+        "enabled" if enabled else "disabled",
+    )
+
+
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    global _tp3_ce_first_active_dispatch_logged
+    global _tp3_ce_first_context_logged
+    global _tp3_ce_first_known_dispatch_logged
+
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
-    if os.environ.get("VLLM_TP3_CE_REDUCE", "0") == "1":
-        from vllm.forward_context import (
-            get_forward_context,
-            is_forward_context_available,
-        )
+    from vllm.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
 
-        logical_tokens = None
-        if is_forward_context_available():
-            logical_tokens = get_forward_context().num_tokens_unpadded
-        if _should_use_tp3_ce(
-            logical_tokens,
-            get_dcp_group().world_size,
-            tensor.dim(),
-            tensor.shape[-1],
+    forward_context = (
+        get_forward_context() if is_forward_context_available() else None
+    )
+    large_shape_key = (
+        int(tensor.shape[0]),
+        forward_context is not None,
+    )
+    if (
+        tensor.dim() == 2
+        and tensor.shape[-1] == 5120
+        and tensor.shape[0] >= 1000
+        and large_shape_key not in _tp3_ce_large_shapes_logged
+        and len(_tp3_ce_large_shapes_logged) < 16
+    ):
+        logger.info(
+            "TP3 all-reduce first large physical shape: shape=%s group=%s tp=%s "
+            "context_available=%s logical_tokens=%s config_enabled=%s",
+            tuple(tensor.shape),
+            group_name,
             group.world_size,
-        ):
+            forward_context is not None,
+            forward_context.num_tokens_unpadded
+            if forward_context is not None
+            else None,
+            forward_context.tp3_ce_reduce
+            if forward_context is not None
+            else None,
+        )
+        _tp3_ce_large_shapes_logged.add(large_shape_key)
+    tp3_ce_enabled = _tp3_ce_runtime_enabled
+    if (
+        forward_context is not None
+        and forward_context.num_tokens_unpadded is not None
+        and not _tp3_ce_first_context_logged
+    ):
+        logger.info(
+            "TP3 all-reduce first runtime context: env_enabled=%s "
+            "config_enabled=%s logical_tokens=%s shape=%s group=%s tp=%s",
+            os.environ.get("VLLM_TP3_CE_REDUCE", "0") == "1",
+            forward_context.tp3_ce_reduce,
+            forward_context.num_tokens_unpadded,
+            tuple(tensor.shape),
+            group_name,
+            group.world_size,
+        )
+        _tp3_ce_first_context_logged = True
+    if tp3_ce_enabled:
+        logical_tokens = (
+            forward_context.num_tokens_unpadded
+            if forward_context is not None
+            else None
+        )
+        should_use_tp3_ce = (
+            _should_use_tp3_ce(
+                logical_tokens,
+                get_dcp_group().world_size,
+                tensor.dim(),
+                tensor.shape[-1],
+                group.world_size,
+            )
+            if logical_tokens is not None
+            else _should_use_tp3_ce_physical(
+                True,
+                tensor.shape[0] if tensor.dim() == 2 else 0,
+                tensor.dim(),
+                tensor.shape[-1],
+                group.world_size,
+            )
+        )
+        if logical_tokens is not None and not _tp3_ce_first_known_dispatch_logged:
+            logger.info(
+                "TP3 compressed all-reduce first known dispatch: "
+                "logical_tokens=%s dcp=%s shape=%s tp=%s selected=%s",
+                logical_tokens,
+                get_dcp_group().world_size,
+                tuple(tensor.shape),
+                group.world_size,
+                should_use_tp3_ce,
+            )
+            _tp3_ce_first_known_dispatch_logged = True
+        if should_use_tp3_ce:
+            if not _tp3_ce_first_active_dispatch_logged:
+                logger.info(
+                    "TP3 compressed all-reduce data path active: "
+                    "logical_tokens=%s dcp=%s shape=%s tp=%s",
+                    logical_tokens,
+                    get_dcp_group().world_size,
+                    tuple(tensor.shape),
+                    group.world_size,
+                )
+                _tp3_ce_first_active_dispatch_logged = True
             from .device_communicators.tp3_ce_all_reduce import (
                 tp3_ce_all_reduce as run,
             )
 
             return run(tensor, group.device_group)
+    if os.environ.get("VLLM_TP3_LL_REDUCE", "0") == "1":
+        from .device_communicators.tp3_ll_all_reduce import (
+            should_use_tp3_ll,
+            tp3_ll_all_reduce,
+        )
+
+        tp_group = _TP
+        if tp_group is not None and group is tp_group and should_use_tp3_ll(
+            tensor.dim(),
+            tensor.shape[0] if tensor.dim() == 2 else 0,
+            tensor.shape[-1],
+            group.world_size,
+        ):
+            try:
+                return tp3_ll_all_reduce(tensor, group.rank_in_group)
+            except Exception:
+                pass
+    if (
+        os.environ.get("VLLM_TP3_SD_PHASE_REDUCE", "0") == "1"
+        and _is_tp3_sd_phase_reduce()
+        and _should_use_tp3_sd_deterministic_reduce(
+            True,
+            tensor.dim(),
+            tensor.shape[0],
+            tensor.shape[-1],
+            group.world_size,
+        )
+    ):
+        return _tp3_sd_deterministic_reduce(tensor, group)
+    if (
+        os.environ.get("VLLM_TP3_SD_DETERMINISTIC_REDUCE", "0") == "1"
+        and _should_use_tp3_sd_deterministic_reduce(
+            True,
+            tensor.dim(),
+            tensor.shape[0],
+            tensor.shape[-1],
+            group.world_size,
+        )
+    ):
+        return _tp3_sd_deterministic_reduce(tensor, group)
+    if os.environ.get("VLLM_TP3_SD_CANONICAL_REDUCE", "0") == "1":
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        cudagraph_mode = (
+            get_forward_context().cudagraph_runtime_mode
+            if is_forward_context_available()
+            else None
+        )
+        if _should_use_tp3_sd_canonical_reduce(
+            True,
+            cudagraph_mode,
+            tensor.dim(),
+            tensor.shape[0],
+            tensor.shape[-1],
+            group.world_size,
+        ):
+            return _tp3_sd_canonical_reduce(tensor, group._all_reduce_out_place)
     return group._all_reduce_out_place(tensor)
+
+
+def _is_tp3_sd_phase_reduce() -> bool:
+    """Read the explicit target pure-decode lane from forward context."""
+    from vllm.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+
+    return (
+        is_forward_context_available()
+        and get_forward_context().tp3_sd_phase_reduce
+    )
 
 
 def _should_use_tp3_ce(
@@ -172,6 +344,96 @@ def _should_use_tp3_ce(
         and hidden_size == 5120
         and tp_world_size == 3
     )
+
+
+def _should_use_tp3_ce_physical(
+    runtime_enabled: bool,
+    rows: int,
+    tensor_dim: int,
+    hidden_size: int,
+    tp_world_size: int,
+) -> bool:
+    """Conservative fallback when compiled fallback loses forward context.
+
+    The 4096-row boundary intentionally does not reconstruct a DCP-global
+    token count. It admits the measured 6528/7056 large-prefill shapes while
+    excluding startup (runtime gate off), decode and short-prefill graphs.
+    """
+    return (
+        runtime_enabled
+        and rows >= 4096
+        and tensor_dim == 2
+        and hidden_size == 5120
+        and tp_world_size == 3
+    )
+
+
+def _should_use_tp3_sd_canonical_reduce(
+    enabled: bool,
+    cudagraph_mode: object | None,
+    tensor_dim: int,
+    rows: int,
+    hidden_size: int,
+    tp_world_size: int,
+) -> bool:
+    """Canonicalize only the K0 FULL decode lanes paired with K=2 MTP."""
+    return (
+        enabled
+        and getattr(cudagraph_mode, "name", None) == "FULL"
+        and tensor_dim == 2
+        and 1 <= rows <= 8
+        and hidden_size == 5120
+        and tp_world_size == 3
+    )
+
+
+def _should_use_tp3_sd_deterministic_reduce(
+    enabled: bool,
+    tensor_dim: int,
+    rows: int,
+    hidden_size: int,
+    tp_world_size: int,
+) -> bool:
+    """Select only bounded TP3 decode and MTP verification reductions."""
+    return (
+        enabled
+        and tensor_dim == 2
+        and 1 <= rows <= 24
+        and hidden_size == 5120
+        and tp_world_size == 3
+    )
+
+
+def _tp3_sd_deterministic_sum(gathered: torch.Tensor) -> torch.Tensor:
+    """Accumulate exact TP3 inputs in a defined order and round once."""
+    if gathered.shape[0] != 3:
+        raise ValueError(f"expected three TP ranks, got shape={gathered.shape}")
+    output = gathered[0].float() + gathered[1].float()
+    output.add_(gathered[2].float())
+    return output.to(gathered.dtype)
+
+
+def _tp3_sd_deterministic_reduce(
+    tensor: torch.Tensor,
+    group: "GroupCoordinator",
+) -> torch.Tensor:
+    """All-gather exact local values, then perform a fixed FP32 TP3 sum."""
+    communicator = group.device_communicator
+    if communicator is None:
+        raise ValueError("No device communicator found")
+    gathered = communicator.all_gather(tensor, dim=0)
+    gathered = gathered.view(3, *tensor.shape)
+    return _tp3_sd_deterministic_sum(gathered)
+
+
+def _tp3_sd_canonical_reduce(
+    tensor: torch.Tensor,
+    reduce_fn: Callable[[torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """Reduce K0 as physical M=3N, then return its N logical rows."""
+    rows = tensor.shape[0]
+    padded = torch.nn.functional.pad(tensor, (0, 0, 0, rows * 2))
+    return reduce_fn(padded)[:rows]
 
 
 def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
@@ -749,6 +1011,16 @@ class GroupCoordinator:
             )
         else:
             return self._reduce_scatter_out_place(input_, dim)
+
+    def reduce_scatter_chunked(
+        self, input_: torch.Tensor, dim: int = -1
+    ) -> torch.Tensor:
+        """Memory-bounded reduce-scatter for non-leading dimensions."""
+        if self.world_size == 1:
+            return input_
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.reduce_scatter_chunked(input_, dim)
 
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None

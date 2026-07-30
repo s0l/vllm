@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import Sequence
 from typing import NamedTuple
 
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_capacity import PhysicalPoolCapacityPlanner
@@ -28,6 +30,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 def _validate_prefix_cache_retention_interval(
@@ -113,6 +117,9 @@ class KVCacheCoordinator(ABC):
             hash_block_size=hash_block_size,
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
+            prefer_low_id_allocations=bool(
+                kv_cache_config.elastic_mapping_quantum
+            ),
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
@@ -136,6 +143,7 @@ class KVCacheCoordinator(ABC):
         self._elastic_transition: tuple[int, int] | None = None
         self._last_emitted_elastic_transition: tuple[int, int] | None = None
         self._physical_pool_planner: PhysicalPoolCapacityPlanner | None = None
+        self.last_elastic_rejection: dict[str, object] | None = None
         if separate_gdn_pool:
             pool_sizes = {
                 spec.separate_pool_num_blocks for spec in separate_mamba_specs
@@ -207,6 +215,13 @@ class KVCacheCoordinator(ABC):
         )
 
     def _elastic_attention_capacity(self, gdn_blocks: int) -> int:
+        rank_safe_capacity = (
+            self.kv_cache_config.elastic_attention_capacity_by_gdn_blocks
+        )
+        if rank_safe_capacity:
+            if not 0 <= gdn_blocks < len(rank_safe_capacity):
+                return 0
+            return rank_safe_capacity[gdn_blocks]
         assert self._physical_pool_planner is not None
         return self._physical_pool_planner.max_primary_blocks(
             gdn_blocks,
@@ -220,6 +235,32 @@ class KVCacheCoordinator(ABC):
             self.mamba_block_pool.active_num_gpu_blocks,
         )
 
+    def _reject_elastic_capacity(
+        self,
+        reason: str,
+        requirements: "KVCacheBlockPoolRequirements",
+        *,
+        desired_gdn_blocks: int,
+        desired_attention_blocks: int | None = None,
+        pinned_attention_tail: tuple[tuple[int, int], ...] = (),
+    ) -> bool:
+        assert self.mamba_block_pool is not None
+        rejection: dict[str, object] = {
+            "reason": reason,
+            "requirements": requirements,
+            "attention_active": self.block_pool.active_num_gpu_blocks,
+            "attention_free": self.block_pool.get_num_free_blocks(),
+            "gdn_active": self.mamba_block_pool.active_num_gpu_blocks,
+            "gdn_free": self.mamba_block_pool.get_num_free_blocks(),
+            "desired_gdn": desired_gdn_blocks,
+            "desired_attention": desired_attention_blocks,
+            "pinned_attention_tail": pinned_attention_tail,
+        }
+        if rejection != self.last_elastic_rejection:
+            logger.warning("Elastic KV admission rejected: %s", rejection)
+        self.last_elastic_rejection = rejection
+        return False
+
     def ensure_elastic_capacity(
         self, requirements: "KVCacheBlockPoolRequirements"
     ) -> bool:
@@ -230,18 +271,106 @@ class KVCacheCoordinator(ABC):
             return True
         missing = max(requirements.mamba - pool.get_num_free_blocks(), 0)
         if missing == 0:
+            self.last_elastic_rejection = None
             return True
         new_gdn_blocks = pool.active_num_gpu_blocks + missing
         if new_gdn_blocks > pool.num_gpu_blocks:
-            return False
+            return self._reject_elastic_capacity(
+                "virtual_gdn_limit",
+                requirements,
+                desired_gdn_blocks=new_gdn_blocks,
+            )
         new_attention_blocks = self._elastic_attention_capacity(new_gdn_blocks)
         if new_attention_blocks < 1:
-            return False
+            return self._reject_elastic_capacity(
+                "physical_budget",
+                requirements,
+                desired_gdn_blocks=new_gdn_blocks,
+                desired_attention_blocks=new_attention_blocks,
+            )
         if not self.block_pool.deactivate_tail_blocks(new_attention_blocks):
-            return False
+            pinned_tail = tuple(
+                (block.block_id, block.ref_cnt)
+                for block in self.block_pool.blocks[
+                    new_attention_blocks : self.block_pool.active_num_gpu_blocks
+                ]
+                if block.ref_cnt != 0
+            )
+            return self._reject_elastic_capacity(
+                "attention_tail_pinned",
+                requirements,
+                desired_gdn_blocks=new_gdn_blocks,
+                desired_attention_blocks=new_attention_blocks,
+                pinned_attention_tail=pinned_tail,
+            )
         pool.activate_tail_blocks(new_gdn_blocks)
         self._record_elastic_transition()
+        self.last_elastic_rejection = None
         return True
+
+    def reserve_elastic_admission_wave(
+        self, primary_blocks_per_request: Sequence[int]
+    ) -> int:
+        """Reserve a jointly feasible GDN wave before attention allocation.
+
+        Incremental GDN growth can otherwise let early requests take logical
+        attention IDs from a tail that a later request needs to deactivate.
+        This reservation changes only scheduler-visible active ranges. The
+        normal end-of-step rebalance removes unused GDN blocks before workers
+        observe a transition.
+        """
+        pool = self.mamba_block_pool
+        blocks_per_request = self.kv_cache_config.elastic_gdn_blocks_per_request
+        if (
+            not primary_blocks_per_request
+            or not self.kv_cache_config.elastic_mapping_quantum
+            or pool is None
+            or blocks_per_request <= 0
+        ):
+            return 0
+        if any(blocks < 0 for blocks in primary_blocks_per_request):
+            raise ValueError("primary admission requirements cannot be negative")
+
+        max_virtual_requests = (pool.num_gpu_blocks - 1) // blocks_per_request
+        candidates = min(len(primary_blocks_per_request), max_virtual_requests)
+        # active - free includes the null block and every referenced primary
+        # block. Cached tail blocks have ref_cnt=0 and may be evicted.
+        used_primary = (
+            self.block_pool.active_num_gpu_blocks
+            - self.block_pool.get_num_free_blocks()
+        )
+        for num_requests in range(candidates, 0, -1):
+            required_primary = sum(primary_blocks_per_request[:num_requests])
+            required_free_gdn = num_requests * blocks_per_request
+            missing_gdn = max(required_free_gdn - pool.get_num_free_blocks(), 0)
+            desired_gdn = pool.active_num_gpu_blocks + missing_gdn
+            if desired_gdn > pool.num_gpu_blocks:
+                continue
+
+            desired_attention = (
+                self.block_pool.active_num_gpu_blocks
+                if missing_gdn == 0
+                else self._elastic_attention_capacity(desired_gdn)
+            )
+            # Preserve every candidate's conservative full-sequence primary
+            # requirement in addition to null/currently referenced blocks.
+            if desired_attention < used_primary + required_primary:
+                continue
+            if desired_attention < self.block_pool.active_num_gpu_blocks and any(
+                block.ref_cnt != 0
+                for block in self.block_pool.blocks[
+                    desired_attention : self.block_pool.active_num_gpu_blocks
+                ]
+            ):
+                continue
+
+            requirements = KVCacheBlockPoolRequirements(
+                primary=required_primary,
+                mamba=required_free_gdn,
+            )
+            if self.ensure_elastic_capacity(requirements):
+                return num_requests
+        return 0
 
     def rebalance_elastic_capacity(self) -> None:
         """Return unused GDN tail mappings to the attention arena."""
@@ -305,7 +434,9 @@ class KVCacheCoordinator(ABC):
     ) -> int:
         """Return the newest exact recurrent checkpoint boundary in tokens."""
         checkpoint_block_size = (
-            spec.block_size * self.dcp_world_size * self.pcp_world_size
+            self.hash_block_size
+            if getattr(self, "enable_dcp_fine_prefix", False)
+            else spec.block_size * self.dcp_world_size * self.pcp_world_size
         )
         spec_hashes = BlockHashListWithBlockSize(
             block_hashes,
@@ -824,9 +955,35 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     "full-attention and Mamba groups, got: "
                     f"{type(g.kv_cache_spec).__name__}."
                 )
+        self.enable_dcp_fine_prefix = (
+            os.environ.get("AG2_VLLM_DCP_FINE_PREFIX", "0") == "1"
+        )
+        if self.enable_dcp_fine_prefix:
+            if dcp_world_size <= 1:
+                raise ValueError(
+                    "AG2_VLLM_DCP_FINE_PREFIX requires DCP world size > 1"
+                )
+            if self.gdn_checkpoint_keys is None:
+                raise ValueError(
+                    "AG2_VLLM_DCP_FINE_PREFIX requires a separate GDN pool"
+                )
+            if hash_block_size % dcp_world_size != 0:
+                raise ValueError(
+                    "DCP fine-prefix match unit must be divisible by DCP world size"
+                )
+            if not all(
+                isinstance(g.kv_cache_spec, (FullAttentionSpec, MambaSpec))
+                for g in kv_cache_config.kv_cache_groups
+            ):
+                raise ValueError(
+                    "DCP fine-prefix only supports full-attention + Mamba groups"
+                )
         # Partial hash hits are limited to full-attention + mamba ("align")
-        # without context parallelism.
-        self.enable_partial_hash_hits = dcp_world_size == 1 and any(
+        # without context parallelism. The research-only separate-GDN path
+        # pairs each partial attention boundary with an exact host checkpoint.
+        self.enable_partial_hash_hits = (
+            dcp_world_size == 1 or self.enable_dcp_fine_prefix
+        ) and any(
             isinstance(g.kv_cache_spec, MambaSpec)
             and g.kv_cache_spec.mamba_cache_mode == "align"
             and g.kv_cache_spec.block_size > hash_block_size
@@ -1015,7 +1172,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     # boundaries newest-first and represent a verified hit with
                     # positional nulls. Allocation later creates one live slot.
                     checkpoint_block_size = (
-                        spec.block_size * self.dcp_world_size * self.pcp_world_size
+                        self.hash_block_size
+                        if self.enable_dcp_fine_prefix
+                        else spec.block_size
+                        * self.dcp_world_size
+                        * self.pcp_world_size
                     )
                     _new_hit_length = self.find_gdn_checkpoint_boundary(
                         block_hashes, _max_length, spec
