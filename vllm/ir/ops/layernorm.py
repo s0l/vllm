@@ -23,10 +23,14 @@ def rms_norm(
 
 @rms_norm.register_input_generator
 def _rms_norm_input_generator(
-    num_tokens: int, hidden_size: int, dtype: torch.dtype, epsilon: float = 1e-5
+    num_tokens: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    epsilon: float = 1e-5,
+    device: torch.device | str | None = None,
 ) -> tuple:
-    x = torch.randn(num_tokens, hidden_size, dtype=dtype)
-    weight = torch.randn(hidden_size, dtype=dtype)
+    x = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
+    weight = torch.randn(hidden_size, dtype=dtype, device=device)
     return x, weight, epsilon
 
 
@@ -93,9 +97,13 @@ fused_add_rms_norm_output_only.override_tolerance(
 
 @fused_add_rms_norm.register_input_generator
 def _fused_add_rms_norm_input_generator(
-    num_tokens: int, hidden_size: int, dtype: torch.dtype, epsilon: float = 1e-5
+    num_tokens: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    epsilon: float = 1e-5,
+    device: torch.device | str | None = None,
 ) -> tuple:
-    x = torch.randn(num_tokens, hidden_size, dtype=dtype)
-    x_residual = torch.randn(num_tokens, hidden_size, dtype=dtype)
-    weight = torch.randn(hidden_size, dtype=dtype)
+    x = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
+    x_residual = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
+    weight = torch.randn(hidden_size, dtype=dtype, device=device)
     return x, x_residual, weight, epsilon
