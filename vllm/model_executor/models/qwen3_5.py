@@ -24,7 +24,9 @@
 # limitations under the License.
 """Inference-only Qwen3.5 Series compatible with HuggingFace weights."""
 
+import os
 from collections.abc import Iterable
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -34,10 +36,14 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
+    get_tp_group,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.mamba.gdn.head_partition import (
+    make_gdn_head_partition,
+)
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
@@ -98,6 +104,33 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _ag2_layer0_trace_match_row(
+    *,
+    output: str | None,
+    saved_query_lens: set[int],
+    query_len: int,
+    expected_query_lens: set[int],
+    token_ids: list[int],
+    expected_token_id: int,
+    positions: list[int],
+    expected_position: int,
+) -> int | None:
+    if (
+        not output
+        or query_len in saved_query_lens
+        or query_len not in expected_query_lens
+    ):
+        return None
+    matches = [
+        row
+        for row, (token_id, position) in enumerate(
+            zip(token_ids[:query_len], positions[:query_len])
+        )
+        if token_id == expected_token_id and position == expected_position
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
@@ -195,6 +228,55 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                     config.hidden_size,
                 ),
             )
+        trace_layer = int(os.environ.get("AG2_VLLM_LAYER_TRACE_LAYER", "0"))
+        self._ag2_layer0_trace_enabled = (
+            bool(os.environ.get("AG2_VLLM_LAYER0_TRACE_OUTPUT"))
+            and self.layer_idx == trace_layer
+        )
+        self._ag2_aux_attention_boundary_enabled = (
+            os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_ATTENTION_BOUNDARY", "0")
+            == "1"
+            and self.layer_idx
+            == int(
+                os.environ.get(
+                    "AG2_VLLM_AUX_HIDDEN_TRACE_ATTENTION_BOUNDARY_LAYER", "0"
+                )
+            )
+        )
+        self._ag2_aux_gdn_boundaries_enabled = (
+            os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_GDN_BOUNDARIES", "0")
+            == "1"
+            and self.layer_idx
+            == int(
+                os.environ.get(
+                    "AG2_VLLM_AUX_HIDDEN_TRACE_GDN_BOUNDARY_LAYER",
+                    "0",
+                )
+            )
+            and self.layer_type == "linear_attention"
+        )
+        if self._ag2_layer0_trace_enabled:
+            self.register_buffer(
+                "_ag2_trace_positions",
+                torch.full((3,), -1, dtype=torch.long),
+                persistent=False,
+            )
+            for name in (
+                "input",
+                "input_norm",
+                "attention_output",
+                "post_attention_norm",
+                "post_attention_residual",
+                "mlp_output",
+            ):
+                self.register_buffer(
+                    f"_ag2_trace_{name}",
+                    torch.zeros(
+                        (3, config.hidden_size),
+                        dtype=vllm_config.model_config.dtype,
+                    ),
+                    persistent=False,
+                )
 
 
 @support_torch_compile(
@@ -355,7 +437,10 @@ class Qwen3_5ForCausalLMBase(
         **kwargs: object,
     ):
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
         )
 
         return hidden_states
@@ -419,13 +504,16 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         # Qwen3.5 does not support multimodal pruning (EVS).
         self.is_multimodal_pruning_enabled = False
 
-        with self._mark_tower_model(vllm_config, {"image", "video"}):
-            self.visual = Qwen3_VisionTransformer(
-                config.vision_config,
-                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "visual"),
-            )
+        if multimodal_config.language_model_only:
+            self.visual = None
+        else:
+            with self._mark_tower_model(vllm_config, {"image", "video"}):
+                self.visual = Qwen3_VisionTransformer(
+                    config.vision_config,
+                    norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "visual"),
+                )
 
         with self._mark_language_model(vllm_config):
             self.language_model = Qwen3_5ForCausalLM(
@@ -434,6 +522,250 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
 
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
+        )
+        self._ag2_layer0_trace_output = os.environ.get("AG2_VLLM_LAYER0_TRACE_OUTPUT")
+        self._ag2_layer0_trace_layer = int(
+            os.environ.get("AG2_VLLM_LAYER_TRACE_LAYER", "0")
+        )
+        query_lens_raw = os.environ.get(
+            "AG2_VLLM_LAYER0_TRACE_QUERY_LENS"
+        ) or os.environ.get("AG2_VLLM_LAYER0_TRACE_QUERY_LEN", "")
+        self._ag2_layer0_trace_query_lens = {
+            int(value) for value in query_lens_raw.split(",") if value
+        }
+        self._ag2_layer0_trace_token_id = int(
+            os.environ.get("AG2_VLLM_LAYER0_TRACE_TOKEN_ID", "-1")
+        )
+        self._ag2_layer0_trace_position = int(
+            os.environ.get("AG2_VLLM_LAYER0_TRACE_POSITION", "-1")
+        )
+        self._ag2_layer0_trace_saved_query_lens: set[int] = set()
+        if self._ag2_layer0_trace_output and (
+            not self._ag2_layer0_trace_query_lens
+            or not self._ag2_layer0_trace_query_lens.issubset({1, 3})
+            or self._ag2_layer0_trace_token_id < 0
+            or self._ag2_layer0_trace_position < 0
+        ):
+            raise ValueError(
+                "Layer trace requires query lengths in {1,3}, "
+                "a token id and an absolute position"
+            )
+
+    def maybe_save_ag2_layer0_trace(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        query_len: int,
+        cudagraph_mode: str,
+    ) -> None:
+        output = self._ag2_layer0_trace_output
+        if not output:
+            return
+        position_values = positions[0] if positions.ndim == 2 else positions
+        token_ids = input_ids[:query_len].detach().cpu().tolist()
+        position_ids = position_values[:query_len].detach().cpu().tolist()
+        match_row = _ag2_layer0_trace_match_row(
+            output=output,
+            saved_query_lens=self._ag2_layer0_trace_saved_query_lens,
+            query_len=query_len,
+            expected_query_lens=self._ag2_layer0_trace_query_lens,
+            token_ids=token_ids,
+            expected_token_id=self._ag2_layer0_trace_token_id,
+            positions=position_ids,
+            expected_position=self._ag2_layer0_trace_position,
+        )
+        if match_row is None:
+            return
+
+        layer_idx = self._ag2_layer0_trace_layer
+        layer = self.language_model.model.layers[layer_idx]
+        rank = get_tp_group().rank_in_group
+        path = Path(f"{output}.q{query_len}.rank{rank}.pt")
+        if path.exists():
+            raise RuntimeError(f"Refusing to overwrite layer trace: {path}")
+
+        graph_positions = layer._ag2_trace_positions[:query_len]
+        expected_positions = position_values[:query_len]
+        # CUDA Graph replay is asynchronous with respect to this host-side
+        # diagnostic. Synchronize before reading graph-written buffers.
+        torch.cuda.current_stream().synchronize()
+        graph_marker_matches = torch.equal(graph_positions, expected_positions)
+        if not graph_marker_matches:
+            logger.warning(
+                "Layer trace graph position marker was not replayed: "
+                "graph=%s request=%s. Saving the diagnostic with "
+                "graph_marker_matches=false; host input ids/positions remain "
+                "the trace identity.",
+                graph_positions.detach().cpu().tolist(),
+                expected_positions.detach().cpu().tolist(),
+            )
+
+        stages = {}
+        for name in (
+            "input",
+            "input_norm",
+            "attention_output",
+            "post_attention_norm",
+            "post_attention_residual",
+            "mlp_output",
+        ):
+            stages[f"decoder.{name}"] = (
+                getattr(layer, f"_ag2_trace_{name}")[:query_len].detach().cpu().clone()
+            )
+        trace_metadata = {"layer_idx": layer_idx, "layer_type": layer.layer_type}
+        if layer.layer_type == "linear_attention":
+            linear_attn = layer.linear_attn
+            for name in (
+                "qkvz",
+                "ba",
+                "post_conv_qkv",
+                "core",
+                "z",
+                "gated_norm",
+                "attention_output",
+            ):
+                stages[f"gdn.{name}"] = (
+                    getattr(linear_attn, f"_ag2_trace_{name}")[:query_len]
+                    .detach()
+                    .cpu()
+                    .clone()
+                )
+            stages["gdn.local_attention_output"] = (
+                linear_attn.out_proj._ag2_trace_output_parallel[:query_len]
+                .detach()
+                .cpu()
+                .clone()
+            )
+            stages["gdn.ssm_state"] = (
+                linear_attn._ag2_trace_ssm_state.detach().cpu().clone()
+            )
+            stages["gdn.conv_state"] = (
+                linear_attn._ag2_trace_conv_state.detach().cpu().clone()
+            )
+            stages["gdn.state_indices"] = (
+                linear_attn._ag2_trace_state_indices.detach().cpu().clone()
+            )
+            stages["gdn.num_accepted_tokens"] = (
+                linear_attn._ag2_trace_num_accepted_tokens.detach().cpu().clone()
+            )
+            trace_metadata.update(
+                {
+                    "local_num_k_heads": linear_attn.local_num_k_heads,
+                    "local_num_v_heads": linear_attn.local_num_v_heads,
+                    "padded_local_num_k_heads": (linear_attn.padded_local_num_k_heads),
+                    "padded_local_num_v_heads": (linear_attn.padded_local_num_v_heads),
+                }
+            )
+        elif layer.layer_type == "full_attention":
+            full_attn = layer.self_attn
+            for name in (
+                "qkv",
+                "q",
+                "k",
+                "v",
+                "gate",
+                "core",
+                "gated_output",
+                "attention_output",
+            ):
+                stages[f"full.{name}"] = (
+                    getattr(full_attn, f"_ag2_trace_{name}")[:query_len]
+                    .detach()
+                    .cpu()
+                    .clone()
+                )
+            stages["full.local_attention_output"] = (
+                full_attn.o_proj._ag2_trace_output_parallel[:query_len]
+                .detach()
+                .cpu()
+                .clone()
+            )
+            dcp_trace_names = (
+                (
+                    "decode_local_output",
+                    "decode_local_lse",
+                    "decode_combined_output",
+                    "decode_combined_lse",
+                )
+                if query_len == 1
+                else (
+                    "prefill_context_local_output",
+                    "prefill_context_local_lse",
+                    "prefill_context_combined_output",
+                    "prefill_context_combined_lse",
+                    "prefill_query_output",
+                    "prefill_query_lse",
+                    "prefill_merged_output",
+                )
+            )
+            for name in dcp_trace_names:
+                stages[f"full.dcp.{name}"] = (
+                    getattr(full_attn.attn, f"_ag2_dcp_trace_{name}")[:query_len]
+                    .detach()
+                    .cpu()
+                    .clone()
+                )
+            prefix_end = self._ag2_layer0_trace_position + 1
+            prefix_positions = full_attn._ag2_trace_prefix_positions[:prefix_end]
+            expected_prefix_positions = torch.arange(
+                prefix_end,
+                device=prefix_positions.device,
+                dtype=prefix_positions.dtype,
+            )
+            if not torch.equal(prefix_positions, expected_prefix_positions):
+                raise RuntimeError(
+                    "Full-attention prefix trace is incomplete: "
+                    f"observed={prefix_positions.detach().cpu().tolist()}"
+                )
+            stages["full.prefix_k"] = (
+                full_attn._ag2_trace_prefix_k[:prefix_end].detach().cpu().clone()
+            )
+            stages["full.prefix_v"] = (
+                full_attn._ag2_trace_prefix_v[:prefix_end].detach().cpu().clone()
+            )
+            trace_metadata.update(
+                {
+                    "local_num_heads": full_attn.num_heads,
+                    "local_num_kv_heads": full_attn.num_kv_heads,
+                    "total_num_heads": full_attn.total_num_heads,
+                    "total_num_kv_heads": full_attn.total_num_kv_heads,
+                    "head_dim": full_attn.head_dim,
+                    "scale": full_attn.scaling,
+                    "local_kv_head_indices": tuple(
+                        full_attn.attn_head_partition.kv_head_indices
+                    ),
+                }
+            )
+        else:
+            raise ValueError(f"Unsupported trace layer type {layer.layer_type}")
+
+        torch.save(
+            {
+                "rank": rank,
+                "query_len": query_len,
+                "cudagraph_mode": cudagraph_mode,
+                "input_ids": input_ids[:query_len].detach().cpu().clone(),
+                "positions": position_values[:query_len].detach().cpu().clone(),
+                "graph_positions": graph_positions.detach().cpu().clone(),
+                "graph_marker_matches": graph_marker_matches,
+                "match_row": match_row,
+                "stages": stages,
+                **trace_metadata,
+            },
+            path,
+        )
+        self._ag2_layer0_trace_saved_query_lens.add(query_len)
+        logger.warning(
+            "Saved matched layer-%d phase trace rank=%d qlen=%d row=%d "
+            "token=%d position=%d mode=%s path=%s",
+            layer_idx,
+            rank,
+            query_len,
+            match_row,
+            token_ids[match_row],
+            position_ids[match_row],
+            cudagraph_mode,
+            path,
         )
 
     def embed_input_ids(
@@ -513,9 +845,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        skip_prefixes = ["mtp."]
+        if self.multimodal_config.language_model_only:
+            skip_prefixes.append("visual.")
         loader = AutoWeightsLoader(
             self,
-            skip_prefixes=["mtp."],
+            skip_prefixes=skip_prefixes,
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
@@ -542,6 +877,33 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             if vllm_config.speculative_config
             else 0
         )
+        if (
+            hf_config.linear_num_key_heads % tp_size != 0
+            or hf_config.linear_num_value_heads % tp_size != 0
+        ):
+            partition = make_gdn_head_partition(
+                num_k_heads=hf_config.linear_num_key_heads,
+                num_v_heads=hf_config.linear_num_value_heads,
+                head_k_dim=hf_config.linear_key_head_dim,
+                head_v_dim=hf_config.linear_value_head_dim,
+                tp_size=tp_size,
+                tp_rank=0,
+            )
+            conv_state_shape = MambaStateShapeCalculator._orient_conv_shape(
+                partition.padded_conv_dim,
+                hf_config.linear_conv_kernel_dim - 1 + num_spec,
+            )
+            temporal_state_shape = (
+                partition.max_v_count,
+                hf_config.linear_value_head_dim,
+                hf_config.linear_key_head_dim,
+            )
+            return (
+                conv_state_shape,
+                temporal_state_shape,
+                conv_state_shape,
+                temporal_state_shape,
+            )
         return MambaStateShapeCalculator.gated_delta_net_state_shape(
             tp_size,
             hf_config.linear_num_key_heads,

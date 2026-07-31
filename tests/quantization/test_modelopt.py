@@ -495,6 +495,37 @@ def test_modelopt_nvfp4_config_dispatches_w4a16_method():
     assert config.quant_method == "W4A16_NVFP4"
 
 
+def test_modelopt_nvfp4_env_can_force_w4a4_checkpoint_to_w4a16(monkeypatch):
+    """The research override changes only runtime activation arithmetic.
+
+    W4A4-shaped checkpoints retain their packed weights/scales and are loaded
+    by the W4A16 method, whose compatibility placeholder consumes and discards
+    the otherwise-unused input scale.
+    """
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptNvFp4Config,
+        ModelOptNvFp4W4A16LinearMethod,
+    )
+
+    monkeypatch.setenv("AG2_VLLM_NVFP4_FORCE_W4A16", "1")
+    config = ModelOptNvFp4Config._from_config(
+        quant_method="NVFP4",
+        kv_cache_quant_method=None,
+        exclude_modules=[],
+        original_config={
+            "quantization": {
+                "group_size": 16,
+                "kv_cache_quant_algo": None,
+                "exclude_modules": [],
+            }
+        },
+        group_size=16,
+    )
+
+    assert config.quant_method == "W4A16_NVFP4"
+    assert config.LinearMethodCls is ModelOptNvFp4W4A16LinearMethod
+
+
 @pytest.mark.parametrize(
     "quant_method, expected_use_a16, act_key_is_none",
     [

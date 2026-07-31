@@ -58,8 +58,37 @@ def fused_add_rms_norm(
     return x.to(orig_dtype), x_residual
 
 
+@register_op
+def fused_add_rms_norm_output_only(
+    x: Tensor,
+    x_residual: Tensor,
+    weight: Tensor | None,
+    epsilon: float,
+    variance_size: int | None = None,
+) -> Tensor:
+    """Fused add and RMS normalization when the residual output is dead.
+
+    Keep this expression identical to ``fused_add_rms_norm``. The narrower
+    result contract lets Inductor omit the otherwise unused BF16 residual
+    materialization without donating or aliasing model inputs.
+    """
+    orig_dtype = x.dtype
+    x = x.to(torch.float32)
+    x = x + x_residual.to(torch.float32)
+
+    x_var = x if variance_size is None else x[..., :variance_size]
+    variance = x_var.pow(2).mean(dim=-1, keepdim=True)
+    x = x * torch.rsqrt(variance + epsilon)
+    if weight is not None:
+        x = x.to(weight.dtype) * weight
+    return x.to(orig_dtype)
+
+
 # fused_add_rms_norm has similar rounding error accumulation as rms_norm
 fused_add_rms_norm.override_tolerance(torch.float16, atol=1e-2, rtol=2e-3)
+fused_add_rms_norm_output_only.override_tolerance(
+    torch.float16, atol=1e-2, rtol=2e-3
+)
 
 
 @fused_add_rms_norm.register_input_generator

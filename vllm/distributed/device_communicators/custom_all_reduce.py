@@ -71,6 +71,7 @@ class CustomAllreduce:
         """
         self._IS_CAPTURING = False
         self.disabled = True
+        self._ag2_host_backed = False
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -147,7 +148,15 @@ class CustomAllreduce:
         # this checks hardware and driver support for NVLink
         assert current_platform.is_cuda_alike()
         fully_connected = current_platform.is_fully_connected(physical_device_ids)
-        if world_size > 2 and not fully_connected:
+        from vllm.distributed.device_communicators import ag2_host_shared_buffer
+
+        self._ag2_host_backed = ag2_host_shared_buffer.enabled()
+        if self._ag2_host_backed:
+            logger.info(
+                "AG2 host-backed CustomAllreduce: bypassing the P2P/NVLink "
+                "gate; peer buffers live in pinned host memory."
+            )
+        if world_size > 2 and not fully_connected and not self._ag2_host_backed:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"
                 " more than two PCIe-only GPUs. To silence this warning, "
@@ -158,7 +167,11 @@ class CustomAllreduce:
         # this is expensive to compute at the first time
         # then we cache the result
         # On AMD GPU, p2p is always enabled between XGMI connected GPUs
-        if not current_platform.is_rocm() and not _can_p2p(rank, world_size):
+        if (
+            not current_platform.is_rocm()
+            and not self._ag2_host_backed
+            and not _can_p2p(rank, world_size)
+        ):
             logger.warning(
                 "Custom allreduce is disabled because your platform lacks "
                 "GPU P2P capability or P2P test failed. To silence this "
@@ -170,12 +183,22 @@ class CustomAllreduce:
         # Buffers memory are owned by this Python class and passed to C++.
         # Metadata composes of two parts: metadata for synchronization and a
         # temporary buffer for storing intermediate allreduce results.
-        self.meta_ptrs = self.create_shared_buffer(
-            ops.meta_size() + max_size, group=group, uncached=True
-        )
+        if self._ag2_host_backed:
+            self.meta_ptrs = ag2_host_shared_buffer.create_host_shared_buffer(
+                ops.meta_size() + max_size, world_size, rank, "meta"
+            )
+        else:
+            self.meta_ptrs = self.create_shared_buffer(
+                ops.meta_size() + max_size, group=group, uncached=True
+            )
         # This is a pre-registered IPC buffer. In eager mode, input tensors
         # are first copied into this buffer before allreduce is performed
-        self.buffer_ptrs = self.create_shared_buffer(max_size, group=group)
+        if self._ag2_host_backed:
+            self.buffer_ptrs = ag2_host_shared_buffer.create_host_shared_buffer(
+                max_size, world_size, rank, "data"
+            )
+        else:
+            self.buffer_ptrs = self.create_shared_buffer(max_size, group=group)
         # This is a buffer for storing the tuples of pointers pointing to
         # IPC buffers from all ranks. Each registered tuple has size of
         # 8*world_size bytes where world_size is at most 8. Allocating 8MB
@@ -205,7 +228,7 @@ class CustomAllreduce:
             yield
         finally:
             self._IS_CAPTURING = False
-            if not self.disabled:
+            if not self.disabled and not self._ag2_host_backed:
                 self.register_graph_buffers()
 
     def register_graph_buffers(self):
@@ -268,7 +291,11 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.all_reduce(input, registered=True)
+                # Host-backed peers cannot IPC-register graph-pool addresses;
+                # the staged path is capturable and is the only correct one.
+                return self.all_reduce(
+                    input, registered=not self._ag2_host_backed
+                )
             else:
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.
@@ -284,8 +311,16 @@ class CustomAllreduce:
             if ops is not None:
                 ops.dispose(self._ptr)
             self._ptr = 0
-            self.free_shared_buffer(self.meta_ptrs, rank=self.rank)
-            self.free_shared_buffer(self.buffer_ptrs, rank=self.rank)
+            if getattr(self, "_ag2_host_backed", False):
+                from vllm.distributed.device_communicators import (
+                    ag2_host_shared_buffer,
+                )
+
+                ag2_host_shared_buffer.free_host_shared_buffer("meta")
+                ag2_host_shared_buffer.free_host_shared_buffer("data")
+            else:
+                self.free_shared_buffer(self.meta_ptrs, rank=self.rank)
+                self.free_shared_buffer(self.buffer_ptrs, rank=self.rank)
 
     def __del__(self):
         self.close()

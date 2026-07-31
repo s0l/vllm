@@ -401,6 +401,36 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # Reshape before returning
         return output.movedim(0, dim).contiguous()
 
+    def reduce_scatter_chunked(
+        self, input_: torch.Tensor, dim: int = -1
+    ) -> torch.Tensor:
+        """Reduce dim-1 chunks without a full transposed input allocation."""
+        if dim < 0:
+            dim += input_.dim()
+        pynccl_comm = self.pynccl_comm
+        if (
+            current_platform.is_rocm()
+            or pynccl_comm is None
+            or dim != 1
+            or input_.dim() != 3
+        ):
+            return self.reduce_scatter(input_, dim)
+
+        world_size = self.world_size
+        assert input_.shape[1] % world_size == 0
+        local_heads = input_.shape[1] // world_size
+        output = torch.empty(
+            (input_.shape[0], local_heads, input_.shape[2]),
+            dtype=input_.dtype,
+            device=input_.device,
+        )
+        scratch = torch.empty_like(output)
+        for root in range(world_size):
+            start = root * local_heads
+            scratch.copy_(input_[:, start : start + local_heads, :])
+            pynccl_comm.reduce(output, scratch, root)
+        return output
+
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
     ):

@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+from pathlib import Path
 from typing import Any
 
 import torch
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
@@ -17,17 +21,49 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.spec_decode.autoregressive.ag2_draft_capture import (
+    Ag2DraftCapture,
+)
+from vllm.v1.worker.gpu.spec_decode.autoregressive.ag2_flight_recorder import (
+    Ag2FlightRecorder,
+)
 from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
     SpeculatorCudaGraphManager,
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _resolve_prefill_cudagraph_mode(
+    configured_mode: CUDAGraphMode,
+    attention_support: AttentionCGSupport,
+    query_len: int,
+) -> CUDAGraphMode:
+    """Select a safe graph mode for the first autoregressive draft pass."""
+    if (
+        query_len > 1
+        and attention_support
+        == AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    ):
+        if configured_mode.has_piecewise_cudagraphs():
+            return CUDAGraphMode.PIECEWISE
+        return CUDAGraphMode.NONE
+    return configured_mode
 
 
 class AutoRegressiveSpeculator(DraftModelSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
+        self._ag2_mtp_boundary_saved = False
+        self._ag2_mtp_boundary_path: Path | None = None
+        self._ag2_draft_capture = Ag2DraftCapture.from_env()
+        self._ag2_flight_recorder = (
+            Ag2FlightRecorder.from_env()
+            if get_tensor_model_parallel_rank() == 0
+            else None
+        )
 
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
@@ -59,12 +95,33 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         return True
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        prefill_query_len = self.num_speculative_steps + 1
+        prefill_cudagraph_mode = _resolve_prefill_cudagraph_mode(
+            cudagraph_mode,
+            self.attn_cg_support.min_cg_support,
+            prefill_query_len,
+        )
+        if prefill_cudagraph_mode != cudagraph_mode:
+            logger.info(
+                "Draft prefill query_len=%d will use %s instead of %s "
+                "because %s only supports full CUDA graphs for single-token "
+                "decode.",
+                prefill_query_len,
+                prefill_cudagraph_mode,
+                cudagraph_mode,
+                self.attn_cg_support.min_cg_attn_backend,
+            )
+
         # Initialize cudagraph manager for draft prefill (draft position 0).
         self.prefill_cudagraph_manager = SpeculatorCudaGraphManager(
             self.vllm_config,
             self.device,
-            cudagraph_mode,
-            self.num_speculative_steps + 1,
+            prefill_cudagraph_mode,
+            prefill_query_len,
+            expand_dynamic_decode_query_lens=False,
+            max_uniform_decode_reqs=(
+                self.kv_cache_config.effective_max_resident_seqs or self.max_num_reqs
+            ),
         )
 
         # PIECEWISE cudagraphs are not supported for draft decodes.
@@ -79,6 +136,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             decode_query_len=1,
+            expand_dynamic_decode_query_lens=False,
+            max_uniform_decode_reqs=(
+                self.kv_cache_config.effective_max_resident_seqs or self.max_num_reqs
+            ),
         )
 
     def capture(self) -> None:
@@ -124,6 +185,16 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.kv_cache_config,
             progress_bar_desc="Capturing decode CUDA graphs",
         )
+
+    @torch.inference_mode()
+    def capture_target_lm_head_inputs(
+        self, target_lm_head_hidden_states: torch.Tensor
+    ) -> None:
+        if self._ag2_draft_capture is not None:
+            self._ag2_draft_capture.stage_target_lm_head_inputs(
+                rank=get_tensor_model_parallel_rank(),
+                hidden_states=target_lm_head_hidden_states,
+            )
 
     @torch.inference_mode()
     def propose(
@@ -195,6 +266,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             next_prefill_tokens,
             self.max_num_reqs,
         )
+        self._maybe_save_ag2_mtp_boundary(
+            input_batch=input_batch,
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+            dummy_run=dummy_run,
+        )
 
         # When all requests are decoding (no true prefills), each has
         # num_speculative_steps + 1 tokens, enabling FULL graph replay.
@@ -220,35 +299,44 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Replay the full graph for draft prefill.
             assert self.prefill_cudagraph_manager is not None
-            self.prefill_cudagraph_manager.run_fullgraph(prefill_batch_desc)
+            with record_function_or_nullcontext("ag2.mtp_prefill.full"):
+                self.prefill_cudagraph_manager.run_fullgraph(prefill_batch_desc)
         else:
             # The target model's attention metadata and slot mappings
             # can directly be used for draft prefill, because of the
             # identical batch shape and KV cache layout.
-            self._prefill(
-                num_reqs,
-                prefill_batch_desc.num_tokens,
-                attn_metadata,
-                slot_mappings,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
-                mm_inputs=mm_inputs,
+            scope = (
+                "ag2.mtp_prefill.piecewise"
+                if prefill_batch_desc.cg_mode == CUDAGraphMode.PIECEWISE
+                else "ag2.mtp_prefill.eager"
             )
+            with record_function_or_nullcontext(scope):
+                self._prefill(
+                    num_reqs,
+                    prefill_batch_desc.num_tokens,
+                    attn_metadata,
+                    slot_mappings,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
+                    mm_inputs=mm_inputs,
+                )
 
         if self.num_speculative_steps == 1:
             # Early exit.
+            self._maybe_append_ag2_mtp_drafts(num_reqs)
             return self.draft_tokens[:num_reqs, :1]
 
         # Prepare the inputs for the decode steps.
-        prepare_decode_inputs(
-            self.draft_tokens[:num_reqs, 0],
-            input_batch.seq_lens,
-            num_rejected,
-            self.input_buffers,
-            self.max_model_len,
-            self.max_num_reqs,
-            advance_draft_positions=self.advance_draft_positions,
-        )
+        with record_function_or_nullcontext("ag2.mtp_prepare_decode"):
+            prepare_decode_inputs(
+                self.draft_tokens[:num_reqs, 0],
+                input_batch.seq_lens,
+                num_rejected,
+                self.input_buffers,
+                self.max_model_len,
+                self.max_num_reqs,
+                advance_draft_positions=self.advance_draft_positions,
+            )
 
         # Each request produces exactly 1 token per draft generation step,
         # enabling FULL graph replay.
@@ -263,15 +351,129 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
         # Generate the remaining num_speculative_steps - 1 draft tokens.
-        self._multi_step_decode(
+        scope = (
+            "ag2.mtp_decode.full"
+            if decode_batch_desc.cg_mode == CUDAGraphMode.FULL
+            else "ag2.mtp_decode.eager"
+        )
+        with record_function_or_nullcontext(scope):
+            self._multi_step_decode(
+                num_reqs,
+                dummy_run and skip_attn_for_dummy_run,
+                decode_batch_desc,
+                num_tokens_across_dp,
+                input_batch.seq_lens_cpu_upper_bound,
+            )
+
+        self._maybe_append_ag2_mtp_drafts(num_reqs)
+        if self._ag2_flight_recorder is not None and not dummy_run:
+            self._ag2_flight_recorder.record(
+                num_reqs=num_reqs,
+                draft_tokens=self.draft_tokens,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+                last_sampled=last_sampled,
+                idx_mapping=self.idx_mapping,
+            )
+        if self._ag2_draft_capture is not None and not dummy_run:
+            self._ag2_draft_capture.collect(
+                rank=get_tensor_model_parallel_rank(),
+                num_reqs=num_reqs,
+                draft_logits=self.draft_logits,
+                draft_tokens=self.draft_tokens,
+                hidden_states=self.hidden_states,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+                last_sampled=last_sampled,
+                next_prefill_tokens=next_prefill_tokens,
+                idx_mapping=self.idx_mapping,
+            )
+        return self.draft_tokens[:num_reqs]
+
+    def _maybe_save_ag2_mtp_boundary(
+        self,
+        *,
+        input_batch: InputBatch,
+        num_tokens: int,
+        num_reqs: int,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        dummy_run: bool,
+    ) -> None:
+        """Save the exact first MTP inputs once for offline reference replay."""
+        output = os.environ.get("AG2_VLLM_MTP_BOUNDARY_OUTPUT")
+        if not output or dummy_run or self._ag2_mtp_boundary_saved:
+            return
+
+        rank = get_tensor_model_parallel_rank()
+        path = Path(f"{output}.rank{rank}.pt")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema": 1,
+            "rank": rank,
+            "num_speculative_steps": self.num_speculative_steps,
+            "num_tokens": num_tokens,
+            "num_reqs": num_reqs,
+            "target_input_ids": input_batch.input_ids[:num_tokens]
+            .detach()
+            .cpu(),
+            "target_positions": input_batch.positions[:num_tokens]
+            .detach()
+            .cpu(),
+            "target_query_start_loc": input_batch.query_start_loc[
+                : num_reqs + 1
+            ]
+            .detach()
+            .cpu(),
+            "target_seq_lens": input_batch.seq_lens[:num_reqs]
+            .detach()
+            .cpu(),
+            "target_hidden_states": self.hidden_states[:num_tokens]
+            .detach()
+            .cpu(),
+            "mtp_input_ids": self.input_buffers.input_ids[:num_tokens]
+            .detach()
+            .cpu(),
+            "mtp_positions": self.input_buffers.positions[:num_tokens]
+            .detach()
+            .cpu(),
+            "mtp_query_start_loc": self.input_buffers.query_start_loc[
+                : num_reqs + 1
+            ]
+            .detach()
+            .cpu(),
+            "mtp_seq_lens": self.input_buffers.seq_lens[:num_reqs]
+            .detach()
+            .cpu(),
+            "last_token_indices": self.last_token_indices[:num_reqs]
+            .detach()
+            .cpu(),
+            "num_sampled": num_sampled[:num_reqs].detach().cpu(),
+            "num_rejected": num_rejected[:num_reqs].detach().cpu(),
+        }
+        torch.save(payload, path)
+        self._ag2_mtp_boundary_saved = True
+        self._ag2_mtp_boundary_path = path
+        logger.warning(
+            "Saved one-shot MTP consumed-input boundary rank=%d path=%s "
+            "tokens=%d requests=%d K=%d",
+            rank,
+            path,
+            num_tokens,
             num_reqs,
-            dummy_run and skip_attn_for_dummy_run,
-            decode_batch_desc,
-            num_tokens_across_dp,
-            input_batch.seq_lens_cpu_upper_bound,
+            self.num_speculative_steps,
         )
 
-        return self.draft_tokens[:num_reqs]
+    def _maybe_append_ag2_mtp_drafts(self, num_reqs: int) -> None:
+        path = self._ag2_mtp_boundary_path
+        if path is None:
+            return
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        payload["runtime_draft_tokens"] = self.draft_tokens[
+            :num_reqs, : self.num_speculative_steps
+        ].detach().cpu()
+        torch.save(payload, path)
+        self._ag2_mtp_boundary_path = None
 
     @torch.inference_mode()
     def _run_model(

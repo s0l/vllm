@@ -530,6 +530,36 @@ class Attention(nn.Module, AttentionLayerBase):
             output_shape = torch.Size((num_tokens, self.num_heads * self.head_size_v))
         output = torch.empty(output_shape, dtype=output_dtype, device=query.device)
         hidden_size = output_shape[-1]
+        dcp_output_pack = None
+        dcp_lse_pack = None
+        if getattr(self, "_ag2_aux_dcp_pack_enabled", False):
+            if self.impl.dcp_world_size <= 1:
+                raise RuntimeError("DCP auxiliary pack requires DCP world size > 1")
+            # The diagnostic records only row zero. Unlike registered trace
+            # buffers, these tensors are explicit mutated arguments and model
+            # outputs, so compile/CUDA Graph replay cannot hide stale side
+            # effects. Layout:
+            # output = local | combined | query | merged
+            # lse    = local | combined | query
+            total_heads = self.num_heads * self.impl.dcp_world_size
+            output_pack_width = (
+                total_heads + 3 * self.num_heads
+            ) * self.head_size_v
+            lse_pack_width = total_heads + 2 * self.num_heads
+            dcp_output_pack = torch.full(
+                (1, output_pack_width),
+                torch.nan,
+                dtype=output_dtype,
+                device=query.device,
+            )
+            dcp_lse_pack = torch.full(
+                (1, lse_pack_width),
+                torch.nan,
+                dtype=torch.float32,
+                device=query.device,
+            )
+            self._ag2_aux_dcp_output_pack = dcp_output_pack
+            self._ag2_aux_dcp_lse_pack = dcp_lse_pack
         # Reshape the query, key, and value tensors.
         # NOTE(woosuk): We do this outside the custom op to minimize the
         # CPU overheads from the non-CUDA-graph regions.
@@ -558,6 +588,8 @@ class Attention(nn.Module, AttentionLayerBase):
                 output,
                 self.layer_name,
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
+                dcp_output_pack=dcp_output_pack,
+                dcp_lse_pack=dcp_lse_pack,
             )
         else:
             # Skip this if sharing KV cache with an earlier attention layer.
@@ -578,6 +610,8 @@ class Attention(nn.Module, AttentionLayerBase):
                 output,
                 encoded,
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
+                dcp_output_pack=dcp_output_pack,
+                dcp_lse_pack=dcp_lse_pack,
             )
         return output.view(-1, hidden_size)
 
@@ -824,6 +858,8 @@ def unified_attention_with_output(
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
     kv_cache_dummy_dep: torch.Tensor | None = None,
+    dcp_output_pack: torch.Tensor | None = None,
+    dcp_lse_pack: torch.Tensor | None = None,
 ) -> None:
     # kv_cache_dummy_dep is not used but accepting it creates a data dependency
     # that ensures torch.compile preserves ordering between KV cache update and
@@ -832,6 +868,18 @@ def unified_attention_with_output(
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
 
+    forward_kwargs = {
+        "output": output,
+        "output_scale": output_scale,
+        "output_block_scale": output_block_scale,
+    }
+    if dcp_output_pack is not None or dcp_lse_pack is not None:
+        if dcp_output_pack is None or dcp_lse_pack is None:
+            raise RuntimeError("DCP auxiliary output and LSE packs must be paired")
+        forward_kwargs.update(
+            dcp_output_pack=dcp_output_pack,
+            dcp_lse_pack=dcp_lse_pack,
+        )
     self.impl.forward(
         self,
         query,
@@ -839,9 +887,7 @@ def unified_attention_with_output(
         value,
         kv_cache,
         attn_metadata,
-        output=output,
-        output_scale=output_scale,
-        output_block_scale=output_block_scale,
+        **forward_kwargs,
     )
 
 
@@ -854,6 +900,8 @@ def unified_attention_with_output_fake(
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
     kv_cache_dummy_dep: torch.Tensor | None = None,
+    dcp_output_pack: torch.Tensor | None = None,
+    dcp_lse_pack: torch.Tensor | None = None,
 ) -> None:
     return
 
@@ -861,6 +909,11 @@ def unified_attention_with_output_fake(
 direct_register_custom_op(
     op_name="unified_attention_with_output",
     op_func=unified_attention_with_output,
-    mutates_args=["output", "output_block_scale"],
+    mutates_args=[
+        "output",
+        "output_block_scale",
+        "dcp_output_pack",
+        "dcp_lse_pack",
+    ],
     fake_impl=unified_attention_with_output_fake,
 )

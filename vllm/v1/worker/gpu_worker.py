@@ -831,6 +831,15 @@ class Worker(WorkerBase):
         # gate so subsequent `execute_model` / `sample_tokens` calls enforce it.
         enable_gpu_sync_check()
 
+        from vllm.distributed.parallel_state import set_tp3_ce_runtime_enabled
+
+        set_tp3_ce_runtime_enabled(
+            bool(
+                self.vllm_config.additional_config
+                and self.vllm_config.additional_config.get("tp3_ce_reduce", False)
+            )
+        )
+
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
@@ -1145,6 +1154,10 @@ class Worker(WorkerBase):
                 logger.warning("Profiler was not started, nothing to stop.")
                 return
             self.profiler.stop()
+            # torch.profiler.profile instances cannot be restarted after
+            # stop(). Release the wrapper so the next start_profile request
+            # creates a fresh profiler and trace handler.
+            self.profiler = None
 
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)

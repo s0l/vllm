@@ -305,7 +305,13 @@ class EngineCore:
         if max_model_len_after != max_model_len_before:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
 
-        scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+        scheduler_kv_cache_config = generate_scheduler_kv_cache_config(
+            kv_cache_configs,
+            configured_max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
+            enable_auto_resident_cap=(
+                os.environ.get("AG2_VLLM_ELASTIC_AUTO_RESIDENT_CAP", "0") == "1"
+            ),
+        )
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
         if kv_cache_groups:

@@ -33,6 +33,7 @@ def chunk_gated_delta_rule_fwd(
     chunk_indices: torch.Tensor | None = None,
     chunk_offsets: torch.Tensor | None = None,
     core_attn_out: torch.Tensor | None = None,
+    value_out: torch.Tensor | None = None,
 ):
     g = chunk_local_cumsum(
         g, chunk_size=FLA_CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -58,6 +59,15 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
+    # A is consumed only by recompute_w_u_fwd. The inference caller does not
+    # use the saved training intermediates, so release A before allocating the
+    # per-chunk recurrent states. Same-stream allocator reuse is ordered after
+    # the queued recompute kernel and avoids keeping both large tensors live.
+    if core_attn_out is not None and SUPPRESS_LEVEL < 3:
+        A_for_return = None
+        del A
+    else:
+        A_for_return = A
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
@@ -68,6 +78,7 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
+        v_new_out=value_out,
     )
     o = chunk_fwd_o(
         q=q,
@@ -81,9 +92,9 @@ def chunk_gated_delta_rule_fwd(
         core_attn_out=core_attn_out,
     )
     if SUPPRESS_LEVEL < 3:
-        return g, o, A, final_state, None, None, None
+        return g, o, A_for_return, final_state, None, None, None
     elif SUPPRESS_LEVEL >= 3:
-        return g, o, A, final_state, w, h, v_new
+        return g, o, A_for_return, final_state, w, h, v_new
 
 
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
@@ -105,6 +116,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = False,
         core_attn_out: torch.Tensor | None = None,
+        value_out: torch.Tensor | None = None,
     ):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
@@ -123,13 +135,15 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
             core_attn_out=core_attn_out,
+            value_out=value_out,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
-        if core_attn_out is not None:
+        if core_attn_out is not None or value_out is not None:
             assert not torch.is_grad_enabled(), (
-                "core_attn_out buffer reuse is only supported for inference"
+                "output buffer reuse is only supported for inference"
             )
+        if core_attn_out is not None:
             assert q.dtype == o.dtype, "Incompatible dtype for inplace computation"
         return o.to(q.dtype), final_state
 
@@ -149,6 +163,7 @@ def chunk_gated_delta_rule(
     chunk_offsets: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     core_attn_out: torch.Tensor | None = None,
+    value_out: torch.Tensor | None = None,
 ):
     r"""
     Args:
@@ -214,6 +229,14 @@ def chunk_gated_delta_rule(
         "ChunkGatedDeltaRuleFunction does not support float32. Please use bfloat16."
     )
     assert len(beta.shape) == 3, "beta must be of shape [B, T, H]."
+    if value_out is not None:
+        assert not torch.is_grad_enabled(), (
+            "value_out buffer reuse is only supported for inference"
+        )
+        assert value_out.shape == v.shape
+        assert value_out.dtype == v.dtype
+        assert value_out.device == v.device
+        assert value_out.is_contiguous()
     if cu_seqlens is not None:
         if q.shape[0] != 1:
             raise ValueError(
@@ -241,5 +264,6 @@ def chunk_gated_delta_rule(
         chunk_offsets,
         use_qk_l2norm_in_kernel,
         core_attn_out,
+        value_out,
     )
     return o, final_state

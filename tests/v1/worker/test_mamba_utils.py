@@ -2133,13 +2133,14 @@ class TestPostprocessMambaFusedKernel:
             msg="num_accepted_tokens mismatch at accept_token_bias=2",
         )
 
+    @pytest.mark.parametrize("conv_inner_dim", [64, 5120])
     def test_ds_conv_layout_bias_gt_0_byte_equal_to_sd(
-        self, device, test_config, monkeypatch
+        self, device, conv_inner_dim, monkeypatch
     ):
         """DS conv postprocess should match SD when accept_token_bias > 0."""
         from vllm.model_executor.layers.mamba import mamba_utils as model_mamba_utils
 
-        cfg = test_config
+        cfg = _TestConfig(conv_inner_dim=conv_inner_dim)
         torch.manual_seed(38898)
 
         req_ids = ["req_0"]

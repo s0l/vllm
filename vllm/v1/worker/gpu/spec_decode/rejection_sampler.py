@@ -99,8 +99,13 @@ class RejectionSampler:
         cu_num_logits: torch.Tensor,
         cu_num_logits_np: np.ndarray,
         max_num_logprobs: int,
+        expanded_idx_mapping: torch.Tensor,
+        idx_mapping_np: np.ndarray,
     ) -> LogprobsTensors | None:
-        if max_num_logprobs == NO_LOGPROBS:
+        max_per_req_token_ids = (
+            self.sampler.logprob_token_ids_state.max_num_token_ids(idx_mapping_np)
+        )
+        if max_num_logprobs == NO_LOGPROBS and max_per_req_token_ids == 0:
             return None
 
         num_reqs = cu_num_logits.shape[0] - 1
@@ -119,9 +124,12 @@ class RejectionSampler:
         expanded_logits = num_logits != num_reqs
         return compute_topk_scores(
             logits,
-            max_num_logprobs,
+            max_num_logprobs if max_num_logprobs != NO_LOGPROBS else 0,
             flat_sampled,
             cu_num_logits_np.tolist() if expanded_logits else None,
+            logprob_token_ids_state=self.sampler.logprob_token_ids_state,
+            expanded_idx_mapping=expanded_idx_mapping,
+            max_per_req_token_ids=max_per_req_token_ids,
             logits_mode=self.sampler.logprobs_mode
             in ("raw_logits", "processed_logits"),
         )
@@ -144,6 +152,12 @@ class RejectionSampler:
             idx_mapping_np,
             pos,
             draft_sampled,
+            expanded_local_pos,
+        )
+        self.sampler.thinking_budget_state.apply_to_logits(
+            processed_logits,
+            draft_sampled,
+            expanded_idx_mapping,
             expanded_local_pos,
         )
         sampled, num_sampled = rejection_sample(
@@ -204,6 +218,8 @@ class RejectionSampler:
                 chunk_cu_num_logits,
                 chunk_cu_num_logits_np,
                 max_num_logprobs,
+                input_batch.expanded_idx_mapping[lo:hi],
+                input_batch.idx_mapping_np[start:end],
             )
             if chunk_logprobs is not None:
                 logprobs_chunks.append(chunk_logprobs)

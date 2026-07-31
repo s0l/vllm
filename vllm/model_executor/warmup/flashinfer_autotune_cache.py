@@ -7,7 +7,7 @@ import os
 import tempfile
 from contextlib import suppress
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import vllm.envs as envs
 from vllm.compilation.caching import aot_compile_hash_factors
@@ -54,3 +54,30 @@ def write_flashinfer_autotune_cache(cache_path: Path, contents: bytes) -> None:
         with suppress(OSError):
             os.unlink(tmp_path)
         raise
+
+
+def synchronize_flashinfer_autotune_cache(
+    *,
+    cache_path: Path,
+    world: Any,
+    tuner: Any,
+    save_leader: bool,
+) -> bool:
+    """Replace rank-local tuning results with rank 0's serialized choices."""
+    is_leader = world.rank_in_group == 0
+    if is_leader and save_leader:
+        tuner.save_configs(str(cache_path))
+
+    tune_results = (
+        cache_path.read_bytes() if is_leader and cache_path.exists() else None
+    )
+    tune_results = world.broadcast_object(tune_results, src=0)
+    if tune_results is None:
+        return False
+
+    write_flashinfer_autotune_cache(cache_path, tune_results)
+    world.barrier()
+    tuner.clear_cache()
+    if not tuner.load_configs(str(cache_path)):
+        raise RuntimeError("Failed to load synchronized FlashInfer autotune configs")
+    return True

@@ -62,6 +62,12 @@ class AttentionBackend(ABC):
         "float16",
         "bfloat16",
     ]
+    # Whether this backend implements the special DCP layout where every rank
+    # stores all global KV heads and selects the rank-local GQA mapping only
+    # for the new-token attention path. This is stricter than generic DCP
+    # support: a backend must opt in after implementing both context combine
+    # and local KV-head selection.
+    supports_dcp_full_kv_attention_heads: ClassVar[bool] = False
 
     # Does attention's forward() include kv cache update?
     forward_includes_kv_cache_update: bool = True
@@ -460,6 +466,12 @@ class CommonAttentionMetadata:
     """(batch_size,) bool tensor: True if request is still in prefill phase
     (num_computed_tokens < num_prompt_tokens). Used by some backends to
     distinguish actual decodes from short extends."""
+
+    num_decode_draft_tokens_cpu: torch.Tensor | None = None
+    """(batch_size,) number of valid speculative draft tokens for each decode
+    row, or -1 for rows that are not exact speculative-decode verification.
+    This is a semantic execution marker; a matching physical query length alone
+    does not imply that a row belongs to the speculative-decode path."""
 
     seq_lens_cpu_upper_bound: torch.Tensor | None = None
     """(batch_size,) CPU upper bound on seq_lens. Precise for prefill rows

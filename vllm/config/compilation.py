@@ -1530,7 +1530,6 @@ class CompilationConfig:
                 if round_up(size, multiple_of) <= self.max_cudagraph_capture_size
             )
         )
-
         if len(rounded_sizes) == 0 and multiple_of <= self.max_cudagraph_capture_size:
             # if one valid but would be round_down use that
             rounded_sizes = [multiple_of]

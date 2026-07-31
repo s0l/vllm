@@ -259,6 +259,20 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # Explicit phase contract for target-model collectives. True only when all
+    # scheduled rows are ordinary autoregressive decode rows (including prior
+    # draft positions), never for prefill, replay or mixed batches.
+    is_pure_decode_step: bool = False
+
+    # Experimental separate-pool GDN prefix checkpoint commands. Keys are the
+    # exact chained content hashes of scheduler-block boundaries. Workers save
+    # after a successful forward and restore before preprocess_mamba.
+    gdn_checkpoint_save: dict[str, bytes] | None = None
+    gdn_checkpoint_restore: dict[str, bytes] | None = None
+
+    # Physical mapped-prefix sizes for (attention, GDN) stable-VA arenas.
+    elastic_kv_transition: tuple[int, int] | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

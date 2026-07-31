@@ -14,11 +14,19 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .op import exp, exp2
-from .utils import FLA_CHUNK_SIZE, use_cuda_graph
+from .utils import FLA_CHUNK_SIZE, use_blackwell_safe_gdn, use_cuda_graph
 
 NUM_WARPS = [2, 4, 8, 16]
 # Triton's AMD backend fails to lower this kernel with num_stages=4.
-_CHUNK_DELTA_H_NUM_STAGES = [2, 3] if torch.version.hip else [2, 3, 4]
+_CHUNK_DELTA_H_WARP_STAGE_CONFIGS = (
+    [(2, 2), (2, 3)]
+    if use_blackwell_safe_gdn
+    else [
+        (num_warps, num_stages)
+        for num_warps in (2, 4)
+        for num_stages in ([2, 3] if torch.version.hip else [2, 3, 4])
+    ]
+)
 
 
 @triton.heuristics(
@@ -34,8 +42,7 @@ _CHUNK_DELTA_H_NUM_STAGES = [2, 3] if torch.version.hip else [2, 3, 4]
 @triton.autotune(
     configs=[
         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in _CHUNK_DELTA_H_NUM_STAGES
+        for num_warps, num_stages in _CHUNK_DELTA_H_WARP_STAGE_CONFIGS
         for BV in [32, 64]
     ],
     key=["H", "K", "V", "BT"],
@@ -331,7 +338,8 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_indices: torch.Tensor | None = None,
     chunk_offsets: torch.Tensor | None = None,
     use_exp2: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    v_new_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     # This kernel is slightly different from fla to support Q/K with different head numbers.
     # In fla, Q/K always have the same head number, so Hg is always equal to H.
     B, T, Hg, K, V = *k.shape, u.shape[-1]
@@ -354,7 +362,19 @@ def chunk_gated_delta_rule_fwd_h(
         k.new_empty(N, H, V, K, dtype=torch.float32) if output_final_state else None
     )
 
-    v_new = torch.empty_like(u) if save_new_value else None
+    if v_new_out is not None:
+        assert save_new_value, "v_new_out requires save_new_value=True"
+        assert v_new_out.shape == u.shape
+        assert v_new_out.dtype == u.dtype
+        assert v_new_out.device == u.device
+        assert v_new_out.is_contiguous()
+    v_new = (
+        v_new_out
+        if v_new_out is not None
+        else torch.empty_like(u)
+        if save_new_value
+        else None
+    )
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
