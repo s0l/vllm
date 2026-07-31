@@ -159,8 +159,83 @@ def run_case(num_requests: int) -> dict[str, int | bool]:
     }
 
 
+@torch.inference_mode()
+def run_replay_conv_case(num_requests: int) -> dict[str, int | bool]:
+    """Replay topology: one physical block, shift conv only, keep SSM intact."""
+    torch.manual_seed(20260730 + num_requests)
+    device = torch.device("cuda:0")
+    num_blocks = 1 + num_requests
+    block_table = torch.arange(
+        1, num_blocks, dtype=torch.int32, device=device
+    ).view(num_requests, 1)
+    conv = torch.randn(
+        num_blocks,
+        CONV_WIDTH,
+        CONV_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    temporal = torch.randn(
+        num_blocks,
+        *TEMPORAL_SHAPE,
+        dtype=torch.float32,
+        device=device,
+    )
+    original_conv = conv.clone()
+    original_temporal = temporal.clone()
+    expected_conv = conv.clone()
+    idx_mapping = torch.arange(
+        num_requests - 1, -1, -1, dtype=torch.int32, device=device
+    )
+    accepted = (
+        torch.arange(MAX_REQUESTS, dtype=torch.int32, device=device) + 2
+    ) % 3 + 1
+    for batch_index in range(num_requests):
+        slot = int(idx_mapping[batch_index].item())
+        accept_bias = int(accepted[slot].item()) - 1
+        if accept_bias == 0:
+            continue
+        block_id = int(block_table[batch_index, 0].item())
+        expected_conv[block_id, : CONV_WIDTH - accept_bias] = original_conv[
+            block_id, accept_bias:
+        ]
+
+    context = _context(conv, temporal, block_table)
+    context.run_fused_postprocess_separate(
+        num_requests,
+        accepted,
+        idx_mapping,
+        conv_only=True,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
+    torch.testing.assert_close(temporal, original_temporal, rtol=0, atol=0)
+    torch.testing.assert_close(
+        accepted[:num_requests],
+        torch.ones(num_requests, dtype=torch.int32, device=device),
+        rtol=0,
+        atol=0,
+    )
+    return {
+        "requests": num_requests,
+        "conv_bit_exact": bool(torch.equal(conv, expected_conv)),
+        "temporal_untouched": bool(torch.equal(temporal, original_temporal)),
+        "accepted_reset_exact": bool(
+            torch.equal(
+                accepted[:num_requests],
+                torch.ones(num_requests, dtype=torch.int32, device=device),
+            )
+        ),
+    }
+
+
 def main() -> None:
-    result = {"x1": run_case(1), "max_x": run_case(MAX_REQUESTS)}
+    result = {
+        "legacy_x1": run_case(1),
+        "legacy_max_x": run_case(MAX_REQUESTS),
+        "replay_x1": run_replay_conv_case(1),
+        "replay_max_x": run_replay_conv_case(MAX_REQUESTS),
+    }
     print(json.dumps({"result": "pass", **result}))
 
 

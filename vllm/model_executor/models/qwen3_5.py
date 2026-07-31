@@ -246,7 +246,13 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         self._ag2_aux_gdn_boundaries_enabled = (
             os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_GDN_BOUNDARIES", "0")
             == "1"
-            and self.layer_idx == 0
+            and self.layer_idx
+            == int(
+                os.environ.get(
+                    "AG2_VLLM_AUX_HIDDEN_TRACE_GDN_BOUNDARY_LAYER",
+                    "0",
+                )
+            )
             and self.layer_type == "linear_attention"
         )
         if self._ag2_layer0_trace_enabled:
@@ -431,7 +437,10 @@ class Qwen3_5ForCausalLMBase(
         **kwargs: object,
     ):
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
         )
 
         return hidden_states

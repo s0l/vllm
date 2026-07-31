@@ -1349,14 +1349,31 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )
         self._decode_wrapper = None  # Wrapper for decode (general shape)
 
+        prefill_batch_invariant = envs.VLLM_BATCH_INVARIANT or (
+            os.environ.get(
+                "AG2_VLLM_FLASHINFER_PREFILL_BATCH_INVARIANT",
+                "0",
+            )
+            == "1"
+        )
         if envs.VLLM_BATCH_INVARIANT:
             self.decode_fixed_split_size = 2048
-            self.prefill_fixed_split_size = 4096
-            self.disable_split_kv = True
+            self.decode_disable_split_kv = True
         else:
             self.decode_fixed_split_size = -1
+            self.decode_disable_split_kv = False
+        if prefill_batch_invariant:
+            self.prefill_fixed_split_size = 4096
+            self.prefill_disable_split_kv = True
+            if not envs.VLLM_BATCH_INVARIANT:
+                logger.warning_once(
+                    "Research POC: FlashInfer prefill-only batch-invariant "
+                    "planning is enabled (fixed_split_size=4096, "
+                    "disable_split_kv=True); decode and GDN are unchanged."
+                )
+        else:
             self.prefill_fixed_split_size = -1
-            self.disable_split_kv = False
+            self.prefill_disable_split_kv = False
 
         self.compilation_config = vllm_config.compilation_config
         self.max_num_batched_tokens = (
@@ -2667,7 +2684,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         q_data_type=self.q_data_type_prefill,
                         kv_cache_dtype=self.kv_cache_dtype,
                         prefill_fixed_split_size=self.prefill_fixed_split_size,
-                        disable_split_kv=self.disable_split_kv,
+                        disable_split_kv=self.prefill_disable_split_kv,
                     )
                 else:
                     assert isinstance(
@@ -2697,7 +2714,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         kv_data_type=self.kv_cache_dtype,
                         o_data_type=o_dtype,
                         fixed_split_size=self.prefill_fixed_split_size,
-                        disable_split_kv=self.disable_split_kv,
+                        disable_split_kv=self.prefill_disable_split_kv,
                     )
                 attn_metadata.prefill = FIPrefill(
                     wrapper=prefill_wrapper,
@@ -2766,7 +2783,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     kv_data_type=self.kv_cache_dtype,
                     o_data_type=o_dtype,
                     fixed_split_size=self.decode_fixed_split_size,
-                    disable_split_kv=self.disable_split_kv,
+                    disable_split_kv=self.decode_disable_split_kv,
                 )
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
         return attn_metadata

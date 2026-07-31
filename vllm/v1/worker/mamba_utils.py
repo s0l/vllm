@@ -462,6 +462,7 @@ def postprocess_mamba_fused_kernel(
     # the post-step new_num_computed value (V2 supplies the advanced count).
     PRECOMPUTED_NEW_COMPUTED: tl.constexpr = False,
     SEPARATE_POOL: tl.constexpr = False,
+    CONV_ONLY: tl.constexpr = False,
 ):
     """
     Fused GPU kernel for postprocess_mamba that computes decisions AND performs
@@ -480,6 +481,8 @@ def postprocess_mamba_fused_kernel(
 
     # Bounds check
     if batch_idx >= num_reqs:
+        return
+    if CONV_ONLY and tl.load(state_conv_widths_ptr + state_idx) == 0:
         return
 
     if HAS_IDX_MAPPING:
@@ -1197,6 +1200,9 @@ class MambaSpecDecodeGPUContext:
         num_reqs: int,
         num_accepted_tokens_gpu: torch.Tensor,
         idx_mapping: torch.Tensor,
+        *,
+        conv_only: bool = False,
+        reset_accepted: bool = True,
     ) -> None:
         """Commit an accepted speculative GDN state into constant column 0."""
         if num_reqs == 0 or not self.is_initialized:
@@ -1231,15 +1237,17 @@ class MambaSpecDecodeGPUContext:
             HAS_IDX_MAPPING=True,
             PRECOMPUTED_NEW_COMPUTED=True,
             SEPARATE_POOL=True,
+            CONV_ONLY=conv_only,
         )
         # This second launch is the grid-wide ordering point. Every state
         # program above must finish reading the accepted count before it is
         # reset for the next model step.
-        _reset_num_accepted_kernel[(num_reqs,)](
-            idx_mapping,
-            num_accepted_tokens_gpu,
-            num_reqs,
-        )
+        if reset_accepted:
+            _reset_num_accepted_kernel[(num_reqs,)](
+                idx_mapping,
+                num_accepted_tokens_gpu,
+                num_reqs,
+            )
 
 
 @dataclasses.dataclass

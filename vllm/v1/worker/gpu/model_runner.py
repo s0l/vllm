@@ -1561,6 +1561,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
+                num_tokens_unpadded=input_batch.num_tokens,
                 tp3_sd_phase_reduce=tp3_sd_phase_reduce,
             ):
                 self.kv_connector.pre_forward(scheduler_output)

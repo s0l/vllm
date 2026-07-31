@@ -127,6 +127,8 @@ _tp3_ce_first_context_logged = False
 _tp3_ce_large_shapes_logged: set[tuple[int, bool]] = set()
 _tp3_ce_first_known_dispatch_logged = False
 _tp3_ce_first_active_dispatch_logged = False
+_tp3_piecewise_device_ce_logged = False
+_tp3_prefill_canonical_logged = False
 
 
 def _register_group(group: "GroupCoordinator") -> None:
@@ -147,6 +149,8 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     global _tp3_ce_first_active_dispatch_logged
     global _tp3_ce_first_context_logged
     global _tp3_ce_first_known_dispatch_logged
+    global _tp3_piecewise_device_ce_logged
+    global _tp3_prefill_canonical_logged
 
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
@@ -160,6 +164,48 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     forward_context = (
         get_forward_context() if is_forward_context_available() else None
     )
+    cudagraph_mode = (
+        forward_context.cudagraph_runtime_mode
+        if forward_context is not None
+        else None
+    )
+    if (
+        os.environ.get("AG2_VLLM_TP3_PIECEWISE_DEVICE_CE", "0") == "1"
+        and _should_use_tp3_piecewise_device_ce(
+            cudagraph_mode=cudagraph_mode,
+            tensor_dim=tensor.dim(),
+            rows=tensor.shape[0] if tensor.dim() == 2 else 0,
+            hidden_size=tensor.shape[-1] if tensor.dim() else 0,
+            tp_world_size=group.world_size,
+        )
+    ):
+        if not _tp3_piecewise_device_ce_logged:
+            logger.warning(
+                "TP3 device-CE reduction active for all PIECEWISE "
+                "all-reduces: shape=%s",
+                tuple(tensor.shape),
+            )
+            _tp3_piecewise_device_ce_logged = True
+        return _tp3_device_ce_reduce(tensor, group)
+    if (
+        os.environ.get("AG2_VLLM_TP3_PREFILL_CANONICAL_REDUCE", "0") == "1"
+        and tensor.dim() == 2
+        and tensor.shape == (2976, 5120)
+        and group.world_size == 3
+    ):
+        if not _tp3_prefill_canonical_logged:
+            logger.warning(
+                "TP3 all-layer prefill canonical reduction control active: "
+                "shape=%s proof_rows=64",
+                tuple(tensor.shape),
+            )
+            _tp3_prefill_canonical_logged = True
+        output = group._all_reduce_out_place(tensor)
+        proof_rows = 64
+        output[:proof_rows].copy_(
+            _tp3_sd_deterministic_reduce(tensor[:proof_rows], group)
+        )
+        return output
     large_shape_key = (
         int(tensor.shape[0]),
         forward_context is not None,
@@ -314,6 +360,104 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
         ):
             return _tp3_sd_canonical_reduce(tensor, group._all_reduce_out_place)
     return group._all_reduce_out_place(tensor)
+
+
+def _should_use_tp3_piecewise_device_ce(
+    *,
+    cudagraph_mode: object | None,
+    tensor_dim: int,
+    rows: int,
+    hidden_size: int,
+    tp_world_size: int,
+) -> bool:
+    """Select graph-capturable compressed reduction for GDN prefill."""
+    return (
+        getattr(cudagraph_mode, "name", None) == "PIECEWISE"
+        and tensor_dim == 2
+        and rows > 0
+        and hidden_size == 5120
+        and tp_world_size == 3
+    )
+
+
+def _tp3_device_ce_reduce(
+    tensor: torch.Tensor,
+    group: "GroupCoordinator",
+) -> torch.Tensor:
+    """Compress per row, all-gather exact payloads, then sum in fixed order."""
+    from .device_communicators.tp3_ce_all_reduce import (
+        _dequant_sum_i8_block,
+        _quantize_i8_block,
+    )
+
+    rows, cols = tensor.shape
+    quant_block = 8192
+    num_blocks = (cols + quant_block - 1) // quant_block
+    q_local = torch.empty((rows, cols), dtype=torch.uint8, device=tensor.device)
+    scale_local = torch.empty(
+        (rows, num_blocks), dtype=torch.float32, device=tensor.device
+    )
+    _quantize_i8_block[(rows, num_blocks)](
+        tensor,
+        q_local,
+        scale_local,
+        cols,
+        quant_block,
+    )
+    q_gathered = group._all_gather_out_place(q_local, 0).view(
+        3,
+        rows,
+        cols,
+    )
+    scale_gathered = group._all_gather_out_place(scale_local, 0).view(
+        3,
+        rows,
+        num_blocks,
+    )
+    output = torch.empty_like(tensor)
+    _dequant_sum_i8_block[(rows, num_blocks)](
+        q_gathered[0],
+        q_gathered[1],
+        q_gathered[2],
+        scale_gathered[0],
+        scale_gathered[1],
+        scale_gathered[2],
+        output,
+        cols,
+        quant_block,
+    )
+    return output
+
+
+def gdn_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    """Use a row-invariant compressed reduction for PIECEWISE GDN."""
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+
+    from vllm.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+
+    forward_context = (
+        get_forward_context() if is_forward_context_available() else None
+    )
+    cudagraph_mode = (
+        forward_context.cudagraph_runtime_mode
+        if forward_context is not None
+        else None
+    )
+    if _should_use_tp3_piecewise_device_ce(
+        cudagraph_mode=cudagraph_mode,
+        tensor_dim=tensor.dim(),
+        rows=tensor.shape[0] if tensor.dim() == 2 else 0,
+        hidden_size=tensor.shape[-1] if tensor.dim() else 0,
+        tp_world_size=group.world_size,
+    ):
+        return _tp3_device_ce_reduce(tensor, group)
+    return all_reduce(tensor, group_name)
 
 
 def _is_tp3_sd_phase_reduce() -> bool:
@@ -631,6 +775,12 @@ def patched_fused_scaled_matmul_reduce_scatter(
 direct_register_custom_op(
     op_name="all_reduce",
     op_func=all_reduce,
+    fake_impl=all_reduce_fake,
+)
+
+direct_register_custom_op(
+    op_name="gdn_all_reduce",
+    op_func=gdn_all_reduce,
     fake_impl=all_reduce_fake,
 )
 

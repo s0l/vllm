@@ -38,6 +38,18 @@ if not is_gather_supported:
 else:
     gather = tl.gather
 
+
+@triton.jit
+def safe_dot(
+    a,
+    b,
+    input_precision: tl.constexpr = None,
+):
+    if input_precision is None:
+        return tl.dot(a, b)
+    return tl.dot(a, b, input_precision=input_precision)
+
+
 if hasattr(triton.language, "_experimental_make_tensor_descriptor"):
     # For Triton 3.3.x
     make_tensor_descriptor = triton.language._experimental_make_tensor_descriptor

@@ -14,6 +14,21 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     return get_tp_group().all_reduce(input_)
 
 
+def tensor_model_parallel_gdn_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """Use the GDN-specific runtime reduction policy."""
+    group = get_tp_group()
+    if group.world_size == 1:
+        return input_
+    if group.use_custom_op_call:
+        return torch.ops.vllm.gdn_all_reduce(
+            input_,
+            group_name=group.unique_name,
+        )
+    from .parallel_state import gdn_all_reduce
+
+    return gdn_all_reduce(input_, group.unique_name)
+
+
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:

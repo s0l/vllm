@@ -98,6 +98,19 @@ class ElasticGDNTopologyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "MTP topology requires"):
             _elastic_gdn_blocks_per_seq(config, 3)
 
+    def test_replay_commit_removes_speculative_state_blocks(self):
+        config = SimpleNamespace(
+            num_speculative_tokens=3,
+            additional_config={
+                "gdn_mtp_replay_commit": True,
+                "elastic_gdn_max_seqs": 64,
+                # A stale pre-replay value must not retain hidden scratch cost.
+                "elastic_gdn_blocks_per_seq": 4,
+            },
+        )
+        self.assertEqual(_elastic_gdn_blocks_per_seq(config, 3), 3)
+        self.assertEqual(_elastic_gdn_pool_blocks(config, 3), 193)
+
 
 class _Store:
     def __init__(self):

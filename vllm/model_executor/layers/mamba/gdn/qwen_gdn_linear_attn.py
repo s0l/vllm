@@ -15,6 +15,7 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
+from vllm.distributed import tensor_model_parallel_gdn_all_reduce
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
@@ -85,6 +86,10 @@ if GDN_AITER_TRITON_AVAILABLE:
     )
 
 logger = init_logger(__name__)
+
+_AG2_GDN_REPLAY_MAX_TOKENS = 128
+_AG2_GDN_REPLAY_MAX_SEQS = 8
+_AG2_GDN_REPLAY_META_ELEMENTS = 512
 
 
 def _resolve_gdn_prefill_backend(
@@ -554,7 +559,77 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._ag2_aux_boundaries_enabled = (
             os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_GDN_BOUNDARIES", "0")
             == "1"
+            and prefix.endswith(
+                ".layers."
+                + os.environ.get(
+                    "AG2_VLLM_AUX_HIDDEN_TRACE_GDN_BOUNDARY_LAYER",
+                    "0",
+                )
+                + ".linear_attn"
+            )
+        )
+        if self._ag2_aux_boundaries_enabled:
+            per_token_elements = (
+                2 * self.local_key_dim
+                + self.local_value_dim
+                + 2 * self.local_num_v_heads
+            )
+            state_elements = (
+                _AG2_GDN_REPLAY_MAX_SEQS
+                * self.padded_local_num_v_heads
+                * self.head_v_dim
+                * self.head_k_dim
+            )
+            self.register_buffer(
+                "_ag2_replay_float_buffer",
+                torch.zeros(
+                    _AG2_GDN_REPLAY_MAX_TOKENS * per_token_elements,
+                    dtype=torch.float32,
+                    device=current_platform.current_device(),
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_ag2_replay_state_buffer",
+                torch.zeros(
+                    state_elements,
+                    dtype=torch.float32,
+                    device=current_platform.current_device(),
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_ag2_replay_meta_buffer",
+                torch.full(
+                    (_AG2_GDN_REPLAY_META_ELEMENTS,),
+                    -1,
+                    dtype=torch.int64,
+                    device=current_platform.current_device(),
+                ),
+                persistent=False,
+            )
+            self._ag2_aux_replay_float = self._ag2_replay_float_buffer
+            self._ag2_aux_replay_state = self._ag2_replay_state_buffer
+            self._ag2_aux_replay_meta = self._ag2_replay_meta_buffer
+        self._ag2_gdn_prefill_batch_invariant_reduce = (
+            os.environ.get(
+                "AG2_VLLM_GDN_PREFILL_BATCH_INVARIANT_REDUCE",
+                "0",
+            )
+            == "1"
+            and reduce_results
+            and self.tp_size == 3
+        )
+        if (
+            self._ag2_gdn_prefill_batch_invariant_reduce
             and prefix.endswith(".layers.0.linear_attn")
+        ):
+            logger.warning(
+                "Enabled experimental TP3 batch-invariant reduction for "
+                "short GDN prefills"
+            )
+        out_proj_reduce_results = (
+            reduce_results and not self._ag2_gdn_prefill_batch_invariant_reduce
         )
 
         if self.gdn_explicit_partition:
@@ -566,7 +641,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 output_size=self.hidden_size,
                 bias=False,
                 input_is_parallel=True,
-                reduce_results=reduce_results,
+                reduce_results=out_proj_reduce_results,
                 quant_config=self.quant_config,
                 prefix=f"{prefix}.out_proj",
             )
@@ -576,7 +651,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.hidden_size,
                 bias=False,
                 input_is_parallel=True,
-                reduce_results=reduce_results,
+                reduce_results=out_proj_reduce_results,
                 quant_config=self.quant_config,
                 prefix=f"{prefix}.out_proj",
                 disable_tp=self.disable_tp_for_gdn,
@@ -594,6 +669,61 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._ag2_mtp_gdn_row0_reference = (
             os.environ.get("AG2_VLLM_MTP_GDN_ROW0_REFERENCE", "0") == "1"
         )
+        self._ag2_mtp_replay_commit = bool(
+            vllm_config.additional_config.get("gdn_mtp_replay_commit", False)
+        )
+        if self._ag2_mtp_replay_commit:
+            if self.num_spec < 1:
+                raise ValueError("gdn_mtp_replay_commit requires speculative decoding")
+            max_reqs = vllm_config.scheduler_config.max_num_seqs
+            max_window = self.num_spec + 1
+            max_tokens = max_reqs * max_window
+            activation_dtype = vllm_config.model_config.dtype
+            self.register_buffer(
+                "_ag2_mtp_journal_k",
+                torch.empty(
+                    max_tokens,
+                    self.local_num_k_heads,
+                    self.head_k_dim,
+                    dtype=activation_dtype,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_ag2_mtp_journal_v",
+                torch.empty(
+                    max_tokens,
+                    self.local_num_v_heads,
+                    self.head_v_dim,
+                    dtype=activation_dtype,
+                ),
+                persistent=False,
+            )
+            for name in ("a", "b"):
+                self.register_buffer(
+                    f"_ag2_mtp_journal_{name}",
+                    torch.empty(
+                        max_tokens,
+                        self.local_num_v_heads,
+                        dtype=activation_dtype,
+                    ),
+                    persistent=False,
+                )
+            self.register_buffer(
+                "_ag2_mtp_journal_query_start",
+                torch.empty(max_reqs + 1, dtype=torch.int32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_ag2_mtp_journal_state_ids",
+                torch.empty(max_reqs, dtype=torch.int32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_ag2_mtp_journal_batch_indices",
+                torch.empty(max_reqs, dtype=torch.int32),
+                persistent=False,
+            )
         if self._ag2_layer0_trace_enabled:
             trace_rows = 3
             self.out_proj.register_buffer(
@@ -666,6 +796,74 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+
+    def _record_mtp_replay_journal(
+        self,
+        *,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ) -> None:
+        """Capture raw recurrence inputs while leaving live FP32 state frozen."""
+        num_reqs = attn_metadata.num_spec_decodes
+        query_start = attn_metadata.spec_query_start_loc
+        state_ids = attn_metadata.spec_state_indices_tensor
+        batch_indices = attn_metadata.spec_batch_indices
+        assert num_reqs > 0
+        assert query_start is not None
+        assert state_ids is not None
+        assert batch_indices is not None
+        num_tokens = key.shape[1]
+        self._ag2_mtp_journal_k[:num_tokens].copy_(key.squeeze(0))
+        self._ag2_mtp_journal_v[:num_tokens].copy_(value.squeeze(0))
+        # Match the exact rows consumed by the current recurrent verifier.
+        self._ag2_mtp_journal_a[:num_tokens].copy_(
+            a[:num_tokens, : self.local_num_v_heads]
+        )
+        self._ag2_mtp_journal_b[:num_tokens].copy_(
+            b[:num_tokens, : self.local_num_v_heads]
+        )
+        self._ag2_mtp_journal_query_start[: num_reqs + 1].copy_(
+            query_start[: num_reqs + 1]
+        )
+        self._ag2_mtp_journal_state_ids[:num_reqs].copy_(state_ids[:num_reqs, 0])
+        self._ag2_mtp_journal_batch_indices[:num_reqs].copy_(
+            batch_indices[:num_reqs]
+        )
+
+    def commit_mtp_replay_journal(
+        self,
+        accepted: torch.Tensor,
+        num_reqs: int,
+    ) -> None:
+        """Replay exactly the accepted raw-input prefix into the live state."""
+        if not self._ag2_mtp_replay_commit:
+            return
+        if num_reqs == 0:
+            return
+        source_cu = self._ag2_mtp_journal_query_start[: num_reqs + 1]
+        replay_ids = self._ag2_mtp_journal_state_ids[:num_reqs, None].expand(
+            -1, self.num_spec + 1
+        )
+        journal_k = self._ag2_mtp_journal_k.unsqueeze(0)
+        fused_sigmoid_gating_delta_rule_update(
+            A_log=self.A_log[: self.local_num_v_heads],
+            a=self._ag2_mtp_journal_a,
+            b=self._ag2_mtp_journal_b,
+            dt_bias=self.dt_bias[: self.local_num_v_heads],
+            q=journal_k,
+            k=journal_k,
+            v=self._ag2_mtp_journal_v.unsqueeze(0),
+            initial_state=self.kv_cache[1],
+            inplace_final_state=True,
+            store_output=False,
+            cu_seqlens=source_cu,
+            ssm_state_indices=replay_ids,
+            sequence_lengths=accepted[:num_reqs],
+            use_qk_l2norm_in_kernel=True,
+        )
 
     def create_qkvz_proj(
         self,
@@ -1059,6 +1257,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             trace = core_attn_out[:3]
             self._ag2_trace_gated_norm[: trace.shape[0]].copy_(trace)
         output, _ = self.out_proj(core_attn_out)
+        if self._ag2_gdn_prefill_batch_invariant_reduce:
+            output = tensor_model_parallel_gdn_all_reduce(output)
         if self._ag2_aux_boundaries_enabled:
             self._ag2_aux_output_parallel = self.out_proj._ag2_aux_output_parallel
         if self._ag2_layer0_trace_enabled:
@@ -1153,6 +1353,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
+        replay_float_out = None
+        replay_state_out = None
+        replay_meta_out = None
+        if self._ag2_aux_boundaries_enabled:
+            replay_float_out = self._ag2_replay_float_buffer
+            replay_state_out = self._ag2_replay_state_buffer
+            replay_meta_out = self._ag2_replay_meta_buffer
 
         torch.ops.vllm.qwen_gdn_attention_core(
             mixed_qkv,
@@ -1160,8 +1367,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             a,
             core_attn_out,
             layer_name=_encode_layer_name(self.prefix),
+            replay_float_out=replay_float_out,
+            replay_state_out=replay_state_out,
+            replay_meta_out=replay_meta_out,
         )
         if self._ag2_aux_boundaries_enabled:
+            assert replay_float_out is not None
+            assert replay_state_out is not None
+            assert replay_meta_out is not None
+            self._ag2_aux_replay_float = replay_float_out
+            self._ag2_aux_replay_state = replay_state_out
+            self._ag2_aux_replay_meta = replay_meta_out
             self._ag2_aux_core = self._pad_local_value_flat(
                 core_attn_out.flatten(-2)
             )
@@ -1470,12 +1686,138 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
         )
 
+    @staticmethod
+    def _capture_gdn_replay_inputs(
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        chunk_indices: torch.Tensor,
+        chunk_offsets: torch.Tensor,
+        replay_float_out: torch.Tensor | None,
+        replay_state_out: torch.Tensor | None,
+        replay_meta_out: torch.Tensor | None,
+    ) -> None:
+        """Copy one short packed FLA call into explicit custom-op outputs.
+
+        Python attribute mutation inside a custom op is invisible to
+        torch.compile/CUDA Graph replay.  These buffers are instead declared as
+        mutable custom-op arguments, so the captured copies are authoritative.
+        Metadata layout:
+
+        - [0]: status (1=captured, -2=capacity exceeded)
+        - [1:8]: float lengths for q/k/v/g/beta, state length, sequence count
+        - [8:28]: q/k/v/g/beta shapes, four dimensions each
+        - [28:32]: initial-state shape
+        - [32:36]: cu/chunk-index/chunk-offset lengths and chunk-index columns
+        - [64...]: concatenated integer addressing metadata
+        """
+        if (
+            replay_float_out is None
+            or replay_state_out is None
+            or replay_meta_out is None
+        ):
+            return
+
+        tensors = (q, k, v, g, beta)
+        lengths = tuple(tensor.numel() for tensor in tensors)
+        float_required = sum(lengths)
+        state_required = initial_state.numel()
+        integer_required = (
+            cu_seqlens.numel() + chunk_indices.numel() + chunk_offsets.numel()
+        )
+        fits = (
+            q.shape[1] <= _AG2_GDN_REPLAY_MAX_TOKENS
+            and float_required <= replay_float_out.numel()
+            and state_required <= replay_state_out.numel()
+            and 64 + integer_required <= replay_meta_out.numel()
+        )
+        replay_meta_out.fill_(-1)
+        replay_meta_out[0] = 1 if fits else -2
+        if not fits:
+            return
+
+        offset = 0
+        for tensor, length in zip(tensors, lengths, strict=True):
+            replay_float_out[offset : offset + length].copy_(
+                tensor.reshape(-1).float()
+            )
+            offset += length
+        replay_state_out[:state_required].copy_(initial_state.reshape(-1).float())
+
+        replay_meta_out[1:8].copy_(
+            torch.tensor(
+                (*lengths, state_required, initial_state.shape[0]),
+                dtype=torch.int64,
+                device=replay_meta_out.device,
+            )
+        )
+        for index, tensor in enumerate(tensors):
+            shape = (*tensor.shape, 1, 1, 1, 1)[:4]
+            replay_meta_out[8 + 4 * index : 12 + 4 * index].copy_(
+                torch.tensor(
+                    shape,
+                    dtype=torch.int64,
+                    device=replay_meta_out.device,
+                )
+            )
+        state_shape = (*initial_state.shape, 1, 1, 1, 1)[:4]
+        replay_meta_out[28:32].copy_(
+            torch.tensor(
+                state_shape,
+                dtype=torch.int64,
+                device=replay_meta_out.device,
+            )
+        )
+        chunk_index_columns = chunk_indices.shape[-1] if chunk_indices.ndim > 1 else 1
+        replay_meta_out[32:36].copy_(
+            torch.tensor(
+                (
+                    cu_seqlens.numel(),
+                    chunk_indices.numel(),
+                    chunk_offsets.numel(),
+                    chunk_index_columns,
+                ),
+                dtype=torch.int64,
+                device=replay_meta_out.device,
+            )
+        )
+        dtype_codes = {
+            torch.bfloat16: 1,
+            torch.float32: 2,
+            torch.float16: 3,
+        }
+        replay_meta_out[36:38].copy_(
+            torch.tensor(
+                (
+                    dtype_codes.get(initial_state.dtype, 0),
+                    dtype_codes.get(q.dtype, 0),
+                ),
+                dtype=torch.int64,
+                device=replay_meta_out.device,
+            )
+        )
+        integer_offset = 64
+        for tensor in (cu_seqlens, chunk_indices, chunk_offsets):
+            length = tensor.numel()
+            replay_meta_out[integer_offset : integer_offset + length].copy_(
+                tensor.reshape(-1).to(torch.int64)
+            )
+            integer_offset += length
+
     def _forward_core(
         self,
         mixed_qkv: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
         core_attn_out: torch.Tensor,
+        replay_float_out: torch.Tensor | None = None,
+        replay_state_out: torch.Tensor | None = None,
+        replay_meta_out: torch.Tensor | None = None,
     ):
         """Core conv1d + recurrent attention (standard path).
 
@@ -1557,7 +1899,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
-
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 mixed_qkv_spec = mixed_qkv
@@ -1769,6 +2110,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
+            if self._ag2_mtp_replay_commit:
+                self._record_mtp_replay_journal(
+                    key=key_spec,
+                    value=value_spec,
+                    a=a,
+                    b=b,
+                    attn_metadata=attn_metadata,
+                )
             row0_reference_core = None
             if row0_reference_conv is not None:
                 assert row0_reference_ssm is not None
@@ -1811,6 +2160,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     v=value_spec,
                     initial_state=ssm_state,
                     inplace_final_state=True,
+                    store_final_state=not self._ag2_mtp_replay_commit,
                     cu_seqlens=spec_query_start_loc[  # type: ignore[index]
                         : attn_metadata.num_spec_decodes
                         + 1  # type: ignore[attr-defined]
@@ -1872,6 +2222,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefill_output = core_attn_out[
                 prefill_output_start : prefill_output_start + prefill_num_tokens
             ].unsqueeze(0)
+            self._capture_gdn_replay_inputs(
+                q=query_non_spec,
+                k=key_non_spec,
+                v=value_non_spec,
+                g=g_non_spec,
+                beta=beta_non_spec,
+                initial_state=initial_state,
+                cu_seqlens=attn_metadata.prefill_query_start_loc,
+                chunk_indices=attn_metadata.chunk_indices,
+                chunk_offsets=attn_metadata.chunk_offsets,
+                replay_float_out=replay_float_out,
+                replay_state_out=replay_state_out,
+                replay_meta_out=replay_meta_out,
+            )
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -2067,6 +2431,9 @@ def qwen_gdn_attention_core(
     core_attn_out: torch.Tensor,
     layer_name: LayerNameType,
     use_aiter: bool = False,
+    replay_float_out: torch.Tensor | None = None,
+    replay_state_out: torch.Tensor | None = None,
+    replay_meta_out: torch.Tensor | None = None,
 ) -> None:
     """Custom op dispatching to _forward_core or _forward_core_rocm.
 
@@ -2097,6 +2464,9 @@ def qwen_gdn_attention_core(
             b=b_or_ba,
             a=a_or_z_out,
             core_attn_out=core_attn_out,
+            replay_float_out=replay_float_out,
+            replay_state_out=replay_state_out,
+            replay_meta_out=replay_meta_out,
         )
 
 
@@ -2107,6 +2477,9 @@ def gdn_attention_core_fake(
     core_attn_out: torch.Tensor,
     layer_name: LayerNameType,
     use_aiter: bool = False,
+    replay_float_out: torch.Tensor | None = None,
+    replay_state_out: torch.Tensor | None = None,
+    replay_meta_out: torch.Tensor | None = None,
 ) -> None:
     """Fake implementation for torch.compile."""
     return
@@ -2115,7 +2488,13 @@ def gdn_attention_core_fake(
 direct_register_custom_op(
     op_name="qwen_gdn_attention_core",
     op_func=qwen_gdn_attention_core,
-    mutates_args=["a_or_z_out", "core_attn_out"],
+    mutates_args=[
+        "a_or_z_out",
+        "core_attn_out",
+        "replay_float_out",
+        "replay_state_out",
+        "replay_meta_out",
+    ],
     fake_impl=gdn_attention_core_fake,
 )
 

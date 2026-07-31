@@ -69,6 +69,53 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
         }
 
 
+@triton.jit
+def _gather_gdn_replay_acceptance_kernel(
+    batch_indices_ptr,
+    idx_mapping_ptr,
+    num_accepted_ptr,
+    query_start_ptr,
+    accepted_out_ptr,
+    num_reqs,
+    BLOCK_SIZE: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = rows < num_reqs
+    batch_rows = tl.load(batch_indices_ptr + rows, mask=mask, other=0)
+    req_slots = tl.load(idx_mapping_ptr + batch_rows, mask=mask, other=-1)
+    valid = mask & (req_slots >= 0)
+    accepted = tl.load(num_accepted_ptr + req_slots, mask=valid, other=0)
+    starts = tl.load(query_start_ptr + rows, mask=mask, other=0)
+    ends = tl.load(query_start_ptr + rows + 1, mask=mask, other=0)
+    accepted = tl.minimum(tl.maximum(accepted, 0), ends - starts)
+    tl.store(accepted_out_ptr + rows, accepted, mask=mask)
+
+
+def gather_gdn_replay_acceptance(
+    batch_indices: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    query_start: torch.Tensor,
+    accepted_out: torch.Tensor,
+    num_reqs: int,
+) -> torch.Tensor:
+    if num_reqs == 0:
+        return accepted_out[:0]
+    block_size = 128
+    _gather_gdn_replay_acceptance_kernel[
+        (triton.cdiv(num_reqs, block_size),)
+    ](
+        batch_indices,
+        idx_mapping,
+        num_accepted_tokens,
+        query_start,
+        accepted_out,
+        num_reqs,
+        BLOCK_SIZE=block_size,
+    )
+    return accepted_out[:num_reqs]
+
+
 class MambaHybridModelState(DefaultModelState):
     """Model state for hybrid attention + Mamba / linear-attention models."""
 
@@ -82,6 +129,26 @@ class MambaHybridModelState(DefaultModelState):
         super().__init__(vllm_config, model, encoder_cache, device)
         self.cache_config = vllm_config.cache_config
         self.num_accepted_tokens_gpu = torch.ones(
+            self.max_num_reqs, dtype=torch.int32, device=self.device
+        )
+        self._gdn_mtp_replay_commit = bool(
+            vllm_config.additional_config.get("gdn_mtp_replay_commit", False)
+        )
+        self._gdn_mtp_replay_layers = (
+            [
+                layer
+                for layer in model.modules()
+                if getattr(layer, "_ag2_mtp_replay_commit", False)
+            ]
+            if self._gdn_mtp_replay_commit
+            else []
+        )
+        if self._gdn_mtp_replay_commit and not self._gdn_mtp_replay_layers:
+            raise ValueError(
+                "gdn_mtp_replay_commit is enabled but no compatible GDN layers exist"
+            )
+        self._gdn_mtp_replay_num_reqs = 0
+        self._gdn_mtp_replay_accepted = torch.empty(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
         # Pre-copy "align" prefix-cache state (V2). The migration of each
@@ -281,6 +348,9 @@ class MambaHybridModelState(DefaultModelState):
                 num_decode_draft_tokens_np[: input_batch.num_reqs] = np.where(
                     spec_decode_mask, num_draft_tokens_per_req, -1
                 )
+                self._gdn_mtp_replay_num_reqs = int(spec_decode_mask.sum())
+            else:
+                self._gdn_mtp_replay_num_reqs = 0
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
 
         mamba_attn_metadata = MambaHybridAttnMetadata(
@@ -341,11 +411,32 @@ class MambaHybridModelState(DefaultModelState):
             num_reqs = idx_mapping.shape[0]
             if num_reqs:
                 if self._separate_mamba_pool:
+                    if self._gdn_mtp_replay_commit:
+                        # Sampling has chosen the accepted prefix. Advance every
+                        # FP32 recurrent state first, then shift the extended
+                        # convolution window, and reset acceptance only after
+                        # both parts of the logical commit are enqueued.
+                        first_layer = self._gdn_mtp_replay_layers[0]
+                        replay_accepted = gather_gdn_replay_acceptance(
+                            first_layer._ag2_mtp_journal_batch_indices,
+                            idx_mapping,
+                            self.num_accepted_tokens_gpu,
+                            first_layer._ag2_mtp_journal_query_start,
+                            self._gdn_mtp_replay_accepted,
+                            self._gdn_mtp_replay_num_reqs,
+                        )
+                        for layer in self._gdn_mtp_replay_layers:
+                            layer.commit_mtp_replay_journal(
+                                replay_accepted,
+                                self._gdn_mtp_replay_num_reqs,
+                            )
                     self._mamba_ctx.run_fused_postprocess_separate(
                         num_reqs,
                         self.num_accepted_tokens_gpu,
                         idx_mapping,
+                        conv_only=self._gdn_mtp_replay_commit,
                     )
+                    self._gdn_mtp_replay_num_reqs = 0
                 else:
                     self._mamba_ctx.run_fused_postprocess_align(
                         num_reqs,

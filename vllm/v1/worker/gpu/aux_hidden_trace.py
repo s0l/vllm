@@ -41,6 +41,7 @@ class AuxHiddenTrace:
     full_attention_boundaries: bool = False
     full_attention_stages: tuple[str, ...] = FULL_ATTENTION_STAGE_ORDER
     first_gdn_boundaries: bool = False
+    gdn_boundary_layer: int = 0
     _saved_matches: dict[int, int] = field(default_factory=dict)
 
     @classmethod
@@ -96,6 +97,12 @@ class AuxHiddenTrace:
             os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_GDN_BOUNDARIES", "0")
             == "1"
         )
+        gdn_boundary_layer = int(
+            os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_GDN_BOUNDARY_LAYER",
+                "0",
+            )
+        )
         if not layers or any(layer < 0 for layer in layers):
             raise ValueError("Aux hidden trace layers must be nonnegative")
         if token_id < 0 or position < 0:
@@ -124,8 +131,16 @@ class AuxHiddenTrace:
             raise ValueError(
                 "First-attention and first-GDN boundary traces are mutually exclusive"
             )
-        if first_gdn_boundaries and 0 not in layers:
-            raise ValueError("First-GDN trace requires auxiliary layer 0")
+        if gdn_boundary_layer < 0:
+            raise ValueError("GDN boundary layer must be nonnegative")
+        if first_gdn_boundaries and not {
+            gdn_boundary_layer,
+            gdn_boundary_layer + 1,
+        }.issubset(layers):
+            raise ValueError(
+                "GDN boundary trace requires auxiliary checkpoints at "
+                "the selected layer and the following layer"
+            )
         return cls(
             output=output,
             layers=layers,
@@ -137,6 +152,7 @@ class AuxHiddenTrace:
             full_attention_boundaries=full_attention_boundaries,
             full_attention_stages=full_attention_stages,
             first_gdn_boundaries=first_gdn_boundaries,
+            gdn_boundary_layer=gdn_boundary_layer,
         )
 
     @property
@@ -156,13 +172,14 @@ class AuxHiddenTrace:
             "Enabled authoritative auxiliary hidden trace for layers=%s "
             "first_attention_boundary=%s attention_boundary_layer=%d "
             "full_attention_boundaries=%s full_attention_stages=%s "
-            "first_gdn_boundaries=%s",
+            "first_gdn_boundaries=%s gdn_boundary_layer=%d",
             self.layers,
             self.first_attention_boundary,
             self.attention_boundary_layer,
             self.full_attention_boundaries,
             self.full_attention_stages,
             self.first_gdn_boundaries,
+            self.gdn_boundary_layer,
         )
 
     def output_labels(self) -> tuple[str, ...]:
@@ -185,16 +202,22 @@ class AuxHiddenTrace:
                         f"post_attention_residual.{decoder_layer}",
                     )
                 )
-            if self.first_gdn_boundaries and decoder_layer == 0:
+            if (
+                self.first_gdn_boundaries
+                and decoder_layer == self.gdn_boundary_layer
+            ):
                 labels.extend(
                     (
-                        "gdn_input_norm.0",
-                        "gdn_qkvz.0",
-                        "gdn_ba.0",
-                        "gdn_core.0",
-                        "gdn_gated_norm.0",
-                        "gdn_output_parallel.0",
-                        "gdn_output.0",
+                        f"gdn_input_norm.{decoder_layer}",
+                        f"gdn_qkvz.{decoder_layer}",
+                        f"gdn_ba.{decoder_layer}",
+                        f"gdn_replay_float.{decoder_layer}",
+                        f"gdn_replay_state.{decoder_layer}",
+                        f"gdn_replay_meta.{decoder_layer}",
+                        f"gdn_core.{decoder_layer}",
+                        f"gdn_gated_norm.{decoder_layer}",
+                        f"gdn_output_parallel.{decoder_layer}",
+                        f"gdn_output.{decoder_layer}",
                     )
                 )
             checkpoint = decoder_layer + 1
@@ -214,6 +237,7 @@ class AuxHiddenTrace:
                     (
                         "gdn_qkvz.",
                         "gdn_ba.",
+                        "gdn_replay_",
                         "gdn_core.",
                         "gdn_gated_norm.",
                         "gdn_output_parallel.",
@@ -265,7 +289,8 @@ class AuxHiddenTrace:
 
         torch.cuda.current_stream().synchronize()
         rank = get_tp_group().rank_in_group
-        for row in matches[: self.max_matches_per_query_len - saved]:
+        selected_matches = matches[: self.max_matches_per_query_len - saved]
+        for compact_index, row in enumerate(selected_matches):
             if has_dcp_pack and row != 0:
                 raise RuntimeError(
                     "Authoritative DCP pack is intentionally row-zero only; "
@@ -288,7 +313,14 @@ class AuxHiddenTrace:
                     "input_ids": input_ids[:query_len].detach().cpu().clone(),
                     "positions": flat_positions[:query_len].detach().cpu().clone(),
                     "layers": {
-                        label: hidden[row].detach().cpu().clone()
+                        label: (
+                            hidden
+                            if label.startswith("gdn_replay_")
+                            else hidden[row]
+                        )
+                        .detach()
+                        .cpu()
+                        .clone()
                         for label, hidden in zip(labels, aux_hidden_states, strict=True)
                     },
                     "scopes": self.output_scopes(),

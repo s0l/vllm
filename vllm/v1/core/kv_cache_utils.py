@@ -94,6 +94,10 @@ def _use_elastic_gdn_backing(vllm_config: VllmConfig) -> bool:
     return bool(vllm_config.additional_config.get("elastic_gdn_backing", False))
 
 
+def _use_gdn_mtp_replay_commit(vllm_config: VllmConfig) -> bool:
+    return bool(vllm_config.additional_config.get("gdn_mtp_replay_commit", False))
+
+
 def _elastic_gdn_blocks_per_seq(vllm_config: VllmConfig, num_mamba_groups: int) -> int:
     if num_mamba_groups < 1:
         raise ValueError("elastic GDN requires at least one Mamba cache group")
@@ -101,10 +105,18 @@ def _elastic_gdn_blocks_per_seq(vllm_config: VllmConfig, num_mamba_groups: int) 
     # Every Mamba cache group owns one base recurrent-state block plus one
     # scratch block per speculative token. All groups allocate from the same
     # separate pool, so the per-request capacity must include every group.
-    required_per_group = 1 + max(vllm_config.num_speculative_tokens, 0)
-    configured_per_group = int(
-        vllm_config.additional_config.get(
-            "elastic_gdn_blocks_per_seq", required_per_group
+    required_per_group = (
+        1
+        if _use_gdn_mtp_replay_commit(vllm_config)
+        else 1 + max(vllm_config.num_speculative_tokens, 0)
+    )
+    configured_per_group = (
+        required_per_group
+        if _use_gdn_mtp_replay_commit(vllm_config)
+        else int(
+            vllm_config.additional_config.get(
+                "elastic_gdn_blocks_per_seq", required_per_group
+            )
         )
     )
     if configured_per_group < required_per_group:

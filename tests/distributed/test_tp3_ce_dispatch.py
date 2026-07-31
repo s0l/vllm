@@ -5,12 +5,46 @@ import torch
 from vllm.distributed.parallel_state import (
     _should_use_tp3_ce,
     _should_use_tp3_ce_physical,
+    _should_use_tp3_piecewise_device_ce,
     _should_use_tp3_sd_canonical_reduce,
     _should_use_tp3_sd_deterministic_reduce,
     _tp3_sd_canonical_reduce,
     _tp3_sd_deterministic_reduce,
     _tp3_sd_deterministic_sum,
 )
+
+
+def test_tp3_device_ce_is_piecewise_only():
+    common = {
+        "tensor_dim": 2,
+        "rows": 4464,
+        "hidden_size": 5120,
+        "tp_world_size": 3,
+    }
+    assert _should_use_tp3_piecewise_device_ce(
+        cudagraph_mode=_Mode("PIECEWISE"),
+        **common,
+    )
+    assert not _should_use_tp3_piecewise_device_ce(
+        cudagraph_mode=_Mode("FULL"),
+        **common,
+    )
+    assert not _should_use_tp3_piecewise_device_ce(
+        cudagraph_mode=None,
+        **common,
+    )
+    assert not _should_use_tp3_piecewise_device_ce(
+        cudagraph_mode=_Mode("PIECEWISE"),
+        **(common | {"rows": 0}),
+    )
+    assert not _should_use_tp3_piecewise_device_ce(
+        cudagraph_mode=_Mode("PIECEWISE"),
+        **(common | {"hidden_size": 4096}),
+    )
+    assert not _should_use_tp3_piecewise_device_ce(
+        cudagraph_mode=_Mode("PIECEWISE"),
+        **(common | {"tp_world_size": 2}),
+    )
 
 
 def test_tp3_ce_requires_known_large_logical_batch():

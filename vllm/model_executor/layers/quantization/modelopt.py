@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any, cast
 
@@ -1084,6 +1085,18 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
         group_size: int | None,
         **kwargs: Any,
     ) -> "ModelOptNvFp4Config":
+        if (
+            quant_method == "NVFP4"
+            and os.environ.get("AG2_VLLM_NVFP4_FORCE_W4A16", "0") == "1"
+        ):
+            logger.warning(
+                "AG2_VLLM_NVFP4_FORCE_W4A16=1: loading an NVFP4 W4A4 "
+                "checkpoint through the W4A16 Marlin path. Packed weights "
+                "and weight scales are preserved; checkpoint input_scale is "
+                "loaded only for compatibility and is not used."
+            )
+            quant_method = "W4A16_NVFP4"
+
         is_checkpoint_nvfp4_serialized = "NVFP4" in quant_method
 
         if group_size is None:

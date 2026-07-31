@@ -43,6 +43,35 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+def copy_aux_hidden_state(
+    destination: torch.Tensor,
+    source: torch.Tensor,
+    *,
+    num_tokens: int,
+    token_major: bool,
+) -> None:
+    """Copy either a token-major or a fixed-shape diagnostic graph output."""
+    if token_major:
+        destination[:num_tokens].copy_(source)
+    else:
+        if destination.shape != source.shape:
+            raise RuntimeError(
+                "Fixed-shape auxiliary CUDA Graph output changed shape: "
+                f"{tuple(destination.shape)} != {tuple(source.shape)}"
+            )
+        destination.copy_(source)
+
+
+def view_aux_hidden_state(
+    tensor: torch.Tensor,
+    *,
+    num_tokens: int,
+    token_major: bool,
+) -> torch.Tensor:
+    """Return the active token slice or the complete fixed-shape output."""
+    return tensor[:num_tokens] if token_major else tensor
+
+
 class AttentionState(NamedTuple):
     attn_metadata: dict[str, Any] | None
     slot_mappings: dict[str, torch.Tensor]
@@ -794,6 +823,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         )
         self.hidden_states: torch.Tensor | None = None
         self.aux_hidden_states: list[torch.Tensor] = []
+        self.aux_hidden_states_token_major: list[bool] = []
         self.use_aux_hidden_state_outputs = False
         self.intermediate_tensors: IntermediateTensors | None = None
         self.tp3_sd_phase_reduce = tp3_sd_phase_reduce
@@ -918,8 +948,22 @@ class ModelCudaGraphManager(CudaGraphManager):
                         self.aux_hidden_states = [
                             torch.empty_like(x) for x in aux_hidden_states
                         ]
-                    for i, aux in enumerate(aux_hidden_states):
-                        self.aux_hidden_states[i][:num_tokens] = aux
+                        self.aux_hidden_states_token_major = [
+                            aux.ndim > 0 and aux.shape[0] == num_tokens
+                            for aux in aux_hidden_states
+                        ]
+                    for destination, aux, token_major in zip(
+                        self.aux_hidden_states,
+                        aux_hidden_states,
+                        self.aux_hidden_states_token_major,
+                        strict=True,
+                    ):
+                        copy_aux_hidden_state(
+                            destination,
+                            aux,
+                            num_tokens=num_tokens,
+                            token_major=token_major,
+                        )
                 else:
                     # Non-last PP rank.
                     assert isinstance(model_output, IntermediateTensors)
@@ -948,7 +992,18 @@ class ModelCudaGraphManager(CudaGraphManager):
         hidden_states = self.hidden_states[: desc.num_tokens]
         if not self.use_aux_hidden_state_outputs:
             return hidden_states
-        return hidden_states, [x[: desc.num_tokens] for x in self.aux_hidden_states]
+        return hidden_states, [
+            view_aux_hidden_state(
+                tensor,
+                num_tokens=desc.num_tokens,
+                token_major=token_major,
+            )
+            for tensor, token_major in zip(
+                self.aux_hidden_states,
+                self.aux_hidden_states_token_major,
+                strict=True,
+            )
+        ]
 
 
 def prepare_inputs_to_capture(

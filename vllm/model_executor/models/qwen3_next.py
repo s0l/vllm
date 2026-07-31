@@ -818,6 +818,9 @@ class Qwen3NextDecoderLayer(nn.Module):
                     self._ag2_aux_gdn_input_norm,
                     self.linear_attn._ag2_aux_qkvz,
                     self.linear_attn._ag2_aux_ba,
+                    self.linear_attn._ag2_aux_replay_float,
+                    self.linear_attn._ag2_aux_replay_state,
+                    self.linear_attn._ag2_aux_replay_meta,
                     self.linear_attn._ag2_aux_core,
                     self.linear_attn._ag2_aux_gated_norm,
                     self.linear_attn._ag2_aux_output_parallel,
@@ -1174,7 +1177,10 @@ class Qwen3NextForCausalLM(
         **kwargs: object,
     ):
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
         )
 
         return hidden_states
