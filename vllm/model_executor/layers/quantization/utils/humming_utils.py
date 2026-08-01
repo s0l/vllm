@@ -509,7 +509,10 @@ def prepare_humming_layer(
         layer.register_buffer("locks", locks)
 
     compute_config = {
-        "use_batch_invariant": envs.VLLM_BATCH_INVARIANT,
+        "use_batch_invariant": (
+            envs.VLLM_BATCH_INVARIANT
+            or envs.AG2_VLLM_NVFP4_BATCH_INVARIANT
+        ),
         "use_f16_accum": envs.VLLM_HUMMING_USE_F16_ACCUM,
         "gemm_type": "dense",
     }

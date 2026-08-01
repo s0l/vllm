@@ -1642,6 +1642,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             query_len=scheduler_output.total_num_scheduled_tokens,
                             cudagraph_mode=batch_desc.cg_mode.name,
                             aux_hidden_states=aux_hidden_states,
+                            req_ids=list(input_batch.req_ids),
+                            query_start_loc=[
+                                int(value)
+                                for value in input_batch.query_start_loc_np[
+                                    : input_batch.num_reqs + 1
+                                ]
+                            ],
+                            num_scheduled_tokens=[
+                                int(value)
+                                for value in input_batch.num_scheduled_tokens
+                            ],
+                            num_computed_tokens=[
+                                int(value)
+                                for value in input_batch.num_computed_tokens_np
+                            ],
+                            slot_mappings_by_layer=slot_mappings_by_layer,
                         )
                     # The trace is a graph-output observer, not a drafter input.
                     aux_hidden_states = None

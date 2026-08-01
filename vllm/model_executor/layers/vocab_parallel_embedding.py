@@ -14,7 +14,7 @@ from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_embedding_all_reduce,
 )
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.batch_invariant import (
@@ -506,7 +506,7 @@ class VocabParallelEmbedding(PluggableLayer):
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
             # Reduce across all the model parallel GPUs.
-            return tensor_model_parallel_all_reduce(output_parallel)
+            return tensor_model_parallel_embedding_all_reduce(output_parallel)
         return output_parallel
 
     def extra_repr(self) -> str:

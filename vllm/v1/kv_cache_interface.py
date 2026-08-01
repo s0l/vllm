@@ -708,6 +708,7 @@ class MambaSpec(KVCacheSpec):
     num_speculative_blocks: int = 0
     separate_pool: bool = False
     separate_pool_num_blocks: int = 0
+    state_update_chunk_alignment: int = 1
 
     @property
     def page_size_bytes(self) -> int:
@@ -753,6 +754,8 @@ class MambaSpec(KVCacheSpec):
         return all(
             isinstance(spec, MambaSpec)
             and spec.num_speculative_blocks == self.num_speculative_blocks
+            and spec.state_update_chunk_alignment
+            == self.state_update_chunk_alignment
             for spec in kv_cache_specs.values()
         )
 

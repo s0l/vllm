@@ -14,7 +14,7 @@ from vllm.distributed.parallel_state import (
 )
 
 
-def test_tp3_device_ce_is_piecewise_only():
+def test_tp3_device_ce_covers_piecewise_and_intermediate_prefill():
     common = {
         "tensor_dim": 2,
         "rows": 4464,
@@ -28,6 +28,22 @@ def test_tp3_device_ce_is_piecewise_only():
     assert not _should_use_tp3_piecewise_device_ce(
         cudagraph_mode=_Mode("FULL"),
         **common,
+    )
+    assert _should_use_tp3_piecewise_device_ce(
+        cudagraph_mode=_Mode("NONE"),
+        **(common | {"rows": 845}),
+    )
+    assert _should_use_tp3_piecewise_device_ce(
+        cudagraph_mode=_Mode("NONE"),
+        **(common | {"rows": 1344}),
+    )
+    assert not _should_use_tp3_piecewise_device_ce(
+        cudagraph_mode=_Mode("NONE"),
+        **(common | {"rows": 24}),
+    )
+    assert not _should_use_tp3_piecewise_device_ce(
+        cudagraph_mode=_Mode("NONE"),
+        **(common | {"rows": 4096}),
     )
     assert not _should_use_tp3_piecewise_device_ce(
         cudagraph_mode=None,

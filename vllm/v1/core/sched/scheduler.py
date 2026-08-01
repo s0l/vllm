@@ -372,6 +372,29 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        from math import lcm
+
+        state_alignments = [
+            group.kv_cache_spec.state_update_chunk_alignment
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        ]
+        self.mamba_state_update_alignment = lcm(*state_alignments, 1)
+        if self.need_mamba_block_aligned_split:
+            if self.block_size % self.mamba_state_update_alignment:
+                raise ValueError(
+                    "The resolved scheduler block size must be divisible by "
+                    "the recurrent state-update alignment: "
+                    f"block_size={self.block_size}, "
+                    f"alignment={self.mamba_state_update_alignment}"
+                )
+            if self.hash_block_size % self.mamba_state_update_alignment:
+                raise ValueError(
+                    "The prefix hash unit must be divisible by the recurrent "
+                    "state-update alignment: "
+                    f"hash_block_size={self.hash_block_size}, "
+                    f"alignment={self.mamba_state_update_alignment}"
+                )
         # A finer prefix_match_unit is configured: a mamba partial tail entry
         # can only be registered by a step ending exactly at the prompt's last
         # hash boundary, so the split adds that stop.
@@ -599,6 +622,21 @@ class Scheduler(SchedulerInterface):
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
+
+        # Preserve the backend's recurrence grouping across artificial prefill
+        # splits. The natural prompt end is intentionally exempt: prompt to
+        # decode is a real model boundary and may occur at any token. Prefix
+        # restore and persistent checkpoint geometry are validated on the same
+        # grid during scheduler construction.
+        state_alignment = getattr(self, "mamba_state_update_alignment", 1)
+        if state_alignment > 1 and end < request.num_prompt_tokens:
+            if start % state_alignment:
+                raise RuntimeError(
+                    "Cannot resume an unfinished recurrent prefill from an "
+                    "unaligned state boundary: "
+                    f"start={start}, alignment={state_alignment}"
+                )
+            end = end // state_alignment * state_alignment
         return max(end - start, 0)
 
     @staticmethod

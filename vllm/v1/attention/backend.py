@@ -406,6 +406,16 @@ class AttentionBackend(ABC):
     def is_ssm(cls) -> bool:
         return False
 
+    @classmethod
+    def get_state_update_chunk_alignment(cls) -> int:
+        """Return the token alignment required for resumable state updates.
+
+        Stateless attention backends have no recurrence boundary constraint.
+        Stateful backends override this when splitting a prefill at an
+        arbitrary position changes the arithmetic of a later resumed update.
+        """
+        return 1
+
 
 class AttentionMetadata:
     pass

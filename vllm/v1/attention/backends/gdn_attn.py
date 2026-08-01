@@ -37,6 +37,13 @@ class GDNAttentionBackend(AttentionBackend):
     def is_ssm(cls) -> bool:
         return True
 
+    @classmethod
+    def get_state_update_chunk_alignment(cls) -> int:
+        # The FLA/CuTeDSL GDN prefill scan groups recurrence updates in
+        # 64-token chunks. A resumed prefill is numerically identical to the
+        # uninterrupted scan only when its artificial split is on this grid.
+        return 64
+
 
 @dataclass
 class GDNAttentionMetadata:

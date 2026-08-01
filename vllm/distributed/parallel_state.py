@@ -203,8 +203,8 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     ):
         if not _tp3_piecewise_device_ce_logged:
             logger.warning(
-                "TP3 device-CE reduction active for all PIECEWISE "
-                "all-reduces: shape=%s",
+                "TP3 device-CE reduction active for PIECEWISE/intermediate "
+                "prefill all-reduces: shape=%s",
                 tuple(tensor.shape),
             )
             _tp3_piecewise_device_ce_logged = True
@@ -392,9 +392,13 @@ def _should_use_tp3_piecewise_device_ce(
     hidden_size: int,
     tp_world_size: int,
 ) -> bool:
-    """Select graph-capturable compressed reduction for GDN prefill."""
+    """Select one compressed reduction for graph and intermediate prefills."""
+    mode = getattr(cudagraph_mode, "name", None)
+    selected_shape = mode == "PIECEWISE" or (
+        mode == "NONE" and 24 < rows < 4096
+    )
     return (
-        getattr(cudagraph_mode, "name", None) == "PIECEWISE"
+        selected_shape
         and tensor_dim == 2
         and rows > 0
         and hidden_size == 5120
@@ -482,6 +486,49 @@ def gdn_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     return all_reduce(tensor, group_name)
 
 
+def _should_use_tp3_embedding_ce(
+    runtime_enabled: bool,
+    rows: int,
+    tensor_dim: int,
+    hidden_size: int,
+    tp_world_size: int,
+) -> bool:
+    """Keep every prefill embedding on one reduction contract.
+
+    Decode and MTP verification use at most three physical rows. Prefill uses
+    more than three. Unlike the generic CE fallback, this must not depend on
+    the arbitrary 4096-row physical threshold.
+    """
+    return (
+        runtime_enabled
+        and rows > 3
+        and tensor_dim == 2
+        and hidden_size == 5120
+        and tp_world_size == 3
+    )
+
+
+def embedding_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    """Apply a phase-stable TP3 reduction to vocabulary embeddings."""
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    if _should_use_tp3_embedding_ce(
+        runtime_enabled=_tp3_ce_runtime_enabled,
+        rows=tensor.shape[0] if tensor.dim() == 2 else 0,
+        tensor_dim=tensor.dim(),
+        hidden_size=tensor.shape[-1] if tensor.dim() else 0,
+        tp_world_size=group.world_size,
+    ):
+        from .device_communicators.tp3_ce_all_reduce import (
+            tp3_ce_all_reduce,
+        )
+
+        return tp3_ce_all_reduce(tensor, group.device_group)
+    return group._all_reduce_out_place(tensor)
+
+
 def _is_tp3_sd_phase_reduce() -> bool:
     """Read the explicit target pure-decode lane from forward context."""
     from vllm.forward_context import (
@@ -561,10 +608,11 @@ def _should_use_tp3_sd_deterministic_reduce(
     tp_world_size: int,
 ) -> bool:
     """Select only bounded TP3 decode and MTP verification reductions."""
+    max_rows = int(os.environ.get("VLLM_TP3_SD_DETERMINISTIC_MAX_ROWS", "24"))
     return (
         enabled
         and tensor_dim == 2
-        and 1 <= rows <= 24
+        and 1 <= rows <= max_rows
         and hidden_size == 5120
         and tp_world_size == 3
     )
@@ -803,6 +851,12 @@ direct_register_custom_op(
 direct_register_custom_op(
     op_name="gdn_all_reduce",
     op_func=gdn_all_reduce,
+    fake_impl=all_reduce_fake,
+)
+
+direct_register_custom_op(
+    op_name="embedding_all_reduce",
+    op_func=embedding_all_reduce,
     fake_impl=all_reduce_fake,
 )
 

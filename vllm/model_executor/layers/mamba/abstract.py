@@ -92,6 +92,9 @@ class MambaBase(AttentionLayerBase):
             mamba_type=self.mamba_type,
             mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
             num_speculative_blocks=num_speculative_blocks,
+            state_update_chunk_alignment=(
+                self.get_attn_backend().get_state_update_chunk_alignment()
+            ),
         )
 
     def get_attn_backend(self) -> type[AttentionBackend]:

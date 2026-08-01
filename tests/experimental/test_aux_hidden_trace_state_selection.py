@@ -54,6 +54,13 @@ def test_per_request_gdn_boundaries_use_occurrence_not_token_row(
         query_len=50,
         cudagraph_mode="PIECEWISE",
         aux_hidden_states=hidden_states,
+        req_ids=["request-a", "request-b"],
+        query_start_loc=[0, 25, 50],
+        num_scheduled_tokens=[25, 25],
+        num_computed_tokens=[0, 1488],
+        slot_mappings_by_layer={
+            "model.layers.0.self_attn.attn": torch.arange(100, 150),
+        },
     )
 
     for occurrence, token_row in enumerate((24, 49)):
@@ -61,6 +68,19 @@ def test_per_request_gdn_boundaries_use_occurrence_not_token_row(
             tmp_path / f"trace.q50.occ{occurrence}.rank0.pt",
             weights_only=False,
         )
+        provenance = saved["request_provenance"]
+        assert provenance == {
+            "req_id": f"request-{'a' if occurrence == 0 else 'b'}",
+            "request_index": occurrence,
+            "request_row_offset": 24,
+            "query_start": occurrence * 25,
+            "query_end": (occurrence + 1) * 25,
+            "num_scheduled_tokens": 25,
+            "num_computed_tokens": 0 if occurrence == 0 else 1488,
+            "slot_mappings": {
+                "model.layers.0.self_attn.attn": 124 + occurrence * 25,
+            },
+        }
         for index, label in enumerate(labels):
             if label in full_replay:
                 assert torch.equal(

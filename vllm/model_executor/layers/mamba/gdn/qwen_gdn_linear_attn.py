@@ -1730,23 +1730,33 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         integer_required = (
             cu_seqlens.numel() + chunk_indices.numel() + chunk_offsets.numel()
         )
-        fits = (
+        fits_float = (
             q.shape[1] <= _AG2_GDN_REPLAY_MAX_TOKENS
             and float_required <= replay_float_out.numel()
-            and state_required <= replay_state_out.numel()
+        )
+        fits_state_meta = (
+            state_required <= replay_state_out.numel()
             and 64 + integer_required <= replay_meta_out.numel()
         )
         replay_meta_out.fill_(-1)
-        replay_meta_out[0] = 1 if fits else -2
-        if not fits:
+        # A long packed prefill can exceed the deliberately small q/k/v
+        # replay buffer while its per-request initial states and addressing
+        # metadata still fit.  Preserve that causal evidence instead of
+        # leaving stale buffers behind.  Status 1 is a full capture, 2 is a
+        # state/metadata-only capture, and -2 means even those did not fit.
+        replay_meta_out[0] = (
+            1 if fits_float and fits_state_meta else 2 if fits_state_meta else -2
+        )
+        if not fits_state_meta:
             return
 
-        offset = 0
-        for tensor, length in zip(tensors, lengths, strict=True):
-            replay_float_out[offset : offset + length].copy_(
-                tensor.reshape(-1).float()
-            )
-            offset += length
+        if fits_float:
+            offset = 0
+            for tensor, length in zip(tensors, lengths, strict=True):
+                replay_float_out[offset : offset + length].copy_(
+                    tensor.reshape(-1).float()
+                )
+                offset += length
         replay_state_out[:state_required].copy_(initial_state.reshape(-1).float())
 
         replay_meta_out[1:8].copy_(

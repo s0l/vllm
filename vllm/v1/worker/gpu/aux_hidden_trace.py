@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -42,6 +43,9 @@ class AuxHiddenTrace:
     full_attention_stages: tuple[str, ...] = FULL_ATTENTION_STAGE_ORDER
     first_gdn_boundaries: bool = False
     gdn_boundary_layer: int = 0
+    packed_compare_prefix_tokens: int = 0
+    packed_compare_sequence_tokens: int = 0
+    packed_compare_sequences: int = 0
     _saved_matches: dict[int, int] = field(default_factory=dict)
 
     @classmethod
@@ -103,6 +107,21 @@ class AuxHiddenTrace:
                 "0",
             )
         )
+        packed_compare_prefix_tokens = int(
+            os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_PACKED_COMPARE_PREFIX_TOKENS", "0"
+            )
+        )
+        packed_compare_sequence_tokens = int(
+            os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_PACKED_COMPARE_SEQUENCE_TOKENS", "0"
+            )
+        )
+        packed_compare_sequences = int(
+            os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_PACKED_COMPARE_SEQUENCES", "0"
+            )
+        )
         if not layers or any(layer < 0 for layer in layers):
             raise ValueError("Aux hidden trace layers must be nonnegative")
         if token_id < 0 or position < 0:
@@ -133,6 +152,20 @@ class AuxHiddenTrace:
             )
         if gdn_boundary_layer < 0:
             raise ValueError("GDN boundary layer must be nonnegative")
+        packed_compare = (
+            packed_compare_prefix_tokens,
+            packed_compare_sequence_tokens,
+            packed_compare_sequences,
+        )
+        if any(packed_compare) and not (
+            packed_compare_prefix_tokens >= 0
+            and packed_compare_sequence_tokens > 0
+            and packed_compare_sequences > 1
+        ):
+            raise ValueError(
+                "Packed comparison requires a nonnegative prefix, positive "
+                "sequence length, and at least two sequences"
+            )
         if first_gdn_boundaries and not {
             gdn_boundary_layer,
             gdn_boundary_layer + 1,
@@ -153,7 +186,60 @@ class AuxHiddenTrace:
             full_attention_stages=full_attention_stages,
             first_gdn_boundaries=first_gdn_boundaries,
             gdn_boundary_layer=gdn_boundary_layer,
+            packed_compare_prefix_tokens=packed_compare_prefix_tokens,
+            packed_compare_sequence_tokens=packed_compare_sequence_tokens,
+            packed_compare_sequences=packed_compare_sequences,
         )
+
+    def _packed_sequence_diffs(
+        self,
+        *,
+        query_len: int,
+        labels: tuple[str, ...],
+        aux_hidden_states: list[torch.Tensor],
+    ) -> dict[str, list[dict[str, int | float | bool]]] | None:
+        sequence_tokens = self.packed_compare_sequence_tokens
+        sequence_count = self.packed_compare_sequences
+        if sequence_tokens == 0 or sequence_count == 0:
+            return None
+        prefix_tokens = self.packed_compare_prefix_tokens
+        required_tokens = prefix_tokens + sequence_tokens * sequence_count
+        if query_len != required_tokens:
+            return None
+
+        summaries: dict[str, list[dict[str, int | float | bool]]] = {}
+        for label, hidden in zip(labels, aux_hidden_states, strict=True):
+            if label.startswith("gdn_replay_") or hidden.shape[0] < required_tokens:
+                continue
+            reference = hidden[prefix_tokens : prefix_tokens + sequence_tokens]
+            comparisons: list[dict[str, int | float | bool]] = []
+            for sequence_index in range(1, sequence_count):
+                start = prefix_tokens + sequence_index * sequence_tokens
+                candidate = hidden[start : start + sequence_tokens]
+                unequal = reference.ne(candidate)
+                per_token = unequal.reshape(sequence_tokens, -1).any(dim=1)
+                differing_tokens = int(per_token.sum().item())
+                first_differing_token = (
+                    int(per_token.nonzero(as_tuple=False)[0].item())
+                    if differing_tokens
+                    else -1
+                )
+                max_abs = (
+                    float((reference.float() - candidate.float()).abs().max().item())
+                    if differing_tokens
+                    else 0.0
+                )
+                comparisons.append(
+                    {
+                        "sequence": sequence_index,
+                        "exact": differing_tokens == 0,
+                        "differing_tokens": differing_tokens,
+                        "first_differing_token": first_differing_token,
+                        "max_abs": max_abs,
+                    }
+                )
+            summaries[label] = comparisons
+        return summaries
 
     @property
     def enabled(self) -> bool:
@@ -256,6 +342,11 @@ class AuxHiddenTrace:
         query_len: int,
         cudagraph_mode: str,
         aux_hidden_states: list[torch.Tensor],
+        req_ids: list[str] | None = None,
+        query_start_loc: list[int] | None = None,
+        num_scheduled_tokens: list[int] | None = None,
+        num_computed_tokens: list[int] | None = None,
+        slot_mappings_by_layer: dict[str, torch.Tensor] | None = None,
     ) -> None:
         saved = self._saved_matches.get(query_len, 0)
         if not self.enabled or saved >= self.max_matches_per_query_len:
@@ -290,6 +381,11 @@ class AuxHiddenTrace:
         torch.cuda.current_stream().synchronize()
         rank = get_tp_group().rank_in_group
         selected_matches = matches[: self.max_matches_per_query_len - saved]
+        packed_sequence_diffs = self._packed_sequence_diffs(
+            query_len=query_len,
+            labels=labels,
+            aux_hidden_states=aux_hidden_states,
+        )
         for compact_index, row in enumerate(selected_matches):
             if has_dcp_pack and row != 0:
                 raise RuntimeError(
@@ -301,6 +397,47 @@ class AuxHiddenTrace:
             path = Path(f"{self.output}.q{query_len}.occ{occurrence}.rank{rank}.pt")
             if path.exists():
                 raise RuntimeError(f"Refusing to overwrite aux hidden trace: {path}")
+            request_provenance = None
+            if req_ids is not None or query_start_loc is not None:
+                if req_ids is None or query_start_loc is None:
+                    raise RuntimeError(
+                        "Aux hidden trace request provenance requires both "
+                        "req_ids and query_start_loc"
+                    )
+                if len(query_start_loc) != len(req_ids) + 1:
+                    raise RuntimeError(
+                        "Aux hidden trace request provenance has inconsistent "
+                        "request boundaries"
+                    )
+                request_index = bisect_right(query_start_loc, row) - 1
+                if not 0 <= request_index < len(req_ids):
+                    raise RuntimeError(
+                        f"Matched row {row} is outside request boundaries "
+                        f"{query_start_loc}"
+                    )
+                request_provenance = {
+                    "req_id": req_ids[request_index],
+                    "request_index": request_index,
+                    "request_row_offset": row - query_start_loc[request_index],
+                    "query_start": query_start_loc[request_index],
+                    "query_end": query_start_loc[request_index + 1],
+                    "num_scheduled_tokens": (
+                        num_scheduled_tokens[request_index]
+                        if num_scheduled_tokens is not None
+                        else None
+                    ),
+                    "num_computed_tokens": (
+                        num_computed_tokens[request_index]
+                        if num_computed_tokens is not None
+                        else None
+                    ),
+                    "slot_mappings": {
+                        layer_name: int(slot_mapping[row].item())
+                        for layer_name, slot_mapping in (
+                            slot_mappings_by_layer or {}
+                        ).items()
+                    },
+                }
             torch.save(
                 {
                     "rank": rank,
@@ -312,6 +449,7 @@ class AuxHiddenTrace:
                     "position": self.position,
                     "input_ids": input_ids[:query_len].detach().cpu().clone(),
                     "positions": flat_positions[:query_len].detach().cpu().clone(),
+                    "request_provenance": request_provenance,
                     "layers": {
                         label: (
                             hidden
@@ -324,6 +462,7 @@ class AuxHiddenTrace:
                         for label, hidden in zip(labels, aux_hidden_states, strict=True)
                     },
                     "scopes": self.output_scopes(),
+                    "packed_sequence_diffs": packed_sequence_diffs,
                 },
                 path,
             )
