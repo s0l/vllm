@@ -92,6 +92,15 @@ if TYPE_CHECKING:
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
     AG2_VLLM_NVFP4_BATCH_INVARIANT: bool = False
+    AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE: bool = False
+    AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL: bool = False
+    AG2_VLLM_NVFP4_MARLIN_WHOLE_SLICE_PREFILL: bool = False
+    AG2_VLLM_NVFP4_MARLIN_GATE_UP_SCRATCH: bool = False
+    AG2_VLLM_MTP_BF16_GATE_UP_SCRATCH: bool = False
+    AG2_VLLM_MTP_FC_BATCH_INVARIANT: bool = False
+    AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH: bool = False
+    AG2_VLLM_NVFP4_HUMMING_STABLE_K64: bool = False
+    AG2_VLLM_NVFP4_HUMMING_NARROW_PAD64: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     # Deprecated alias of VLLM_TRITON_USE_TD (removed in v0.25).
     VLLM_TRITON_ATTN_USE_TD: bool | None = None
@@ -612,6 +621,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
     "AG2_VLLM_NVFP4_BATCH_INVARIANT": lambda: bool(
         int(os.getenv("AG2_VLLM_NVFP4_BATCH_INVARIANT", "0"))
+    ),
+    "AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE": lambda: bool(
+        int(os.getenv("AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE", "0"))
+    ),
+    "AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL": lambda: bool(
+        int(os.getenv("AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL", "0"))
+    ),
+    "AG2_VLLM_NVFP4_MARLIN_WHOLE_SLICE_PREFILL": lambda: bool(
+        int(os.getenv("AG2_VLLM_NVFP4_MARLIN_WHOLE_SLICE_PREFILL", "0"))
+    ),
+    "AG2_VLLM_NVFP4_MARLIN_GATE_UP_SCRATCH": lambda: bool(
+        int(os.getenv("AG2_VLLM_NVFP4_MARLIN_GATE_UP_SCRATCH", "0"))
+    ),
+    "AG2_VLLM_MTP_BF16_GATE_UP_SCRATCH": lambda: bool(
+        int(os.getenv("AG2_VLLM_MTP_BF16_GATE_UP_SCRATCH", "0"))
+    ),
+    "AG2_VLLM_MTP_FC_BATCH_INVARIANT": lambda: bool(
+        int(os.getenv("AG2_VLLM_MTP_FC_BATCH_INVARIANT", "0"))
+    ),
+    "AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH": lambda: bool(
+        int(os.getenv("AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH", "0"))
+    ),
+    "AG2_VLLM_NVFP4_HUMMING_STABLE_K64": lambda: bool(
+        int(os.getenv("AG2_VLLM_NVFP4_HUMMING_STABLE_K64", "0"))
+    ),
+    "AG2_VLLM_NVFP4_HUMMING_NARROW_PAD64": lambda: bool(
+        int(os.getenv("AG2_VLLM_NVFP4_HUMMING_NARROW_PAD64", "0"))
     ),
     # Use tensor descriptors for Q/K/V loads and output stores in the
     # Triton unified-attention kernel.  Enables HW 2D block reads on

@@ -679,6 +679,22 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             counter_num_kv_tail_deferrals, per_engine_labelvalues
         )
 
+        counter_num_canonical_prefill_admission_deferrals = self._counter_cls(
+            name="vllm:num_canonical_prefill_admission_deferrals",
+            documentation=(
+                "Cumulative number of waiting text prefills deferred because "
+                "the residual token budget could not reach their normal "
+                "aligned chunk boundary."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_num_canonical_prefill_admission_deferrals = (
+            create_metric_per_engine(
+                counter_num_canonical_prefill_admission_deferrals,
+                per_engine_labelvalues,
+            )
+        )
+
         counter_prompt_tokens = self._counter_cls(
             name="vllm:prompt_tokens",
             documentation="Number of prefill tokens processed.",
@@ -1135,6 +1151,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
             self.counter_num_kv_tail_deferrals[engine_idx].inc(
                 scheduler_stats.num_kv_tail_deferrals
+            )
+            self.counter_num_canonical_prefill_admission_deferrals[engine_idx].inc(
+                scheduler_stats.num_canonical_prefill_admission_deferrals
             )
 
             self.counter_prefix_cache_queries[engine_idx].inc(

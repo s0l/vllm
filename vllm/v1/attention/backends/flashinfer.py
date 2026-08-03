@@ -92,6 +92,44 @@ FP4_DTYPE = torch.uint8
 logger = init_logger(__name__)
 
 trtllm_workspace_buffer = None
+_ag2_dcp_prefill_query_scratch: torch.Tensor | None = None
+
+
+def set_ag2_dcp_prefill_query_scratch(scratch: torch.Tensor | None) -> None:
+    global _ag2_dcp_prefill_query_scratch
+    if scratch is not None and (scratch.dtype != torch.bfloat16 or not scratch.is_cuda):
+        raise ValueError("DCP prefill query scratch must be a CUDA BF16 tensor")
+    _ag2_dcp_prefill_query_scratch = scratch
+
+
+def _resolve_decode_split_plan(
+    *,
+    num_decode_tokens: int,
+    num_decodes: int,
+    fixed_split_size: int,
+    disable_split_kv: bool,
+    spec_target_only: bool,
+) -> tuple[int, bool, bool]:
+    """Resolve native-decode split policy and graph-wrapper eligibility.
+
+    A speculative target verifies more than one query token per request.  Its
+    vLLM lane is already PIECEWISE, so a fixed split can use FlashInfer's
+    ordinary replannable wrapper.  MTP draft decode has one query token and
+    retains the existing FULL CUDA-graph wrapper.
+
+    Returns ``(fixed_split_size, disable_split_kv, force_non_graph_wrapper)``.
+    """
+    if num_decodes <= 0 or num_decode_tokens % num_decodes:
+        raise ValueError(
+            "FlashInfer native decode requires a positive request count and "
+            "uniform query length: "
+            f"{num_decode_tokens=} {num_decodes=}"
+        )
+    query_len = num_decode_tokens // num_decodes
+    if spec_target_only and query_len == 1:
+        return -1, False, False
+    force_non_graph_wrapper = spec_target_only and fixed_split_size > 0
+    return fixed_split_size, disable_split_kv, force_non_graph_wrapper
 
 
 def _flashinfer_seq_lens_and_blocks_for_paged_kv(
@@ -332,14 +370,41 @@ def _copy_ag2_dcp_trace(
     buffer[: trace.shape[0]].copy_(trace)
 
 
+AG2_DCP_OBSERVER_SCHEMA_VERSION = 1
+AG2_DCP_OBSERVER_PLAN_BIT = 1 << 0
+AG2_DCP_OBSERVER_HISTORY_BIT = 1 << 1
+AG2_DCP_OBSERVER_CURRENT_KV_BIT = 1 << 2
+AG2_DCP_OBSERVER_SCALES_BIT = 1 << 3
+AG2_DCP_OBSERVER_STAGE_BITS = {
+    "local_output": 1 << 4,
+    "local_lse": 1 << 5,
+    "combined_output": 1 << 6,
+    "combined_lse": 1 << 7,
+    "query_output": 1 << 8,
+    "query_lse": 1 << 9,
+    "merged_output": 1 << 10,
+}
+AG2_DCP_OBSERVER_COMPLETE_MASK = (
+    AG2_DCP_OBSERVER_PLAN_BIT
+    | AG2_DCP_OBSERVER_HISTORY_BIT
+    | AG2_DCP_OBSERVER_CURRENT_KV_BIT
+    | AG2_DCP_OBSERVER_SCALES_BIT
+    | sum(AG2_DCP_OBSERVER_STAGE_BITS.values())
+)
+
+
 def _write_ag2_dcp_aux_pack(
     layer: torch.nn.Module,
     stage: str,
     value: torch.Tensor,
     dcp_output_pack: torch.Tensor | None,
     dcp_lse_pack: torch.Tensor | None,
+    request_tail_indices: torch.Tensor | None = None,
+    request_tail_count: int = 0,
+    request_row_stride: int = 0,
+    dcp_observer_meta: torch.Tensor | None = None,
 ) -> None:
-    """Write row-zero DCP state into explicit custom-op output tensors.
+    """Write per-request-tail DCP state into explicit custom-op outputs.
 
     These packs differ from the historical registered trace buffers: they are
     explicit mutated arguments of the attention custom op and are returned as
@@ -350,6 +415,25 @@ def _write_ag2_dcp_aux_pack(
         return
     if dcp_output_pack is None or dcp_lse_pack is None:
         raise RuntimeError("DCP auxiliary output and LSE packs must be paired")
+    if request_tail_indices is not None and request_row_stride:
+        raise RuntimeError(
+            "DCP auxiliary pack cannot combine explicit indices and row stride"
+        )
+    if request_row_stride < 0:
+        raise RuntimeError("DCP auxiliary pack row stride must be nonnegative")
+    strided_request_rows = request_row_stride > 0
+    legacy_row_zero = request_tail_indices is None and not strided_request_rows
+    if legacy_row_zero:
+        request_tail_count = 1
+    if request_tail_count > dcp_output_pack.shape[0]:
+        # Non-target CUDA Graph capture shapes can be wider than the bounded
+        # observer. Preserve an explicit incomplete sentinel; the analyzer
+        # must reject it if such a shape reaches the target packet.
+        dcp_output_pack.fill_(torch.nan)
+        dcp_lse_pack.fill_(torch.nan)
+        if dcp_observer_meta is not None:
+            dcp_observer_meta.fill_(-1)
+        return
     local_heads = layer.num_heads
     total_heads = local_heads * get_dcp_group().world_size
     head_dim = value.shape[-1] if value.ndim == 3 else layer.head_size
@@ -375,25 +459,513 @@ def _write_ag2_dcp_aux_pack(
     }
     if stage in output_layout:
         offset, expected = output_layout[stage]
-        flat = value[0].reshape(-1)
-        if flat.numel() != expected:
+        if legacy_row_zero:
+            selected = value[:1]
+        elif strided_request_rows:
+            selected = value[
+                : request_tail_count * request_row_stride : request_row_stride
+            ]
+        else:
+            selected = torch.index_select(
+                value,
+                0,
+                request_tail_indices[:request_tail_count],
+            )
+        selected = selected.reshape(request_tail_count, -1)
+        if selected.shape[1] != expected:
             raise RuntimeError(
-                f"DCP auxiliary {stage} output has {flat.numel()} values, "
+                f"DCP auxiliary {stage} output has {selected.shape[1]} values, "
                 f"expected {expected}"
             )
-        dcp_output_pack[0, offset : offset + expected].copy_(flat)
+        dcp_output_pack[:request_tail_count, offset : offset + expected].copy_(selected)
+        if (
+            dcp_observer_meta is not None
+            and request_tail_count <= dcp_observer_meta.shape[0]
+        ):
+            dcp_observer_meta[:request_tail_count, 1].bitwise_or_(
+                AG2_DCP_OBSERVER_STAGE_BITS[stage]
+            )
         return
     if stage in lse_layout:
         offset, expected = lse_layout[stage]
-        flat = value[0].reshape(-1)
-        if flat.numel() != expected:
+        if legacy_row_zero:
+            selected = value[:1]
+        elif strided_request_rows:
+            selected = value[
+                : request_tail_count * request_row_stride : request_row_stride
+            ]
+        else:
+            selected = torch.index_select(
+                value,
+                0,
+                request_tail_indices[:request_tail_count],
+            )
+        selected = selected.reshape(request_tail_count, -1)
+        if selected.shape[1] != expected:
             raise RuntimeError(
-                f"DCP auxiliary {stage} LSE has {flat.numel()} values, "
+                f"DCP auxiliary {stage} LSE has {selected.shape[1]} values, "
                 f"expected {expected}"
             )
-        dcp_lse_pack[0, offset : offset + expected].copy_(flat)
+        dcp_lse_pack[:request_tail_count, offset : offset + expected].copy_(selected)
+        if (
+            dcp_observer_meta is not None
+            and request_tail_count <= dcp_observer_meta.shape[0]
+        ):
+            dcp_observer_meta[:request_tail_count, 1].bitwise_or_(
+                AG2_DCP_OBSERVER_STAGE_BITS[stage]
+            )
         return
     raise ValueError(f"Unknown DCP auxiliary pack stage: {stage}")
+
+
+def _write_ag2_dcp_kv_history_pack(
+    layer: torch.nn.Module,
+    kv_cache_tuple: tuple[torch.Tensor, torch.Tensor],
+    decode: "FIDecode",
+    history_pack: torch.Tensor | None,
+    history_meta: torch.Tensor | None,
+    page_indices_pack: torch.Tensor | None,
+    observer_meta: torch.Tensor | None,
+    *,
+    request_count: int,
+    request_row_stride: int,
+) -> None:
+    """Copy each request's first decode row's logical paged KV into a trace.
+
+    The trace contains only consumed tokens, in logical sequence order. Physical
+    page ids and unused last-page tails are excluded, so equal histories compare
+    byte-for-byte even when requests occupy different cache blocks.
+    """
+    del layer
+    outputs = (history_pack, history_meta, page_indices_pack, observer_meta)
+    if all(output is None for output in outputs):
+        return
+    if any(output is None for output in outputs):
+        raise RuntimeError(
+            "DCP KV history data, pages and observer metadata must be paired"
+        )
+    assert history_pack is not None
+    assert history_meta is not None
+    assert page_indices_pack is not None
+    assert observer_meta is not None
+    if request_row_stride < 1:
+        raise RuntimeError("DCP KV history requires a positive request row stride")
+    if request_count > history_pack.shape[0]:
+        history_pack.zero_()
+        history_meta.fill_(-1)
+        page_indices_pack.fill_(-1)
+        observer_meta.fill_(-1)
+        return
+    wrapper = decode.wrapper
+    indptr = wrapper._paged_kv_indptr_buf
+    indices = wrapper._paged_kv_indices_buf
+    last_page_len = wrapper._paged_kv_last_page_len_buf
+    if indptr is None or indices is None or last_page_len is None:
+        raise RuntimeError("FlashInfer decode wrapper did not retain paged KV metadata")
+    if indices.numel() == 0:
+        # Dummy CUDA Graph inputs can have valid zero-page indptr metadata and
+        # an empty page table. There is no consumed history to observe.
+        history_pack.zero_()
+        history_meta.fill_(-1)
+        page_indices_pack.fill_(-1)
+        observer_meta.fill_(-1)
+        return
+
+    layout = get_kv_cache_layout()
+    if layout == "HND":
+        page_size = kv_cache_tuple[0].shape[2]
+    elif layout == "NHD":
+        page_size = kv_cache_tuple[0].shape[1]
+    else:
+        raise RuntimeError(f"Unsupported KV cache layout for history trace: {layout}")
+    capacity = history_pack.shape[2]
+    if any(cache.element_size() != 1 for cache in kv_cache_tuple):
+        raise RuntimeError("DCP KV history byte trace currently requires FP8 KV")
+
+    if request_row_stride == 1:
+        # Draft qlen=1 runs inside FULL CUDA Graphs. Capture a bounded logical
+        # tail using only device tensor operations: scalar CPU reads would
+        # either break capture or turn the record into a stale side effect.
+        # The wrapper buffers are the exact metadata consumed by FlashInfer.
+        request_rows = torch.arange(
+            request_count,
+            dtype=torch.long,
+            device=indptr.device,
+        )
+        page_starts = indptr[:request_count].to(torch.long)
+        page_ends = indptr[1 : request_count + 1].to(torch.long)
+        total_pages = page_ends - page_starts
+        max_trace_pages = (history_pack.shape[2] + page_size - 1) // page_size
+        if max_trace_pages > page_indices_pack.shape[1]:
+            raise RuntimeError("DCP page provenance pack is narrower than KV history")
+        trace_starts = torch.maximum(page_starts, page_ends - max_trace_pages)
+        trace_pages = page_ends - trace_starts
+        page_offsets = torch.arange(
+            max_trace_pages,
+            dtype=torch.long,
+            device=indptr.device,
+        )
+        flat_offsets = trace_starts[:, None] + page_offsets[None, :]
+        valid_pages = page_offsets[None, :] < trace_pages[:, None]
+        safe_offsets = flat_offsets.clamp(0, max(indices.numel() - 1, 0))
+        selected_page_ids = indices.to(torch.long)[safe_offsets]
+        selected_page_ids = torch.where(
+            valid_pages,
+            selected_page_ids,
+            torch.zeros_like(selected_page_ids),
+        )
+
+        final_page_lens = last_page_len[:request_count].to(torch.long)
+        logical_tokens = torch.where(
+            total_pages > 0,
+            (total_pages - 1) * page_size + final_page_lens,
+            torch.zeros_like(total_pages),
+        )
+        retained_tokens = torch.where(
+            trace_pages > 0,
+            (trace_pages - 1) * page_size + final_page_lens,
+            torch.zeros_like(trace_pages),
+        ).clamp_max(history_pack.shape[2])
+
+        history_pack.zero_()
+        history_meta.fill_(-1)
+        page_indices_pack.fill_(-1)
+        page_indices_pack[:request_count, :max_trace_pages].copy_(
+            torch.where(
+                valid_pages,
+                selected_page_ids.to(page_indices_pack.dtype),
+                torch.full_like(selected_page_ids, -1).to(page_indices_pack.dtype),
+            )
+        )
+        for kv_index, cache in enumerate(kv_cache_tuple):
+            pages = torch.index_select(cache, 0, selected_page_ids.reshape(-1))
+            pages = pages.reshape(request_count, max_trace_pages, *cache.shape[1:])
+            if layout == "HND":
+                pages = pages.permute(0, 1, 3, 2, 4)
+            logical = pages.reshape(
+                request_count,
+                max_trace_pages * page_size,
+                pages.shape[-2],
+                pages.shape[-1],
+            )[:, : history_pack.shape[2]]
+            token_offsets = torch.arange(
+                history_pack.shape[2],
+                dtype=torch.long,
+                device=logical.device,
+            )
+            valid_tokens = token_offsets[None, :] < retained_tokens[:, None]
+            logical = torch.where(
+                valid_tokens[:, :, None, None],
+                logical,
+                torch.zeros_like(logical),
+            )
+            history_pack[:request_count, kv_index].copy_(logical.view(torch.uint8))
+
+        history_meta[:request_count].copy_(
+            torch.stack(
+                [request_rows, retained_tokens, trace_pages, final_page_lens], dim=1
+            ).to(history_meta.dtype)
+        )
+        if observer_meta is not None:
+            if observer_meta.shape[1] < 24:
+                raise RuntimeError("DCP causal observer metadata requires 24 columns")
+            observer_meta.fill_(-1)
+            observer_meta[:request_count, 0] = AG2_DCP_OBSERVER_SCHEMA_VERSION
+            observer_meta[:request_count, 1] = (
+                AG2_DCP_OBSERVER_PLAN_BIT | AG2_DCP_OBSERVER_HISTORY_BIT
+            )
+            observer_meta[:request_count, 2] = 1
+            observer_meta[:request_count, 3] = request_rows.to(observer_meta.dtype)
+            observer_meta[:request_count, 4] = request_rows.to(observer_meta.dtype)
+            observer_meta[:request_count, 5] = request_row_stride
+            observer_meta[:request_count, 6] = logical_tokens.to(observer_meta.dtype)
+            observer_meta[:request_count, 7] = total_pages.to(observer_meta.dtype)
+            observer_meta[:request_count, 8] = final_page_lens.to(observer_meta.dtype)
+            observer_meta[:request_count, 9] = page_starts.to(observer_meta.dtype)
+            observer_meta[:request_count, 10] = page_ends.to(observer_meta.dtype)
+            observer_meta[:request_count, 11] = request_count
+            observer_meta[:request_count, 12] = int(
+                getattr(wrapper, "_use_cuda_graph", True)
+            )
+            observer_meta[:request_count, 13] = 3  # decode request row
+            observer_meta[:request_count, 14] = page_size
+            observer_meta[:request_count, 15] = 1 if layout == "NHD" else 2
+        return
+    history_pack.zero_()
+    history_meta.fill_(-1)
+    for request_index in range(request_count):
+        source_row = request_index * request_row_stride
+        page_start = int(indptr[source_row].item())
+        page_end = int(indptr[source_row + 1].item())
+        num_pages = page_end - page_start
+        final_page_len = int(last_page_len[source_row].item())
+        logical_tokens = (
+            (num_pages - 1) * page_size + final_page_len if num_pages else 0
+        )
+        if logical_tokens > capacity:
+            raise RuntimeError(
+                "DCP KV history exceeds trace capacity: "
+                f"{logical_tokens=} > {capacity=}"
+            )
+        page_ids = indices[page_start:page_end].to(torch.long)
+        for kv_index, cache in enumerate(kv_cache_tuple):
+            pages = torch.index_select(cache, 0, page_ids)
+            if layout == "HND":
+                pages = pages.permute(0, 2, 1, 3)
+            logical = pages.reshape(-1, pages.shape[-2], pages.shape[-1])[
+                :logical_tokens
+            ]
+            history_pack[request_index, kv_index, :logical_tokens].copy_(
+                logical.view(torch.uint8)
+            )
+        history_meta[request_index, 0] = source_row
+        history_meta[request_index, 1] = logical_tokens
+        history_meta[request_index, 2] = num_pages
+        history_meta[request_index, 3] = final_page_len
+
+
+def _ag2_dcp_request_trace_indices(
+    qo_indptr_cpu: torch.Tensor,
+    row: str,
+) -> torch.Tensor:
+    """Return one flattened query-row index for each DCP prefill request."""
+    if row == "first":
+        return qo_indptr_cpu[:-1]
+    if row == "tail":
+        return qo_indptr_cpu[1:] - 1
+    raise ValueError(
+        f"AG2 DCP request-row trace must select 'first' or 'tail', got {row!r}"
+    )
+
+
+def _write_ag2_dcp_prefill_kv_history_pack(
+    kv_cache_tuple: tuple[torch.Tensor, torch.Tensor],
+    *,
+    qo_indptr_cpu: torch.Tensor | None,
+    paged_kv_indptr_cpu: torch.Tensor | None,
+    paged_kv_indices: torch.Tensor | None,
+    paged_kv_last_page_len_cpu: torch.Tensor | None,
+    history_pack: torch.Tensor | None,
+    history_meta: torch.Tensor | None,
+    page_indices_pack: torch.Tensor | None,
+    observer_meta: torch.Tensor | None,
+    use_cuda_graph: bool,
+    request_row: str,
+    selected_query_len: int = 4,
+) -> None:
+    """Capture logical historical KV for selected DCP-prefill requests.
+
+    Pack row ``i`` always describes request ``i``. Only requests whose query
+    length equals ``selected_query_len`` are populated; other rows retain the
+    fail-closed ``zero/-1`` sentinel. This excludes unrelated long prefills in
+    a mixed batch while preserving request-index alignment with auxiliary QKV
+    and attention-output packs.
+    """
+    observer_outputs = (
+        history_pack,
+        history_meta,
+        page_indices_pack,
+        observer_meta,
+    )
+    if all(value is None for value in observer_outputs):
+        return
+    if any(value is None for value in observer_outputs):
+        raise RuntimeError(
+            "DCP causal observer history, pages and metadata must be provided together"
+        )
+    assert history_pack is not None
+    assert history_meta is not None
+    assert page_indices_pack is not None
+    assert observer_meta is not None
+    if any(
+        value is None
+        for value in (
+            qo_indptr_cpu,
+            paged_kv_indptr_cpu,
+            paged_kv_indices,
+            paged_kv_last_page_len_cpu,
+        )
+    ):
+        # Compile/profile and graph warmup can execute the compile-time trace
+        # contract before a real paged plan has populated wrapper metadata.
+        # Publish an explicit invalid sentinel; a real persisted qlen1 packet
+        # must later satisfy the complete observer bitmap in the analyzer.
+        history_pack.zero_()
+        history_meta.fill_(-1)
+        page_indices_pack.fill_(-1)
+        observer_meta.fill_(-1)
+        return
+    assert qo_indptr_cpu is not None
+    assert paged_kv_indptr_cpu is not None
+    assert paged_kv_indices is not None
+    assert paged_kv_last_page_len_cpu is not None
+
+    request_count = int(qo_indptr_cpu.numel()) - 1
+    if request_count > history_pack.shape[0]:
+        # The five-row observer is intentionally narrower than the 44-request
+        # compile envelope. Leave a fail-closed sentinel for unrelated warmup
+        # or larger batches; the target x5 must fit and become complete.
+        history_pack.zero_()
+        history_meta.fill_(-1)
+        page_indices_pack.fill_(-1)
+        observer_meta.fill_(-1)
+        return
+    if any(
+        value.shape[0] < request_count
+        for value in (history_meta, page_indices_pack, observer_meta)
+    ):
+        raise RuntimeError("DCP causal observer outputs have inconsistent row capacity")
+    if observer_meta.shape[1] < 24:
+        raise RuntimeError("DCP causal observer metadata requires 24 columns")
+    if int(paged_kv_indptr_cpu.numel()) != request_count + 1:
+        raise RuntimeError("DCP prefill KV indptr does not match request count")
+    if int(paged_kv_last_page_len_cpu.numel()) < request_count:
+        raise RuntimeError("DCP prefill last-page lengths do not match requests")
+
+    layout = get_kv_cache_layout()
+    if layout == "HND":
+        page_size = kv_cache_tuple[0].shape[2]
+    elif layout == "NHD":
+        page_size = kv_cache_tuple[0].shape[1]
+    else:
+        raise RuntimeError(f"Unsupported KV cache layout for history trace: {layout}")
+    if any(cache.element_size() != 1 for cache in kv_cache_tuple):
+        raise RuntimeError("DCP KV history byte trace currently requires FP8 KV")
+
+    capacity = history_pack.shape[2]
+    history_pack.zero_()
+    history_meta.fill_(-1)
+    page_indices_pack.fill_(-1)
+    observer_meta.fill_(-1)
+    query_lens = qo_indptr_cpu[1:] - qo_indptr_cpu[:-1]
+    for request_index in range(request_count):
+        request_query_len = int(query_lens[request_index].item())
+        trace_row = int(
+            _ag2_dcp_request_trace_indices(qo_indptr_cpu, request_row)[
+                request_index
+            ].item()
+        )
+        selected = request_query_len == selected_query_len
+        # Scalar device fills are CUDA-Graph-capturable. Constructing a CUDA
+        # tensor from this CPU metadata performs a host-to-device copy during
+        # capture and is rejected by PyTorch (or can freeze capture-time
+        # values into later replays).
+        observer_meta[request_index, 0] = AG2_DCP_OBSERVER_SCHEMA_VERSION
+        observer_meta[request_index, 1] = AG2_DCP_OBSERVER_PLAN_BIT
+        observer_meta[request_index, 2] = int(selected)
+        observer_meta[request_index, 3] = trace_row
+        observer_meta[request_index, 4] = request_index
+        observer_meta[request_index, 5] = request_query_len
+        observer_meta[request_index, 11] = int(qo_indptr_cpu[-1].item())
+        observer_meta[request_index, 12] = int(use_cuda_graph)
+        observer_meta[request_index, 13] = 1 if request_row == "first" else 2
+        observer_meta[request_index, 14] = page_size
+        observer_meta[request_index, 15] = 1 if layout == "NHD" else 2
+        if not selected:
+            continue
+        page_start = int(paged_kv_indptr_cpu[request_index].item())
+        page_end = int(paged_kv_indptr_cpu[request_index + 1].item())
+        num_pages = page_end - page_start
+        final_page_len = int(paged_kv_last_page_len_cpu[request_index].item())
+        logical_tokens = (
+            (num_pages - 1) * page_size + final_page_len if num_pages else 0
+        )
+        if logical_tokens > capacity:
+            raise RuntimeError(
+                "DCP KV history exceeds trace capacity: "
+                f"{logical_tokens=} > {capacity=}"
+            )
+        if num_pages > page_indices_pack.shape[1]:
+            raise RuntimeError(
+                "DCP KV page provenance exceeds trace capacity: "
+                f"{num_pages=} > {page_indices_pack.shape[1]}"
+            )
+        page_ids = paged_kv_indices[page_start:page_end].to(torch.long)
+        page_indices_pack[request_index, :num_pages].copy_(
+            page_ids.to(page_indices_pack.dtype)
+        )
+        for kv_index, cache in enumerate(kv_cache_tuple):
+            pages = torch.index_select(cache, 0, page_ids)
+            if layout == "HND":
+                pages = pages.permute(0, 2, 1, 3)
+            logical = pages.reshape(-1, pages.shape[-2], pages.shape[-1])[
+                :logical_tokens
+            ]
+            history_pack[request_index, kv_index, :logical_tokens].copy_(
+                logical.view(torch.uint8)
+            )
+        history_meta[request_index, 0] = trace_row
+        history_meta[request_index, 1] = logical_tokens
+        history_meta[request_index, 2] = num_pages
+        history_meta[request_index, 3] = final_page_len
+        observer_meta[request_index, 1].bitwise_or_(AG2_DCP_OBSERVER_HISTORY_BIT)
+        observer_meta[request_index, 6] = logical_tokens
+        observer_meta[request_index, 7] = num_pages
+        observer_meta[request_index, 8] = final_page_len
+        observer_meta[request_index, 9] = page_start
+        observer_meta[request_index, 10] = page_end
+
+
+def _write_ag2_dcp_current_kv_and_scales(
+    layer: torch.nn.Module,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    request_indices: torch.Tensor | None,
+    request_count: int,
+    current_kv_pack: torch.Tensor | None,
+    scale_pack: torch.Tensor | None,
+    observer_meta: torch.Tensor | None,
+    match_fp8_new_tokens: bool,
+    sm_scale: float,
+) -> None:
+    outputs = (current_kv_pack, scale_pack, observer_meta)
+    if all(output is None for output in outputs):
+        return
+    if any(output is None for output in outputs):
+        raise RuntimeError("DCP current-KV, scale and observer packs must be paired")
+    assert current_kv_pack is not None
+    assert scale_pack is not None
+    assert observer_meta is not None
+    if request_indices is None:
+        if request_count == 0:
+            # Profile/compile can execute before semantic request rows are
+            # attached. Keep the complete pack invalid until a real plan
+            # supplies row ownership.
+            current_kv_pack.zero_()
+            scale_pack.fill_(torch.nan)
+            observer_meta.fill_(-1)
+            return
+        raise RuntimeError("DCP current-KV observer requires request row indices")
+    if request_count > current_kv_pack.shape[0]:
+        current_kv_pack.zero_()
+        scale_pack.fill_(torch.nan)
+        observer_meta.fill_(-1)
+        return
+    selected_key = torch.index_select(key, 0, request_indices[:request_count])
+    selected_value = torch.index_select(value, 0, request_indices[:request_count])
+    if current_kv_pack.shape[2:] != selected_key.shape[1:]:
+        raise RuntimeError(
+            "DCP current-KV observer geometry differs from consumed K/V: "
+            f"{current_kv_pack.shape[2:]} != {selected_key.shape[1:]}"
+        )
+    current_kv_pack.zero_()
+    current_kv_pack[:request_count, 0].copy_(selected_key)
+    current_kv_pack[:request_count, 1].copy_(selected_value)
+    scale_pack.fill_(torch.nan)
+    # Avoid torch.tensor([...], device="cuda") here. This function executes
+    # inside the qlen=1 FULL CUDA Graph and such construction is a CPU->CUDA
+    # copy during capture. Device scalar fills are recorded by the graph and
+    # these scales are immutable for the lifetime of the loaded layer.
+    scale_pack[:request_count, 0].fill_(sm_scale)
+    scale_pack[:request_count, 1].fill_(float(layer._q_scale_float))
+    scale_pack[:request_count, 2].fill_(float(layer._k_scale_float))
+    scale_pack[:request_count, 3].fill_(float(layer._v_scale_float))
+    observer_meta[:request_count, 1].bitwise_or_(
+        AG2_DCP_OBSERVER_CURRENT_KV_BIT | AG2_DCP_OBSERVER_SCALES_BIT
+    )
+    observer_meta[:request_count, 18] = int(match_fp8_new_tokens)
+    observer_meta[:request_count, 20] = selected_key.shape[1]
 
 
 def _match_fp8_cache_representation(
@@ -429,11 +1001,22 @@ class BatchDCPPrefillWrapper:
         self._use_cuda_graph = use_cuda_graph
         self._disable_split_kv_for_cuda_graph = (
             use_cuda_graph
-            and os.environ.get(
-                "AG2_VLLM_FLASHINFER_DCP_PREFILL_NO_SPLIT", "0"
-            )
-            == "1"
+            and os.environ.get("AG2_VLLM_FLASHINFER_DCP_PREFILL_NO_SPLIT", "0") == "1"
         )
+        self._ragged_fixed_split_size = int(
+            os.environ.get(
+                "AG2_VLLM_FLASHINFER_DCP_RAGGED_FIXED_SPLIT_SIZE",
+                "-1",
+            )
+        )
+        self._context_fixed_split_size = int(
+            os.environ.get(
+                "AG2_VLLM_FLASHINFER_DCP_CONTEXT_FIXED_SPLIT_SIZE",
+                "-1",
+            )
+        )
+        if self._context_fixed_split_size == 0 or self._context_fixed_split_size < -1:
+            raise ValueError("DCP context fixed split size must be -1 or positive")
         self._context = BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer,
             get_kv_cache_layout(),
@@ -467,6 +1050,18 @@ class BatchDCPPrefillWrapper:
         self._local_kv_head_index_tensors: dict[
             tuple[tuple[int, ...], torch.device], torch.Tensor
         ] = {}
+        self._ag2_request_tail_indices: torch.Tensor | None = None
+        self._ag2_request_tail_count = 0
+        self._ag2_history_qo_indptr_cpu: torch.Tensor | None = None
+        self._ag2_history_paged_kv_indptr_cpu: torch.Tensor | None = None
+        self._ag2_history_paged_kv_indices: torch.Tensor | None = None
+        self._ag2_history_last_page_len_cpu: torch.Tensor | None = None
+        self._ag2_request_trace_row = "tail"
+        self._ag2_prefill_fixed_split_size = -1
+        self._ag2_prefill_disable_split_kv = False
+        self._ag2_window_left = -1
+        self._ag2_dcp_world_size = 1
+        self._ag2_sm_scale = 1.0
 
     def _get_local_kv_head_index_tensor(
         self,
@@ -509,6 +1104,71 @@ class BatchDCPPrefillWrapper:
         disable_split_kv: bool,
     ):
         """Plan the prefill operation with given parameters."""
+        context_fixed_split_size = (
+            self._context_fixed_split_size
+            if self._context_fixed_split_size > 0
+            else prefill_fixed_split_size
+        )
+        self._ag2_prefill_fixed_split_size = context_fixed_split_size
+        self._ag2_prefill_disable_split_kv = disable_split_kv
+        self._ag2_window_left = window_left
+        self._ag2_dcp_world_size = dcp_world_size
+        self._ag2_sm_scale = sm_scale
+        trace_tail_rows = int(
+            os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_DCP_REQUEST_TAIL_ROWS",
+                "0",
+            )
+        )
+        if trace_tail_rows:
+            request_tail_count = int(qo_indptr_cpu.numel()) - 1
+            if request_tail_count > trace_tail_rows:
+                raise RuntimeError(
+                    "DCP request-tail trace capacity is smaller than the "
+                    f"planned request count: {trace_tail_rows} < "
+                    f"{request_tail_count}"
+                )
+            if (
+                self._ag2_request_tail_indices is None
+                or self._ag2_request_tail_indices.shape[0] != trace_tail_rows
+                or self._ag2_request_tail_indices.device != paged_kv_indices.device
+            ):
+                self._ag2_request_tail_indices = torch.zeros(
+                    trace_tail_rows,
+                    dtype=qo_indptr_cpu.dtype,
+                    device=paged_kv_indices.device,
+                )
+            trace_row = os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_DCP_REQUEST_ROW",
+                "tail",
+            )
+            self._ag2_request_trace_row = trace_row
+            tail_indices = _ag2_dcp_request_trace_indices(
+                qo_indptr_cpu,
+                trace_row,
+            ).to(
+                device=paged_kv_indices.device,
+                non_blocking=True,
+            )
+            self._ag2_request_tail_indices[:request_tail_count].copy_(tail_indices)
+            self._ag2_request_tail_count = request_tail_count
+        if int(
+            os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_DCP_KV_HISTORY_TOKENS",
+                "0",
+            )
+        ):
+            # The ordinary qlen4 DCP-prefill lane is PIECEWISE, so planning is
+            # outside graph replay. Clone the small CPU metadata because the
+            # builder reuses its staging tensors for later batches.
+            if self._use_cuda_graph:
+                raise RuntimeError(
+                    "DCP prefill KV history observer is not CUDA-graph compatible"
+                )
+            self._ag2_history_qo_indptr_cpu = qo_indptr_cpu.clone()
+            self._ag2_history_paged_kv_indptr_cpu = paged_kv_indptr_cpu.clone()
+            self._ag2_history_paged_kv_indices = paged_kv_indices
+            self._ag2_history_last_page_len_cpu = paged_kv_last_page_len_cpu.clone()
         self._context.plan(
             qo_indptr=qo_indptr_cpu,
             paged_kv_indptr=paged_kv_indptr_cpu,
@@ -524,7 +1184,7 @@ class BatchDCPPrefillWrapper:
             logits_soft_cap=logits_soft_cap,
             q_data_type=q_data_type,
             kv_data_type=kv_cache_dtype,
-            fixed_split_size=prefill_fixed_split_size,
+            fixed_split_size=context_fixed_split_size,
             # Research draft: forcing launch-static split-K did not make M6
             # replay correct. Keep it available only for explicit reproduction,
             # not as part of the native DCP prefill CUDA Graph POC.
@@ -544,6 +1204,11 @@ class BatchDCPPrefillWrapper:
             window_left=window_left,
             logits_soft_cap=logits_soft_cap,
             q_data_type=q_data_type,
+            fixed_split_size=(
+                self._ragged_fixed_split_size
+                if self._ragged_fixed_split_size > 0
+                else prefill_fixed_split_size
+            ),
             disable_split_kv=(
                 disable_split_kv or self._disable_split_kv_for_cuda_graph
             ),
@@ -559,11 +1224,71 @@ class BatchDCPPrefillWrapper:
         out: torch.Tensor,
         dcp_output_pack: torch.Tensor | None = None,
         dcp_lse_pack: torch.Tensor | None = None,
+        dcp_kv_history_pack: torch.Tensor | None = None,
+        dcp_kv_history_meta: torch.Tensor | None = None,
+        dcp_kv_page_indices_pack: torch.Tensor | None = None,
+        dcp_observer_meta: torch.Tensor | None = None,
+        dcp_current_kv_pack: torch.Tensor | None = None,
+        dcp_scale_pack: torch.Tensor | None = None,
         match_fp8_new_tokens: bool = False,
     ):
-        prefill_query_across_dcp = get_dcp_group().all_gather(
-            prefill_query.contiguous(), dim=1
+        _write_ag2_dcp_prefill_kv_history_pack(
+            kv_cache_tuple,
+            qo_indptr_cpu=self._ag2_history_qo_indptr_cpu,
+            paged_kv_indptr_cpu=self._ag2_history_paged_kv_indptr_cpu,
+            paged_kv_indices=self._ag2_history_paged_kv_indices,
+            paged_kv_last_page_len_cpu=self._ag2_history_last_page_len_cpu,
+            history_pack=dcp_kv_history_pack,
+            history_meta=dcp_kv_history_meta,
+            page_indices_pack=dcp_kv_page_indices_pack,
+            observer_meta=dcp_observer_meta,
+            use_cuda_graph=self._use_cuda_graph,
+            request_row=self._ag2_request_trace_row,
         )
+        if dcp_observer_meta is not None:
+            request_count = self._ag2_request_tail_count
+            dcp_observer_meta[:request_count, 16] = self._ag2_prefill_fixed_split_size
+            dcp_observer_meta[:request_count, 17] = int(
+                self._ag2_prefill_disable_split_kv
+            )
+            dcp_observer_meta[:request_count, 19] = self._ag2_dcp_world_size
+            dcp_observer_meta[:request_count, 21] = self._ag2_window_left
+        if envs.AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH:
+            query = prefill_query.contiguous()
+            dcp_group = get_dcp_group()
+            if dcp_group.world_size != 3 or query.ndim != 3:
+                raise RuntimeError(
+                    "AG2 DCP query scratch requires DCP3 and a rank-3 query, got "
+                    f"world_size={dcp_group.world_size} shape={tuple(query.shape)}"
+                )
+            scratch = _ag2_dcp_prefill_query_scratch
+            output_elements = dcp_group.world_size * query.numel()
+            if scratch is None or scratch.numel() < 2 * output_elements:
+                raise RuntimeError(
+                    "AG2 DCP query scratch is absent or too small: "
+                    f"need={2 * output_elements} available="
+                    f"{0 if scratch is None else scratch.numel()}"
+                )
+            flat_scratch = scratch.view(-1)
+            raw_output = flat_scratch[:output_elements].view(
+                dcp_group.world_size * query.shape[0],
+                query.shape[1],
+                query.shape[2],
+            )
+            prefill_query_across_dcp = flat_scratch[
+                output_elements : 2 * output_elements
+            ].view(
+                query.shape[0],
+                dcp_group.world_size * query.shape[1],
+                query.shape[2],
+            )
+            dcp_group.all_gather_into(
+                query, raw_output, prefill_query_across_dcp, dim=1
+            )
+        else:
+            prefill_query_across_dcp = get_dcp_group().all_gather(
+                prefill_query.contiguous(), dim=1
+            )
         output_context_tmp, lse_context_tmp = self._context.run(
             prefill_query_across_dcp,
             kv_cache_tuple,
@@ -579,6 +1304,9 @@ class BatchDCPPrefillWrapper:
             output_context_tmp,
             dcp_output_pack,
             dcp_lse_pack,
+            request_tail_indices=self._ag2_request_tail_indices,
+            request_tail_count=self._ag2_request_tail_count,
+            dcp_observer_meta=dcp_observer_meta,
         )
         _write_ag2_dcp_aux_pack(
             layer,
@@ -586,6 +1314,9 @@ class BatchDCPPrefillWrapper:
             lse_context_tmp,
             dcp_output_pack,
             dcp_lse_pack,
+            request_tail_indices=self._ag2_request_tail_indices,
+            request_tail_count=self._ag2_request_tail_count,
+            dcp_observer_meta=dcp_observer_meta,
         )
         del prefill_query_across_dcp
         output_context, lse_context = self._dcp_combine(
@@ -602,6 +1333,9 @@ class BatchDCPPrefillWrapper:
             output_context,
             dcp_output_pack,
             dcp_lse_pack,
+            request_tail_indices=self._ag2_request_tail_indices,
+            request_tail_count=self._ag2_request_tail_count,
+            dcp_observer_meta=dcp_observer_meta,
         )
         _write_ag2_dcp_aux_pack(
             layer,
@@ -609,6 +1343,9 @@ class BatchDCPPrefillWrapper:
             lse_context,
             dcp_output_pack,
             dcp_lse_pack,
+            request_tail_indices=self._ag2_request_tail_indices,
+            request_tail_count=self._ag2_request_tail_count,
+            dcp_observer_meta=dcp_observer_meta,
         )
         del output_context_tmp, lse_context_tmp
         lse_context = lse_context.transpose(0, 1).contiguous()
@@ -629,6 +1366,19 @@ class BatchDCPPrefillWrapper:
             key = _match_fp8_cache_representation(key, layer._k_scale)
             value = _match_fp8_cache_representation(value, layer._v_scale)
 
+        _write_ag2_dcp_current_kv_and_scales(
+            layer,
+            key,
+            value,
+            request_indices=self._ag2_request_tail_indices,
+            request_count=self._ag2_request_tail_count,
+            current_kv_pack=dcp_current_kv_pack,
+            scale_pack=dcp_scale_pack,
+            observer_meta=dcp_observer_meta,
+            match_fp8_new_tokens=match_fp8_new_tokens,
+            sm_scale=self._ag2_sm_scale,
+        )
+
         output_query, lse_query = self._new_tokens.run(
             prefill_query,
             key,
@@ -644,6 +1394,9 @@ class BatchDCPPrefillWrapper:
             output_query,
             dcp_output_pack,
             dcp_lse_pack,
+            request_tail_indices=self._ag2_request_tail_indices,
+            request_tail_count=self._ag2_request_tail_count,
+            dcp_observer_meta=dcp_observer_meta,
         )
         _write_ag2_dcp_aux_pack(
             layer,
@@ -651,6 +1404,9 @@ class BatchDCPPrefillWrapper:
             lse_query.transpose(0, 1),
             dcp_output_pack,
             dcp_lse_pack,
+            request_tail_indices=self._ag2_request_tail_indices,
+            request_tail_count=self._ag2_request_tail_count,
+            dcp_observer_meta=dcp_observer_meta,
         )
 
         # FlashInfer returns base-2 LSE, while vLLM's generic
@@ -673,6 +1429,9 @@ class BatchDCPPrefillWrapper:
             out,
             dcp_output_pack,
             dcp_lse_pack,
+            request_tail_indices=self._ag2_request_tail_indices,
+            request_tail_count=self._ag2_request_tail_count,
+            dcp_observer_meta=dcp_observer_meta,
         )
         return out
 
@@ -1334,9 +2093,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             os.environ.get("AG2_VLLM_FLASHINFER_DCP_PREFILL_CUDAGRAPH", "0") == "1"
         )
         self._dcp_prefill_wrappers_cudagraph: dict[int, BatchDCPPrefillWrapper] = {}
-        self._dcp_prefill_captured_wrappers: dict[
-            int, BatchDCPPrefillWrapper
-        ] = {}
+        self._dcp_prefill_captured_wrappers: dict[int, BatchDCPPrefillWrapper] = {}
         self._dcp_prefill_qo_indptr_buffer: torch.Tensor | None = None
         self._dcp_prefill_context_int_workspace: torch.Tensor | None = None
         self._dcp_prefill_new_tokens_int_workspace: torch.Tensor | None = None
@@ -1361,9 +2118,36 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if envs.VLLM_BATCH_INVARIANT:
             self.decode_fixed_split_size = 2048
             self.decode_disable_split_kv = True
+            self.decode_fixed_split_spec_target_only = False
         else:
-            self.decode_fixed_split_size = -1
-            self.decode_disable_split_kv = False
+            self.decode_fixed_split_size = int(
+                os.environ.get(
+                    "AG2_VLLM_FLASHINFER_SPEC_TARGET_FIXED_SPLIT_SIZE",
+                    "-1",
+                )
+            )
+            self.decode_disable_split_kv = (
+                os.environ.get(
+                    "AG2_VLLM_FLASHINFER_SPEC_TARGET_DISABLE_SPLIT_KV",
+                    "0",
+                )
+                == "1"
+            )
+            self.decode_fixed_split_spec_target_only = True
+            if self.decode_fixed_split_size == 0 or self.decode_fixed_split_size < -1:
+                raise ValueError(
+                    "FlashInfer speculative-target fixed split size must be "
+                    "-1 or positive"
+                )
+            if self.decode_fixed_split_size > 0:
+                logger.warning_once(
+                    "Research POC: FlashInfer fixed-split planning is enabled "
+                    "only for multi-token speculative target verification "
+                    "(fixed_split_size=%d, disable_split_kv=%s); qlen=1 "
+                    "decode and its FULL CUDA graphs are unchanged.",
+                    self.decode_fixed_split_size,
+                    self.decode_disable_split_kv,
+                )
         if prefill_batch_invariant:
             self.prefill_fixed_split_size = 4096
             self.prefill_disable_split_kv = True
@@ -1484,6 +2268,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self._dcp_match_fp8_new_tokens = (
             os.environ.get("AG2_VLLM_MTP_DCP_MATCH_FP8_NEW_TOKENS", "0") == "1"
         )
+        self._dcp_prefill_match_fp8_new_tokens = (
+            os.environ.get("AG2_VLLM_DCP_PREFILL_MATCH_FP8_NEW_TOKENS", "0") == "1"
+        )
         enabled_special_paths = sum(
             (
                 self._dcp_pseudo_decode_enabled,
@@ -1575,16 +2362,25 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             assert self.kv_cache_spec.dtype == self.model_config.dtype
             self.kv_cache_dtype = self.kv_cache_spec.dtype
 
+        if (
+            self._dcp_match_fp8_new_tokens or self._dcp_prefill_match_fp8_new_tokens
+        ) and (not self.use_dcp or not self.cache_dtype.startswith("fp8")):
+            raise ValueError(
+                "Matching live new-token K/V to the FP8 cache "
+                "requires DCP and an FP8 KV cache."
+            )
         if self._dcp_match_fp8_new_tokens:
-            if not self.use_dcp or not self.cache_dtype.startswith("fp8"):
-                raise ValueError(
-                    "Matching speculative new-token K/V to the FP8 cache "
-                    "requires DCP and an FP8 KV cache."
-                )
             logger.warning_once(
                 "Research-only DCP speculative new-token FP8 matching is enabled. "
                 "Only uniform target decode queries with is_prefilling=false "
                 "will round-trip live K/V through the cache representation."
+            )
+        if self._dcp_prefill_match_fp8_new_tokens:
+            logger.warning_once(
+                "Research-only causal DCP prefill new-token FP8 matching is enabled. "
+                "Every native causal DCP prefill will round-trip live K/V through "
+                "the cache representation to remove scheduler-dependent mixed "
+                "BF16/FP8 attention inputs."
             )
 
         # Compute per-phase Q dtype.  On SM90 (XQA decode), the prefill and
@@ -1790,8 +2586,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
         if (
-            os.environ.get("AG2_VLLM_FLASHINFER_DCP_PREFILL_CUDAGRAPH", "0")
-            == "1"
+            os.environ.get("AG2_VLLM_FLASHINFER_DCP_PREFILL_CUDAGRAPH", "0") == "1"
             and vllm_config.parallel_config.decode_context_parallel_size > 1
         ):
             return AttentionCGSupport.UNIFORM_BATCH
@@ -1875,9 +2670,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             if wrapper is None:
                 qo_indptr = self._dcp_prefill_qo_indptr_buffer
                 context_int_workspace = self._dcp_prefill_context_int_workspace
-                new_tokens_int_workspace = (
-                    self._dcp_prefill_new_tokens_int_workspace
-                )
+                new_tokens_int_workspace = self._dcp_prefill_new_tokens_int_workspace
                 assert qo_indptr is not None
                 assert context_int_workspace is not None
                 assert new_tokens_int_workspace is not None
@@ -1959,13 +2752,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )
         active_rows = query_lens != 0
         nonzero_query_lens = query_lens[active_rows]
-        if (
-            nonzero_query_lens.numel() == 0
-            or bool(
-                torch.any(
-                    nonzero_query_lens != self._dcp_pseudo_decode_query_len
-                )
-            )
+        if nonzero_query_lens.numel() == 0 or bool(
+            torch.any(nonzero_query_lens != self._dcp_pseudo_decode_query_len)
         ):
             return None
 
@@ -1986,10 +2774,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 return None
             active_draft_counts = num_decode_draft_tokens_cpu[active_rows]
             if bool(
-                torch.any(
-                    active_draft_counts
-                    != self._dcp_pseudo_decode_query_len - 1
-                )
+                torch.any(active_draft_counts != self._dcp_pseudo_decode_query_len - 1)
             ):
                 return None
 
@@ -2171,6 +2956,24 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         return True
 
+    def _should_match_fp8_new_tokens(
+        self,
+        *,
+        causal: bool,
+        num_prefills: int,
+        use_dcp_pseudo_decode: bool,
+        uniform_target_decode: bool,
+    ) -> bool:
+        if self._dcp_match_fp8_new_tokens and uniform_target_decode:
+            return True
+        return (
+            self._dcp_prefill_match_fp8_new_tokens
+            and self.use_dcp
+            and causal
+            and num_prefills > 0
+            and not use_dcp_pseudo_decode
+        )
+
     def _can_use_dcp_pseudo_decode(
         self,
         common_prefix_len: int,
@@ -2325,12 +3128,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             common_prefix_len,
             common_attn_metadata,
         )
-        match_fp8_new_tokens = (
-            self._dcp_match_fp8_new_tokens
-            and self._is_uniform_dcp_target_decode(
-                common_prefix_len,
-                common_attn_metadata,
-            )
+        uniform_target_decode = self._is_uniform_dcp_target_decode(
+            common_prefix_len,
+            common_attn_metadata,
         )
         if causal:
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
@@ -2347,6 +3147,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             num_prefills = num_reqs
             num_decode_tokens = 0
             num_prefill_tokens = num_actual_tokens
+        match_fp8_new_tokens = self._should_match_fp8_new_tokens(
+            causal=causal,
+            num_prefills=num_prefills,
+            use_dcp_pseudo_decode=use_dcp_pseudo_decode,
+            uniform_target_decode=uniform_target_decode,
+        )
         if use_dcp_pseudo_decode:
             # Every flattened verification token becomes an independent
             # single-query paged-prefill row. The output remains in the
@@ -2745,12 +3551,31 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
             else:
                 assert seq_lens_cpu is not None
+                (
+                    decode_fixed_split_size,
+                    decode_disable_split_kv,
+                    force_non_graph_wrapper,
+                ) = _resolve_decode_split_plan(
+                    num_decode_tokens=num_decode_tokens,
+                    num_decodes=num_decodes,
+                    fixed_split_size=self.decode_fixed_split_size,
+                    disable_split_kv=self.decode_disable_split_kv,
+                    spec_target_only=self.decode_fixed_split_spec_target_only,
+                )
                 pure_decode = num_prefills == 0
                 use_cudagraph = (
                     self.enable_cuda_graph
                     and pure_decode
                     and num_decode_tokens <= self._decode_cudagraph_max_bs
                 )
+                if force_non_graph_wrapper:
+                    # FlashInfer explicitly does not guarantee fixed split-K
+                    # compatibility with CUDA graphs because changing KV
+                    # lengths changes the internal number of CTAs.  K>0 target
+                    # verification already uses vLLM's PIECEWISE lane, so use
+                    # the ordinary replannable wrapper for this attention op
+                    # without touching qlen=1 FULL graphs.
+                    use_cudagraph = False
                 num_input_tokens = num_decode_tokens
 
                 decode_wrapper = self._get_decode_wrapper(
@@ -2784,8 +3609,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     q_data_type=self.q_data_type_decode,
                     kv_data_type=self.kv_cache_dtype,
                     o_data_type=o_dtype,
-                    fixed_split_size=self.decode_fixed_split_size,
-                    disable_split_kv=self.decode_disable_split_kv,
+                    fixed_split_size=decode_fixed_split_size,
+                    disable_split_kv=decode_disable_split_kv,
                 )
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
         return attn_metadata
@@ -2964,6 +3789,12 @@ class FlashInferImpl(AttentionImpl):
         output_block_scale: torch.Tensor | None = None,
         dcp_output_pack: torch.Tensor | None = None,
         dcp_lse_pack: torch.Tensor | None = None,
+        dcp_kv_history_pack: torch.Tensor | None = None,
+        dcp_kv_history_meta: torch.Tensor | None = None,
+        dcp_kv_page_indices_pack: torch.Tensor | None = None,
+        dcp_observer_meta: torch.Tensor | None = None,
+        dcp_current_kv_pack: torch.Tensor | None = None,
+        dcp_scale_pack: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass with FlashInfer.
 
@@ -3149,8 +3980,7 @@ class FlashInferImpl(AttentionImpl):
                 if use_dcp:
                     if isinstance(
                         prefill_wrapper,
-                        BatchDCPBatchedDecodeWrapper
-                        | BatchDCPSequentialDecodeWrapper,
+                        BatchDCPBatchedDecodeWrapper | BatchDCPSequentialDecodeWrapper,
                     ):
                         prefill_wrapper.run(
                             layer,
@@ -3197,6 +4027,12 @@ class FlashInferImpl(AttentionImpl):
                             out=output[num_decode_tokens:],
                             dcp_output_pack=dcp_output_pack,
                             dcp_lse_pack=dcp_lse_pack,
+                            dcp_kv_history_pack=dcp_kv_history_pack,
+                            dcp_kv_history_meta=dcp_kv_history_meta,
+                            dcp_kv_page_indices_pack=dcp_kv_page_indices_pack,
+                            dcp_observer_meta=dcp_observer_meta,
+                            dcp_current_kv_pack=dcp_current_kv_pack,
+                            dcp_scale_pack=dcp_scale_pack,
                             match_fp8_new_tokens=(
                                 attn_metadata.prefill.match_fp8_new_tokens
                             ),
@@ -3357,6 +4193,12 @@ class FlashInferImpl(AttentionImpl):
         if num_decode_tokens > 0:
             decode_query = query[:num_decode_tokens]
             assert decode_query.shape[0] == num_decode_tokens
+            if num_decode_tokens % attn_metadata.num_decodes != 0:
+                raise RuntimeError(
+                    "FlashInfer decode tokens must divide evenly across requests: "
+                    f"{num_decode_tokens=} {attn_metadata.num_decodes=}"
+                )
+            decode_query_len_per_req = num_decode_tokens // attn_metadata.num_decodes
 
             # Convert query to the expected dtype for decode if needed.
             decode_query = self.maybe_quant_query(
@@ -3388,6 +4230,36 @@ class FlashInferImpl(AttentionImpl):
                     out_decode = output[:num_decode_tokens]
 
                 if use_dcp:
+                    _write_ag2_dcp_kv_history_pack(
+                        layer,
+                        kv_cache_tuple,
+                        attn_metadata.decode,
+                        dcp_kv_history_pack,
+                        dcp_kv_history_meta,
+                        dcp_kv_page_indices_pack,
+                        dcp_observer_meta,
+                        request_count=attn_metadata.num_decodes,
+                        request_row_stride=decode_query_len_per_req,
+                    )
+                    decode_request_rows = torch.arange(
+                        0,
+                        num_decode_tokens,
+                        decode_query_len_per_req,
+                        dtype=torch.long,
+                        device=key.device,
+                    )
+                    _write_ag2_dcp_current_kv_and_scales(
+                        layer,
+                        key,
+                        value,
+                        request_indices=decode_request_rows,
+                        request_count=attn_metadata.num_decodes,
+                        current_kv_pack=dcp_current_kv_pack,
+                        scale_pack=dcp_scale_pack,
+                        observer_meta=dcp_observer_meta,
+                        match_fp8_new_tokens=False,
+                        sm_scale=self.scale,
+                    )
                     decode_query = get_dcp_group().all_gather(
                         decode_query.contiguous(), dim=-2
                     )
@@ -3416,6 +4288,9 @@ class FlashInferImpl(AttentionImpl):
                         output_tmp,
                         dcp_output_pack,
                         dcp_lse_pack,
+                        request_tail_count=attn_metadata.num_decodes,
+                        request_row_stride=decode_query_len_per_req,
+                        dcp_observer_meta=dcp_observer_meta,
                     )
                     _write_ag2_dcp_aux_pack(
                         layer,
@@ -3423,6 +4298,9 @@ class FlashInferImpl(AttentionImpl):
                         lse,
                         dcp_output_pack,
                         dcp_lse_pack,
+                        request_tail_count=attn_metadata.num_decodes,
+                        request_row_stride=decode_query_len_per_req,
+                        dcp_observer_meta=dcp_observer_meta,
                     )
                     if getattr(layer, "_ag2_dcp_trace_enabled", False):
                         combined_output, combined_lse = self.dcp_combine(
@@ -3441,6 +4319,9 @@ class FlashInferImpl(AttentionImpl):
                             combined_output,
                             dcp_output_pack,
                             dcp_lse_pack,
+                            request_tail_count=attn_metadata.num_decodes,
+                            request_row_stride=decode_query_len_per_req,
+                            dcp_observer_meta=dcp_observer_meta,
                         )
                         _write_ag2_dcp_aux_pack(
                             layer,
@@ -3448,6 +4329,9 @@ class FlashInferImpl(AttentionImpl):
                             combined_lse,
                             dcp_output_pack,
                             dcp_lse_pack,
+                            request_tail_count=attn_metadata.num_decodes,
+                            request_row_stride=decode_query_len_per_req,
+                            dcp_observer_meta=dcp_observer_meta,
                         )
                         output[:num_decode_tokens] = combined_output
                     else:
@@ -3464,6 +4348,9 @@ class FlashInferImpl(AttentionImpl):
                                 combined_output,
                                 dcp_output_pack,
                                 dcp_lse_pack,
+                                request_tail_count=attn_metadata.num_decodes,
+                                request_row_stride=decode_query_len_per_req,
+                                dcp_observer_meta=dcp_observer_meta,
                             )
                             _write_ag2_dcp_aux_pack(
                                 layer,
@@ -3471,6 +4358,9 @@ class FlashInferImpl(AttentionImpl):
                                 combined_lse,
                                 dcp_output_pack,
                                 dcp_lse_pack,
+                                request_tail_count=attn_metadata.num_decodes,
+                                request_row_stride=decode_query_len_per_req,
+                                dcp_observer_meta=dcp_observer_meta,
                             )
                             output[:num_decode_tokens] = combined_output
                         else:
@@ -3622,6 +4512,8 @@ class FlashInferImpl(AttentionImpl):
                         out,
                         dcp_output_pack,
                         dcp_lse_pack,
+                        request_tail_count=attn_metadata.num_decodes,
+                        request_row_stride=decode_query_len_per_req,
                     )
                     _write_ag2_dcp_aux_pack(
                         layer,
@@ -3629,6 +4521,8 @@ class FlashInferImpl(AttentionImpl):
                         lse,
                         dcp_output_pack,
                         dcp_lse_pack,
+                        request_tail_count=attn_metadata.num_decodes,
+                        request_row_stride=decode_query_len_per_req,
                     )
                     if getattr(layer, "_ag2_dcp_trace_enabled", False):
                         combined_output, combined_lse = self.dcp_combine(
@@ -3647,6 +4541,8 @@ class FlashInferImpl(AttentionImpl):
                             combined_output,
                             dcp_output_pack,
                             dcp_lse_pack,
+                            request_tail_count=attn_metadata.num_decodes,
+                            request_row_stride=decode_query_len_per_req,
                         )
                         _write_ag2_dcp_aux_pack(
                             layer,
@@ -3654,6 +4550,8 @@ class FlashInferImpl(AttentionImpl):
                             combined_lse,
                             dcp_output_pack,
                             dcp_lse_pack,
+                            request_tail_count=attn_metadata.num_decodes,
+                            request_row_stride=decode_query_len_per_req,
                         )
                         output[:num_decode_tokens] = combined_output
                     else:
@@ -3670,6 +4568,8 @@ class FlashInferImpl(AttentionImpl):
                                 combined_output,
                                 dcp_output_pack,
                                 dcp_lse_pack,
+                                request_tail_count=attn_metadata.num_decodes,
+                                request_row_stride=decode_query_len_per_req,
                             )
                             _write_ag2_dcp_aux_pack(
                                 layer,
@@ -3677,6 +4577,8 @@ class FlashInferImpl(AttentionImpl):
                                 combined_lse,
                                 dcp_output_pack,
                                 dcp_lse_pack,
+                                request_tail_count=attn_metadata.num_decodes,
+                                request_row_stride=decode_query_len_per_req,
                             )
                             output[:num_decode_tokens] = combined_output
                         else:

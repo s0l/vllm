@@ -495,6 +495,7 @@ class Attention(nn.Module, AttentionLayerBase):
         # definition specify the output tensor shape.
         output_shape: torch.Size | None = None,
         output_dtype: torch.dtype | None = None,
+        ag2_dcp_trace: bool = False,
     ) -> torch.Tensor:
         """
         The KV cache is stored inside this class and is accessed via
@@ -532,34 +533,90 @@ class Attention(nn.Module, AttentionLayerBase):
         hidden_size = output_shape[-1]
         dcp_output_pack = None
         dcp_lse_pack = None
-        if getattr(self, "_ag2_aux_dcp_pack_enabled", False):
+        dcp_kv_history_pack = None
+        dcp_kv_history_meta = None
+        dcp_kv_page_indices_pack = None
+        dcp_observer_meta = None
+        dcp_current_kv_pack = None
+        dcp_scale_pack = None
+        if ag2_dcp_trace and getattr(self, "_ag2_aux_dcp_pack_enabled", False):
             if self.impl.dcp_world_size <= 1:
                 raise RuntimeError("DCP auxiliary pack requires DCP world size > 1")
-            # The diagnostic records only row zero. Unlike registered trace
-            # buffers, these tensors are explicit mutated arguments and model
-            # outputs, so compile/CUDA Graph replay cannot hide stale side
-            # effects. Layout:
+            pack_rows = int(getattr(self, "_ag2_aux_dcp_pack_rows", 0))
+            if pack_rows < 1:
+                raise RuntimeError("DCP auxiliary pack requires positive row capacity")
+            # The diagnostic records one tail per active request. Unlike
+            # registered trace buffers, these tensors are explicit mutated
+            # arguments and model outputs. Compile/CUDA Graph replay therefore
+            # cannot hide stale side effects. Layout:
             # output = local | combined | query | merged
             # lse    = local | combined | query
             total_heads = self.num_heads * self.impl.dcp_world_size
-            output_pack_width = (
-                total_heads + 3 * self.num_heads
-            ) * self.head_size_v
+            output_pack_width = (total_heads + 3 * self.num_heads) * self.head_size_v
             lse_pack_width = total_heads + 2 * self.num_heads
             dcp_output_pack = torch.full(
-                (1, output_pack_width),
+                (pack_rows, output_pack_width),
                 torch.nan,
                 dtype=output_dtype,
                 device=query.device,
             )
             dcp_lse_pack = torch.full(
-                (1, lse_pack_width),
+                (pack_rows, lse_pack_width),
                 torch.nan,
                 dtype=torch.float32,
                 device=query.device,
             )
             self._ag2_aux_dcp_output_pack = dcp_output_pack
             self._ag2_aux_dcp_lse_pack = dcp_lse_pack
+        if ag2_dcp_trace and getattr(
+            self, "_ag2_aux_dcp_kv_history_enabled", False
+        ):
+            pack_rows = int(getattr(self, "_ag2_aux_dcp_kv_history_rows", 0))
+            history_tokens = int(getattr(self, "_ag2_aux_dcp_kv_history_tokens", 0))
+            if pack_rows < 1 or history_tokens < 1:
+                raise RuntimeError(
+                    "DCP KV history trace requires positive row and token capacities"
+                )
+            dcp_kv_history_pack = torch.empty(
+                (
+                    pack_rows,
+                    2,
+                    history_tokens,
+                    self.num_kv_heads,
+                    self.head_size,
+                ),
+                dtype=torch.uint8,
+                device=query.device,
+            )
+            dcp_kv_history_meta = torch.empty(
+                (pack_rows, 4), dtype=torch.int32, device=query.device
+            )
+            dcp_kv_page_indices_pack = torch.empty(
+                (pack_rows, history_tokens),
+                dtype=torch.int32,
+                device=query.device,
+            )
+            dcp_observer_meta = torch.empty(
+                (pack_rows, 24),
+                dtype=torch.int32,
+                device=query.device,
+            )
+            dcp_current_kv_pack = torch.empty(
+                (pack_rows, 2, self.num_kv_heads, self.head_size),
+                dtype=output_dtype,
+                device=query.device,
+            )
+            dcp_scale_pack = torch.empty(
+                (pack_rows, 4),
+                dtype=torch.float32,
+                device=query.device,
+            )
+            self._ag2_aux_dcp_kv_history_pack = dcp_kv_history_pack
+            self._ag2_aux_dcp_kv_history_meta = dcp_kv_history_meta
+            self._ag2_aux_dcp_kv_page_indices_pack = dcp_kv_page_indices_pack
+            self._ag2_aux_dcp_observer_meta = dcp_observer_meta
+            self._ag2_aux_dcp_current_kv_pack = dcp_current_kv_pack
+            self._ag2_aux_dcp_scale_pack = dcp_scale_pack
         # Reshape the query, key, and value tensors.
         # NOTE(woosuk): We do this outside the custom op to minimize the
         # CPU overheads from the non-CUDA-graph regions.
@@ -590,6 +647,12 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
                 dcp_output_pack=dcp_output_pack,
                 dcp_lse_pack=dcp_lse_pack,
+                dcp_kv_history_pack=dcp_kv_history_pack,
+                dcp_kv_history_meta=dcp_kv_history_meta,
+                dcp_kv_page_indices_pack=dcp_kv_page_indices_pack,
+                dcp_observer_meta=dcp_observer_meta,
+                dcp_current_kv_pack=dcp_current_kv_pack,
+                dcp_scale_pack=dcp_scale_pack,
             )
         else:
             # Skip this if sharing KV cache with an earlier attention layer.
@@ -612,6 +675,12 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
                 dcp_output_pack=dcp_output_pack,
                 dcp_lse_pack=dcp_lse_pack,
+                dcp_kv_history_pack=dcp_kv_history_pack,
+                dcp_kv_history_meta=dcp_kv_history_meta,
+                dcp_kv_page_indices_pack=dcp_kv_page_indices_pack,
+                dcp_observer_meta=dcp_observer_meta,
+                dcp_current_kv_pack=dcp_current_kv_pack,
+                dcp_scale_pack=dcp_scale_pack,
             )
         return output.view(-1, hidden_size)
 
@@ -860,6 +929,12 @@ def unified_attention_with_output(
     kv_cache_dummy_dep: torch.Tensor | None = None,
     dcp_output_pack: torch.Tensor | None = None,
     dcp_lse_pack: torch.Tensor | None = None,
+    dcp_kv_history_pack: torch.Tensor | None = None,
+    dcp_kv_history_meta: torch.Tensor | None = None,
+    dcp_kv_page_indices_pack: torch.Tensor | None = None,
+    dcp_observer_meta: torch.Tensor | None = None,
+    dcp_current_kv_pack: torch.Tensor | None = None,
+    dcp_scale_pack: torch.Tensor | None = None,
 ) -> None:
     # kv_cache_dummy_dep is not used but accepting it creates a data dependency
     # that ensures torch.compile preserves ordering between KV cache update and
@@ -879,6 +954,30 @@ def unified_attention_with_output(
         forward_kwargs.update(
             dcp_output_pack=dcp_output_pack,
             dcp_lse_pack=dcp_lse_pack,
+        )
+    causal_observer_outputs = (
+        dcp_kv_history_pack,
+        dcp_kv_history_meta,
+        dcp_kv_page_indices_pack,
+        dcp_observer_meta,
+        dcp_current_kv_pack,
+        dcp_scale_pack,
+    )
+    if any(value is not None for value in causal_observer_outputs):
+        if any(
+            value is None
+            for value in causal_observer_outputs
+        ):
+            raise RuntimeError(
+                "DCP causal observer history, pages and metadata must be paired"
+            )
+        forward_kwargs.update(
+            dcp_kv_history_pack=dcp_kv_history_pack,
+            dcp_kv_history_meta=dcp_kv_history_meta,
+            dcp_kv_page_indices_pack=dcp_kv_page_indices_pack,
+            dcp_observer_meta=dcp_observer_meta,
+            dcp_current_kv_pack=dcp_current_kv_pack,
+            dcp_scale_pack=dcp_scale_pack,
         )
     self.impl.forward(
         self,
@@ -902,6 +1001,12 @@ def unified_attention_with_output_fake(
     kv_cache_dummy_dep: torch.Tensor | None = None,
     dcp_output_pack: torch.Tensor | None = None,
     dcp_lse_pack: torch.Tensor | None = None,
+    dcp_kv_history_pack: torch.Tensor | None = None,
+    dcp_kv_history_meta: torch.Tensor | None = None,
+    dcp_kv_page_indices_pack: torch.Tensor | None = None,
+    dcp_observer_meta: torch.Tensor | None = None,
+    dcp_current_kv_pack: torch.Tensor | None = None,
+    dcp_scale_pack: torch.Tensor | None = None,
 ) -> None:
     return
 
@@ -914,6 +1019,12 @@ direct_register_custom_op(
         "output_block_scale",
         "dcp_output_pack",
         "dcp_lse_pack",
+        "dcp_kv_history_pack",
+        "dcp_kv_history_meta",
+        "dcp_kv_page_indices_pack",
+        "dcp_observer_meta",
+        "dcp_current_kv_pack",
+        "dcp_scale_pack",
     ],
     fake_impl=unified_attention_with_output_fake,
 )

@@ -5,6 +5,7 @@ import torch
 from vllm.distributed.parallel_state import (
     _should_use_tp3_ce,
     _should_use_tp3_ce_physical,
+    _should_use_tp3_embedding_ce,
     _should_use_tp3_piecewise_device_ce,
     _should_use_tp3_sd_canonical_reduce,
     _should_use_tp3_sd_deterministic_reduce,
@@ -12,6 +13,25 @@ from vllm.distributed.parallel_state import (
     _tp3_sd_deterministic_reduce,
     _tp3_sd_deterministic_sum,
 )
+
+
+def test_tp3_embedding_exact_nccl_override_is_shape_invariant():
+    common = {
+        "runtime_enabled": True,
+        "tensor_dim": 2,
+        "hidden_size": 5120,
+        "tp_world_size": 3,
+    }
+    assert not _should_use_tp3_embedding_ce(rows=1, **common)
+    assert not _should_use_tp3_embedding_ce(rows=3, **common)
+    assert _should_use_tp3_embedding_ce(rows=4, **common)
+    assert _should_use_tp3_embedding_ce(rows=7056, **common)
+    for rows in (1, 3, 4, 7056):
+        assert not _should_use_tp3_embedding_ce(
+            rows=rows,
+            force_exact_nccl=True,
+            **common,
+        )
 
 
 def test_tp3_device_ce_covers_piecewise_and_intermediate_prefill():

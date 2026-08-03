@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -887,6 +888,23 @@ class ModelCudaGraphManager(CudaGraphManager):
                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
             )
 
+            if envs.AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL:
+                layout = input_buffers.marlin_request_layout_cpu
+                if desc.cg_mode == CUDAGraphMode.FULL:
+                    # FULL graphs are replayed only for uniform decode lanes.
+                    # Capture the original single batched Marlin launch.
+                    layout[0] = num_reqs
+                    layout[1] = num_reqs
+                    layout[2 : num_reqs + 3].zero_()
+                else:
+                    # The op is cudagraph-unsafe in PIECEWISE mode and is
+                    # executed dynamically. This valid one-request layout is
+                    # only for compile/capture warmup.
+                    layout[0] = 1
+                    layout[1] = 0
+                    layout[2] = 0
+                    layout[3] = num_tokens
+
             # Capture with dummy rows marked as padding.
             input_buffers.is_padding.fill_(True)
 
@@ -917,6 +935,11 @@ class ModelCudaGraphManager(CudaGraphManager):
                     batch_descriptor=batch_descriptor,
                     is_padding=input_buffers.is_padding[:num_tokens],
                     tp3_sd_phase_reduce=tp3_sd_phase_reduce,
+                    marlin_request_layout_cpu=(
+                        input_buffers.marlin_request_layout_cpu
+                        if envs.AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL
+                        else None
+                    ),
                 ):
                     if cg_mode == CUDAGraphMode.PIECEWISE:
                         # PIECEWISE graph (compiled PW or breakable, chosen inside

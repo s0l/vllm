@@ -26,12 +26,15 @@ GPU->CPU synchronization.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 import torch
 
-_SCHEMA = "ag2-draft-capture-v3"
+from vllm.v1.worker.gpu.input_batch import InputBatch
+
+_SCHEMA = "ag2-draft-capture-v6"
 
 
 class Ag2DraftCapture:
@@ -44,11 +47,27 @@ class Ag2DraftCapture:
         self.steps_captured = 0
         self.parts_written = 0
         self.warned_target_only = False
-        self.pending_target_lm_head_hidden_states: torch.Tensor | None = None
+        self.pending_target: dict | None = None
         self.done = False
+        manifest = Path(f"{self.output}.manifest.json")
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schema": _SCHEMA,
+                    "state": "initialized",
+                    "max_steps": max_steps,
+                    "topk": topk,
+                    "flush_every": flush_every,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
     @classmethod
-    def from_env(cls) -> "Ag2DraftCapture | None":
+    def from_env(cls) -> Ag2DraftCapture | None:
         output = os.environ.get("AG2_VLLM_DRAFT_CAPTURE_OUTPUT")
         if not output:
             return None
@@ -66,13 +85,45 @@ class Ag2DraftCapture:
         *,
         rank: int,
         hidden_states: torch.Tensor,
+        input_batch: InputBatch,
     ) -> None:
         """Stage the exact rows immediately before target ``compute_logits``."""
         if self.done or rank != 0:
             return
-        self.pending_target_lm_head_hidden_states = (
-            hidden_states.detach().to("cpu", torch.float32)
-        )
+        num_reqs = input_batch.num_reqs
+        num_logits = int(input_batch.cu_num_logits_np[num_reqs])
+        if hidden_states.shape[0] != num_logits:
+            raise RuntimeError(
+                "AG2 target lm_head rows do not match cu_num_logits: "
+                f"{hidden_states.shape[0]} != {num_logits}"
+            )
+        logits_indices = input_batch.logits_indices[:num_logits].detach().cpu()
+        positions = input_batch.positions.detach().cpu()
+        input_ids = input_batch.input_ids.detach().cpu()
+        if logits_indices.numel() and (
+            int(logits_indices.min()) < 0
+            or int(logits_indices.max()) >= positions.shape[0]
+            or int(logits_indices.max()) >= input_ids.shape[0]
+        ):
+            raise RuntimeError(
+                "AG2 target lm_head logits_indices exceed captured input buffers"
+            )
+        self.pending_target = {
+            "hidden_states": hidden_states.detach().to("cpu", torch.float32),
+            "req_ids": list(input_batch.req_ids[:num_reqs]),
+            "idx_mapping": input_batch.idx_mapping[:num_reqs].detach().cpu(),
+            "expanded_idx_mapping": input_batch.expanded_idx_mapping[:num_logits]
+            .detach()
+            .cpu(),
+            "expanded_local_pos": input_batch.expanded_local_pos[:num_logits]
+            .detach()
+            .cpu(),
+            "cu_num_logits": input_batch.cu_num_logits[: num_reqs + 1]
+            .detach()
+            .cpu(),
+            "positions": positions[logits_indices],
+            "input_ids": input_ids[logits_indices],
+        }
 
     def collect(
         self,
@@ -87,12 +138,20 @@ class Ag2DraftCapture:
         last_sampled: torch.Tensor,
         next_prefill_tokens: torch.Tensor,
         idx_mapping: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        step_input_hidden: torch.Tensor,
+        step_sample_hidden: torch.Tensor,
+        step_input_ids: torch.Tensor,
+        step_positions: torch.Tensor,
+        step_top_pairs: torch.Tensor,
+        step_top_tokens: torch.Tensor,
     ) -> None:
         if self.done or rank != 0 or num_reqs <= 0:
             return
-        target_lm_head_hidden_states = self.pending_target_lm_head_hidden_states
-        self.pending_target_lm_head_hidden_states = None
-        if target_lm_head_hidden_states is None:
+        target = self.pending_target
+        self.pending_target = None
+        if target is None:
             raise RuntimeError(
                 "AG2 draft capture is missing the exact target lm_head input; "
                 "stage it immediately before target compute_logits"
@@ -109,17 +168,44 @@ class Ag2DraftCapture:
             topk_vals = None
             topk_ids = None
         else:
-            # draft_logits rows are written by request-state index
-            # (idx_mapping), not by batch slot.
-            state_idx = idx_mapping[:num_reqs].long().clamp(min=0)
-            logits = draft_logits[state_idx]
+            # Validate request-state provenance on CPU before any diagnostic
+            # GPU indexing. The observer must never introduce an asynchronous
+            # IndexKernel into the production stream.
+            state_idx_cpu = idx_mapping[:num_reqs].detach().cpu().long()
+            if bool((state_idx_cpu < 0).any()) or bool(
+                (state_idx_cpu >= draft_logits.shape[0]).any()
+            ):
+                raise RuntimeError("AG2 draft capture request state is out of bounds")
+            logits = draft_logits.detach().cpu()[state_idx_cpu]
             k = min(self.topk, logits.shape[-1])
             topk_vals, topk_ids = torch.topk(logits, k, dim=-1)
-        state_idx = idx_mapping[:num_reqs].long().clamp(min=0)
+        state_idx_cpu = idx_mapping[:num_reqs].detach().cpu().long()
+        if bool((state_idx_cpu < 0).any()):
+            raise RuntimeError("AG2 draft capture saw a negative active state")
+        last_sampled_cpu = last_sampled.detach().cpu()
+        next_prefill_cpu = next_prefill_tokens.detach().cpu()
+        if next_prefill_cpu.ndim != 2 or next_prefill_cpu.shape[0] < 1:
+            raise RuntimeError(
+                "AG2 draft capture expected next_prefill_tokens with shape "
+                "[lookahead, request_state]"
+            )
+        temperature_cpu = temperature.detach().to("cpu", torch.float32)
+        seeds_cpu = seeds.detach().cpu()
+        state_capacity = min(
+            last_sampled_cpu.shape[0],
+            next_prefill_cpu.shape[1],
+            temperature_cpu.shape[0],
+            seeds_cpu.shape[0],
+        )
+        if state_idx_cpu.numel() and int(state_idx_cpu.max()) >= state_capacity:
+            raise RuntimeError(
+                "AG2 draft capture active state exceeds request-state buffers"
+            )
         self.records.append(
             {
                 "step": self.steps_captured,
                 "num_reqs": num_reqs,
+                "req_ids": target["req_ids"],
                 "topk_vals": (
                     topk_vals.detach().to("cpu", torch.float32)
                     if topk_vals is not None
@@ -129,7 +215,13 @@ class Ag2DraftCapture:
                     topk_ids.detach().cpu() if topk_ids is not None else None
                 ),
                 "draft_tokens": draft_tokens[:num_reqs].detach().cpu(),
-                "target_lm_head_hidden_states": target_lm_head_hidden_states,
+                "target_lm_head_hidden_states": target["hidden_states"],
+                "target_idx_mapping": target["idx_mapping"],
+                "target_expanded_idx_mapping": target["expanded_idx_mapping"],
+                "target_expanded_local_pos": target["expanded_local_pos"],
+                "target_cu_num_logits": target["cu_num_logits"],
+                "target_positions": target["positions"],
+                "target_input_ids": target["input_ids"],
                 "retained_hidden": hidden_states[:num_reqs]
                 .detach()
                 .to("cpu", torch.float32),
@@ -137,11 +229,33 @@ class Ag2DraftCapture:
                 "num_rejected": num_rejected[:num_reqs].detach().cpu(),
                 # last_sampled / next_prefill_tokens are indexed by request
                 # state (idx_mapping), like draft_logits.
-                "last_sampled": last_sampled[state_idx].detach().cpu(),
-                "next_prefill_tokens": next_prefill_tokens[state_idx]
+                "last_sampled": last_sampled_cpu[state_idx_cpu],
+                # The autoregressive prepare-prefill kernel consumes the first
+                # lookahead row and indexes request state along dimension 1.
+                "next_prefill_tokens": next_prefill_cpu[0, state_idx_cpu],
+                "idx_mapping": state_idx_cpu,
+                "temperature": temperature_cpu[state_idx_cpu],
+                "seeds": seeds_cpu[state_idx_cpu],
+                # Proposal-major tensors preserve all K autoregressive steps;
+                # active request rows are compact within each step.
+                "proposal_input_hidden": step_input_hidden[:, :num_reqs]
+                .detach()
+                .to("cpu", torch.float32),
+                "proposal_sample_hidden": step_sample_hidden[:, :num_reqs]
+                .detach()
+                .to("cpu", torch.float32),
+                "proposal_input_ids": step_input_ids[:, :num_reqs]
                 .detach()
                 .cpu(),
-                "idx_mapping": idx_mapping[:num_reqs].detach().cpu(),
+                "proposal_positions": step_positions[:, :num_reqs]
+                .detach()
+                .cpu(),
+                "proposal_top_pairs": step_top_pairs[:, :num_reqs]
+                .detach()
+                .cpu(),
+                "proposal_top_tokens": step_top_tokens[:, :num_reqs]
+                .detach()
+                .cpu(),
             }
         )
         self.steps_captured += 1

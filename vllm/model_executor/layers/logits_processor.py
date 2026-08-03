@@ -60,6 +60,23 @@ class LogitsProcessor(PluggableLayer):
         model_config = get_current_vllm_config().model_config
         self.head_dtype = model_config.head_dtype if model_config is not None else None
 
+    def ag2_enable_top_token_trace(
+        self, max_num_reqs: int, tp_size: int, device: torch.device
+    ) -> None:
+        """Allocate default-off evidence buffers for local-argmax reduction."""
+        self.register_buffer(
+            "ag2_top_token_gathered_pairs",
+            torch.zeros(max_num_reqs, tp_size, 2, dtype=torch.float32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "ag2_top_token_selected",
+            torch.full(
+                (max_num_reqs,), -1, dtype=torch.int64, device=device
+            ),
+            persistent=False,
+        )
+
     def forward(
         self,
         lm_head: VocabParallelEmbedding,
@@ -188,21 +205,33 @@ class LogitsProcessor(PluggableLayer):
         vocab_start = lm_head.shard_indices.org_vocab_start_index
         global_indices = local_max_indices + vocab_start
 
-        if tp_size == 1:
-            return global_indices
-
-        # All-gather (value, index) pairs, then reduce to global argmax.
-        # Use float32 to avoid bf16 precision loss on large vocab indices.
         local_pair = torch.stack(
             [local_max_vals.float(), global_indices.float()], dim=-1
         )
-        # [batch, 2] -> [batch, 2 * tp_size]
-        gathered = tensor_model_parallel_all_gather(local_pair, dim=-1)
-        # [batch, tp_size, 2] where [:, :, 0]=values, [:, :, 1]=indices
-        gathered = gathered.view(hidden_states.shape[0], tp_size, 2)
-        max_rank_idx = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
-        top_tokens = gathered[:, :, 1].gather(dim=-1, index=max_rank_idx)
-        return top_tokens.squeeze(-1).to(torch.int64)
+        if tp_size == 1:
+            gathered = local_pair.unsqueeze(1)
+            top_tokens = global_indices
+        else:
+            # All-gather (value, index) pairs, then reduce to global argmax.
+            # Use float32 to avoid bf16 precision loss on large vocab indices.
+            gathered = tensor_model_parallel_all_gather(local_pair, dim=-1)
+            # [batch, tp_size, 2] where [:, :, 0]=values, [:, :, 1]=indices
+            gathered = gathered.view(hidden_states.shape[0], tp_size, 2)
+            max_rank_idx = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
+            top_tokens = (
+                gathered[:, :, 1]
+                .gather(dim=-1, index=max_rank_idx)
+                .squeeze(-1)
+                .to(torch.int64)
+            )
+
+        trace_pairs = getattr(self, "ag2_top_token_gathered_pairs", None)
+        trace_selected = getattr(self, "ag2_top_token_selected", None)
+        if trace_pairs is not None and trace_selected is not None:
+            rows = hidden_states.shape[0]
+            trace_pairs[:rows].copy_(gathered)
+            trace_selected[:rows].copy_(top_tokens)
+        return top_tokens
 
     def extra_repr(self) -> str:
         s = f"vocab_size={self.vocab_size}"

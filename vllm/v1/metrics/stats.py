@@ -193,6 +193,9 @@ class SchedulerStats:
     # Running requests whose KV was retained while a peer was allowed to make
     # progress under transient tail pressure.
     num_kv_tail_deferrals: int = 0
+    # Waiting text prefills deferred because the residual step budget could
+    # not reach their normal aligned chunk boundary.
+    num_canonical_prefill_admission_deferrals: int = 0
 
     # These are used for internal DP load-balancing.
     step_counter: int = 0

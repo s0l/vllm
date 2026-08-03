@@ -158,6 +158,12 @@ class ForwardContext:
     # must use this instead of tensor shapes for quality-sensitive dispatch.
     num_tokens_unpadded: int | None = None
 
+    # Fixed-size pinned-CPU runtime layout for the default-off NVFP4 Marlin
+    # prefill isolation POC. Layout: [num_reqs, num_decodes,
+    # query_start_loc[0:max_num_reqs+1]]. Keeping the tensor shape and address
+    # stable avoids compile specialization on request count or prompt lengths.
+    marlin_request_layout_cpu: torch.Tensor | None = None
+
     # Serialized runtime authority for the TP3 compressed all-reduce path.
     # Frontend-only environment variables are not a reliable contract across
     # the spawned EngineCore/worker boundary.
@@ -243,6 +249,7 @@ def create_forward_context(
     is_padding: torch.Tensor | None = None,
     num_tokens_unpadded: int | None = None,
     tp3_sd_phase_reduce: bool = False,
+    marlin_request_layout_cpu: torch.Tensor | None = None,
 ):
     if vllm_config.compilation_config.fast_moe_cold_start:
         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
@@ -262,6 +269,7 @@ def create_forward_context(
         additional_kwargs=additional_kwargs or {},
         is_padding=is_padding,
         num_tokens_unpadded=num_tokens_unpadded,
+        marlin_request_layout_cpu=marlin_request_layout_cpu,
         tp3_ce_reduce=bool(
             vllm_config.additional_config
             and vllm_config.additional_config.get("tp3_ce_reduce", False)
@@ -299,6 +307,7 @@ def set_forward_context(
     is_padding: torch.Tensor | None = None,
     num_tokens_unpadded: int | None = None,
     tp3_sd_phase_reduce: bool = False,
+    marlin_request_layout_cpu: torch.Tensor | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -370,6 +379,7 @@ def set_forward_context(
         is_padding=is_padding,
         num_tokens_unpadded=num_tokens_unpadded,
         tp3_sd_phase_reduce=tp3_sd_phase_reduce,
+        marlin_request_layout_cpu=marlin_request_layout_cpu,
     )
 
     try:

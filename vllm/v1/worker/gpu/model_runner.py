@@ -276,6 +276,67 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_tokens=self.max_num_tokens,
             device=self.device,
         )
+        self.marlin_gate_up_scratch: torch.Tensor | None = None
+        if envs.AG2_VLLM_NVFP4_MARLIN_GATE_UP_SCRATCH:
+            # Qwen3.5/3.6 TP3 gate+up physical width: 2 * 5824.  Allocate the
+            # largest destination before model/KV profiling so its ownership
+            # and HBM cost are explicit instead of depending on runtime
+            # allocator contiguity after smaller outputs split the segment.
+            gate_up_elements = self.max_num_tokens * 11648
+            workspace_elements = gate_up_elements
+            if envs.AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH:
+                if not envs.AG2_VLLM_MTP_BF16_GATE_UP_SCRATCH:
+                    raise RuntimeError(
+                        "DCP prefill query scratch requires shared target/MTP "
+                        "gate/up scratch ownership"
+                    )
+                if self.dtype != torch.bfloat16:
+                    raise RuntimeError(
+                        f"DCP prefill query scratch requires BF16, got {self.dtype}"
+                    )
+                dcp_world_size = self.parallel_config.decode_context_parallel_size
+                if (
+                    self.parallel_config.tensor_parallel_size != 3
+                    or dcp_world_size != 3
+                ):
+                    raise RuntimeError("DCP prefill query scratch requires TP3/DCP3")
+                local_q_heads = self.model_config.get_num_attention_heads(
+                    self.parallel_config
+                )
+                head_dim = self.model_config.get_head_size()
+                dcp_elements = (
+                    2
+                    * self.max_num_tokens
+                    * dcp_world_size
+                    * local_q_heads
+                    * head_dim
+                )
+                workspace_elements = max(workspace_elements, dcp_elements)
+            workspace_rows = cdiv(workspace_elements, 11648)
+            self.marlin_gate_up_scratch = torch.empty(
+                (workspace_rows, 11648),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            from vllm.model_executor.kernels.linear.nvfp4.marlin import (
+                set_nvfp4_marlin_gate_up_scratch,
+            )
+
+            set_nvfp4_marlin_gate_up_scratch(self.marlin_gate_up_scratch)
+            if envs.AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH:
+                from vllm.v1.attention.backends.flashinfer import (
+                    set_ag2_dcp_prefill_query_scratch,
+                )
+
+                set_ag2_dcp_prefill_query_scratch(self.marlin_gate_up_scratch)
+            logger.info(
+                "Configured model-runner-owned shared DCP/gate-up scratch: "
+                "shape=%s bytes=%d dcp_prefill=%s",
+                tuple(self.marlin_gate_up_scratch.shape),
+                self.marlin_gate_up_scratch.numel()
+                * self.marlin_gate_up_scratch.element_size(),
+                envs.AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH,
+            )
         if self.use_pp:
             self.pp_handler = PPHandler(
                 max_num_reqs=self.max_num_reqs,
@@ -1120,6 +1181,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens
         num_computed_prefill_tokens_np = computed_prefill_tokens_np[idx_mapping_np]
         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
+        if envs.AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL:
+            prefill_indices = np.flatnonzero(is_prefilling_np)
+            num_decodes = int(prefill_indices[0]) if prefill_indices.size else num_reqs
+            if np.any(is_prefilling_np[:num_decodes]) or np.any(
+                ~is_prefilling_np[num_decodes:]
+            ):
+                raise RuntimeError(
+                    "NVFP4 Marlin prefill isolation requires decode requests "
+                    "before prefill requests"
+                )
+            layout = self.input_buffers.marlin_request_layout_cpu
+            layout[0] = num_reqs
+            layout[1] = num_decodes
+            layout[2 : num_reqs + 3].copy_(
+                torch.from_numpy(query_start_loc_np[: num_reqs + 1])
+            )
 
         # Get prefill tokens if any.
         if np.any(is_prefilling_np):
@@ -1206,6 +1283,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_draft_tokens_per_req=num_draft_tokens_per_req,
             query_start_loc=query_start_loc,
             query_start_loc_np=query_start_loc_np,
+            marlin_request_layout_cpu=self.input_buffers.marlin_request_layout_cpu,
             seq_lens=seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=dcp_local_seq_lens,
@@ -1265,7 +1343,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.speculator is not None and hasattr(
             self.speculator, "capture_target_lm_head_inputs"
         ):
-            self.speculator.capture_target_lm_head_inputs(sample_hidden_states)
+            self.speculator.capture_target_lm_head_inputs(
+                sample_hidden_states, input_batch
+            )
         logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
@@ -1600,6 +1680,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 is_padding=input_batch.is_padding,
                 num_tokens_unpadded=input_batch.num_tokens,
                 tp3_sd_phase_reduce=tp3_sd_phase_reduce,
+                marlin_request_layout_cpu=(
+                    self.input_buffers.marlin_request_layout_cpu
+                    if envs.AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL
+                    else None
+                ),
             ):
                 self.kv_connector.pre_forward(scheduler_output)
                 if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
@@ -1662,7 +1747,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # The trace is a graph-output observer, not a drafter input.
                     aux_hidden_states = None
             else:
-                assert isinstance(model_output, torch.Tensor)
+                assert isinstance(model_output, torch.Tensor), (
+                    "Target model must return a Tensor when auxiliary hidden "
+                    "states are disabled; got "
+                    f"{type(model_output).__name__}"
+                    + (
+                        f" with length {len(model_output)}"
+                        if isinstance(model_output, (tuple, list))
+                        else ""
+                    )
+                )
                 hidden_states = model_output
                 aux_hidden_states = None
             output_intermediate_tensors = None

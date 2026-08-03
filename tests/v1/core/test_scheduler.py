@@ -844,6 +844,70 @@ def test_ag2_concurrent_partial_prefill_disabled_by_default(
     assert list(scheduler.waiting) == requests[1:]
 
 
+def test_ag2_canonical_prefill_admission_defers_residual_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("AG2_VLLM_CANONICAL_PREFILL_ADMISSION", "1")
+    scheduler = create_scheduler(
+        max_num_batched_tokens=7056,
+        max_model_len=20000,
+    )
+    requests = create_requests(num_requests=8, num_tokens=1513)
+    for request in requests:
+        scheduler.add_request(request)
+
+    first = scheduler.schedule()
+
+    assert first.total_num_scheduled_tokens == 4 * 1513
+    assert first.num_scheduled_tokens == {
+        request.request_id: 1513 for request in requests[:4]
+    }
+    assert list(scheduler.running) == requests[:4]
+    assert list(scheduler.waiting) == requests[4:]
+    assert scheduler.num_canonical_prefill_deferrals_since_last_stats == 1
+
+    scheduler.update_from_output(
+        first,
+        ModelRunnerOutput(
+            req_ids=[request.request_id for request in requests[:4]],
+            req_id_to_index={
+                request.request_id: i for i, request in enumerate(requests[:4])
+            },
+            sampled_token_ids=[[0] for _ in requests[:4]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    second = scheduler.schedule()
+
+    assert second.total_num_scheduled_tokens == 4 + 4 * 1513
+    assert all(
+        request.request_id in second.num_scheduled_tokens for request in requests
+    )
+    assert not scheduler.waiting
+
+
+def test_ag2_canonical_prefill_admission_is_disabled_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("AG2_VLLM_CANONICAL_PREFILL_ADMISSION", raising=False)
+    scheduler = create_scheduler(
+        max_num_batched_tokens=7056,
+        max_model_len=20000,
+    )
+    requests = create_requests(num_requests=8, num_tokens=1513)
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.total_num_scheduled_tokens == 7056
+    assert output.num_scheduled_tokens[requests[4].request_id] == 1004
+    assert list(scheduler.running) == requests[:5]
+    assert list(scheduler.waiting) == requests[5:]
+
+
 def test_ag2_concurrent_partial_prefill_admission_delay_is_bounded(
     monkeypatch: pytest.MonkeyPatch,
 ):

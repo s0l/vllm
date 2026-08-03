@@ -161,6 +161,46 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
 
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
+        # Qwen3_5 intentionally bypasses Qwen3NextDecoderLayer.__init__, while
+        # inheriting its forward. Keep diagnostic forward attributes explicit.
+        self._ag2_aux_compact_boundary_enabled = (
+            os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_ALL_BOUNDARIES",
+                "0",
+            )
+            == "1"
+            and self.layer_idx
+            <= int(
+                os.environ.get(
+                    "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_BOUNDARY_MAX_LAYER",
+                    "2147483647",
+                )
+            )
+            or self.layer_idx
+            == int(
+                os.environ.get(
+                    "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_BOUNDARY_LAYER",
+                    "-1",
+                )
+            )
+            or self.layer_idx
+            == int(
+                os.environ.get(
+                    "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_GDN_BOUNDARY_LAYER",
+                    "-1",
+                )
+            )
+        )
+        self._ag2_aux_compact_gdn_boundaries_enabled = (
+            layer_type == "linear_attention"
+            and self.layer_idx
+            == int(
+                os.environ.get(
+                    "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_GDN_BOUNDARY_LAYER",
+                    "-1",
+                )
+            )
+        )
         is_moe_layer = config.model_type == "qwen3_5_moe_text"
         self.use_attn_reduce_scatter_for_moe = (
             parallel_config.use_sequence_parallel_moe
@@ -246,6 +286,18 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         )
         self._ag2_aux_gdn_boundaries_enabled = (
             os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_GDN_BOUNDARIES", "0")
+            == "1"
+            and self.layer_idx
+            == int(
+                os.environ.get(
+                    "AG2_VLLM_AUX_HIDDEN_TRACE_GDN_BOUNDARY_LAYER",
+                    "0",
+                )
+            )
+            and self.layer_type == "linear_attention"
+        )
+        self._ag2_aux_gdn_replay_enabled = (
+            os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_GDN_REPLAY_ONLY", "0")
             == "1"
             and self.layer_idx
             == int(

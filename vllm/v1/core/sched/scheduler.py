@@ -353,6 +353,15 @@ class Scheduler(SchedulerInterface):
                 self.prefill_admission_delay_s * 1000,
                 self.prefill_admission_max_delay_s * 1000,
             )
+        self.canonical_prefill_admission = (
+            os.environ.get("AG2_VLLM_CANONICAL_PREFILL_ADMISSION", "0") == "1"
+        )
+        self.num_canonical_prefill_deferrals_since_last_stats = 0
+        if self.canonical_prefill_admission:
+            logger.info(
+                "Canonical waiting-prefill admission POC enabled: residual "
+                "token budget cannot introduce an extra aligned split."
+            )
         self.kv_tail_handoff_enabled = (
             os.environ.get("AG2_VLLM_KV_TAIL_HANDOFF", "0") == "1"
         )
@@ -1243,6 +1252,35 @@ class Scheduler(SchedulerInterface):
                     )
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
+
+                    # A waiting text prefill must not acquire an additional
+                    # numerical boundary merely because earlier requests left
+                    # less than its normal aligned chunk in this step.  The
+                    # normal chunk is derived with the full scheduler budget,
+                    # then clipped by the existing Mamba/GDN boundary logic.
+                    # Encoder requests retain their existing joint-budget
+                    # contract; already-running prefills have a separate
+                    # liveness/ITL contract and are deliberately out of scope.
+                    if (
+                        self.canonical_prefill_admission
+                        and not load_kv_async
+                        and not request.has_encoder_inputs
+                        and self._is_prefill_request(request)
+                    ):
+                        canonical_num_new_tokens = min(
+                            num_new_tokens,
+                            self.max_num_scheduled_tokens,
+                        )
+                        if self.need_mamba_block_aligned_split:
+                            canonical_num_new_tokens = self._mamba_block_aligned_split(
+                                request,
+                                canonical_num_new_tokens,
+                                num_new_local_computed_tokens,
+                                num_external_computed_tokens,
+                            )
+                        if canonical_num_new_tokens > token_budget:
+                            self.num_canonical_prefill_deferrals_since_last_stats += 1
+                            break
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -3042,11 +3080,18 @@ class Scheduler(SchedulerInterface):
         )
         num_kv_tail_deferrals = self.num_kv_tail_deferrals_since_last_stats
         self.num_kv_tail_deferrals_since_last_stats = 0
+        num_canonical_prefill_admission_deferrals = (
+            self.num_canonical_prefill_deferrals_since_last_stats
+        )
+        self.num_canonical_prefill_deferrals_since_last_stats = 0
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
             num_kv_tail_deferrals=num_kv_tail_deferrals,
+            num_canonical_prefill_admission_deferrals=(
+                num_canonical_prefill_admission_deferrals
+            ),
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,

@@ -49,6 +49,7 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -58,6 +59,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (
@@ -79,6 +81,32 @@ def _ceil_to_multiple(value: int, multiple: int) -> int:
 def _dense_mlp_padded_intermediate_multiple(tp_size: int) -> int:
     # Keep the rank-local K dimension aligned for grouped W4A16/AWQ kernels.
     return tp_size * 32
+
+
+def _ag2_bf16_mm_out_impl(
+    input_: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Keep a caller-owned BF16 GEMM destination opaque to functionalization."""
+    torch.mm(input_, weight.t(), out=output)
+
+
+def _ag2_bf16_mm_out_fake(
+    input_: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    del input_, weight, output
+
+
+direct_register_custom_op(
+    op_name="ag2_bf16_mm_out",
+    op_func=_ag2_bf16_mm_out_impl,
+    mutates_args=["output"],
+    fake_impl=_ag2_bf16_mm_out_fake,
+    tags=(torch.Tag.cudagraph_unsafe,),
+)
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -142,9 +170,78 @@ class Qwen2MoeMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
         self.expert_gate = expert_gate
+        self.register_buffer(
+            "_bf16_gate_up_scratch",
+            None,
+            persistent=False,
+        )
+
+    def enable_bf16_gate_up_scratch(
+        self,
+        max_num_tokens: int,
+        scratch: torch.Tensor | None = None,
+    ) -> None:
+        """Give an unquantized dense MLP a compiler-visible output scratch.
+
+        Ownership lives on the MLP because the caller must provide the buffer
+        to ``torch.mm(..., out=...)`` before Inductor plans the gate/up GEMM.
+        Selecting a buffer inside a lower linear kernel is too late: Inductor
+        has already emitted a fresh output allocation at that point.
+        """
+        if max_num_tokens <= 0:
+            raise ValueError("max_num_tokens must be positive")
+        if not isinstance(
+            self.gate_up_proj.quant_method,
+            UnquantizedLinearMethod,
+        ):
+            raise ValueError("BF16 gate/up scratch requires an unquantized MLP")
+        if self.gate_up_proj.bias is not None:
+            raise ValueError("BF16 gate/up scratch does not support bias")
+        if self.gate_up_proj.gather_output:
+            raise ValueError("BF16 gate/up scratch requires rank-local output")
+        weight = self.gate_up_proj.weight
+        if scratch is None:
+            scratch = torch.empty(
+                (max_num_tokens, weight.shape[0]),
+                dtype=weight.dtype,
+                device=weight.device,
+            )
+        elif (
+            scratch.ndim != 2
+            or scratch.shape[0] < max_num_tokens
+            or scratch.shape[1] != weight.shape[0]
+            or scratch.dtype != weight.dtype
+            or scratch.device != weight.device
+            or not scratch.is_contiguous()
+        ):
+            raise ValueError(
+                "Shared BF16 gate/up scratch does not match the MTP layer: "
+                f"scratch={tuple(scratch.shape)} {scratch.dtype} "
+                f"{scratch.device}; required=({max_num_tokens}, "
+                f"{weight.shape[0]}) {weight.dtype} {weight.device}"
+            )
+        self._bf16_gate_up_scratch = scratch
+
+    def _gate_up(self, x: torch.Tensor) -> torch.Tensor:
+        scratch = self._bf16_gate_up_scratch
+        if scratch is None:
+            gate_up, _ = self.gate_up_proj(x)
+            return gate_up
+        if x.ndim != 2:
+            raise RuntimeError(
+                "BF16 gate/up scratch currently requires a two-dimensional input"
+            )
+        if x.shape[0] > scratch.shape[0]:
+            raise RuntimeError(
+                "BF16 gate/up scratch is smaller than the runtime token batch: "
+                f"rows={x.shape[0]} capacity={scratch.shape[0]}"
+            )
+        output = scratch[: x.shape[0]]
+        torch.ops.vllm.ag2_bf16_mm_out(x, self.gate_up_proj.weight, output)
+        return output
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
+        gate_up = self._gate_up(x)
         out = self.act_fn(gate_up)
         out, _ = self.down_proj(out)
 

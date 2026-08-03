@@ -19,6 +19,9 @@ from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
+from vllm.v1.worker.gpu.spec_decode.ag2_rejection_capture import (
+    Ag2RejectionCapture,
+)
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
@@ -90,6 +93,7 @@ class RejectionSampler:
             )
         elif rejection_sample_method == "block":
             self.use_block_verification = True
+        self._ag2_rejection_capture = Ag2RejectionCapture.from_env()
 
     def _get_logprobs_tensors(
         self,
@@ -145,6 +149,7 @@ class RejectionSampler:
         idx_mapping_np: np.ndarray,
         expanded_idx_mapping: torch.Tensor,
         expanded_local_pos: torch.Tensor,
+        req_ids: list[str],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         processed_logits = self.sampler.apply_sampling_params(
             logits,
@@ -176,6 +181,30 @@ class RejectionSampler:
             use_fp64=self.sampler.use_fp64_gumbel,
             use_block_verification=self.use_block_verification,
         )
+        if self._ag2_rejection_capture is not None:
+            from vllm.distributed.parallel_state import (
+                get_tensor_model_parallel_rank,
+            )
+
+            self._ag2_rejection_capture.capture(
+                rank=get_tensor_model_parallel_rank(),
+                req_ids=req_ids,
+                processed_target_logits=processed_logits,
+                draft_logits=draft_logits,
+                draft_sampled=draft_sampled,
+                sampled=sampled,
+                num_sampled=num_sampled,
+                positions=pos,
+                cu_num_logits=cu_num_logits,
+                idx_mapping=idx_mapping,
+                idx_mapping_np=idx_mapping_np,
+                expanded_idx_mapping=expanded_idx_mapping,
+                expanded_local_pos=expanded_local_pos,
+                temperature=self.sampler.sampling_states.temperature.gpu,
+                seeds=self.sampler.sampling_states.seeds.gpu,
+                use_fp64=self.sampler.use_fp64_gumbel,
+                use_block_verification=self.use_block_verification,
+            )
         return processed_logits, sampled, num_sampled
 
     def _verify_in_chunks(
@@ -210,6 +239,7 @@ class RejectionSampler:
                 input_batch.idx_mapping_np[start:end],
                 input_batch.expanded_idx_mapping[lo:hi],
                 input_batch.expanded_local_pos[lo:hi],
+                input_batch.req_ids[start:end],
             )
             chunk_logprobs = self._get_logprobs_tensors(
                 sampled,

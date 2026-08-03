@@ -549,6 +549,7 @@ def test_modelopt_w4a16_respects_linear_backend(linear_backend, kernel_cls):
 def test_modelopt_w4a16_batch_invariant_dispatches_humming(monkeypatch):
     """The narrow W4A16 flag must not alter attention or select W4A4 CUTLASS."""
     monkeypatch.setenv("AG2_VLLM_NVFP4_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE", "0")
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     vllm_config = VllmConfig()
     with set_current_vllm_config(vllm_config):
@@ -556,6 +557,20 @@ def test_modelopt_w4a16_batch_invariant_dispatches_humming(monkeypatch):
             ModelOptNvFp4Config(quant_method="W4A16_NVFP4")
         )
     assert isinstance(method.kernel, HummingNvFp4LinearKernel)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+def test_modelopt_w4a16_batch_invariant_dispatches_fixed_marlin(monkeypatch):
+    """The fixed-schedule POC keeps W4A16 and selects Marlin explicitly."""
+    monkeypatch.setenv("AG2_VLLM_NVFP4_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE", "1")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    vllm_config = VllmConfig()
+    with set_current_vllm_config(vllm_config):
+        method = ModelOptNvFp4W4A16LinearMethod(
+            ModelOptNvFp4Config(quant_method="W4A16_NVFP4")
+        )
+    assert isinstance(method.kernel, MarlinNvFp4LinearKernel)
 
 
 @pytest.mark.parametrize(

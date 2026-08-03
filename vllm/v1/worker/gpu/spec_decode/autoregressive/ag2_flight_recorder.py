@@ -18,26 +18,53 @@ Reader: evals/flight_recorder_dump.py.
 
 from __future__ import annotations
 
+import hashlib
 import os
+import string
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
 import torch
 
-MAGIC = 0xA62F11A7
+MAGIC = 0xA62F11A9
 MAX_SLOTS = 64
-HEADER = 4  # int64s: magic, ring_size, write_seq, max_slots
+HEADER = 5  # int64s: magic, ring_size, write_seq, max_slots, num_drafts
+
+
+def external_request_id(req_id: str) -> str:
+    """Undo vLLM's documented ``external_id-<8 random hex>`` suffix."""
+    prefix, separator, suffix = req_id.rpartition("-")
+    if (
+        separator
+        and len(suffix) == 8
+        and all(char in string.hexdigits for char in suffix)
+    ):
+        return prefix
+    return req_id
+
+
+def stable_request_hash(req_id: str) -> int:
+    """Return a reproducible signed int64 join key for an external request."""
+    external_id = external_request_id(req_id)
+    digest = hashlib.sha256(external_id.encode("utf-8")).digest()[:8]
+    return int.from_bytes(digest, byteorder="little", signed=True)
 
 
 class Ag2FlightRecorder:
-    def __init__(self, output: str, steps: int):
+    def __init__(self, output: str, steps: int, num_drafts: int):
+        if num_drafts <= 0:
+            raise ValueError("flight recorder requires at least one draft token")
         self.ring_size = steps
+        self.num_drafts = num_drafts
         path = Path(f"{output}.rank0.fr.npy")
         path.parent.mkdir(parents=True, exist_ok=True)
-        # record: step, t_ns, num_reqs, per-slot [state, tok0, tok1,
-        # sampled, rejected, last_sampled]
-        self.rec_len = 3 + MAX_SLOTS * 6
+        # record: step, t_ns, num_reqs, draft_width, then per-slot
+        # [state, external_request_hash, sampled, rejected, last_sampled,
+        # drafts...]
+        self.slot_len = 5 + num_drafts
+        self.rec_len = 4 + MAX_SLOTS * self.slot_len
         self.mm = np.memmap(
             path,
             dtype=np.int64,
@@ -48,21 +75,34 @@ class Ag2FlightRecorder:
         self.mm[1] = steps
         self.mm[2] = 0
         self.mm[3] = MAX_SLOTS
+        self.mm[4] = num_drafts
         self.staged: list[dict | None] = [None, None]
         self.seq = 0
+        self._request_hashes: dict[str, int] = {}
 
     @classmethod
-    def from_env(cls) -> "Ag2FlightRecorder | None":
+    def from_env(cls, *, num_drafts: int) -> Ag2FlightRecorder | None:
         out = os.environ.get("AG2_VLLM_FLIGHT_RECORDER")
         if not out:
             return None
         steps = int(os.environ.get("AG2_VLLM_FLIGHT_RECORDER_STEPS", "4096"))
-        return cls(out, steps)
+        return cls(out, steps, num_drafts)
+
+    def _hash_request_ids(self, req_ids: Sequence[str], n: int) -> np.ndarray:
+        hashes = np.empty(n, dtype=np.int64)
+        for i, req_id in enumerate(req_ids[:n]):
+            value = self._request_hashes.get(req_id)
+            if value is None:
+                value = stable_request_hash(req_id)
+                self._request_hashes[req_id] = value
+            hashes[i] = value
+        return hashes
 
     def record(
         self,
         *,
         num_reqs: int,
+        req_ids: Sequence[str],
         draft_tokens: torch.Tensor,
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
@@ -70,12 +110,19 @@ class Ag2FlightRecorder:
         idx_mapping: torch.Tensor,
     ) -> None:
         n = min(num_reqs, MAX_SLOTS)
+        if len(req_ids) < n:
+            raise ValueError(f"only {len(req_ids)} request ids for {n} slots")
+        if draft_tokens.ndim != 2 or draft_tokens.shape[1] != self.num_drafts:
+            raise ValueError(
+                "flight recorder draft width changed: "
+                f"expected {self.num_drafts}, got {tuple(draft_tokens.shape)}"
+            )
         state_idx = idx_mapping[:n].long().clamp(min=0)
         cur = self.seq % 2
         stage = self.staged[cur]
         need = {
             "state": state_idx,
-            "dt": draft_tokens[:n, :2],
+            "dt": draft_tokens[:n, : self.num_drafts],
             "ns": num_sampled[:n],
             "nr": num_rejected[:n],
             "ls": last_sampled[state_idx].reshape(n, -1)[:, 0],
@@ -93,6 +140,7 @@ class Ag2FlightRecorder:
                 },
             }
             self.staged[cur] = stage
+        stage["req_hash"] = self._hash_request_ids(req_ids, n)
         for k, v in need.items():
             stage[k][:n].copy_(v, non_blocking=True)
         stage["n"] = n
@@ -113,11 +161,13 @@ class Ag2FlightRecorder:
         rec[0] = stage["seq"]
         rec[1] = stage["t_ns"]
         rec[2] = n
-        body = rec[3:].reshape(MAX_SLOTS, 6)
+        rec[3] = self.num_drafts
+        body = rec[4:].reshape(MAX_SLOTS, self.slot_len)
         body[:n, 0] = stage["state"][:n].numpy()
-        body[:n, 1:3] = stage["dt"][:n].numpy().reshape(n, -1)[:, :2]
-        body[:n, 3] = stage["ns"][:n].numpy()
-        body[:n, 4] = stage["nr"][:n].numpy()
-        body[:n, 5] = stage["ls"][:n].numpy()
+        body[:n, 1] = stage["req_hash"][:n]
+        body[:n, 2] = stage["ns"][:n].numpy()
+        body[:n, 3] = stage["nr"][:n].numpy()
+        body[:n, 4] = stage["ls"][:n].numpy()
+        body[:n, 5:] = stage["dt"][:n].numpy().reshape(n, -1)
         self.mm[base : base + self.rec_len] = rec
         self.mm[2] = stage["seq"] + 1

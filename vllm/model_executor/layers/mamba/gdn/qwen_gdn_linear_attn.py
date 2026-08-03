@@ -87,9 +87,29 @@ if GDN_AITER_TRITON_AVAILABLE:
 
 logger = init_logger(__name__)
 
-_AG2_GDN_REPLAY_MAX_TOKENS = 128
-_AG2_GDN_REPLAY_MAX_SEQS = 8
+_AG2_GDN_REPLAY_MAX_TOKENS = int(
+    os.environ.get("AG2_VLLM_GDN_REPLAY_MAX_TOKENS", "128")
+)
+if _AG2_GDN_REPLAY_MAX_TOKENS < 1:
+    raise ValueError("AG2_VLLM_GDN_REPLAY_MAX_TOKENS must be positive")
+_AG2_GDN_REPLAY_MAX_SEQS = int(
+    os.environ.get("AG2_VLLM_GDN_REPLAY_MAX_SEQS", "8")
+)
+if _AG2_GDN_REPLAY_MAX_SEQS < 1:
+    raise ValueError("AG2_VLLM_GDN_REPLAY_MAX_SEQS must be positive")
 _AG2_GDN_REPLAY_META_ELEMENTS = 512
+
+
+def _ag2_compact_select_rows(
+    value: torch.Tensor,
+    row_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Select fixed-capacity diagnostic rows without unsafe -1 indexing."""
+    valid = row_indices.ge(0)
+    safe = torch.where(valid, row_indices, torch.zeros_like(row_indices))
+    selected = torch.index_select(value, 0, safe)
+    mask = valid.reshape(valid.shape + (1,) * (selected.ndim - 1))
+    return torch.where(mask, selected, torch.zeros_like(selected))
 
 
 def _resolve_gdn_prefill_backend(
@@ -102,7 +122,8 @@ def _resolve_gdn_prefill_backend(
     * ``platform == cuda``;
     * one of the following:
       - Hopper (SM90) — no further constraints;
-      - Blackwell (SM10.x) with ``head_k_dim == 128``, ``cuda_runtime >= 13``.
+      - Blackwell (SM10.x or SM12.x) with ``head_k_dim == 128`` and
+        ``cuda_runtime >= 13``.
 
     In-tree CuteDSL GDN prefill kernel is chosen when:
     * "cutedsl" is requested; (opt-in only)
@@ -129,7 +150,10 @@ def _resolve_gdn_prefill_backend(
     if current_platform.is_device_capability(90):
         supports_flashinfer = True
     elif (
-        current_platform.is_device_capability_family(100)
+        (
+            current_platform.is_device_capability_family(100)
+            or current_platform.is_device_capability_family(120)
+        )
         and head_k_dim == 128
         and current_platform.get_cuda_runtime_major() >= 13
     ):
@@ -180,6 +204,7 @@ def fi_chunk_gated_delta_rule(
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
+    output: torch.Tensor | None = None,
 ):
     from flashinfer.gdn_prefill import (
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
@@ -208,6 +233,7 @@ def fi_chunk_gated_delta_rule(
         initial_state=fi_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        output=output,
     )
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.
@@ -257,6 +283,7 @@ class ChunkGatedDeltaRule(CustomOp):
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
     ):
+        output = core_attn_out.squeeze(0) if core_attn_out is not None else None
         o, final_state = fi_chunk_gated_delta_rule(
             q=q,
             k=k,
@@ -267,11 +294,8 @@ class ChunkGatedDeltaRule(CustomOp):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            output=output,
         )
-        if core_attn_out is not None:
-            o_flat = o.squeeze(0).reshape(-1)
-            co_flat = core_attn_out.reshape(-1)
-            co_flat[: o_flat.numel()].copy_(o_flat)
         return o, final_state
 
     def forward_native(
@@ -568,7 +592,27 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 + ".linear_attn"
             )
         )
-        if self._ag2_aux_boundaries_enabled:
+        self._ag2_aux_replay_enabled = self._ag2_aux_boundaries_enabled or (
+            os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_GDN_REPLAY_ONLY", "0")
+            == "1"
+            and prefix.endswith(
+                ".layers."
+                + os.environ.get(
+                    "AG2_VLLM_AUX_HIDDEN_TRACE_GDN_BOUNDARY_LAYER",
+                    "0",
+                )
+                + ".linear_attn"
+            )
+        )
+        self._ag2_aux_compact_boundaries_enabled = prefix.endswith(
+            ".layers."
+            + os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_GDN_BOUNDARY_LAYER",
+                "-1",
+            )
+            + ".linear_attn"
+        )
+        if self._ag2_aux_replay_enabled:
             per_token_elements = (
                 2 * self.local_key_dim
                 + self.local_value_dim
@@ -592,7 +636,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.register_buffer(
                 "_ag2_replay_state_buffer",
                 torch.zeros(
-                    state_elements,
+                    4 * state_elements,
                     dtype=torch.float32,
                     device=current_platform.current_device(),
                 ),
@@ -658,6 +702,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
         self.out_proj._ag2_aux_output_parallel_enabled = (
             self._ag2_aux_boundaries_enabled
+            or self._ag2_aux_compact_boundaries_enabled
         )
 
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
@@ -1253,6 +1298,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = self._pad_local_value_flat(core_attn_out)
         if self._ag2_aux_boundaries_enabled:
             self._ag2_aux_gated_norm = core_attn_out
+        if self._ag2_aux_compact_boundaries_enabled:
+            self._ag2_aux_compact_gated_norm = _ag2_compact_select_rows(
+                core_attn_out,
+                self._ag2_aux_compact_row_indices,
+            )
         if self._ag2_layer0_trace_enabled:
             trace = core_attn_out[:3]
             self._ag2_trace_gated_norm[: trace.shape[0]].copy_(trace)
@@ -1261,6 +1311,23 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             output = tensor_model_parallel_gdn_all_reduce(output)
         if self._ag2_aux_boundaries_enabled:
             self._ag2_aux_output_parallel = self.out_proj._ag2_aux_output_parallel
+        if self._ag2_aux_compact_boundaries_enabled:
+            self._ag2_aux_compact_output_parallel = _ag2_compact_select_rows(
+                self.out_proj._ag2_aux_output_parallel,
+                self._ag2_aux_compact_row_indices,
+            )
+            self._ag2_aux_compact_output = _ag2_compact_select_rows(
+                output,
+                self._ag2_aux_compact_row_indices,
+            )
+            self._ag2_aux_compact_boundaries = (
+                self._ag2_aux_compact_qkvz,
+                self._ag2_aux_compact_ba,
+                self._ag2_aux_compact_core,
+                self._ag2_aux_compact_gated_norm,
+                self._ag2_aux_compact_output_parallel,
+                self._ag2_aux_compact_output,
+            )
         if self._ag2_layer0_trace_enabled:
             trace = output[:3]
             self._ag2_trace_attention_output[: trace.shape[0]].copy_(trace)
@@ -1321,6 +1388,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if self._ag2_aux_boundaries_enabled:
             self._ag2_aux_qkvz = mixed_qkvz
             self._ag2_aux_ba = ba
+        if self._ag2_aux_compact_boundaries_enabled:
+            self._ag2_aux_compact_qkvz = _ag2_compact_select_rows(
+                mixed_qkvz,
+                self._ag2_aux_compact_row_indices,
+            )
+            self._ag2_aux_compact_ba = _ag2_compact_select_rows(
+                ba,
+                self._ag2_aux_compact_row_indices,
+            )
         if self._ag2_layer0_trace_enabled:
             qkvz_trace = mixed_qkvz[:3]
             ba_trace = ba[:3]
@@ -1356,7 +1432,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         replay_float_out = None
         replay_state_out = None
         replay_meta_out = None
-        if self._ag2_aux_boundaries_enabled:
+        if self._ag2_aux_replay_enabled:
             replay_float_out = self._ag2_replay_float_buffer
             replay_state_out = self._ag2_replay_state_buffer
             replay_meta_out = self._ag2_replay_meta_buffer
@@ -1371,15 +1447,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             replay_state_out=replay_state_out,
             replay_meta_out=replay_meta_out,
         )
-        if self._ag2_aux_boundaries_enabled:
+        if self._ag2_aux_replay_enabled:
             assert replay_float_out is not None
             assert replay_state_out is not None
             assert replay_meta_out is not None
             self._ag2_aux_replay_float = replay_float_out
             self._ag2_aux_replay_state = replay_state_out
             self._ag2_aux_replay_meta = replay_meta_out
+        if self._ag2_aux_boundaries_enabled:
             self._ag2_aux_core = self._pad_local_value_flat(
                 core_attn_out.flatten(-2)
+            )
+        if self._ag2_aux_compact_boundaries_enabled:
+            self._ag2_aux_compact_core = _ag2_compact_select_rows(
+                self._pad_local_value_flat(core_attn_out.flatten(-2)),
+                self._ag2_aux_compact_row_indices,
             )
         if self._ag2_layer0_trace_enabled:
             core_flat = self._pad_local_value_flat(core_attn_out.flatten(-2))[:3]
@@ -1698,6 +1780,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         cu_seqlens: torch.Tensor,
         chunk_indices: torch.Tensor,
         chunk_offsets: torch.Tensor,
+        prefill_state_indices: torch.Tensor,
+        pre_decode_state_length: int,
         replay_float_out: torch.Tensor | None,
         replay_state_out: torch.Tensor | None,
         replay_meta_out: torch.Tensor | None,
@@ -1727,15 +1811,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         lengths = tuple(tensor.numel() for tensor in tensors)
         float_required = sum(lengths)
         state_required = initial_state.numel()
+        state_index_required = prefill_state_indices.numel()
         integer_required = (
-            cu_seqlens.numel() + chunk_indices.numel() + chunk_offsets.numel()
+            cu_seqlens.numel()
+            + chunk_indices.numel()
+            + chunk_offsets.numel()
+            + state_index_required
         )
         fits_float = (
             q.shape[1] <= _AG2_GDN_REPLAY_MAX_TOKENS
             and float_required <= replay_float_out.numel()
         )
         fits_state_meta = (
-            state_required <= replay_state_out.numel()
+            3 * state_required + pre_decode_state_length <= replay_state_out.numel()
             and 64 + integer_required <= replay_meta_out.numel()
         )
         replay_meta_out.fill_(-1)
@@ -1811,8 +1899,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 device=replay_meta_out.device,
             )
         )
+        replay_meta_out[38:42].copy_(
+            torch.tensor(
+                (
+                    state_required,
+                    state_required,
+                    state_index_required,
+                    pre_decode_state_length,
+                ),
+                dtype=torch.int64,
+                device=replay_meta_out.device,
+            )
+        )
         integer_offset = 64
-        for tensor in (cu_seqlens, chunk_indices, chunk_offsets):
+        for tensor in (
+            cu_seqlens,
+            chunk_indices,
+            chunk_offsets,
+            prefill_state_indices,
+        ):
             length = tensor.numel()
             replay_meta_out[integer_offset : integer_offset + length].copy_(
                 tensor.reshape(-1).to(torch.int64)
@@ -2186,8 +2291,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out_spec, last_recurrent_state = None, None
 
         # 2.2: Process non-spec-decode part
+        pre_decode_state_length = 0
         if split_non_spec:
             assert mixed_qkv_decode is not None
+            # The mixed fast path updates decode state before it gathers the
+            # prefill initial states.  Preserve the latter immediately before
+            # that update so replay can distinguish an incoming stale state
+            # from a decode-kernel write into an unrelated state slot.
+            prefill_state_indices = attn_metadata.prefill_state_indices
+            assert prefill_state_indices is not None
+            if replay_state_out is not None:
+                pre_decode_state = ssm_state[prefill_state_indices]
+                pre_decode_state_length = pre_decode_state.numel()
+                if 4 * pre_decode_state_length <= replay_state_out.numel():
+                    replay_state_out[
+                        3 * pre_decode_state_length : 4 * pre_decode_state_length
+                    ].copy_(pre_decode_state.reshape(-1).float())
+                else:
+                    pre_decode_state_length = 0
             query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
                 mixed_qkv_decode
             )
@@ -2242,6 +2363,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 cu_seqlens=attn_metadata.prefill_query_start_loc,
                 chunk_indices=attn_metadata.chunk_indices,
                 chunk_offsets=attn_metadata.chunk_offsets,
+                prefill_state_indices=prefill_state_indices,
+                pre_decode_state_length=pre_decode_state_length,
                 replay_float_out=replay_float_out,
                 replay_state_out=replay_state_out,
                 replay_meta_out=replay_meta_out,
@@ -2263,8 +2386,26 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 use_qk_l2norm_in_kernel=False,
                 core_attn_out=prefill_output,
             )
+            replay_state_required = int(initial_state.numel())
+            replay_state_fits = (
+                replay_state_out is not None
+                and replay_meta_out is not None
+                and 3 * replay_state_required <= replay_state_out.numel()
+            )
+            if replay_state_fits:
+                assert replay_state_out is not None
+                replay_state_out[
+                    replay_state_required : 2 * replay_state_required
+                ].copy_(last_recurrent_state.reshape(-1).float())
             # Init cache
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+            if replay_state_fits:
+                assert replay_state_out is not None
+                replay_state_out[
+                    2 * replay_state_required : 3 * replay_state_required
+                ].copy_(
+                    ssm_state[prefill_state_indices].reshape(-1).float()
+                )
 
             if split_non_spec:
                 # The prefill tail is already in its final destination. Fill

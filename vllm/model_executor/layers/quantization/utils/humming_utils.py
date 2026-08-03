@@ -439,6 +439,7 @@ def prepare_humming_layer(
     layer: LinearBase,
     quant_config: dict,
     input_quant_config: dict | None = None,
+    pad_n_to_multiple: int = 256,
 ):
     from vllm.utils.humming import (
         BaseInputSchema,
@@ -496,7 +497,7 @@ def prepare_humming_layer(
         shape_k=input_size_per_partition,
         weight_schema=weight_schema,
         input_schema=input_schema,
-        pad_n_to_multiple=256,
+        pad_n_to_multiple=pad_n_to_multiple,
         pad_k_to_multiple=128,
         has_bias=layer.has_bias,
         torch_dtype=layer.params_dtype,

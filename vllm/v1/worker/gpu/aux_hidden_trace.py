@@ -23,11 +23,32 @@ FULL_ATTENTION_STAGE_ORDER = (
     "v",
     "dcp_output_pack",
     "dcp_lse_pack",
+    "dcp_kv_history_pack",
+    "dcp_kv_history_meta",
+    "dcp_kv_page_indices_pack",
+    "dcp_observer_meta",
+    "dcp_current_kv_pack",
+    "dcp_scale_pack",
     "core",
     "gated",
     "output_parallel",
     "output",
 )
+DEFAULT_FULL_ATTENTION_STAGES = tuple(
+    stage
+    for stage in FULL_ATTENTION_STAGE_ORDER
+    if stage
+    not in {
+        "dcp_kv_history_pack",
+        "dcp_kv_history_meta",
+        "dcp_kv_page_indices_pack",
+        "dcp_observer_meta",
+        "dcp_current_kv_pack",
+        "dcp_scale_pack",
+    }
+)
+
+AG2_AUX_TRACE_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -40,12 +61,21 @@ class AuxHiddenTrace:
     first_attention_boundary: bool = False
     attention_boundary_layer: int = 0
     full_attention_boundaries: bool = False
-    full_attention_stages: tuple[str, ...] = FULL_ATTENTION_STAGE_ORDER
+    full_attention_stages: tuple[str, ...] = DEFAULT_FULL_ATTENTION_STAGES
     first_gdn_boundaries: bool = False
+    gdn_replay_only: bool = False
     gdn_boundary_layer: int = 0
     packed_compare_prefix_tokens: int = 0
     packed_compare_sequence_tokens: int = 0
     packed_compare_sequences: int = 0
+    dcp_request_tail_rows: int = 0
+    dcp_request_row: str = "tail"
+    compact_rows: bool = False
+    compact_capacity: int = 64
+    compact_boundary_layer: int = -1
+    compact_all_boundaries: bool = False
+    compact_boundary_max_layer: int = -1
+    compact_gdn_boundary_layer: int = -1
     _saved_matches: dict[int, int] = field(default_factory=dict)
 
     @classmethod
@@ -67,14 +97,10 @@ class AuxHiddenTrace:
             == "1"
         )
         attention_boundary_layer = int(
-            os.environ.get(
-                "AG2_VLLM_AUX_HIDDEN_TRACE_ATTENTION_BOUNDARY_LAYER", "0"
-            )
+            os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_ATTENTION_BOUNDARY_LAYER", "0")
         )
         full_attention_boundaries = (
-            os.environ.get(
-                "AG2_VLLM_AUX_HIDDEN_TRACE_FULL_ATTENTION_BOUNDARIES", "0"
-            )
+            os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_FULL_ATTENTION_BOUNDARIES", "0")
             == "1"
         )
         full_attention_stages_raw = os.environ.get(
@@ -94,11 +120,17 @@ class AuxHiddenTrace:
         full_attention_stages = tuple(
             stage
             for stage in FULL_ATTENTION_STAGE_ORDER
-            if not requested_full_attention_stages
-            or stage in requested_full_attention_stages
+            if (
+                stage in requested_full_attention_stages
+                if requested_full_attention_stages
+                else stage in DEFAULT_FULL_ATTENTION_STAGES
+            )
         )
         first_gdn_boundaries = (
-            os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_GDN_BOUNDARIES", "0")
+            os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_GDN_BOUNDARIES", "0") == "1"
+        )
+        gdn_replay_only = (
+            os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_GDN_REPLAY_ONLY", "0")
             == "1"
         )
         gdn_boundary_layer = int(
@@ -118,8 +150,47 @@ class AuxHiddenTrace:
             )
         )
         packed_compare_sequences = int(
+            os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_PACKED_COMPARE_SEQUENCES", "0")
+        )
+        dcp_request_tail_rows = int(
             os.environ.get(
-                "AG2_VLLM_AUX_HIDDEN_TRACE_PACKED_COMPARE_SEQUENCES", "0"
+                "AG2_VLLM_AUX_HIDDEN_TRACE_DCP_REQUEST_TAIL_ROWS",
+                "0",
+            )
+        )
+        dcp_request_row = os.environ.get(
+            "AG2_VLLM_AUX_HIDDEN_TRACE_DCP_REQUEST_ROW",
+            "tail",
+        )
+        compact_rows = (
+            os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_ROWS", "0") == "1"
+        )
+        compact_capacity = int(
+            os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_CAPACITY", "64")
+        )
+        compact_boundary_layer = int(
+            os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_BOUNDARY_LAYER",
+                "-1",
+            )
+        )
+        compact_all_boundaries = (
+            os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_ALL_BOUNDARIES",
+                "0",
+            )
+            == "1"
+        )
+        compact_boundary_max_layer = int(
+            os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_BOUNDARY_MAX_LAYER",
+                "-1",
+            )
+        )
+        compact_gdn_boundary_layer = int(
+            os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_GDN_BOUNDARY_LAYER",
+                "-1",
             )
         )
         if not layers or any(layer < 0 for layer in layers):
@@ -130,6 +201,40 @@ class AuxHiddenTrace:
             )
         if max_matches < 1:
             raise ValueError("Aux hidden trace max matches must be positive")
+        if compact_capacity < 1:
+            raise ValueError("Aux hidden trace compact capacity must be positive")
+        if compact_boundary_layer >= 0 and not compact_rows:
+            raise ValueError("Compact layer boundaries require compact-row tracing")
+        if compact_all_boundaries and not compact_rows:
+            raise ValueError("All compact boundaries require compact-row tracing")
+        if compact_all_boundaries and compact_boundary_max_layer < 0:
+            compact_boundary_max_layer = max(layers) - 1
+        if (
+            compact_all_boundaries
+            and compact_boundary_max_layer >= max(layers)
+        ):
+            raise ValueError(
+                "Compact boundary max layer requires the following auxiliary "
+                "checkpoint: max boundary must be less than max(LAYERS)"
+            )
+        if compact_gdn_boundary_layer >= 0 and not compact_rows:
+            raise ValueError("Compact GDN boundaries require compact-row tracing")
+        if compact_gdn_boundary_layer >= 0 and not {
+            compact_gdn_boundary_layer,
+            compact_gdn_boundary_layer + 1,
+        }.issubset(layers):
+            raise ValueError(
+                "Compact GDN boundaries require auxiliary checkpoints at "
+                "the selected layer and the following layer"
+            )
+        if compact_boundary_layer >= 0 and not {
+            compact_boundary_layer,
+            compact_boundary_layer + 1,
+        }.issubset(layers):
+            raise ValueError(
+                "Compact layer boundaries require auxiliary checkpoints at "
+                "the selected layer and the following layer"
+            )
         if attention_boundary_layer < 0:
             raise ValueError("Attention boundary layer must be nonnegative")
         if first_attention_boundary and not {
@@ -146,6 +251,15 @@ class AuxHiddenTrace:
             )
         if full_attention_boundaries and not full_attention_stages:
             raise ValueError("Full-attention boundary stage set must not be empty")
+        has_dcp_pack = full_attention_boundaries and any(
+            "dcp_" in stage for stage in full_attention_stages
+        )
+        if has_dcp_pack and dcp_request_tail_rows < 1:
+            raise ValueError(
+                "DCP auxiliary pack requires positive DCP_REQUEST_TAIL_ROWS capacity"
+            )
+        if has_dcp_pack and dcp_request_row not in {"first", "tail"}:
+            raise ValueError("DCP request-row trace must select first or tail")
         if first_attention_boundary and first_gdn_boundaries:
             raise ValueError(
                 "First-attention and first-GDN boundary traces are mutually exclusive"
@@ -166,12 +280,42 @@ class AuxHiddenTrace:
                 "Packed comparison requires a nonnegative prefix, positive "
                 "sequence length, and at least two sequences"
             )
+        compact_dcp_attention = (
+            compact_rows
+            and first_attention_boundary
+            and full_attention_boundaries
+            and set(full_attention_stages)
+            == {"dcp_output_pack", "dcp_lse_pack"}
+            and (
+                (
+                    compact_all_boundaries
+                    and attention_boundary_layer <= compact_boundary_max_layer
+                )
+                or compact_boundary_layer == attention_boundary_layer
+            )
+        )
+        if compact_rows and (
+            (first_attention_boundary and not compact_dcp_attention)
+            or first_gdn_boundaries
+            or any(packed_compare)
+        ):
+            raise ValueError("Compact-row tracing supports global checkpoints only")
         if first_gdn_boundaries and not {
             gdn_boundary_layer,
             gdn_boundary_layer + 1,
         }.issubset(layers):
             raise ValueError(
                 "GDN boundary trace requires auxiliary checkpoints at "
+                "the selected layer and the following layer"
+            )
+        if gdn_replay_only and first_gdn_boundaries:
+            raise ValueError("GDN replay-only and full GDN boundaries are exclusive")
+        if gdn_replay_only and not {
+            gdn_boundary_layer,
+            gdn_boundary_layer + 1,
+        }.issubset(layers):
+            raise ValueError(
+                "GDN replay-only trace requires auxiliary checkpoints at "
                 "the selected layer and the following layer"
             )
         return cls(
@@ -185,10 +329,19 @@ class AuxHiddenTrace:
             full_attention_boundaries=full_attention_boundaries,
             full_attention_stages=full_attention_stages,
             first_gdn_boundaries=first_gdn_boundaries,
+            gdn_replay_only=gdn_replay_only,
             gdn_boundary_layer=gdn_boundary_layer,
             packed_compare_prefix_tokens=packed_compare_prefix_tokens,
             packed_compare_sequence_tokens=packed_compare_sequence_tokens,
             packed_compare_sequences=packed_compare_sequences,
+            dcp_request_tail_rows=dcp_request_tail_rows,
+            dcp_request_row=dcp_request_row,
+            compact_rows=compact_rows,
+            compact_capacity=compact_capacity,
+            compact_boundary_layer=compact_boundary_layer,
+            compact_all_boundaries=compact_all_boundaries,
+            compact_boundary_max_layer=compact_boundary_max_layer,
+            compact_gdn_boundary_layer=compact_gdn_boundary_layer,
         )
 
     def _packed_sequence_diffs(
@@ -254,11 +407,38 @@ class AuxHiddenTrace:
                 f"{type(model).__name__} does not expose auxiliary hidden states"
             )
         setter(self.layers)
+        if self.compact_rows:
+            configured_modules = []
+            for module in model.modules():
+                if getattr(module, "aux_hidden_state_layers", None) == self.layers:
+                    module._ag2_aux_trace_compact_position = self.position
+                    module._ag2_aux_trace_compact_capacity = self.compact_capacity
+                    module._ag2_aux_trace_compact_boundary_layer = (
+                        self.compact_boundary_layer
+                    )
+                    module._ag2_aux_trace_compact_all_boundaries = (
+                        self.compact_all_boundaries
+                    )
+                    module._ag2_aux_trace_compact_boundary_max_layer = (
+                        self.compact_boundary_max_layer
+                    )
+                    module._ag2_aux_trace_compact_gdn_boundary_layer = (
+                        self.compact_gdn_boundary_layer
+                    )
+                    module._ag2_aux_trace_compact_rows = True
+                    configured_modules.append(type(module).__name__)
+            if not configured_modules:
+                raise RuntimeError(
+                    "Compact auxiliary trace could not locate the configured "
+                    "EAGLE model"
+                )
         logger.warning(
             "Enabled authoritative auxiliary hidden trace for layers=%s "
             "first_attention_boundary=%s attention_boundary_layer=%d "
             "full_attention_boundaries=%s full_attention_stages=%s "
-            "first_gdn_boundaries=%s gdn_boundary_layer=%d",
+            "first_gdn_boundaries=%s gdn_boundary_layer=%d "
+            "gdn_replay_only=%s "
+            "compact_rows=%s compact_capacity=%d compact_gdn_layer=%d",
             self.layers,
             self.first_attention_boundary,
             self.attention_boundary_layer,
@@ -266,13 +446,41 @@ class AuxHiddenTrace:
             self.full_attention_stages,
             self.first_gdn_boundaries,
             self.gdn_boundary_layer,
+            self.gdn_replay_only,
+            self.compact_rows,
+            self.compact_capacity,
+            self.compact_gdn_boundary_layer,
         )
 
     def output_labels(self) -> tuple[str, ...]:
         labels: list[str] = []
+        compact_boundary_max_layer = self.compact_boundary_max_layer
+        if self.compact_all_boundaries and compact_boundary_max_layer < 0:
+            compact_boundary_max_layer = max(self.layers) - 1
         if 0 in self.layers:
+            if self.compact_rows:
+                labels.extend(
+                    (
+                        "layer_row_indices.0",
+                        "layer_hidden.0",
+                        "layer_residual.0",
+                    )
+                )
             labels.append("layer.0")
         for decoder_layer in range(max(self.layers)):
+            if (
+                self.compact_all_boundaries
+                and decoder_layer <= compact_boundary_max_layer
+            ) or decoder_layer == self.compact_boundary_layer:
+                labels.extend(
+                    (
+                        f"compact_boundary_row_indices.{decoder_layer}",
+                        f"input_norm.{decoder_layer}",
+                        f"attention_output.{decoder_layer}",
+                        f"post_attention_norm.{decoder_layer}",
+                        f"post_attention_residual.{decoder_layer}",
+                    )
+                )
             if (
                 self.first_attention_boundary
                 and decoder_layer == self.attention_boundary_layer
@@ -282,16 +490,14 @@ class AuxHiddenTrace:
                         f"full_{stage}.{decoder_layer}"
                         for stage in self.full_attention_stages
                     )
-                labels.extend(
-                    (
-                        f"post_attention_norm.{decoder_layer}",
-                        f"post_attention_residual.{decoder_layer}",
+                if not self.compact_rows:
+                    labels.extend(
+                        (
+                            f"post_attention_norm.{decoder_layer}",
+                            f"post_attention_residual.{decoder_layer}",
+                        )
                     )
-                )
-            if (
-                self.first_gdn_boundaries
-                and decoder_layer == self.gdn_boundary_layer
-            ):
+            if self.first_gdn_boundaries and decoder_layer == self.gdn_boundary_layer:
                 labels.extend(
                     (
                         f"gdn_input_norm.{decoder_layer}",
@@ -306,8 +512,35 @@ class AuxHiddenTrace:
                         f"gdn_output.{decoder_layer}",
                     )
                 )
+            if self.gdn_replay_only and decoder_layer == self.gdn_boundary_layer:
+                labels.extend(
+                    (
+                        f"gdn_replay_float.{decoder_layer}",
+                        f"gdn_replay_state.{decoder_layer}",
+                        f"gdn_replay_meta.{decoder_layer}",
+                    )
+                )
+            if decoder_layer == self.compact_gdn_boundary_layer:
+                labels.extend(
+                    (
+                        f"compact_gdn_qkvz.{decoder_layer}",
+                        f"compact_gdn_ba.{decoder_layer}",
+                        f"compact_gdn_core.{decoder_layer}",
+                        f"compact_gdn_gated_norm.{decoder_layer}",
+                        f"compact_gdn_output_parallel.{decoder_layer}",
+                        f"compact_gdn_output.{decoder_layer}",
+                    )
+                )
             checkpoint = decoder_layer + 1
             if checkpoint in self.layers:
+                if self.compact_rows:
+                    labels.extend(
+                        (
+                            f"layer_row_indices.{checkpoint}",
+                            f"layer_hidden.{checkpoint}",
+                            f"layer_residual.{checkpoint}",
+                        )
+                    )
                 labels.append(f"layer.{checkpoint}")
         return tuple(labels)
 
@@ -315,10 +548,7 @@ class AuxHiddenTrace:
         return {
             label: (
                 "rank_local"
-                if (
-                    label.startswith("full_")
-                    and not label.startswith("full_output.")
-                )
+                if (label.startswith("full_") and not label.startswith("full_output."))
                 or label.startswith(
                     (
                         "gdn_qkvz.",
@@ -327,6 +557,11 @@ class AuxHiddenTrace:
                         "gdn_core.",
                         "gdn_gated_norm.",
                         "gdn_output_parallel.",
+                        "compact_gdn_qkvz.",
+                        "compact_gdn_ba.",
+                        "compact_gdn_core.",
+                        "compact_gdn_gated_norm.",
+                        "compact_gdn_output_parallel.",
                     )
                 )
                 else "global"
@@ -357,6 +592,8 @@ class AuxHiddenTrace:
                 "Aux hidden trace output count does not match configured outputs: "
                 f"{len(aux_hidden_states)} != {len(labels)}"
             )
+        has_dcp_pack = any("dcp_output_pack" in label for label in labels)
+        hidden_by_label = dict(zip(labels, aux_hidden_states, strict=True))
 
         flat_positions = positions[0] if positions.ndim == 2 else positions
         token_values = input_ids[:query_len].detach().cpu().tolist()
@@ -371,13 +608,6 @@ class AuxHiddenTrace:
         if not matches:
             return
 
-        has_dcp_pack = any("dcp_output_pack" in label for label in labels)
-        if has_dcp_pack and query_len not in (1, 3):
-            # Prompt prefill can contain the same token/position at an
-            # arbitrary row, but the packed diagnostic is defined only for
-            # the matched qlen1 decode and qlen3 verification lanes.
-            return
-
         torch.cuda.current_stream().synchronize()
         rank = get_tp_group().rank_in_group
         selected_matches = matches[: self.max_matches_per_query_len - saved]
@@ -387,12 +617,6 @@ class AuxHiddenTrace:
             aux_hidden_states=aux_hidden_states,
         )
         for compact_index, row in enumerate(selected_matches):
-            if has_dcp_pack and row != 0:
-                raise RuntimeError(
-                    "Authoritative DCP pack is intentionally row-zero only; "
-                    f"matched token was at row {row}. Run the isolated replay "
-                    "instead of widening the graph output."
-                )
             occurrence = self._saved_matches.get(query_len, 0)
             path = Path(f"{self.output}.q{query_len}.occ{occurrence}.rank{rank}.pt")
             if path.exists():
@@ -438,8 +662,92 @@ class AuxHiddenTrace:
                         ).items()
                     },
                 }
+
+            def select_layer(
+                label: str,
+                hidden: torch.Tensor,
+                *,
+                token_row: int,
+                provenance: dict[str, object] | None,
+            ) -> torch.Tensor:
+                if label.startswith(
+                    ("layer_row_indices.", "compact_boundary_row_indices.")
+                ):
+                    return hidden
+                if self.compact_rows and label.startswith(
+                    (
+                        "layer.",
+                        "layer_hidden.",
+                        "layer_residual.",
+                        "input_norm.",
+                        "attention_output.",
+                        "post_attention_norm.",
+                        "post_attention_residual.",
+                        "compact_gdn_",
+                    )
+                ):
+                    checkpoint = label.rsplit(".", 1)[1]
+                    row_label = (
+                        f"compact_boundary_row_indices.{checkpoint}"
+                        if label.startswith("compact_gdn_")
+                        or label.startswith(
+                            (
+                                "input_norm.",
+                                "attention_output.",
+                                "post_attention_norm.",
+                                "post_attention_residual.",
+                            )
+                        )
+                        else f"layer_row_indices.{checkpoint}"
+                    )
+                    row_indices = hidden_by_label[row_label]
+                    selected = row_indices.eq(token_row).nonzero(as_tuple=False)
+                    if selected.numel() != 1:
+                        raise RuntimeError(
+                            "Compact auxiliary trace did not retain matched row "
+                            f"{token_row} at checkpoint {checkpoint}: "
+                            f"indices={row_indices.detach().cpu().tolist()}"
+                        )
+                    return hidden[int(selected[0].item())]
+                if label.startswith("gdn_replay_"):
+                    return hidden
+                if any(
+                    name in label
+                    for name in (
+                        "dcp_output_pack",
+                        "dcp_lse_pack",
+                        "dcp_kv_history_pack",
+                        "dcp_kv_history_meta",
+                        "dcp_kv_page_indices_pack",
+                        "dcp_observer_meta",
+                        "dcp_current_kv_pack",
+                        "dcp_scale_pack",
+                    )
+                ):
+                    if provenance is None:
+                        raise RuntimeError(
+                            "DCP request-tail pack requires request provenance"
+                        )
+                    request_index = int(provenance["request_index"])
+                    if request_index >= hidden.shape[0]:
+                        raise RuntimeError(
+                            "DCP request-tail pack does not contain request "
+                            f"index {request_index}"
+                        )
+                    return hidden[request_index]
+                if has_dcp_pack and label.startswith(("full_q.", "full_k.", "full_v.")):
+                    if provenance is None:
+                        raise RuntimeError(
+                            "DCP request-slice input requires request provenance"
+                        )
+                    query_start = int(provenance["query_start"])
+                    query_end = int(provenance["query_end"])
+                    return hidden[query_start:query_end]
+                return hidden[token_row]
+
             torch.save(
                 {
+                    "schema_version": AG2_AUX_TRACE_SCHEMA_VERSION,
                     "rank": rank,
                     "query_len": query_len,
                     "occurrence": occurrence,
@@ -450,11 +758,16 @@ class AuxHiddenTrace:
                     "input_ids": input_ids[:query_len].detach().cpu().clone(),
                     "positions": flat_positions[:query_len].detach().cpu().clone(),
                     "request_provenance": request_provenance,
+                    "observer_provenance": {
+                        "dcp_request_row": self.dcp_request_row,
+                        "full_attention_stages": list(self.full_attention_stages),
+                    },
                     "layers": {
-                        label: (
-                            hidden
-                            if label.startswith("gdn_replay_")
-                            else hidden[row]
+                        label: select_layer(
+                            label,
+                            hidden,
+                            token_row=row,
+                            provenance=request_provenance,
                         )
                         .detach()
                         .cpu()

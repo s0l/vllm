@@ -129,6 +129,7 @@ _tp3_ce_first_known_dispatch_logged = False
 _tp3_ce_first_active_dispatch_logged = False
 _tp3_piecewise_device_ce_logged = False
 _tp3_prefill_canonical_logged = False
+_tp3_embedding_nccl_logged = False
 
 
 def _register_group(group: "GroupCoordinator") -> None:
@@ -204,8 +205,12 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
         if not _tp3_piecewise_device_ce_logged:
             logger.warning(
                 "TP3 device-CE reduction active for PIECEWISE/intermediate "
-                "prefill all-reduces: shape=%s",
+                "prefill all-reduces: shape=%s packed_one_gather=%s",
                 tuple(tensor.shape),
+                os.environ.get(
+                    "AG2_VLLM_TP3_PIECEWISE_DEVICE_CE_PACKED", "0"
+                )
+                == "1",
             )
             _tp3_piecewise_device_ce_logged = True
         return _tp3_device_ce_reduce(tensor, group)
@@ -419,10 +424,28 @@ def _tp3_device_ce_reduce(
     rows, cols = tensor.shape
     quant_block = 8192
     num_blocks = (cols + quant_block - 1) // quant_block
-    q_local = torch.empty((rows, cols), dtype=torch.uint8, device=tensor.device)
-    scale_local = torch.empty(
-        (rows, num_blocks), dtype=torch.float32, device=tensor.device
+    use_packed_gather = (
+        os.environ.get("AG2_VLLM_TP3_PIECEWISE_DEVICE_CE_PACKED", "0") == "1"
+        and rows >= 4
     )
+    if use_packed_gather:
+        q_bytes = rows * cols
+        scale_bytes = rows * num_blocks * 4
+        payload_bytes = q_bytes + scale_bytes
+        payload_local = torch.empty(
+            payload_bytes, dtype=torch.uint8, device=tensor.device
+        )
+        q_local = payload_local[:q_bytes].view(rows, cols)
+        scale_local = payload_local[q_bytes:].view(torch.float32).view(
+            rows, num_blocks
+        )
+    else:
+        q_local = torch.empty(
+            (rows, cols), dtype=torch.uint8, device=tensor.device
+        )
+        scale_local = torch.empty(
+            (rows, num_blocks), dtype=torch.float32, device=tensor.device
+        )
     _quantize_i8_block[(rows, num_blocks)](
         tensor,
         q_local,
@@ -430,16 +453,31 @@ def _tp3_device_ce_reduce(
         cols,
         quant_block,
     )
-    q_gathered = group._all_gather_out_place(q_local, 0).view(
-        3,
-        rows,
-        cols,
-    )
-    scale_gathered = group._all_gather_out_place(scale_local, 0).view(
-        3,
-        rows,
-        num_blocks,
-    )
+    if use_packed_gather:
+        payload_gathered = group._all_gather_out_place(payload_local, 0).view(
+            3, payload_bytes
+        )
+        q_gathered = [
+            payload_gathered[rank, :q_bytes].view(rows, cols)
+            for rank in range(3)
+        ]
+        scale_gathered = [
+            payload_gathered[rank, q_bytes:].view(torch.float32).view(
+                rows, num_blocks
+            )
+            for rank in range(3)
+        ]
+    else:
+        q_gathered = group._all_gather_out_place(q_local, 0).view(
+            3,
+            rows,
+            cols,
+        )
+        scale_gathered = group._all_gather_out_place(scale_local, 0).view(
+            3,
+            rows,
+            num_blocks,
+        )
     output = torch.empty_like(tensor)
     _dequant_sum_i8_block[(rows, num_blocks)](
         q_gathered[0],
@@ -492,6 +530,7 @@ def _should_use_tp3_embedding_ce(
     tensor_dim: int,
     hidden_size: int,
     tp_world_size: int,
+    force_exact_nccl: bool = False,
 ) -> bool:
     """Keep every prefill embedding on one reduction contract.
 
@@ -501,6 +540,7 @@ def _should_use_tp3_embedding_ce(
     """
     return (
         runtime_enabled
+        and not force_exact_nccl
         and rows > 3
         and tensor_dim == 2
         and hidden_size == 5120
@@ -510,16 +550,29 @@ def _should_use_tp3_embedding_ce(
 
 def embedding_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     """Apply a phase-stable TP3 reduction to vocabulary embeddings."""
+    global _tp3_embedding_nccl_logged
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
+    force_exact_nccl = os.environ.get("AG2_VLLM_TP3_EMBEDDING_NCCL", "0") == "1"
+    if (
+        force_exact_nccl
+        and _tp3_ce_runtime_enabled
+        and not _tp3_embedding_nccl_logged
+    ):
+        logger.warning(
+            "TP3 vocabulary embedding diagnostic uses uniform exact NCCL; "
+            "compressed all-reduce remains enabled for eligible non-embedding paths"
+        )
+        _tp3_embedding_nccl_logged = True
     if _should_use_tp3_embedding_ce(
         runtime_enabled=_tp3_ce_runtime_enabled,
         rows=tensor.shape[0] if tensor.dim() == 2 else 0,
         tensor_dim=tensor.dim(),
         hidden_size=tensor.shape[-1] if tensor.dim() else 0,
         tp_world_size=group.world_size,
+        force_exact_nccl=force_exact_nccl,
     ):
         from .device_communicators.tp3_ce_all_reduce import (
             tp3_ce_all_reduce,
@@ -1213,6 +1266,23 @@ class GroupCoordinator:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_gather(input_, dim)
+
+    def all_gather_into(
+        self,
+        input_: torch.Tensor,
+        raw_output: torch.Tensor,
+        final_output: torch.Tensor,
+        dim: int = -1,
+    ) -> torch.Tensor:
+        """Gather into caller-owned buffers without an allocating custom op."""
+        if self.world_size == 1:
+            final_output.copy_(input_)
+            return final_output
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.all_gather_into(
+            input_, raw_output, final_output, dim
+        )
 
     def all_gatherv(
         self,

@@ -905,12 +905,22 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
         envs.VLLM_BATCH_INVARIANT or envs.AG2_VLLM_NVFP4_BATCH_INVARIANT
     )
     if nvfp4_batch_invariant:
-        bi_kernel = (
-            HummingNvFp4LinearKernel if use_a16 else CutlassNvFp4LinearKernel
-        )
+        if use_a16 and envs.AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE:
+            bi_kernel = MarlinNvFp4LinearKernel
+        else:
+            bi_kernel = (
+                HummingNvFp4LinearKernel if use_a16 else CutlassNvFp4LinearKernel
+            )
         bi_supported, reason = bi_kernel.is_supported()
         if bi_supported:
-            bi_backend = "humming" if use_a16 else "cutlass"
+            if use_a16:
+                bi_backend = (
+                    "marlin"
+                    if bi_kernel is MarlinNvFp4LinearKernel
+                    else "humming"
+                )
+            else:
+                bi_backend = "cutlass"
             if linear_backend not in ("auto", bi_backend):
                 logger.warning_once(
                     "NVFP4 batch invariance overrides --linear-backend=%s; "

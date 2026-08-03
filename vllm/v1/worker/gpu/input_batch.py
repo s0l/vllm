@@ -26,6 +26,12 @@ class InputBuffers:
         self.query_start_loc = torch.zeros(
             max_num_reqs + 1, dtype=torch.int32, device=device
         )
+        # Stable CPU layout consumed by the default-off request-isolated
+        # NVFP4 Marlin prefill path. Layout: [num_reqs, num_decodes,
+        # query_start_loc[0:max_num_reqs+1]].
+        self.marlin_request_layout_cpu = torch.zeros(
+            max_num_reqs + 3, dtype=torch.int32, pin_memory=True
+        )
         self.seq_lens = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
         # DCP: per-request local seq_lens buffer
         self.dcp_local_seq_lens = torch.zeros(
@@ -62,6 +68,7 @@ class InputBatch:
     # [num_reqs + 1]
     query_start_loc: torch.Tensor
     query_start_loc_np: np.ndarray
+    marlin_request_layout_cpu: torch.Tensor
     # [num_reqs]
     seq_lens: torch.Tensor
     # [num_reqs] CPU upper bound on seq_lens (see CommonAttentionMetadata).
@@ -141,6 +148,10 @@ class InputBatch:
         # Pad for full CUDA graph mode.
         input_buffers.query_start_loc[num_reqs + 1 :] = num_tokens
         query_start_loc = input_buffers.query_start_loc[: num_reqs + 1]
+        marlin_layout = input_buffers.marlin_request_layout_cpu
+        marlin_layout[0] = num_reqs
+        marlin_layout[1] = 0
+        marlin_layout[2 : num_reqs + 3].copy_(torch.from_numpy(query_start_loc_np))
 
         input_ids = input_buffers.input_ids[:num_tokens].zero_()
         positions = input_buffers.positions[:num_tokens].zero_()
@@ -168,6 +179,7 @@ class InputBatch:
             num_draft_tokens_per_req=None,
             query_start_loc=query_start_loc,
             query_start_loc_np=query_start_loc_np,
+            marlin_request_layout_cpu=marlin_layout,
             seq_lens=seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=None,

@@ -411,17 +411,10 @@ class Qwen3NextAttention(nn.Module):
             bool(os.environ.get("AG2_VLLM_LAYER0_TRACE_OUTPUT"))
             and layer_idx == trace_layer
         )
-        self._ag2_aux_full_boundaries_enabled = (
-            os.environ.get(
-                "AG2_VLLM_AUX_HIDDEN_TRACE_FULL_ATTENTION_BOUNDARIES", "0"
-            )
-            == "1"
-            and layer_idx
-            == int(
-                os.environ.get(
-                    "AG2_VLLM_AUX_HIDDEN_TRACE_ATTENTION_BOUNDARY_LAYER", "0"
-                )
-            )
+        self._ag2_aux_full_boundaries_enabled = os.environ.get(
+            "AG2_VLLM_AUX_HIDDEN_TRACE_FULL_ATTENTION_BOUNDARIES", "0"
+        ) == "1" and layer_idx == int(
+            os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_ATTENTION_BOUNDARY_LAYER", "0")
         )
         full_attention_stages_raw = os.environ.get(
             "AG2_VLLM_AUX_HIDDEN_TRACE_FULL_ATTENTION_STAGES", ""
@@ -435,13 +428,30 @@ class Qwen3NextAttention(nn.Module):
                 "v",
                 "dcp_output_pack",
                 "dcp_lse_pack",
+                "dcp_kv_history_pack",
+                "dcp_kv_history_meta",
+                "dcp_kv_page_indices_pack",
+                "dcp_observer_meta",
+                "dcp_current_kv_pack",
+                "dcp_scale_pack",
                 "core",
                 "gated",
                 "output_parallel",
                 "output",
             )
-            if not full_attention_stages_raw
-            or stage in full_attention_stages_raw.split(",")
+            if (
+                stage in full_attention_stages_raw.split(",")
+                if full_attention_stages_raw
+                else stage
+                not in {
+                    "dcp_kv_history_pack",
+                    "dcp_kv_history_meta",
+                    "dcp_kv_page_indices_pack",
+                    "dcp_observer_meta",
+                    "dcp_current_kv_pack",
+                    "dcp_scale_pack",
+                }
+            )
         )
         self.o_proj._ag2_aux_output_parallel_enabled = (
             self._ag2_aux_full_boundaries_enabled
@@ -454,12 +464,60 @@ class Qwen3NextAttention(nn.Module):
                 or "dcp_lse_pack" in self._ag2_aux_full_stages
             )
         )
+        self.attn._ag2_aux_dcp_kv_history_enabled = (
+            self._ag2_aux_full_boundaries_enabled
+            and any(
+                stage in self._ag2_aux_full_stages
+                for stage in (
+                    "dcp_kv_history_pack",
+                    "dcp_kv_history_meta",
+                    "dcp_kv_page_indices_pack",
+                    "dcp_observer_meta",
+                    "dcp_current_kv_pack",
+                    "dcp_scale_pack",
+                )
+            )
+        )
+        self.attn._ag2_aux_dcp_kv_history_tokens = int(
+            os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_DCP_KV_HISTORY_TOKENS", "0")
+        )
+        self.attn._ag2_aux_dcp_kv_history_rows = int(
+            os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_DCP_KV_HISTORY_ROWS", "0")
+        )
+        self.attn._ag2_aux_dcp_pack_rows = int(
+            os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_DCP_REQUEST_TAIL_ROWS",
+                "0",
+            )
+        )
         if self.attn._ag2_aux_dcp_pack_enabled and not {
             "dcp_output_pack",
             "dcp_lse_pack",
         }.issubset(self._ag2_aux_full_stages):
             raise ValueError(
                 "DCP auxiliary output and LSE packs must be requested together"
+            )
+        if self.attn._ag2_aux_dcp_kv_history_enabled and not {
+            "dcp_kv_history_pack",
+            "dcp_kv_history_meta",
+            "dcp_kv_page_indices_pack",
+            "dcp_observer_meta",
+            "dcp_current_kv_pack",
+            "dcp_scale_pack",
+        }.issubset(self._ag2_aux_full_stages):
+            raise ValueError(
+                "DCP causal observer history, pages and metadata must be "
+                "requested together"
+            )
+        if (
+            self.attn._ag2_aux_dcp_kv_history_enabled
+            and (
+                self.attn._ag2_aux_dcp_kv_history_tokens < 1
+                or self.attn._ag2_aux_dcp_kv_history_rows < 1
+            )
+        ):
+            raise ValueError(
+                "DCP KV history trace requires positive row and token capacities"
             )
         if self._ag2_full_attn_trace_enabled:
             trace_rows = 3
@@ -616,14 +674,22 @@ class Qwen3NextAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
+        return_ag2_mtp_trace: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        mtp_trace: dict[str, torch.Tensor] = {}
         qkv, _ = self.qkv_proj(hidden_states)
+        if return_ag2_mtp_trace:
+            mtp_trace["qkv"] = qkv
         if self._ag2_aux_full_boundaries_enabled and "qkv" in self._ag2_aux_full_stages:
             self._ag2_aux_qkv = qkv
         if self._ag2_full_attn_trace_enabled:
             trace = qkv[:3]
             self._ag2_trace_qkv[: trace.shape[0]].copy_(trace)
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
+        if return_ag2_mtp_trace:
+            mtp_trace.update({"q": q, "k": k, "v": v})
+            if gate is not None:
+                mtp_trace["gate"] = gate
         if self._ag2_aux_full_boundaries_enabled:
             if "q" in self._ag2_aux_full_stages:
                 self._ag2_aux_q = q
@@ -648,14 +714,56 @@ class Qwen3NextAttention(nn.Module):
             )
             self._ag2_trace_prefix_k.index_copy_(0, prefix_positions, k[:prefix_rows])
             self._ag2_trace_prefix_v.index_copy_(0, prefix_positions, v[:prefix_rows])
-        attn_output = self.attn(q, k, v)
+        attn_output = self.attn(
+            q,
+            k,
+            v,
+            ag2_dcp_trace=(
+                return_ag2_mtp_trace or self._ag2_aux_full_boundaries_enabled
+            ),
+        )
+        if return_ag2_mtp_trace:
+            mtp_trace["core"] = attn_output
+            for name in (
+                "output_pack",
+                "lse_pack",
+                "kv_history_pack",
+                "kv_history_meta",
+                "kv_page_indices_pack",
+                "observer_meta",
+                "current_kv_pack",
+                "scale_pack",
+            ):
+                mtp_trace[f"dcp_{name}"] = getattr(
+                    self.attn, f"_ag2_aux_dcp_{name}"
+                )
         if self._ag2_aux_full_boundaries_enabled:
             if "dcp_output_pack" in self._ag2_aux_full_stages:
-                self._ag2_aux_dcp_output_pack = (
-                    self.attn._ag2_aux_dcp_output_pack
-                )
+                self._ag2_aux_dcp_output_pack = self.attn._ag2_aux_dcp_output_pack
             if "dcp_lse_pack" in self._ag2_aux_full_stages:
                 self._ag2_aux_dcp_lse_pack = self.attn._ag2_aux_dcp_lse_pack
+            if "dcp_kv_history_pack" in self._ag2_aux_full_stages:
+                self._ag2_aux_dcp_kv_history_pack = (
+                    self.attn._ag2_aux_dcp_kv_history_pack
+                )
+            if "dcp_kv_history_meta" in self._ag2_aux_full_stages:
+                self._ag2_aux_dcp_kv_history_meta = (
+                    self.attn._ag2_aux_dcp_kv_history_meta
+                )
+            if "dcp_kv_page_indices_pack" in self._ag2_aux_full_stages:
+                self._ag2_aux_dcp_kv_page_indices_pack = (
+                    self.attn._ag2_aux_dcp_kv_page_indices_pack
+                )
+            if "dcp_observer_meta" in self._ag2_aux_full_stages:
+                self._ag2_aux_dcp_observer_meta = (
+                    self.attn._ag2_aux_dcp_observer_meta
+                )
+            if "dcp_current_kv_pack" in self._ag2_aux_full_stages:
+                self._ag2_aux_dcp_current_kv_pack = (
+                    self.attn._ag2_aux_dcp_current_kv_pack
+                )
+            if "dcp_scale_pack" in self._ag2_aux_full_stages:
+                self._ag2_aux_dcp_scale_pack = self.attn._ag2_aux_dcp_scale_pack
         if (
             self._ag2_aux_full_boundaries_enabled
             and "core" in self._ag2_aux_full_stages
@@ -666,6 +774,8 @@ class Qwen3NextAttention(nn.Module):
             self._ag2_trace_core[: trace.shape[0]].copy_(trace)
         if gate is not None:
             attn_output = attn_output * torch.sigmoid(gate)
+        if return_ag2_mtp_trace:
+            mtp_trace["gated"] = attn_output
         if (
             self._ag2_aux_full_boundaries_enabled
             and "gated" in self._ag2_aux_full_stages
@@ -675,6 +785,9 @@ class Qwen3NextAttention(nn.Module):
             trace = attn_output[:3]
             self._ag2_trace_gated_output[: trace.shape[0]].copy_(trace)
         output, _ = self.o_proj(attn_output)
+        if return_ag2_mtp_trace:
+            mtp_trace["output_parallel"] = self.o_proj._ag2_aux_output_parallel
+            mtp_trace["output"] = output
         if self._ag2_aux_full_boundaries_enabled:
             if "output_parallel" in self._ag2_aux_full_stages:
                 self._ag2_aux_output_parallel = self.o_proj._ag2_aux_output_parallel
@@ -683,7 +796,51 @@ class Qwen3NextAttention(nn.Module):
         if self._ag2_full_attn_trace_enabled:
             trace = output[:3]
             self._ag2_trace_attention_output[: trace.shape[0]].copy_(trace)
+        if return_ag2_mtp_trace:
+            return output, mtp_trace
         return output
+
+
+def _ag2_compact_row_indices(
+    positions: torch.Tensor,
+    target_position: int,
+    capacity: int,
+) -> torch.Tensor:
+    flat_positions = positions[0] if positions.ndim == 2 else positions
+    match_scores = torch.nn.functional.pad(
+        flat_positions.eq(target_position).to(torch.int32),
+        (0, capacity),
+        value=-1,
+    )
+    raw_indices = torch.topk(
+        match_scores,
+        k=capacity,
+        largest=True,
+        sorted=False,
+    ).indices
+    return torch.where(
+        raw_indices < flat_positions.numel(),
+        raw_indices,
+        torch.full_like(raw_indices, -1),
+    )
+
+
+def _ag2_compact_select(
+    value: torch.Tensor,
+    row_indices: torch.Tensor,
+) -> torch.Tensor:
+    valid_rows = row_indices >= 0
+    safe_row_indices = torch.where(
+        valid_rows,
+        row_indices,
+        torch.zeros_like(row_indices),
+    )
+    selected = torch.index_select(value, 0, safe_row_indices)
+    return torch.where(
+        valid_rows.unsqueeze(-1),
+        selected,
+        torch.zeros_like(selected),
+    )
 
 
 class Qwen3NextDecoderLayer(nn.Module):
@@ -703,6 +860,81 @@ class Qwen3NextDecoderLayer(nn.Module):
 
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
+        self._ag2_aux_attention_boundary_enabled = (
+            layer_type == "full_attention"
+            and os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_ATTENTION_BOUNDARY", "0"
+            )
+            == "1"
+            and self.layer_idx
+            == int(
+                os.environ.get(
+                    "AG2_VLLM_AUX_HIDDEN_TRACE_ATTENTION_BOUNDARY_LAYER", "0"
+                )
+            )
+        )
+        self._ag2_aux_gdn_boundaries_enabled = (
+            layer_type == "linear_attention"
+            and os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_GDN_BOUNDARIES", "0")
+            == "1"
+            and self.layer_idx
+            == int(
+                os.environ.get(
+                    "AG2_VLLM_AUX_HIDDEN_TRACE_GDN_BOUNDARY_LAYER",
+                    "0",
+                )
+            )
+        )
+        self._ag2_aux_compact_boundary_enabled = (
+            os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_ALL_BOUNDARIES",
+                "0",
+            )
+            == "1"
+            and self.layer_idx
+            <= int(
+                os.environ.get(
+                    "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_BOUNDARY_MAX_LAYER",
+                    "2147483647",
+                )
+            )
+            or self.layer_idx
+            == int(
+                os.environ.get(
+                    "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_BOUNDARY_LAYER",
+                    "-1",
+                )
+            )
+            or self.layer_idx
+            == int(
+                os.environ.get(
+                    "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_GDN_BOUNDARY_LAYER",
+                    "-1",
+                )
+            )
+        )
+        self._ag2_aux_compact_gdn_boundaries_enabled = (
+            layer_type == "linear_attention"
+            and self.layer_idx
+            == int(
+                os.environ.get(
+                    "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_GDN_BOUNDARY_LAYER",
+                    "-1",
+                )
+            )
+        )
+        self._ag2_aux_gdn_replay_enabled = (
+            layer_type == "linear_attention"
+            and os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_GDN_REPLAY_ONLY", "0")
+            == "1"
+            and self.layer_idx
+            == int(
+                os.environ.get(
+                    "AG2_VLLM_AUX_HIDDEN_TRACE_GDN_BOUNDARY_LAYER",
+                    "0",
+                )
+            )
+        )
 
         mlp_only_layers = (
             [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
@@ -780,8 +1012,10 @@ class Qwen3NextDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         positions: torch.Tensor = None,
+        return_ag2_mtp_trace: bool = False,
         **kwargs: object,
     ):
+        mtp_trace: dict[str, torch.Tensor] = {}
         full_num_tokens = positions.shape[-1]
         input_is_sequence_parallel = (
             self.use_attn_reduce_scatter_for_moe
@@ -792,11 +1026,35 @@ class Qwen3NextDecoderLayer(nn.Module):
         if getattr(self, "_ag2_layer0_trace_enabled", False):
             trace = hidden_states[:3]
             self._ag2_trace_input[: trace.shape[0]].copy_(trace)
+        if return_ag2_mtp_trace:
+            mtp_trace["layer_input"] = hidden_states
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        if return_ag2_mtp_trace:
+            mtp_trace["input_norm"] = hidden_states
+        if self._ag2_aux_compact_boundary_enabled:
+            row_indices = _ag2_compact_row_indices(
+                positions,
+                int(
+                    os.environ[
+                        "AG2_VLLM_AUX_HIDDEN_TRACE_POSITION"
+                    ]
+                ),
+                int(
+                    os.environ.get(
+                        "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_CAPACITY",
+                        "64",
+                    )
+                ),
+            )
+            self._ag2_aux_compact_row_indices = row_indices
+            self._ag2_aux_compact_input_norm = _ag2_compact_select(
+                hidden_states,
+                row_indices,
+            )
         if getattr(self, "_ag2_aux_gdn_boundaries_enabled", False):
             self._ag2_aux_gdn_input_norm = hidden_states
         if getattr(self, "_ag2_layer0_trace_enabled", False):
@@ -810,6 +1068,10 @@ class Qwen3NextDecoderLayer(nn.Module):
             hidden_states = hidden_states[:full_num_tokens]
 
         if self.layer_type == "linear_attention":
+            if self._ag2_aux_compact_gdn_boundaries_enabled:
+                self.linear_attn._ag2_aux_compact_row_indices = (
+                    self._ag2_aux_compact_row_indices
+                )
             hidden_states = self.linear_attn(hidden_states=hidden_states)
             if getattr(self, "_ag2_aux_gdn_boundaries_enabled", False):
                 self._ag2_aux_gdn_boundaries = (
@@ -825,10 +1087,21 @@ class Qwen3NextDecoderLayer(nn.Module):
                     hidden_states,
                 )
         elif self.layer_type == "full_attention":
-            hidden_states = self.self_attn(
+            attn_result = self.self_attn(
                 hidden_states=hidden_states,
                 positions=positions,
+                return_ag2_mtp_trace=return_ag2_mtp_trace,
             )
+            if return_ag2_mtp_trace:
+                hidden_states, attention_trace = attn_result
+                mtp_trace.update(
+                    {
+                        f"attention_{name}": value
+                        for name, value in attention_trace.items()
+                    }
+                )
+            else:
+                hidden_states = attn_result
             if getattr(self.self_attn, "_ag2_aux_full_boundaries_enabled", False):
                 self._ag2_aux_full_boundaries = tuple(
                     getattr(self.self_attn, f"_ag2_aux_{stage}")
@@ -839,6 +1112,13 @@ class Qwen3NextDecoderLayer(nn.Module):
         if getattr(self, "_ag2_layer0_trace_enabled", False):
             trace = hidden_states[:3]
             self._ag2_trace_attention_output[: trace.shape[0]].copy_(trace)
+        if return_ag2_mtp_trace:
+            mtp_trace["attention_output"] = hidden_states
+        if self._ag2_aux_compact_boundary_enabled:
+            self._ag2_aux_compact_attention_output = _ag2_compact_select(
+                hidden_states,
+                self._ag2_aux_compact_row_indices,
+            )
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
@@ -862,9 +1142,21 @@ class Qwen3NextDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if return_ag2_mtp_trace:
+            mtp_trace["post_attention_norm"] = hidden_states
+            mtp_trace["post_attention_residual"] = residual
         if getattr(self, "_ag2_aux_attention_boundary_enabled", False):
             self._ag2_aux_post_attention_norm = hidden_states
             self._ag2_aux_post_attention_residual = residual
+        if self._ag2_aux_compact_boundary_enabled:
+            self._ag2_aux_compact_post_attention_norm = _ag2_compact_select(
+                hidden_states,
+                self._ag2_aux_compact_row_indices,
+            )
+            self._ag2_aux_compact_post_attention_residual = _ag2_compact_select(
+                residual,
+                self._ag2_aux_compact_row_indices,
+            )
         if getattr(self, "_ag2_layer0_trace_enabled", False):
             hidden_trace = hidden_states[:3]
             residual_trace = residual[:3]
@@ -881,6 +1173,8 @@ class Qwen3NextDecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.mlp(hidden_states)
+        if return_ag2_mtp_trace:
+            mtp_trace["mlp_output"] = hidden_states
         if getattr(self, "_ag2_layer0_trace_enabled", False):
             trace = hidden_states[:3]
             self._ag2_trace_mlp_output[: trace.shape[0]].copy_(trace)
@@ -899,6 +1193,8 @@ class Qwen3NextDecoderLayer(nn.Module):
                     self.ffn_layer_scale.to(hidden_states.dtype) + 1
                 )
 
+        if return_ag2_mtp_trace:
+            return hidden_states, residual, mtp_trace
         return hidden_states, residual
 
 
@@ -974,6 +1270,131 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
 
         self.aux_hidden_state_layers: tuple[int, ...] = ()
 
+    def _maybe_add_ag2_aux_hidden_state(
+        self,
+        aux_hidden_states: list[torch.Tensor],
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        positions: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        if layer_idx not in self.aux_hidden_state_layers:
+            return aux_hidden_states
+        compact_position = getattr(
+            self,
+            "_ag2_aux_trace_compact_position",
+            None,
+        )
+        if compact_position is None:
+            return self._maybe_add_hidden_state(
+                aux_hidden_states,
+                layer_idx,
+                hidden_states,
+                residual,
+            )
+
+        # Text mRoPE supplies identical T/H/W rows with shape (3, num_tokens),
+        # while hidden_states remains row-major over num_tokens.  Use the same
+        # authoritative T row as the fused RoPE path; flattening would create
+        # indices up to 3 * num_tokens and corrupt the hidden-state selection.
+        flat_positions = positions[0] if positions.ndim == 2 else positions
+        capacity = int(self._ag2_aux_trace_compact_capacity)
+        num_rows = flat_positions.numel()
+        match_scores = flat_positions.eq(compact_position).to(torch.int32)
+        # TorchCompileWithNoGuards reuses one graph over every shape in the
+        # compile range.  Always append a fixed dummy tail: a Python branch on
+        # num_rows would be specialized at the initial large shape and then be
+        # invalid for a smaller CUDA Graph descriptor.
+        match_scores = torch.nn.functional.pad(
+            match_scores,
+            (0, capacity),
+            value=-1,
+        )
+        row_indices = torch.topk(
+            match_scores,
+            k=capacity,
+            largest=True,
+            sorted=False,
+        ).indices
+        valid_rows = row_indices < num_rows
+        safe_row_indices = torch.where(
+            valid_rows,
+            row_indices,
+            torch.zeros_like(row_indices),
+        )
+        selected_hidden = torch.index_select(hidden_states, 0, safe_row_indices)
+        selected_residual = (
+            torch.zeros_like(selected_hidden)
+            if residual is None
+            else torch.index_select(residual, 0, safe_row_indices)
+        )
+        selected_combined = selected_hidden + selected_residual
+        row_indices = torch.where(
+            valid_rows,
+            row_indices,
+            torch.full_like(row_indices, -1),
+        )
+        selected_hidden = torch.where(
+            valid_rows.unsqueeze(-1),
+            selected_hidden,
+            torch.zeros_like(selected_hidden),
+        )
+        selected_residual = torch.where(
+            valid_rows.unsqueeze(-1),
+            selected_residual,
+            torch.zeros_like(selected_residual),
+        )
+        selected_combined = torch.where(
+            valid_rows.unsqueeze(-1),
+            selected_combined,
+            torch.zeros_like(selected_combined),
+        )
+        aux_hidden_states.extend(
+            (
+                row_indices,
+                selected_hidden,
+                selected_residual,
+                selected_combined,
+            )
+        )
+        return aux_hidden_states
+
+    def _maybe_add_ag2_compact_layer_boundary(
+        self,
+        aux_hidden_states: list[torch.Tensor],
+        layer_idx: int,
+        layer: nn.Module,
+    ) -> list[torch.Tensor]:
+        all_boundaries_enabled = getattr(
+            self,
+            "_ag2_aux_trace_compact_all_boundaries",
+            False,
+        ) and layer_idx <= getattr(
+            self,
+            "_ag2_aux_trace_compact_boundary_max_layer",
+            -1,
+        )
+        if not all_boundaries_enabled and (
+            layer_idx
+            != getattr(
+                self,
+                "_ag2_aux_trace_compact_boundary_layer",
+                -1,
+            )
+        ):
+            return aux_hidden_states
+
+        aux_hidden_states.extend(
+            (
+                layer._ag2_aux_compact_row_indices,
+                layer._ag2_aux_compact_input_norm,
+                layer._ag2_aux_compact_attention_output,
+                layer._ag2_aux_compact_post_attention_norm,
+                layer._ag2_aux_compact_post_attention_residual,
+            )
+        )
+        return aux_hidden_states
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -996,7 +1417,9 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
             residual = intermediate_tensors["residual"]
 
         full_num_tokens = positions.shape[-1]
-        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        aux_hidden_states = self._maybe_add_ag2_aux_hidden_state(
+            [], 0, hidden_states, residual, positions
+        )
         for layer_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -1016,17 +1439,47 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                 hidden_states=hidden_states,
                 residual=residual,
             )
+            all_boundaries_enabled = getattr(
+                self,
+                "_ag2_aux_trace_compact_all_boundaries",
+                False,
+            ) and layer_idx <= getattr(
+                self,
+                "_ag2_aux_trace_compact_boundary_max_layer",
+                -1,
+            )
+            if all_boundaries_enabled or layer_idx == getattr(
+                self,
+                "_ag2_aux_trace_compact_boundary_layer",
+                -1,
+            ):
+                self._maybe_add_ag2_compact_layer_boundary(
+                    aux_hidden_states,
+                    layer_idx,
+                    layer,
+                )
             if getattr(layer, "_ag2_aux_attention_boundary_enabled", False):
                 if getattr(layer, "_ag2_aux_full_boundaries", None) is not None:
                     aux_hidden_states.extend(layer._ag2_aux_full_boundaries)
-                aux_hidden_states.extend(
-                    (
-                        layer._ag2_aux_post_attention_norm,
-                        layer._ag2_aux_post_attention_residual,
+                if not getattr(self, "_ag2_aux_trace_compact_rows", False):
+                    aux_hidden_states.extend(
+                        (
+                            layer._ag2_aux_post_attention_norm,
+                            layer._ag2_aux_post_attention_residual,
+                        )
                     )
-                )
             if getattr(layer, "_ag2_aux_gdn_boundaries_enabled", False):
                 aux_hidden_states.extend(layer._ag2_aux_gdn_boundaries)
+            if getattr(layer, "_ag2_aux_gdn_replay_enabled", False):
+                aux_hidden_states.extend(
+                    (
+                        layer.linear_attn._ag2_aux_replay_float,
+                        layer.linear_attn._ag2_aux_replay_state,
+                        layer.linear_attn._ag2_aux_replay_meta,
+                    )
+                )
+            if getattr(layer, "_ag2_aux_compact_gdn_boundaries_enabled", False):
+                aux_hidden_states.extend(layer.linear_attn._ag2_aux_compact_boundaries)
             if (layer_idx + 1) in self.aux_hidden_state_layers and hidden_states.shape[
                 0
             ] != full_num_tokens:
@@ -1036,8 +1489,12 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                     full_num_tokens,
                     self.config.hidden_size,
                 )
-            self._maybe_add_hidden_state(
-                aux_hidden_states, layer_idx + 1, hidden_states, residual
+            self._maybe_add_ag2_aux_hidden_state(
+                aux_hidden_states,
+                layer_idx + 1,
+                hidden_states,
+                residual,
+                positions,
             )
 
         if not get_pp_group().is_last_rank:
