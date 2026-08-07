@@ -190,6 +190,12 @@ class SchedulerStats:
 
     num_waiting_reqs: int = 0  # length of the "waiting" request queue
     num_skipped_waiting_reqs: int = 0  # length of the "skipped waiting" queue
+    # Running requests whose KV was retained while a peer was allowed to make
+    # progress under transient tail pressure.
+    num_kv_tail_deferrals: int = 0
+    # Waiting text prefills deferred because the residual step budget could
+    # not reach their normal aligned chunk boundary.
+    num_canonical_prefill_admission_deferrals: int = 0
 
     # These are used for internal DP load-balancing.
     step_counter: int = 0

@@ -1029,6 +1029,63 @@ def test_prefill_hybrid_model_mamba_align():
     manager.free(req0)
 
 
+def test_prefill_hybrid_model_mamba_align_dcp_replay():
+    """DCP hybrid cache insertion and lookup must use the same block geometry."""
+    block_size = 16
+    dcp_world_size = 3
+    effective_block_size = block_size * dcp_world_size
+    kv_cache_config = _make_hybrid_kv_cache_config(
+        block_size, 40, ["full", "mamba_align"]
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        scheduler_block_size=effective_block_size,
+        dcp_world_size=dcp_world_size,
+    )
+
+    common_token_ids = list(range(3 * effective_block_size))
+    req0 = make_request("dcp-fill", common_token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req0)
+    assert num_computed_tokens == 0
+    blocks = manager.allocate_slots(
+        req0, req0.num_tokens, num_computed_tokens, computed_blocks
+    )
+    assert blocks is not None
+    manager.new_step_starts()
+
+    coarse_hashes = kv_cache_utils.BlockHashListWithBlockSize(
+        req0.block_hashes, block_size, effective_block_size
+    )
+    cached_by_group = [
+        [
+            manager.block_pool.get_cached_block(block_hash, [group_id]) is not None
+            for block_hash in coarse_hashes
+        ]
+        for group_id in range(2)
+    ]
+    assert cached_by_group == [[True] * 3, [False, False, True]]
+
+    req1 = make_request("dcp-replay", common_token_ids + [101] * 5, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
+
+    assert num_computed_tokens == 3 * effective_block_size
+    assert all(len(group) == 3 for group in computed_blocks.blocks)
+
+    per_group_blocks, per_group_hit_lengths = (
+        manager.coordinator.find_longest_cache_hit_per_group(
+            req1.block_hashes, req1.num_tokens - 1
+        )
+    )
+    assert per_group_hit_lengths == (3 * effective_block_size,) * 2
+    assert all(len(group) == 3 for group in per_group_blocks)
+
+    manager.free(req0)
+    manager.free(req1)
+
+
 def test_hybrid_cache_mamba_align_shared_prefix_detection():
     """Test shared prefix detection heuristic for mamba align cache mode
 
@@ -1078,6 +1135,7 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
     # Create minimal mock with just the needed attributes
     mock = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=block_size),
+        block_size=block_size,
         max_num_scheduled_tokens=3 * block_size,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle=False,
@@ -1583,6 +1641,109 @@ def test_cache_blocks(hash_fn):
     )
     assert len(block_pool.cached_block_hash_to_block) == 3
     assert blocks[0].block_hash is not None
+
+
+def test_low_id_allocation_evicts_selected_cached_block_consistently():
+    """Elastic low-ID selection may differ from LRU but must keep APC coherent."""
+    block_size = 4
+    pool = BlockPool(
+        num_gpu_blocks=6,
+        enable_caching=True,
+        hash_block_size=block_size,
+        enable_kv_cache_events=True,
+        prefer_low_id_allocations=True,
+    )
+    req = make_request("low-id", list(range(20)), block_size, sha256)
+    blocks = pool.get_new_blocks(5)
+    assert [block.block_id for block in blocks] == [1, 2, 3, 4, 5]
+    pool.cache_full_blocks(
+        request=req,
+        blocks=blocks,
+        num_cached_blocks=0,
+        num_full_blocks=5,
+        block_size=block_size,
+        kv_cache_group_id=0,
+    )
+    pool.take_events()
+
+    # Make block 5 the LRU head. The elastic policy deliberately chooses the
+    # lower logical ID 1 instead so a later tail shrink cannot be pinned.
+    pool.free_blocks([blocks[4], *blocks[:4]])
+    selected = pool.get_new_blocks(1)
+    assert [block.block_id for block in selected] == [1]
+
+    # Selection must evict exactly block 1's hashes and publish the same cache
+    # removal semantics as the ordinary LRU path. Other cached blocks survive.
+    assert pool.get_cached_block(req.block_hashes[0], [0]) is None
+    for block_hash in req.block_hashes[1:]:
+        assert pool.get_cached_block(block_hash, [0]) is not None
+    events = pool.take_events()
+    assert len(events) == 1
+    assert isinstance(events[0], BlockRemoved)
+    assert events[0].block_hashes == [
+        kv_cache_utils.maybe_convert_block_hash(req.block_hashes[0])
+    ]
+
+
+def test_low_id_allocation_preserves_cache_while_uncached_blocks_are_free():
+    """Elastic compaction must not turn every new prefix into cache eviction."""
+    block_size = 4
+    pool = BlockPool(
+        num_gpu_blocks=7,
+        enable_caching=True,
+        hash_block_size=block_size,
+        prefer_low_id_allocations=True,
+    )
+    req = make_request("cached-prefix", list(range(8)), block_size, sha256)
+    cached = pool.get_new_blocks(2)
+    pool.cache_full_blocks(
+        request=req,
+        blocks=cached,
+        num_cached_blocks=0,
+        num_full_blocks=2,
+        block_size=block_size,
+        kv_cache_group_id=0,
+    )
+    pool.free_blocks(cached)
+
+    # IDs 1 and 2 are free but cache-bearing. IDs 3+ have never been used.
+    # A different request should occupy the lowest unused IDs and leave the
+    # reusable prefix intact.
+    selected = pool.get_new_blocks(2)
+    assert [block.block_id for block in selected] == [3, 4]
+    for block_hash in req.block_hashes:
+        assert pool.get_cached_block(block_hash, [0]) is not None
+
+
+def test_low_id_allocation_compacts_when_elastic_attention_is_shrunk():
+    """A reduced attention arena must prefer compactness over cached holes."""
+    block_size = 4
+    pool = BlockPool(
+        num_gpu_blocks=7,
+        enable_caching=True,
+        hash_block_size=block_size,
+        prefer_low_id_allocations=True,
+    )
+    req = make_request("cached-prefix", list(range(8)), block_size, sha256)
+    cached = pool.get_new_blocks(2)
+    pool.cache_full_blocks(
+        request=req,
+        blocks=cached,
+        num_cached_blocks=0,
+        num_full_blocks=2,
+        block_size=block_size,
+        kv_cache_group_id=0,
+    )
+    pool.free_blocks(cached)
+    assert pool.deactivate_tail_blocks(6)
+
+    # Elastic has already traded attention tail capacity for GDN blocks. Keep
+    # the live set compact by reusing the cached low-ID holes rather than
+    # allocating IDs 3 and 4 and risking a pinned next handoff.
+    selected = pool.get_new_blocks(2)
+    assert [block.block_id for block in selected] == [1, 2]
+    for block_hash in req.block_hashes:
+        assert pool.get_cached_block(block_hash, [0]) is None
 
 
 def test_cache_blocks_multi_group():
@@ -4214,6 +4375,149 @@ def test_mamba_shared_prefix_reuse_under_zero_retention(monkeypatch):
     assert last_req_hit(retention=0, pin=False) == 0
     # retention=0 with the pin keeps the junction -> reuse restored.
     assert last_req_hit(retention=0, pin=True) == 2 * block_size
+
+
+def test_dcp_separate_gdn_fine_prefix_positive_negative_recovery(monkeypatch):
+    """A partial attention hit is usable only with the exact GDN checkpoint."""
+    monkeypatch.setenv("AG2_VLLM_DCP_FINE_PREFIX", "1")
+    hash_block_size = 3
+    physical_block_size = 6
+    dcp_world_size = 3
+    full_spec = FullAttentionSpec(
+        block_size=physical_block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    gdn_spec = MambaSpec(
+        block_size=physical_block_size,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        separate_pool=True,
+        separate_pool_num_blocks=16,
+    )
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["attention"], full_spec),
+                KVCacheGroupSpec(["gdn"], gdn_spec),
+            ],
+        ),
+        max_model_len=128,
+        enable_caching=True,
+        dcp_world_size=dcp_world_size,
+        scheduler_block_size=physical_block_size * dcp_world_size,
+        hash_block_size=hash_block_size,
+    )
+
+    shared = [11, 12, 13]
+
+    def request(request_id, tokens):
+        return make_request(
+            request_id,
+            tokens,
+            hash_block_size,
+            sha256,
+        )
+
+    prime = request("prime", shared + [20, 21, 22, 23])
+    prime.shared_prefix_boundary = len(shared)
+    blocks, computed, _ = manager.get_computed_blocks(prime)
+    assert computed == 0
+    assert manager.allocate_slots(
+        prime,
+        len(shared),
+        computed,
+        blocks,
+    ) is not None
+    manager.coordinator.register_gdn_checkpoint(bytes(prime.block_hashes[0]))
+
+    positive = request("positive", shared + [30, 31, 32, 33])
+    _, computed, _ = manager.get_computed_blocks(positive)
+    assert computed == len(shared)
+
+    negative = request("negative", [99, 12, 30, 31, 32, 33])
+    _, computed, _ = manager.get_computed_blocks(negative)
+    assert computed == 0
+
+    recovery = request("recovery", shared + [40, 41, 42, 43])
+    _, computed, _ = manager.get_computed_blocks(recovery)
+    assert computed == len(shared)
+
+
+def test_dcp_separate_gdn_fine_prefix_with_eagle_overlap(monkeypatch):
+    """Attention matches one unit past the exact GDN resume checkpoint."""
+    monkeypatch.setenv("AG2_VLLM_DCP_FINE_PREFIX", "1")
+    hash_block_size = 3
+    physical_block_size = 6
+    dcp_world_size = 3
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["attention"],
+                    FullAttentionSpec(
+                        block_size=physical_block_size,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                    ),
+                ),
+                KVCacheGroupSpec(
+                    ["gdn"],
+                    MambaSpec(
+                        block_size=physical_block_size,
+                        shapes=((1,),),
+                        dtypes=(torch.float32,),
+                        mamba_cache_mode="align",
+                        separate_pool=True,
+                        separate_pool_num_blocks=16,
+                    ),
+                ),
+            ],
+        ),
+        max_model_len=128,
+        enable_caching=True,
+        use_eagle=True,
+        dcp_world_size=dcp_world_size,
+        scheduler_block_size=physical_block_size * dcp_world_size,
+        hash_block_size=hash_block_size,
+    )
+
+    shared_match = [11, 12, 13, 14, 15, 16]
+    prime = make_request(
+        "prime",
+        shared_match + [20, 21, 22],
+        hash_block_size,
+        sha256,
+    )
+    prime.shared_prefix_boundary = len(shared_match)
+    blocks, computed, _ = manager.get_computed_blocks(prime)
+    assert computed == 0
+    assert manager.allocate_slots(
+        prime,
+        len(shared_match),
+        computed,
+        blocks,
+    ) is not None
+    resume_tokens = len(shared_match) - hash_block_size
+    manager.coordinator.register_gdn_checkpoint(
+        bytes(prime.block_hashes[resume_tokens // hash_block_size - 1])
+    )
+
+    positive = make_request(
+        "positive",
+        shared_match + [30, 31, 32],
+        hash_block_size,
+        sha256,
+    )
+    _, computed, _ = manager.get_computed_blocks(positive)
+    assert computed == resume_tokens
 
 
 def test_swa_reachable_block_mask_pins_shared_prefix():

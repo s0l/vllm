@@ -62,6 +62,12 @@ class AttentionBackend(ABC):
         "float16",
         "bfloat16",
     ]
+    # Whether this backend implements the special DCP layout where every rank
+    # stores all global KV heads and selects the rank-local GQA mapping only
+    # for the new-token attention path. This is stricter than generic DCP
+    # support: a backend must opt in after implementing both context combine
+    # and local KV-head selection.
+    supports_dcp_full_kv_attention_heads: ClassVar[bool] = False
 
     # Does attention's forward() include kv cache update?
     forward_includes_kv_cache_update: bool = True
@@ -400,6 +406,16 @@ class AttentionBackend(ABC):
     def is_ssm(cls) -> bool:
         return False
 
+    @classmethod
+    def get_state_update_chunk_alignment(cls) -> int:
+        """Return the token alignment required for resumable state updates.
+
+        Stateless attention backends have no recurrence boundary constraint.
+        Stateful backends override this when splitting a prefill at an
+        arbitrary position changes the arithmetic of a later resumed update.
+        """
+        return 1
+
 
 class AttentionMetadata:
     pass
@@ -460,6 +476,26 @@ class CommonAttentionMetadata:
     """(batch_size,) bool tensor: True if request is still in prefill phase
     (num_computed_tokens < num_prompt_tokens). Used by some backends to
     distinguish actual decodes from short extends."""
+
+    request_ids: tuple[str | None, ...] | None = None
+    """Optional semantic request ids for bounded route provenance."""
+
+    num_scheduled_tokens_cpu: torch.Tensor | None = None
+    """Optional per-request scheduled-token counts for route provenance."""
+
+    num_computed_tokens_provenance_cpu: torch.Tensor | None = None
+    """Optional per-request computed-token counts for route provenance."""
+
+    num_prompt_tokens_cpu: torch.Tensor | None = None
+    """Optional per-request semantic prompt lengths. Unlike ``seq_lens``, this
+    does not include generated/speculative tokens and lets prompt-only routes
+    distinguish an aligned intermediate boundary from a natural final tail."""
+
+    num_decode_draft_tokens_cpu: torch.Tensor | None = None
+    """(batch_size,) number of valid speculative draft tokens for each decode
+    row, or -1 for rows that are not exact speculative-decode verification.
+    This is a semantic execution marker; a matching physical query length alone
+    does not imply that a row belongs to the speculative-decode path."""
 
     seq_lens_cpu_upper_bound: torch.Tensor | None = None
     """(batch_size,) CPU upper bound on seq_lens. Precise for prefill rows
@@ -595,6 +631,16 @@ class CommonAttentionMetadata:
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
+            request_ids=self.request_ids[:num_actual_reqs]
+            if self.request_ids is not None
+            else None,
+            num_scheduled_tokens_cpu=maybe_slice_reqs(
+                self.num_scheduled_tokens_cpu
+            ),
+            num_computed_tokens_provenance_cpu=maybe_slice_reqs(
+                self.num_computed_tokens_provenance_cpu
+            ),
+            num_prompt_tokens_cpu=maybe_slice_reqs(self.num_prompt_tokens_cpu),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
             replayssm_decode_base_cpu=maybe_slice_reqs(self.replayssm_decode_base_cpu),
         )

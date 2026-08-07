@@ -18,6 +18,7 @@ from vllm.triton_utils import tl, triton
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
         "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
+        "HAS_SEQUENCE_LENGTHS": lambda args: args["sequence_lengths"] is not None,
     }
 )
 @triton.jit(do_not_specialize=["N", "T"])
@@ -37,6 +38,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     cu_seqlens,
     ssm_state_indices,
     num_accepted_tokens,
+    sequence_lengths,
     scale,
     N: tl.int64,  # num of sequences
     T: tl.int64,  # num of tokens
@@ -53,10 +55,14 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     stride_indices_tok: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
     INPLACE_FINAL_STATE: tl.constexpr,  # whether to store final state inplace
+    STORE_FINAL_STATE: tl.constexpr,  # whether to materialize recurrent states
+    STORE_ONLY_FINAL_STATE: tl.constexpr,
+    STORE_OUTPUT: tl.constexpr,  # whether to materialize recurrent outputs
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
+    HAS_SEQUENCE_LENGTHS: tl.constexpr,
     IS_KDA: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -68,7 +74,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             tl.load(cu_seqlens + i_n + 1).to(tl.int64),
         )
         all = T
-        T = eos - bos
+        if HAS_SEQUENCE_LENGTHS:
+            T = tl.load(sequence_lengths + i_n).to(tl.int64)
+        else:
+            T = eos - bos
     else:
         bos, eos = i_n * T, i_n * T + T
         all = B * T
@@ -93,7 +102,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_dt_bias = dt_bias + i_hv * K + o_k
 
     p_b = b + bos * HV + i_hv
-    p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
+    if STORE_OUTPUT:
+        p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
     mask_k = o_k < K
     mask_v = o_v < V
@@ -107,9 +117,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             else:
                 i_t = 0
             # Load state index and check for invalid entries
-            state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
-                tl.int64
-            )
+            state_idx = tl.load(
+                ssm_state_indices
+                + i_n * stride_indices_seq
+                + i_t * stride_indices_tok
+            ).to(tl.int64)
             # Skip if state index is invalid (NULL_BLOCK_ID=0)
             if state_idx <= 0:
                 return
@@ -150,29 +162,35 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # [BV, BK]
         b_h += b_v[:, None] * b_k[None, :]
         # [BV]
-        b_o = tl.sum(b_h * b_q[None, :], 1)
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+        if STORE_OUTPUT:
+            b_o = tl.sum(b_h * b_q[None, :], 1)
+            tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         # keep the states for multi-query tokens
-        if INPLACE_FINAL_STATE:
-            # Load state index and check for invalid entries
-            final_state_idx = tl.load(
-                ssm_state_indices + i_n * stride_indices_seq + i_t
-            ).to(tl.int64)
-            # Only store if state index is valid (not NULL_BLOCK_ID=0)
-            if final_state_idx > 0:
-                p_ht = ht + final_state_idx * stride_final_state_token
+        if STORE_FINAL_STATE:
+            if INPLACE_FINAL_STATE:
+                if not STORE_ONLY_FINAL_STATE or i_t == T - 1:
+                    # Load state index and check for invalid entries
+                    final_state_idx = tl.load(
+                        ssm_state_indices
+                        + i_n * stride_indices_seq
+                        + i_t * stride_indices_tok
+                    ).to(tl.int64)
+                    # Only store if state index is valid (not NULL_BLOCK_ID=0)
+                    if final_state_idx > 0:
+                        p_ht = ht + final_state_idx * stride_final_state_token
+                        p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+                        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+            else:
+                p_ht = ht + (bos + i_t) * stride_final_state_token
                 p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
                 tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
-        else:
-            p_ht = ht + (bos + i_t) * stride_final_state_token
-            p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-            tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
         # Update pointers for next timestep
         p_q += H * K
         p_k += H * K
-        p_o += HV * V
+        if STORE_OUTPUT:
+            p_o += HV * V
         p_v += HV * V
         p_b += HV
         p_a += HV
@@ -191,9 +209,14 @@ def fused_sigmoid_gating_delta_rule_update(
     scale: float = None,
     initial_state: torch.Tensor = None,
     inplace_final_state: bool = True,
+    store_final_state: bool = True,
+    store_only_final_state: bool = False,
+    final_state_slots_are_repeated: bool = False,
+    store_output: bool = True,
     cu_seqlens: torch.Tensor | None = None,
     ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
+    sequence_lengths: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
 ):
@@ -217,13 +240,35 @@ def fused_sigmoid_gating_delta_rule_update(
             f" when using `cu_seqlens`. Please flatten variable-length"
             f" inputs before processing."
         )
+    if sequence_lengths is not None:
+        if cu_seqlens is None:
+            raise ValueError("sequence_lengths requires cu_seqlens")
+        if sequence_lengths.shape[0] != len(cu_seqlens) - 1:
+            raise ValueError(
+                "sequence_lengths must have one entry per cu_seqlens sequence"
+            )
+    if store_only_final_state:
+        if not store_final_state or not inplace_final_state:
+            raise ValueError(
+                "store_only_final_state requires in-place final-state storage"
+            )
+        if sequence_lengths is None or ssm_state_indices is None:
+            raise ValueError(
+                "store_only_final_state requires sequence lengths and state slots"
+            )
+        if not final_state_slots_are_repeated:
+            raise ValueError(
+                "store_only_final_state requires an asserted repeated-slot contract"
+            )
     if scale is None:
         scale = k.shape[-1] ** -0.5
     else:
         assert scale > 0, "scale must be positive"
 
-    o = q.new_empty(NK, *v.shape)
-    if inplace_final_state:
+    # State-only replay does not consume the output. Reuse an existing tensor
+    # so the wrapper neither allocates nor writes an otherwise-dead result.
+    o = q.new_empty(NK, *v.shape) if store_output else q
+    if inplace_final_state or not store_final_state:
         final_state = initial_state
     else:
         final_state = q.new_empty(T, HV, V, K, dtype=initial_state.dtype)
@@ -255,6 +300,7 @@ def fused_sigmoid_gating_delta_rule_update(
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
+        sequence_lengths=sequence_lengths,
         scale=scale,
         N=N,
         T=T,
@@ -270,6 +316,9 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_indices_seq=stride_indices_seq,
         stride_indices_tok=stride_indices_tok,
         INPLACE_FINAL_STATE=inplace_final_state,
+        STORE_FINAL_STATE=store_final_state,
+        STORE_ONLY_FINAL_STATE=store_only_final_state,
+        STORE_OUTPUT=store_output,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=is_kda,
         num_warps=num_warps,

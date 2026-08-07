@@ -666,6 +666,408 @@ def test_schedule_concurrent_partial_requests(enable_prefix_caching: bool):
     assert output2.num_scheduled_tokens[requests[2].request_id] == 800 - 224 - 224
 
 
+def test_ag2_concurrent_partial_prefill_shares_budget(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("AG2_VLLM_MAX_CONCURRENT_PARTIAL_PREFILLS", "8")
+    scheduler = create_scheduler(
+        max_num_batched_tokens=6656,
+        max_model_len=20000,
+    )
+    scheduler.max_model_len = 20000
+    requests = create_requests(num_requests=3, num_tokens=10000)
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.total_num_scheduled_tokens == 6654
+    assert output.num_scheduled_tokens == {
+        request.request_id: 2218 for request in requests
+    }
+    assert list(scheduler.running) == requests
+    assert not scheduler.waiting
+
+
+def test_ag2_concurrent_partial_prefill_preserves_single_request_budget(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("AG2_VLLM_MAX_CONCURRENT_PARTIAL_PREFILLS", "8")
+    scheduler = create_scheduler(
+        max_num_batched_tokens=6656,
+        max_model_len=20000,
+    )
+    scheduler.max_model_len = 20000
+    request = create_requests(num_requests=1, num_tokens=10000)[0]
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {request.request_id: 6656}
+
+
+def test_ag2_concurrent_partial_prefill_preserves_decode_priority(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("AG2_VLLM_MAX_CONCURRENT_PARTIAL_PREFILLS", "8")
+    scheduler = create_scheduler(
+        max_num_batched_tokens=6656,
+        max_model_len=20000,
+    )
+    scheduler.max_model_len = 20000
+    decode = create_requests(
+        num_requests=1,
+        num_tokens=10,
+        req_ids=["decode"],
+    )[0]
+    scheduler.add_request(decode)
+    prefill_output = scheduler.schedule()
+    scheduler.update_from_output(
+        prefill_output,
+        ModelRunnerOutput(
+            req_ids=[decode.request_id],
+            req_id_to_index={decode.request_id: 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    prefills = create_requests(
+        num_requests=3,
+        num_tokens=10000,
+        req_ids=["prefill-0", "prefill-1", "prefill-2"],
+    )
+    for request in prefills:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[decode.request_id] == 1
+    assert {
+        request.request_id: output.num_scheduled_tokens[request.request_id]
+        for request in prefills
+    } == {request.request_id: 2218 for request in prefills}
+    assert output.total_num_scheduled_tokens == 6655
+
+
+def test_ag2_concurrent_partial_prefill_keeps_requests_in_lockstep(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("AG2_VLLM_MAX_CONCURRENT_PARTIAL_PREFILLS", "8")
+    scheduler = create_scheduler(
+        max_num_batched_tokens=6656,
+        max_model_len=20000,
+    )
+    scheduler.max_model_len = 20000
+    requests = create_requests(num_requests=3, num_tokens=10000)
+    for request in requests:
+        scheduler.add_request(request)
+
+    for _ in range(4):
+        output = scheduler.schedule()
+        assert set(output.num_scheduled_tokens) == {
+            request.request_id for request in requests
+        }
+        assert len(set(output.num_scheduled_tokens.values())) == 1
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id for request in requests],
+                req_id_to_index={
+                    request.request_id: i for i, request in enumerate(requests)
+                },
+                sampled_token_ids=[
+                    [0] if request.num_computed_tokens >= request.num_tokens else []
+                    for request in requests
+                ],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+    assert all(request.num_preemptions == 0 for request in requests)
+    assert {request.num_computed_tokens for request in requests} == {8872}
+
+
+def test_ag2_concurrent_partial_prefill_schedules_equal_tails(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("AG2_VLLM_MAX_CONCURRENT_PARTIAL_PREFILLS", "8")
+    scheduler = create_scheduler(
+        max_num_batched_tokens=6656,
+        max_model_len=20000,
+    )
+    scheduler.max_model_len = 20000
+    requests = create_requests(num_requests=3, num_tokens=5000)
+    for request in requests:
+        scheduler.add_request(request)
+
+    for _ in range(2):
+        output = scheduler.schedule()
+        assert set(output.num_scheduled_tokens.values()) == {2218}
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id for request in requests],
+                req_id_to_index={
+                    request.request_id: i for i, request in enumerate(requests)
+                },
+                sampled_token_ids=[[] for _ in requests],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+    tail = scheduler.schedule()
+    assert tail.num_scheduled_tokens == {
+        request.request_id: 564 for request in requests
+    }
+    assert all(request.num_preemptions == 0 for request in requests)
+
+
+def test_ag2_concurrent_partial_prefill_disabled_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("AG2_VLLM_MAX_CONCURRENT_PARTIAL_PREFILLS", raising=False)
+    scheduler = create_scheduler(
+        max_num_batched_tokens=6656,
+        max_model_len=20000,
+    )
+    scheduler.max_model_len = 20000
+    requests = create_requests(num_requests=3, num_tokens=10000)
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {requests[0].request_id: 6656}
+    assert list(scheduler.running) == [requests[0]]
+    assert list(scheduler.waiting) == requests[1:]
+
+
+def test_ag2_canonical_prefill_admission_defers_residual_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("AG2_VLLM_CANONICAL_PREFILL_ADMISSION", "1")
+    scheduler = create_scheduler(
+        max_num_batched_tokens=7056,
+        max_model_len=20000,
+    )
+    requests = create_requests(num_requests=8, num_tokens=1513)
+    for request in requests:
+        scheduler.add_request(request)
+
+    first = scheduler.schedule()
+
+    assert first.total_num_scheduled_tokens == 4 * 1513
+    assert first.num_scheduled_tokens == {
+        request.request_id: 1513 for request in requests[:4]
+    }
+    assert list(scheduler.running) == requests[:4]
+    assert list(scheduler.waiting) == requests[4:]
+    assert scheduler.num_canonical_prefill_deferrals_since_last_stats == 1
+
+    scheduler.update_from_output(
+        first,
+        ModelRunnerOutput(
+            req_ids=[request.request_id for request in requests[:4]],
+            req_id_to_index={
+                request.request_id: i for i, request in enumerate(requests[:4])
+            },
+            sampled_token_ids=[[0] for _ in requests[:4]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    second = scheduler.schedule()
+
+    assert second.total_num_scheduled_tokens == 4 + 4 * 1513
+    assert all(
+        request.request_id in second.num_scheduled_tokens for request in requests
+    )
+    assert not scheduler.waiting
+
+
+def test_ag2_canonical_prefill_admission_is_disabled_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("AG2_VLLM_CANONICAL_PREFILL_ADMISSION", raising=False)
+    scheduler = create_scheduler(
+        max_num_batched_tokens=7056,
+        max_model_len=20000,
+    )
+    requests = create_requests(num_requests=8, num_tokens=1513)
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.total_num_scheduled_tokens == 7056
+    assert output.num_scheduled_tokens[requests[4].request_id] == 1004
+    assert list(scheduler.running) == requests[:5]
+    assert list(scheduler.waiting) == requests[5:]
+
+
+def test_ag2_concurrent_partial_prefill_admission_delay_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("AG2_VLLM_MAX_CONCURRENT_PARTIAL_PREFILLS", "8")
+    scheduler = create_scheduler(
+        max_num_batched_tokens=6656,
+        max_model_len=20000,
+    )
+    scheduler.max_model_len = 20000
+    scheduler.prefill_admission_delay_s = 0.05
+    scheduler.prefill_admission_max_delay_s = 0.2
+    request = create_requests(num_requests=1, num_tokens=10000)[0]
+    request.arrival_time = 100.0
+    scheduler.add_request(request)
+
+    monkeypatch.setattr("vllm.v1.core.sched.scheduler.time.time", lambda: 100.1)
+    delayed = scheduler.schedule()
+    assert delayed.total_num_scheduled_tokens == 0
+    assert list(scheduler.waiting) == [request]
+
+    monkeypatch.setattr("vllm.v1.core.sched.scheduler.time.time", lambda: 100.2)
+    released = scheduler.schedule()
+    assert released.num_scheduled_tokens == {request.request_id: 6656}
+
+
+def test_ag2_kv_tail_handoff_retains_kv_while_peers_progress(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("AG2_VLLM_MAX_CONCURRENT_PARTIAL_PREFILLS", "8")
+    monkeypatch.setenv("AG2_VLLM_KV_TAIL_HANDOFF", "1")
+    scheduler = create_scheduler(
+        max_num_batched_tokens=96,
+        max_model_len=512,
+    )
+    requests = create_requests(
+        num_requests=3,
+        num_tokens=160,
+        max_tokens=1,
+        req_ids=["blocked", "peer-1", "peer-2"],
+    )
+    for request in requests:
+        scheduler.add_request(request)
+
+    first = scheduler.schedule()
+    scheduler.update_from_output(
+        first,
+        ModelRunnerOutput(
+            req_ids=[request.request_id for request in requests],
+            req_id_to_index={
+                request.request_id: i for i, request in enumerate(requests)
+            },
+            sampled_token_ids=[[] for _ in requests],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    blocked = requests[0]
+    blocked_tokens = blocked.num_computed_tokens
+    blocked_blocks = scheduler.kv_cache_manager.get_blocks(
+        blocked.request_id
+    ).get_block_ids()
+
+    original_allocate_slots = scheduler.kv_cache_manager.allocate_slots
+
+    def reject_blocked_once(request, *args, **kwargs):
+        if request is blocked:
+            return None
+        return original_allocate_slots(request, *args, **kwargs)
+
+    scheduler.kv_cache_manager.allocate_slots = reject_blocked_once
+    handoff = scheduler.schedule()
+
+    assert blocked.request_id not in handoff.num_scheduled_tokens
+    assert set(handoff.num_scheduled_tokens) == {"peer-1", "peer-2"}
+    assert blocked.status == RequestStatus.RUNNING
+    assert blocked.num_computed_tokens == blocked_tokens
+    assert (
+        scheduler.kv_cache_manager.get_blocks(blocked.request_id).get_block_ids()
+        == blocked_blocks
+    )
+    assert all(request.num_preemptions == 0 for request in requests)
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert stats.num_kv_tail_deferrals == 1
+
+    scheduler.update_from_output(
+        handoff,
+        ModelRunnerOutput(
+            req_ids=["peer-1", "peer-2"],
+            req_id_to_index={"peer-1": 0, "peer-2": 1},
+            sampled_token_ids=[[], []],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    scheduler.kv_cache_manager.allocate_slots = original_allocate_slots
+    recovered = scheduler.schedule()
+    assert blocked.request_id in recovered.num_scheduled_tokens
+    assert blocked.num_preemptions == 0
+
+
+def test_ag2_kv_tail_handoff_falls_back_when_every_peer_is_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("AG2_VLLM_MAX_CONCURRENT_PARTIAL_PREFILLS", "8")
+    monkeypatch.setenv("AG2_VLLM_KV_TAIL_HANDOFF", "1")
+    scheduler = create_scheduler(
+        max_num_batched_tokens=96,
+        max_model_len=512,
+    )
+    requests = create_requests(
+        num_requests=3,
+        num_tokens=160,
+        max_tokens=1,
+        req_ids=["first", "second", "victim"],
+    )
+    for request in requests:
+        scheduler.add_request(request)
+
+    first = scheduler.schedule()
+    scheduler.update_from_output(
+        first,
+        ModelRunnerOutput(
+            req_ids=[request.request_id for request in requests],
+            req_id_to_index={
+                request.request_id: i for i, request in enumerate(requests)
+            },
+            sampled_token_ids=[[] for _ in requests],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    original_allocate_slots = scheduler.kv_cache_manager.allocate_slots
+    scheduler.kv_cache_manager.allocate_slots = lambda *args, **kwargs: None
+    blocked = scheduler.schedule()
+
+    assert not blocked.num_scheduled_tokens
+    assert requests[0].num_preemptions == 0
+    assert requests[1].num_preemptions == 0
+    assert requests[2].num_preemptions == 1
+    assert requests[2].status == RequestStatus.PREEMPTED
+    assert requests[2].request_id in blocked.preempted_req_ids
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert stats.num_kv_tail_deferrals == 2
+
+    scheduler.kv_cache_manager.allocate_slots = original_allocate_slots
+    recovered = scheduler.schedule()
+    assert recovered.total_num_scheduled_tokens > 0
+
+
 def test_stop_via_update_from_output():
     """Test stopping behavior through update_from_output"""
     scheduler = create_scheduler(num_speculative_tokens=1)

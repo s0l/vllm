@@ -17,6 +17,7 @@ from vllm.v1.attention.backends import flashinfer as flashinfer_backend
 from vllm.v1.attention.backends.flashinfer import (
     FlashInferDecodeKernel,
     FlashInferMetadataBuilder,
+    _dcp_pseudo_decode_rows,
 )
 from vllm.v1.attention.backends.utils import PerLayerParameters
 from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -73,3 +74,59 @@ def test_flashinfer_gqa_dcp_spec_decode_clamps_reorder_threshold(monkeypatch):
         builder.flashinfer_trtllm_api_decode_kernel == FlashInferDecodeKernel.TRTLLM_GEN
     )
     assert builder.reorder_batch_threshold == 1
+
+
+@pytest.mark.parametrize(
+    ("rank", "expected"),
+    [
+        (0, [14, 15, 15]),
+        (1, [14, 14, 15]),
+        (2, [14, 14, 14]),
+    ],
+)
+def test_dcp_pseudo_decode_rows_preserve_per_token_causal_lengths(rank, expected):
+    row_to_req, local_lens = _dcp_pseudo_decode_rows(
+        seq_lens_cpu=torch.tensor([44], dtype=torch.int32),
+        qo_indptr_cpu=torch.tensor([0, 3], dtype=torch.int32),
+        dcp_world_size=3,
+        dcp_rank=rank,
+        dcp_kv_cache_interleave_size=1,
+    )
+
+    assert row_to_req.tolist() == [0, 0, 0]
+    assert local_lens.tolist() == expected
+
+
+def test_dcp_pseudo_decode_rows_map_multiple_requests_without_aliasing_lengths():
+    row_to_req, local_lens = _dcp_pseudo_decode_rows(
+        seq_lens_cpu=torch.tensor([44, 3553], dtype=torch.int32),
+        qo_indptr_cpu=torch.tensor([0, 3, 6], dtype=torch.int32),
+        dcp_world_size=3,
+        dcp_rank=0,
+        dcp_kv_cache_interleave_size=1,
+    )
+
+    assert row_to_req.tolist() == [0, 0, 0, 1, 1, 1]
+    assert local_lens.tolist() == [14, 15, 15, 1184, 1184, 1185]
+
+
+def test_dcp_pseudo_decode_rejects_non_verification_autotune_shape():
+    builder = FlashInferMetadataBuilder.__new__(FlashInferMetadataBuilder)
+    builder._dcp_pseudo_decode_enabled = True
+    builder._dcp_special_decode_enabled = True
+    builder._dcp_pseudo_decode_query_len = 3
+    builder._dcp_pseudo_decode_max_rows = 192
+    builder.use_dcp = True
+
+    synthetic_decode = type(
+        "SyntheticDecode",
+        (),
+        {
+            "query_start_loc_cpu": torch.tensor([0, 6656], dtype=torch.int32),
+            "num_actual_tokens": 6656,
+            "causal": True,
+            "is_prefilling": torch.tensor([False]),
+        },
+    )()
+
+    assert not builder._can_use_dcp_pseudo_decode(0, synthetic_decode)

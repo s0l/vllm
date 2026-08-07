@@ -64,6 +64,26 @@ class MambaBase(AttentionLayerBase):
         mamba_block_size = vllm_config.cache_config.mamba_block_size
         assert mamba_block_size is not None
         page_size_padded = vllm_config.cache_config.mamba_page_size_padded
+        replay_commit = bool(
+            vllm_config.additional_config.get("gdn_mtp_replay_commit", False)
+        )
+        num_speculative_blocks = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        if replay_commit:
+            if self.mamba_type != MambaAttentionBackendEnum.GDN_ATTN:
+                raise ValueError(
+                    "gdn_mtp_replay_commit is only supported by GDN layers"
+                )
+            if not vllm_config.additional_config.get("gdn_separate_pool", False):
+                raise ValueError(
+                    "gdn_mtp_replay_commit requires gdn_separate_pool"
+                )
+            # The verifier journals compact recurrence inputs and commits the
+            # accepted prefix into the one live state after sampling.
+            num_speculative_blocks = 0
         return MambaSpec(
             shapes=tuple(self.get_state_shape()),
             dtypes=self.get_state_dtype(),
@@ -71,10 +91,9 @@ class MambaBase(AttentionLayerBase):
             page_size_padded=page_size_padded,
             mamba_type=self.mamba_type,
             mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
-            num_speculative_blocks=(
-                vllm_config.speculative_config.num_speculative_tokens
-                if vllm_config.speculative_config
-                else 0
+            num_speculative_blocks=num_speculative_blocks,
+            state_update_chunk_alignment=(
+                self.get_attn_backend().get_state_update_chunk_alignment()
             ),
         )
 

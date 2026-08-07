@@ -166,11 +166,19 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        active_num_gpu_blocks: int | None = None,
+        prefer_low_id_allocations: bool = False,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
+        self.active_num_gpu_blocks = (
+            num_gpu_blocks if active_num_gpu_blocks is None else active_num_gpu_blocks
+        )
+        if not 1 <= self.active_num_gpu_blocks <= num_gpu_blocks:
+            raise ValueError("active_num_gpu_blocks must include the null block")
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
+        self.prefer_low_id_allocations = prefer_low_id_allocations
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
@@ -178,7 +186,9 @@ class BlockPool:
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        self.free_block_queue = FreeKVCacheBlockQueue(
+            self.blocks[: self.active_num_gpu_blocks]
+        )
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -658,7 +668,45 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if self.prefer_low_id_allocations:
+            if self.active_num_gpu_blocks == self.num_gpu_blocks:
+                # At the fully expanded attention mapping, unused capacity can
+                # preserve prefix-cache entries without constraining an
+                # elastic shrink. Prefer lowest-ID uncached blocks first and
+                # evict cached blocks only after unused capacity is exhausted.
+                uncached: list[KVCacheBlock] = []
+                cached: list[KVCacheBlock] = []
+                for block in self.blocks[1 : self.active_num_gpu_blocks]:
+                    if block.ref_cnt != 0:
+                        continue
+                    has_cached_hash = (
+                        block.block_hash is not None
+                        or block.block_id in self.cached_block_hashes_by_block
+                    )
+                    (cached if has_cached_hash else uncached).append(block)
+                ret = uncached[:num_blocks]
+                if len(ret) < num_blocks:
+                    ret.extend(cached[: num_blocks - len(ret)])
+            else:
+                # Once elastic GDN growth has reduced the attention mapping,
+                # live blocks must remain a compact low-ID prefix. A
+                # cache-preserving hole can otherwise push a live allocation
+                # into the tail and make the next attention->GDN handoff
+                # impossible. Under that real memory pressure, evict the
+                # lowest cached hole rather than pinning the tail.
+                ret = [
+                    block
+                    for block in self.blocks[1 : self.active_num_gpu_blocks]
+                    if block.ref_cnt == 0
+                ][:num_blocks]
+            if len(ret) != num_blocks:
+                raise RuntimeError(
+                    "active/free block accounting diverged during low-ID allocation"
+                )
+            for block in ret:
+                self.free_block_queue.remove(block)
+        else:
+            ret = self.free_block_queue.popleft_n(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -804,6 +852,31 @@ class BlockPool:
         """
         return self.free_block_queue.num_free_blocks
 
+    def activate_tail_blocks(self, new_active_num_blocks: int) -> None:
+        """Publish a newly mapped tail to allocation."""
+        if not (
+            self.active_num_gpu_blocks
+            <= new_active_num_blocks
+            <= self.num_gpu_blocks
+        ):
+            raise ValueError("invalid active block growth")
+        blocks = self.blocks[self.active_num_gpu_blocks : new_active_num_blocks]
+        self.free_block_queue.append_n(blocks)
+        self.active_num_gpu_blocks = new_active_num_blocks
+
+    def deactivate_tail_blocks(self, new_active_num_blocks: int) -> bool:
+        """Remove a free/cached tail before its physical pages are unmapped."""
+        if not 1 <= new_active_num_blocks <= self.active_num_gpu_blocks:
+            raise ValueError("invalid active block shrink")
+        blocks = self.blocks[new_active_num_blocks : self.active_num_gpu_blocks]
+        if any(block.ref_cnt != 0 for block in blocks):
+            return False
+        for block in reversed(blocks):
+            self._maybe_evict_cached_block(block)
+            self.free_block_queue.remove(block)
+        self.active_num_gpu_blocks = new_active_num_blocks
+        return True
+
     def get_usage(self) -> float:
         """Get the KV cache usage.
 
@@ -812,7 +885,7 @@ class BlockPool:
         """
 
         # Subtract 1 to account for null block.
-        total_gpu_blocks = self.num_gpu_blocks - 1
+        total_gpu_blocks = self.active_num_gpu_blocks - 1
         if not total_gpu_blocks:
             return 0
         return 1.0 - (self.get_num_free_blocks() / total_gpu_blocks)

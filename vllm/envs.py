@@ -47,6 +47,10 @@ if TYPE_CHECKING:
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
+    VLLM_TP3_CE_REDUCE: bool = False
+    VLLM_TP3_SD_CANONICAL_REDUCE: bool = False
+    VLLM_TP3_SD_DETERMINISTIC_REDUCE: bool = False
+    VLLM_TP3_SD_PHASE_REDUCE: bool = False
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -86,6 +90,16 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
+    AG2_VLLM_NVFP4_BATCH_INVARIANT: bool = False
+    AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE: bool = False
+    AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL: bool = False
+    AG2_VLLM_NVFP4_MARLIN_WHOLE_SLICE_PREFILL: bool = False
+    AG2_VLLM_NVFP4_MARLIN_GATE_UP_SCRATCH: bool = False
+    AG2_VLLM_MTP_BF16_GATE_UP_SCRATCH: bool = False
+    AG2_VLLM_MTP_FC_BATCH_INVARIANT: bool = False
+    AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH: bool = False
+    AG2_VLLM_NVFP4_HUMMING_STABLE_K64: bool = False
+    AG2_VLLM_NVFP4_HUMMING_NARROW_PAD64: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     # Deprecated alias of VLLM_TRITON_USE_TD (removed in v0.25).
     VLLM_TRITON_ATTN_USE_TD: bool | None = None
@@ -608,6 +622,36 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    "AG2_VLLM_NVFP4_BATCH_INVARIANT": lambda: bool(
+        int(os.getenv("AG2_VLLM_NVFP4_BATCH_INVARIANT", "0"))
+    ),
+    "AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE": lambda: bool(
+        int(os.getenv("AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE", "0"))
+    ),
+    "AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL": lambda: bool(
+        int(os.getenv("AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL", "0"))
+    ),
+    "AG2_VLLM_NVFP4_MARLIN_WHOLE_SLICE_PREFILL": lambda: bool(
+        int(os.getenv("AG2_VLLM_NVFP4_MARLIN_WHOLE_SLICE_PREFILL", "0"))
+    ),
+    "AG2_VLLM_NVFP4_MARLIN_GATE_UP_SCRATCH": lambda: bool(
+        int(os.getenv("AG2_VLLM_NVFP4_MARLIN_GATE_UP_SCRATCH", "0"))
+    ),
+    "AG2_VLLM_MTP_BF16_GATE_UP_SCRATCH": lambda: bool(
+        int(os.getenv("AG2_VLLM_MTP_BF16_GATE_UP_SCRATCH", "0"))
+    ),
+    "AG2_VLLM_MTP_FC_BATCH_INVARIANT": lambda: bool(
+        int(os.getenv("AG2_VLLM_MTP_FC_BATCH_INVARIANT", "0"))
+    ),
+    "AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH": lambda: bool(
+        int(os.getenv("AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH", "0"))
+    ),
+    "AG2_VLLM_NVFP4_HUMMING_STABLE_K64": lambda: bool(
+        int(os.getenv("AG2_VLLM_NVFP4_HUMMING_STABLE_K64", "0"))
+    ),
+    "AG2_VLLM_NVFP4_HUMMING_NARROW_PAD64": lambda: bool(
+        int(os.getenv("AG2_VLLM_NVFP4_HUMMING_NARROW_PAD64", "0"))
+    ),
     # Use tensor descriptors for Q/K/V loads and output stores in the
     # Triton unified-attention kernel.  Enables HW 2D block reads on
     # Intel XPU; the non-TD branch is dead-code-eliminated at Triton
@@ -851,6 +895,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if "VLLM_USE_FLASHINFER_SAMPLER" in os.environ
         else True
     ),
+    "VLLM_TP3_CE_REDUCE": lambda: os.environ.get("VLLM_TP3_CE_REDUCE", "0") == "1",
+    "VLLM_TP3_SD_CANONICAL_REDUCE": lambda: os.environ.get(
+        "VLLM_TP3_SD_CANONICAL_REDUCE", "0"
+    )
+    == "1",
+    "VLLM_TP3_SD_DETERMINISTIC_REDUCE": lambda: os.environ.get(
+        "VLLM_TP3_SD_DETERMINISTIC_REDUCE", "0"
+    )
+    == "1",
+    "VLLM_TP3_SD_PHASE_REDUCE": lambda: os.environ.get(
+        "VLLM_TP3_SD_PHASE_REDUCE", "0"
+    )
+    == "1",
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
     # (CPU backend only) CPU key-value cache space.

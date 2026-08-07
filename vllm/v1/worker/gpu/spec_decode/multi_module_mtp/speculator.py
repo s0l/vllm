@@ -5,6 +5,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -175,6 +176,10 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
         self.input_buffers.query_start_loc[: num_reqs + 1].copy_(
             input_batch.query_start_loc[: num_reqs + 1]
         )
+        if envs.AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL:
+            self.input_buffers.marlin_request_layout_cpu.copy_(
+                input_batch.marlin_request_layout_cpu
+            )
 
         self._prepare_inputs(
             last_hidden_states,
@@ -272,6 +277,11 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
             num_tokens_across_dp=num_tokens_across_dp,
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
+            marlin_request_layout_cpu=(
+                self.input_buffers.marlin_request_layout_cpu
+                if envs.AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL
+                else None
+            ),
         ):
             model_inputs = dict(
                 input_ids=self.input_buffers.input_ids[:num_tokens],

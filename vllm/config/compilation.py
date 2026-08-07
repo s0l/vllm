@@ -1229,6 +1229,41 @@ class CompilationConfig:
                 )
                 self.cudagraph_mode = CUDAGraphMode.FULL
 
+        if (
+            envs.AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL
+            and not envs.AG2_VLLM_NVFP4_MARLIN_WHOLE_SLICE_PREFILL
+        ):
+            marlin_isolation_op = "vllm::nvfp4_marlin_request_isolated"
+            if self.use_inductor_graph_partition:
+                # The op's cudagraph_unsafe tag is authoritative in this mode.
+                pass
+            elif self.pass_config.enable_sp or self.pass_config.fuse_gemm_comms:
+                raise ValueError(
+                    "NVFP4 Marlin prefill isolation requires a dynamic graph "
+                    "boundary and is incompatible with the selected full-graph "
+                    "SP/communication-fusion compilation path"
+                )
+            else:
+                assert self.splitting_ops is not None
+                if marlin_isolation_op not in self.splitting_ops:
+                    self.splitting_ops.append(marlin_isolation_op)
+
+        if envs.AG2_VLLM_MTP_BF16_GATE_UP_SCRATCH:
+            mtp_bf16_mm_out_op = "vllm::ag2_bf16_mm_out"
+            if self.use_inductor_graph_partition:
+                # The op's cudagraph_unsafe tag is authoritative in this mode.
+                pass
+            elif self.pass_config.enable_sp or self.pass_config.fuse_gemm_comms:
+                raise ValueError(
+                    "MTP BF16 gate/up scratch requires a dynamic graph boundary "
+                    "and is incompatible with the selected full-graph "
+                    "SP/communication-fusion compilation path"
+                )
+            else:
+                assert self.splitting_ops is not None
+                if mtp_bf16_mm_out_op not in self.splitting_ops:
+                    self.splitting_ops.append(mtp_bf16_mm_out_op)
+
         # Disable CUDA graphs for DeepEP high-throughput since its not CG compatible
         if (
             all2all_backend == "deepep_high_throughput"
@@ -1545,7 +1580,6 @@ class CompilationConfig:
                 if round_up(size, multiple_of) <= self.max_cudagraph_capture_size
             )
         )
-
         if len(rounded_sizes) == 0 and multiple_of <= self.max_cudagraph_capture_size:
             # if one valid but would be round_down use that
             rounded_sizes = [multiple_of]

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
+import os
 from collections.abc import Iterator
 
 import numpy as np
@@ -7,6 +9,7 @@ import torch
 
 from vllm.config import SpeculativeConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
+from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
@@ -19,6 +22,9 @@ from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
+from vllm.v1.worker.gpu.spec_decode.ag2_rejection_capture import (
+    Ag2RejectionCapture,
+)
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
@@ -30,6 +36,9 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
 # its traffic entirely.
 MAX_CHUNK_BYTES = 2**30  # 1GB
 _FP32_BYTES = 4
+_SPARSE_LOCAL_CANDIDATES = 64
+
+logger = logging.getLogger(__name__)
 
 
 def _iter_request_chunks(
@@ -90,6 +99,178 @@ class RejectionSampler:
             )
         elif rejection_sample_method == "block":
             self.use_block_verification = True
+        self._ag2_rejection_capture = Ag2RejectionCapture.from_env()
+        self._ag2_sparse_target_topk = os.environ.get(
+            "AG2_VLLM_SPARSE_TARGET_TOPK", "0"
+        ) == "1"
+        self._ag2_sparse_target_shadow = os.environ.get(
+            "AG2_VLLM_SPARSE_TARGET_SHADOW", "0"
+        ) == "1"
+        self._ag2_sparse_target_request_prefix = os.environ.get(
+            "AG2_VLLM_SPARSE_TARGET_REQUEST_PREFIX", ""
+        )
+        self._ag2_sparse_target_min_reqs = int(
+            os.environ.get("AG2_VLLM_SPARSE_TARGET_MIN_REQS", "1")
+        )
+        if self._ag2_sparse_target_min_reqs < 1:
+            raise ValueError("AG2 sparse target minimum requests must be positive")
+        self._ag2_sparse_steps = 0
+        self._ag2_sparse_fallbacks = 0
+        self._ag2_sparse_shadow_steps = 0
+        self._ag2_sparse_threshold_fallbacks = 0
+        if self._ag2_sparse_target_request_prefix:
+            if not self._ag2_sparse_target_topk:
+                raise ValueError(
+                    "AG2 sparse target request-prefix routing requires sparse "
+                    "target top-k"
+                )
+            logger.warning(
+                "AG2 sparse target request-prefix routing is diagnostic-only: "
+                "prefix=%r min_reqs=%d",
+                self._ag2_sparse_target_request_prefix,
+                self._ag2_sparse_target_min_reqs,
+            )
+        if self._ag2_sparse_target_shadow:
+            if not self._ag2_sparse_target_topk:
+                raise ValueError(
+                    "AG2 sparse target shadow requires sparse target top-k"
+                )
+            logger.warning(
+                "AG2 sparse target shadow enabled: full-gather oracle is active; "
+                "results are diagnostic-only"
+            )
+
+    def can_use_sparse_target_topk(self, input_batch: InputBatch) -> bool:
+        """Return whether the whole active batch is inside the proven domain."""
+        if not self._ag2_sparse_target_topk:
+            return False
+        if not self._ag2_sparse_request_prefix_eligible(input_batch):
+            return False
+        if input_batch.num_reqs < self._ag2_sparse_target_min_reqs:
+            self._record_sparse_threshold_fallback(input_batch.num_reqs)
+            return False
+        if self._ag2_rejection_capture is not None or self.sampler.compute_nans:
+            return False
+
+        idx = input_batch.idx_mapping_np
+        states = self.sampler.sampling_states
+        top_k = states.top_k.np[idx]
+        temperature = states.temperature.np[idx]
+        if np.any(top_k <= 0) or np.any(top_k > _SPARSE_LOCAL_CANDIDATES):
+            return False
+        if np.any(top_k != top_k[0]):
+            return False
+        if np.any(temperature <= 0.0) or np.any(states.min_p.np[idx] != 0.0):
+            return False
+        if states.max_num_logprobs(idx) != NO_LOGPROBS:
+            return False
+        if self.sampler.logprob_token_ids_state.max_num_token_ids(idx) > 0:
+            return False
+        if np.any(self.sampler.logit_bias_state.use_logit_bias[idx]):
+            return False
+        if np.any(self.sampler.bad_words_state.num_bad_words.np[idx] > 0):
+            return False
+        # Thinking-force token values are not yet injected into the local
+        # candidate set. Ordinary prompt-driven thinking does not use this state.
+        if self.sampler.thinking_budget_state.has_requests:
+            return False
+        return True
+
+    def _ag2_sparse_request_prefix_eligible(self, input_batch: InputBatch) -> bool:
+        prefix = self._ag2_sparse_target_request_prefix
+        return not prefix or all(
+            req_id.startswith(prefix)
+            for req_id in input_batch.req_ids[: input_batch.num_reqs]
+        )
+
+    @property
+    def sparse_target_shadow_enabled(self) -> bool:
+        return self._ag2_sparse_target_shadow
+
+    def _record_sparse_step(self, fallback: bool) -> None:
+        self._ag2_sparse_steps += 1
+        if fallback:
+            self._ag2_sparse_fallbacks += 1
+        if self._ag2_sparse_steps == 1 or self._ag2_sparse_steps % 100 == 0:
+            logger.info(
+                "AG2 sparse target top-k: steps=%d fallbacks=%d",
+                self._ag2_sparse_steps,
+                self._ag2_sparse_fallbacks,
+            )
+
+    def _record_sparse_threshold_fallback(self, num_reqs: int) -> None:
+        self._ag2_sparse_threshold_fallbacks += 1
+        if self._ag2_sparse_threshold_fallbacks == 1:
+            logger.info(
+                "AG2 sparse target full-tail fallback: events=%d "
+                "active_reqs=%d min_reqs=%d",
+                self._ag2_sparse_threshold_fallbacks,
+                num_reqs,
+                self._ag2_sparse_target_min_reqs,
+            )
+
+    def _ag2_capture_sampling_state(
+        self,
+        state_idx: torch.Tensor,
+        num_logits: int,
+    ) -> dict[str, object]:
+        """Snapshot every persistent input consumed by target sampling."""
+        state_idx = state_idx.long()
+        state_idx_cpu = state_idx.detach().cpu()
+        states = self.sampler.sampling_states
+        penalties = self.sampler.penalties_state
+        req_states = self.sampler.req_states
+        total_len = req_states.total_len.gpu[state_idx].detach().cpu()
+        max_total_len = int(total_len.max().item()) if total_len.numel() else 0
+        use_penalty = penalties.use_penalty[state_idx_cpu.numpy()].copy()
+        payload: dict[str, object] = {
+            "state_idx": state_idx_cpu,
+            "temperature": states.temperature.gpu[state_idx].detach().cpu(),
+            "top_k": states.top_k.gpu[state_idx].detach().cpu(),
+            "top_p": states.top_p.gpu[state_idx].detach().cpu(),
+            "min_p": states.min_p.gpu[state_idx].detach().cpu(),
+            "seeds": states.seeds.gpu[state_idx].detach().cpu(),
+            "seeds_set": states.seeds_set[state_idx_cpu.numpy()].copy(),
+            "repetition_penalty": penalties.repetition_penalty.gpu[state_idx]
+            .detach()
+            .cpu(),
+            "frequency_penalty": penalties.frequency_penalty.gpu[state_idx]
+            .detach()
+            .cpu(),
+            "presence_penalty": penalties.presence_penalty.gpu[state_idx]
+            .detach()
+            .cpu(),
+            "use_penalty": use_penalty,
+            "prompt_len": req_states.prompt_len.gpu[state_idx].detach().cpu(),
+            "prefill_len": req_states.prefill_len.gpu[state_idx].detach().cpu(),
+            "total_len": total_len,
+            "num_computed_tokens": req_states.num_computed_tokens.gpu[state_idx]
+            .detach()
+            .cpu(),
+            "last_sampled_tokens": req_states.last_sampled_tokens[state_idx]
+            .detach()
+            .cpu(),
+            "draft_tokens": req_states.draft_tokens[state_idx].detach().cpu(),
+            "all_token_ids": req_states.all_token_ids.gpu[
+                state_idx, :max_total_len
+            ]
+            .detach()
+            .cpu(),
+            "thinking_state": self.sampler.thinking_budget_state.state.gpu[state_idx]
+            .detach()
+            .cpu(),
+            "thinking_forced_tokens": self.sampler.thinking_budget_state.forced_tokens[
+                :num_logits
+            ]
+            .detach()
+            .cpu(),
+        }
+        if bool(use_penalty.any()):
+            payload["prompt_bin_mask"] = penalties.prompt_bin_mask[state_idx]
+            payload["prompt_bin_mask"] = payload["prompt_bin_mask"].detach().cpu()
+            payload["output_bin_counts"] = penalties.output_bin_counts[state_idx]
+            payload["output_bin_counts"] = payload["output_bin_counts"].detach().cpu()
+        return payload
 
     def _get_logprobs_tensors(
         self,
@@ -99,8 +280,13 @@ class RejectionSampler:
         cu_num_logits: torch.Tensor,
         cu_num_logits_np: np.ndarray,
         max_num_logprobs: int,
+        expanded_idx_mapping: torch.Tensor,
+        idx_mapping_np: np.ndarray,
     ) -> LogprobsTensors | None:
-        if max_num_logprobs == NO_LOGPROBS:
+        max_per_req_token_ids = (
+            self.sampler.logprob_token_ids_state.max_num_token_ids(idx_mapping_np)
+        )
+        if max_num_logprobs == NO_LOGPROBS and max_per_req_token_ids == 0:
             return None
 
         num_reqs = cu_num_logits.shape[0] - 1
@@ -119,9 +305,12 @@ class RejectionSampler:
         expanded_logits = num_logits != num_reqs
         return compute_topk_scores(
             logits,
-            max_num_logprobs,
+            max_num_logprobs if max_num_logprobs != NO_LOGPROBS else 0,
             flat_sampled,
             cu_num_logits_np.tolist() if expanded_logits else None,
+            logprob_token_ids_state=self.sampler.logprob_token_ids_state,
+            expanded_idx_mapping=expanded_idx_mapping,
+            max_per_req_token_ids=max_per_req_token_ids,
             logits_mode=self.sampler.logprobs_mode
             in ("raw_logits", "processed_logits"),
         )
@@ -137,7 +326,21 @@ class RejectionSampler:
         idx_mapping_np: np.ndarray,
         expanded_idx_mapping: torch.Tensor,
         expanded_local_pos: torch.Tensor,
+        req_ids: list[str],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        capture_rank = -1
+        capture_stages: dict[str, torch.Tensor] | None = None
+        if self._ag2_rejection_capture is not None:
+            from vllm.distributed.parallel_state import (
+                get_tensor_model_parallel_rank,
+            )
+
+            capture_rank = get_tensor_model_parallel_rank()
+            if self._ag2_rejection_capture.should_capture(
+                rank=capture_rank,
+                positions=pos,
+            ):
+                capture_stages = {}
         processed_logits = self.sampler.apply_sampling_params(
             logits,
             expanded_idx_mapping,
@@ -146,7 +349,12 @@ class RejectionSampler:
             pos,
             draft_sampled,
             expanded_local_pos,
+            capture_stages=capture_stages,
         )
+        if capture_stages is not None:
+            capture_stages["after_thinking_budget"] = (
+                processed_logits.detach().cpu().clone()
+            )
         sampled, num_sampled = rejection_sample(
             processed_logits,
             draft_logits,
@@ -163,6 +371,35 @@ class RejectionSampler:
             use_fp64=self.sampler.use_fp64_gumbel,
             use_block_verification=self.use_block_verification,
         )
+        if self._ag2_rejection_capture is not None:
+            self._ag2_rejection_capture.capture(
+                rank=capture_rank,
+                req_ids=req_ids,
+                processed_target_logits=processed_logits,
+                draft_logits=draft_logits,
+                draft_sampled=draft_sampled,
+                sampled=sampled,
+                num_sampled=num_sampled,
+                positions=pos,
+                cu_num_logits=cu_num_logits,
+                idx_mapping=idx_mapping,
+                idx_mapping_np=idx_mapping_np,
+                expanded_idx_mapping=expanded_idx_mapping,
+                expanded_local_pos=expanded_local_pos,
+                temperature=self.sampler.sampling_states.temperature.gpu,
+                seeds=self.sampler.sampling_states.seeds.gpu,
+                use_fp64=self.sampler.use_fp64_gumbel,
+                use_block_verification=self.use_block_verification,
+                sampling_stages=capture_stages,
+                sampling_state=(
+                    self._ag2_capture_sampling_state(
+                        idx_mapping[: len(req_ids)],
+                        processed_logits.shape[0],
+                    )
+                    if capture_stages is not None
+                    else None
+                ),
+            )
         return processed_logits, sampled, num_sampled
 
     def _verify_in_chunks(
@@ -197,6 +434,7 @@ class RejectionSampler:
                 input_batch.idx_mapping_np[start:end],
                 input_batch.expanded_idx_mapping[lo:hi],
                 input_batch.expanded_local_pos[lo:hi],
+                input_batch.req_ids[start:end],
             )
             chunk_logprobs = self._get_logprobs_tensors(
                 sampled,
@@ -205,6 +443,8 @@ class RejectionSampler:
                 chunk_cu_num_logits,
                 chunk_cu_num_logits_np,
                 max_num_logprobs,
+                input_batch.expanded_idx_mapping[lo:hi],
+                input_batch.idx_mapping_np[start:end],
             )
             if chunk_logprobs is not None:
                 logprobs_chunks.append(chunk_logprobs)
@@ -272,3 +512,157 @@ class RejectionSampler:
             num_sampled=num_sampled,
             num_rejected=num_rejected,
         )
+
+    def sample_sparse_target_topk(
+        self,
+        local_logits: torch.Tensor,
+        vocab_start: int,
+        input_batch: InputBatch,
+        draft_logits: torch.Tensor | None = None,
+    ) -> SamplerOutput:
+        """Verify from processed TP-local candidates, with exact full fallback."""
+        if not self.can_use_sparse_target_topk(input_batch):
+            raise RuntimeError("sparse target top-k called outside proven domain")
+
+        rows, local_vocab = local_logits.shape
+        vocab_size = self.sampler.sampling_states.vocab_size
+        full_logits_oracle = None
+        if self._ag2_sparse_target_shadow:
+            full_logits_oracle = tensor_model_parallel_all_gather(
+                local_logits, dim=-1
+            )[..., :vocab_size]
+
+        if local_vocab * 3 < vocab_size:
+            raise RuntimeError(
+                "sparse target local vocabulary cannot cover the global vocabulary: "
+                f"local={local_vocab} global={vocab_size}"
+            )
+        draft_sampled = input_batch.input_ids[input_batch.logits_indices]
+        pos = input_batch.positions[input_batch.logits_indices]
+        processed_local = self.sampler.apply_sampling_params(
+            local_logits,
+            input_batch.expanded_idx_mapping,
+            input_batch.idx_mapping_np,
+            pos,
+            draft_sampled,
+            input_batch.expanded_local_pos,
+            skip_top_k_top_p=True,
+            vocab_start=vocab_start,
+        )
+
+        candidate_k = _SPARSE_LOCAL_CANDIDATES + 1
+        local_values, local_ids = torch.topk(
+            processed_local, candidate_k, dim=-1
+        )
+        global_ids = local_ids + vocab_start
+        local_pairs = torch.stack(
+            (local_values, global_ids.float()), dim=-1
+        ).flatten(1)
+        gathered_flat = tensor_model_parallel_all_gather(local_pairs, dim=-1)
+        tp_size = gathered_flat.shape[-1] // local_pairs.shape[-1]
+        gathered = gathered_flat.view(rows, tp_size, candidate_k, 2)
+        gathered_values = gathered[..., 0]
+        top_k = int(
+            self.sampler.sampling_states.top_k.np[
+                input_batch.idx_mapping_np[0]
+            ]
+        )
+        clear = (
+            gathered_values[..., top_k - 1 : _SPARSE_LOCAL_CANDIDATES]
+            != gathered_values[..., top_k : _SPARSE_LOCAL_CANDIDATES + 1]
+        ).any(dim=-1)
+
+        # Sampling runs outside model CUDA graphs. This one synchronization is
+        # the fail-closed decision; every rank sees the same gathered tensor.
+        if not bool(clear.all().item()):
+            self._record_sparse_step(fallback=True)
+            full_logits = tensor_model_parallel_all_gather(local_logits, dim=-1)
+            full_logits = full_logits[..., : self.sampler.sampling_states.vocab_size]
+            return self(full_logits, input_batch, draft_logits)
+
+        padded_vocab = local_vocab * tp_size
+        sparse = torch.full(
+            (rows, padded_vocab),
+            -float("inf"),
+            dtype=processed_local.dtype,
+            device=processed_local.device,
+        )
+        candidate_values = gathered_values.reshape(rows, -1)
+        candidate_ids = gathered[..., 1].reshape(rows, -1).to(torch.int64)
+        sparse.scatter_(1, candidate_ids, candidate_values)
+        sparse = sparse[..., :vocab_size]
+        processed_logits = self.sampler.sampling_states.apply_top_k_top_p(
+            sparse,
+            input_batch.expanded_idx_mapping,
+            input_batch.idx_mapping_np,
+        )
+        if full_logits_oracle is not None:
+            oracle_processed = self.sampler.apply_sampling_params(
+                full_logits_oracle,
+                input_batch.expanded_idx_mapping,
+                input_batch.idx_mapping_np,
+                pos,
+                draft_sampled,
+                input_batch.expanded_local_pos,
+            )
+            if not torch.equal(processed_logits, oracle_processed):
+                sparse_finite = torch.isfinite(processed_logits)
+                oracle_finite = torch.isfinite(oracle_processed)
+                support_diff = sparse_finite != oracle_finite
+                common = sparse_finite & oracle_finite
+                value_diff = common & (processed_logits != oracle_processed)
+                raise RuntimeError(
+                    "AG2 sparse processed-logits mismatch: "
+                    f"step={self._ag2_sparse_steps + 1} rows={rows} "
+                    f"local_vocab={local_vocab} vocab_start={vocab_start} "
+                    f"support_diff={int(support_diff.sum().item())} "
+                    f"value_diff={int(value_diff.sum().item())} "
+                    f"sparse_finite={int(sparse_finite.sum().item())} "
+                    f"oracle_finite={int(oracle_finite.sum().item())}"
+                )
+            self._ag2_sparse_shadow_steps += 1
+            if (
+                self._ag2_sparse_shadow_steps == 1
+                or self._ag2_sparse_shadow_steps % 100 == 0
+            ):
+                logger.info(
+                    "AG2 sparse processed logits exact: steps=%d rows=%d "
+                    "local_vocab=%d vocab_start=%d",
+                    self._ag2_sparse_shadow_steps,
+                    rows,
+                    local_vocab,
+                    vocab_start,
+                )
+
+        sampled, num_sampled = rejection_sample(
+            processed_logits,
+            draft_logits,
+            draft_sampled,
+            input_batch.cu_num_logits,
+            pos,
+            input_batch.idx_mapping,
+            input_batch.expanded_idx_mapping,
+            input_batch.expanded_local_pos,
+            self.sampler.sampling_states.temperature.gpu,
+            self.sampler.sampling_states.seeds.gpu,
+            self.num_speculative_steps,
+            self.synthetic_conditional_rates,
+            use_fp64=self.sampler.use_fp64_gumbel,
+            use_block_verification=self.use_block_verification,
+        )
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            num_sampled,
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        self._record_sparse_step(fallback=False)
+        sparse_output = SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
+        return sparse_output

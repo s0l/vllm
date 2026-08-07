@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import ctypes
+import os
+import re
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -10,6 +13,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -38,6 +42,35 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+def copy_aux_hidden_state(
+    destination: torch.Tensor,
+    source: torch.Tensor,
+    *,
+    num_tokens: int,
+    token_major: bool,
+) -> None:
+    """Copy either a token-major or a fixed-shape diagnostic graph output."""
+    if token_major:
+        destination[:num_tokens].copy_(source)
+    else:
+        if destination.shape != source.shape:
+            raise RuntimeError(
+                "Fixed-shape auxiliary CUDA Graph output changed shape: "
+                f"{tuple(destination.shape)} != {tuple(source.shape)}"
+            )
+        destination.copy_(source)
+
+
+def view_aux_hidden_state(
+    tensor: torch.Tensor,
+    *,
+    num_tokens: int,
+    token_major: bool,
+) -> torch.Tensor:
+    """Return the active token slice or the complete fixed-shape output."""
+    return tensor[:num_tokens] if token_major else tensor
 
 
 class AttentionState(NamedTuple):
@@ -113,20 +146,83 @@ class CudaGraphManager:
         cudagraph_mode: CUDAGraphMode,
         decode_query_len: int,
         lora_capture_cases: list[int] | None = None,
+        full_decode_query_lens: set[int] | None = None,
+        expand_dynamic_decode_query_lens: bool = True,
+        max_uniform_decode_reqs: int | None = None,
     ):
         self.vllm_config = vllm_config
         self.device = device
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+        self.max_uniform_decode_reqs = (
+            self.max_num_reqs
+            if max_uniform_decode_reqs is None
+            else min(max_uniform_decode_reqs, self.max_num_reqs)
+        )
+        if self.max_uniform_decode_reqs < 1:
+            raise ValueError("max_uniform_decode_reqs must be positive")
         self.compilation_config = vllm_config.compilation_config
         assert self.compilation_config is not None
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
+        self.full_decode_query_lens = full_decode_query_lens
+        self.expand_dynamic_decode_query_lens = expand_dynamic_decode_query_lens
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.is_first_pp_rank = get_pp_group().is_first_rank
         self.is_last_pp_rank = get_pp_group().is_last_rank
         self.lora_capture_cases = lora_capture_cases or [0]
+        additional_config = vllm_config.additional_config
+        self._p3_crash_diagnostic = bool(
+            isinstance(additional_config, dict)
+            and additional_config.get("p3_crash_diagnostic", False)
+        )
+        self._p3_graph_debug = bool(
+            isinstance(additional_config, dict)
+            and additional_config.get("p3_graph_debug", False)
+        )
+        self._p3_global_sync = bool(
+            isinstance(additional_config, dict)
+            and additional_config.get("p3_global_sync", False)
+        )
+        p3_node_cutoff = (
+            additional_config.get("p3_node_cutoff")
+            if isinstance(additional_config, dict)
+            else None
+        )
+        if p3_node_cutoff is not None:
+            if not isinstance(p3_node_cutoff, int) or p3_node_cutoff < 0:
+                raise ValueError("p3_node_cutoff must be a non-negative integer")
+        p3_node_prefix_counts = (
+            additional_config.get("p3_node_prefix_counts")
+            if isinstance(additional_config, dict)
+            else None
+        )
+        if p3_node_prefix_counts is None:
+            p3_node_prefix_counts = []
+        if (
+            not isinstance(p3_node_prefix_counts, list)
+            or any(
+                not isinstance(count, int) or count <= 0
+                for count in p3_node_prefix_counts
+            )
+            or p3_node_prefix_counts != sorted(set(p3_node_prefix_counts))
+        ):
+            raise ValueError(
+                "p3_node_prefix_counts must be a strictly increasing list "
+                "of positive integers"
+            )
+        if p3_node_cutoff is not None and p3_node_prefix_counts:
+            raise ValueError(
+                "p3_node_cutoff and p3_node_prefix_counts are mutually exclusive"
+            )
+        self._p3_node_cutoff: int | None = p3_node_cutoff
+        self._p3_node_prefix_counts = tuple(p3_node_prefix_counts)
+        self._p3_prefix_diagnostic_descs: set[BatchExecutionDescriptor] = set()
+        self._p3_prefix_diagnostic_state: dict[
+            BatchExecutionDescriptor,
+            tuple[Any, list[tuple[int, Any]], int],
+        ] = {}
         # Precompute actual num_active_loras -> captured case mapping so that
         # dispatch() is a plain dict lookup instead of a per-call bisect.
         self._lora_dispatch_map, self._max_lora_case = self._build_lora_dispatch_map()
@@ -181,7 +277,6 @@ class CudaGraphManager:
             return
 
         capture_sizes = sorted(capture_sizes)
-        max_decode_tokens = self.max_num_reqs * self.decode_query_len
         decode_mode = self.cudagraph_mode.decode_mode()
         mixed_mode = self.cudagraph_mode.mixed_mode()
         separate_decode_routine = self.cudagraph_mode.separate_routine()
@@ -199,6 +294,8 @@ class CudaGraphManager:
         # to capture graphs for all possible values during decode.
         speculative_config = self.vllm_config.speculative_config
         if (
+            self.expand_dynamic_decode_query_lens
+            and
             speculative_config
             and speculative_config.uses_dynamic_speculative_decoding()
         ):
@@ -219,21 +316,50 @@ class CudaGraphManager:
             ]
         else:
             decode_query_lens = [self.decode_query_len]
+        if any(query_len <= 0 for query_len in decode_query_lens):
+            raise ValueError(
+                "CUDA graph decode query lengths must be positive, got "
+                f"{decode_query_lens}. A draft-model graph must disable "
+                "dynamic target decode-query expansion."
+            )
+        if self.full_decode_query_lens is not None:
+            # The runtime phase policy can select a non-speculative lane that
+            # is absent from the static batch-size schedule. Capture the
+            # explicitly requested FULL lanes directly instead of intersecting
+            # them with that incomplete schedule.
+            decode_query_lens = sorted(self.full_decode_query_lens)
+        max_decode_tokens = self.max_uniform_decode_reqs * max(decode_query_lens)
 
-        for num_tokens, num_active_loras in product(
-            capture_sizes, self.lora_capture_cases
-        ):
-            # Capture uniform decode specfifc graphs if required
-            #  (i.e. separate decode routine)
-            if separate_decode_routine and decode_mode:
-                for decode_query_len in decode_query_lens:
+        # FULL uniform decode has a request-count contract that is independent
+        # from PIECEWISE token padding. When elastic KV provides a post-profile
+        # cap, capture every reachable request count without expanding the
+        # mixed/PIECEWISE family.
+        if separate_decode_routine and decode_mode:
+            for decode_query_len in decode_query_lens:
+                query_capture_sizes = set(capture_sizes)
+                if self.max_uniform_decode_reqs < self.max_num_reqs:
+                    if decode_query_len > 1:
+                        query_capture_sizes.update(
+                            decode_query_len * num_reqs
+                            for num_reqs in range(
+                                1, self.max_uniform_decode_reqs + 1
+                            )
+                        )
+                    else:
+                        # Single-token FULL decode can pad request rows.
+                        # Preserve its sparse family and add only the exact
+                        # cap boundary.
+                        query_capture_sizes.add(self.max_uniform_decode_reqs)
+                for num_tokens, num_active_loras in product(
+                    sorted(query_capture_sizes), self.lora_capture_cases
+                ):
                     rounded_num_tokens = round_up(num_tokens, decode_query_len)
                     rounded_num_reqs = rounded_num_tokens // decode_query_len
 
                     if (
                         rounded_num_tokens > max_decode_tokens
                         or rounded_num_tokens > max_cg_capture_size
-                        or rounded_num_reqs > self.max_num_reqs
+                        or rounded_num_reqs > self.max_uniform_decode_reqs
                     ):
                         continue
 
@@ -252,6 +378,9 @@ class CudaGraphManager:
                             (rounded_num_tokens, num_active_loras)
                         ].append(desc)
 
+        for num_tokens, num_active_loras in product(
+            capture_sizes, self.lora_capture_cases
+        ):
             if mixed_mode:
                 # for PIECEWISE graphs there is no limit on requests when replaying
                 # i.e. no request padding is needed, so we leave it as None.
@@ -343,7 +472,24 @@ class CudaGraphManager:
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
-                        graph = torch.cuda.CUDAGraph()
+                        prefix_diagnostic_graph = (
+                            (
+                                self._p3_node_cutoff is not None
+                                or bool(self._p3_node_prefix_counts)
+                            )
+                            and progress_bar_desc == "Capturing CUDA graphs"
+                            and desc.uniform_token_count == 3
+                            and desc.num_tokens == 6
+                        )
+                        debug_p3_graph = (
+                            (
+                                self._p3_graph_debug
+                                or prefix_diagnostic_graph
+                            )
+                            and desc.uniform_token_count == 3
+                            and desc.num_tokens == 6
+                        )
+                        graph = torch.cuda.CUDAGraph(keep_graph=debug_p3_graph)
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
@@ -359,6 +505,177 @@ class CudaGraphManager:
                             # the next forward pass.
                             get_offloader().join_after_forward()
                         self.graphs[desc] = graph
+                        if debug_p3_graph:
+                            graph_role = (
+                                progress_bar_desc.lower()
+                                .replace(" ", "-")
+                                .replace("/", "-")
+                            )
+                            dump_path = (
+                                "/workspace/eval-results/"
+                                f"p3-cuda-graph-{graph_role}-pid{os.getpid()}-"
+                                f"tokens{desc.num_tokens}-reqs{desc.num_reqs}.dot"
+                            )
+                            try:
+                                cudart = ctypes.CDLL("libcudart.so.13")
+                                dot_print = cudart.cudaGraphDebugDotPrint
+                                dot_print.argtypes = [
+                                    ctypes.c_void_p,
+                                    ctypes.c_char_p,
+                                    ctypes.c_uint,
+                                ]
+                                dot_print.restype = ctypes.c_int
+                                result = dot_print(
+                                    ctypes.c_void_p(graph.raw_cuda_graph()),
+                                    dump_path.encode(),
+                                    ctypes.c_uint(1),  # Verbose.
+                                )
+                                if result != 0:
+                                    raise RuntimeError(
+                                        "cudaGraphDebugDotPrint failed with "
+                                        f"cudaError_t={result}"
+                                    )
+                                logger.warning(
+                                    "P3 CUDA graph debug dump: desc=%s path=%s",
+                                    desc,
+                                    dump_path,
+                                )
+                                if prefix_diagnostic_graph:
+                                    from cuda.bindings import runtime as cuda_runtime
+
+                                    with open(
+                                        dump_path,
+                                        encoding="utf-8",
+                                    ) as dot_file:
+                                        dot_contents = dot_file.read()
+                                    topo_by_local_id = {
+                                        int(local_id): int(topo_id)
+                                        for local_id, topo_id in re.findall(
+                                            r"(?<![A-Za-z])(\d+) "
+                                            r"\(topoId: (\d+)\)",
+                                            dot_contents,
+                                        )
+                                    }
+                                    graph.instantiate()
+                                    raw_graph = cuda_runtime.cudaGraph_t(
+                                        graph.raw_cuda_graph()
+                                    )
+                                    raw_graph_exec = cuda_runtime.cudaGraphExec_t(
+                                        graph.raw_cuda_graph_exec()
+                                    )
+                                    error, _, num_nodes = (
+                                        cuda_runtime.cudaGraphGetNodes(raw_graph)
+                                    )
+                                    if int(error) != 0:
+                                        raise RuntimeError(
+                                            "cudaGraphGetNodes(size) failed: "
+                                            f"{error}"
+                                        )
+                                    error, nodes, actual_nodes = (
+                                        cuda_runtime.cudaGraphGetNodes(
+                                            raw_graph, num_nodes
+                                        )
+                                    )
+                                    if int(error) != 0 or actual_nodes != num_nodes:
+                                        raise RuntimeError(
+                                            "cudaGraphGetNodes failed: "
+                                            f"error={error}, expected={num_nodes}, "
+                                            f"actual={actual_nodes}"
+                                        )
+                                    supported_types = {
+                                        cuda_runtime.cudaGraphNodeType.cudaGraphNodeTypeKernel,
+                                        cuda_runtime.cudaGraphNodeType.cudaGraphNodeTypeMemcpy,
+                                        cuda_runtime.cudaGraphNodeType.cudaGraphNodeTypeMemset,
+                                    }
+                                    diagnostic_nodes: list[tuple[int, Any]] = []
+                                    if self._p3_node_prefix_counts:
+                                        if self._p3_node_prefix_counts[-1] > actual_nodes:
+                                            raise ValueError(
+                                                "p3_node_prefix_counts exceeds "
+                                                f"target graph size {actual_nodes}: "
+                                                f"{self._p3_node_prefix_counts}"
+                                            )
+                                        active_cutoff = (
+                                            actual_nodes
+                                            - self._p3_node_prefix_counts[0]
+                                        )
+                                    else:
+                                        assert self._p3_node_cutoff is not None
+                                        if self._p3_node_cutoff > actual_nodes:
+                                            raise ValueError(
+                                                "p3_node_cutoff exceeds target "
+                                                f"graph size {actual_nodes}: "
+                                                f"{self._p3_node_cutoff}"
+                                            )
+                                        active_cutoff = self._p3_node_cutoff
+                                    disabled = 0
+                                    for node in nodes[:actual_nodes]:
+                                        error, local_id = (
+                                            cuda_runtime.cudaGraphNodeGetLocalId(node)
+                                        )
+                                        if int(error) != 0:
+                                            raise RuntimeError(
+                                                "cudaGraphNodeGetLocalId failed: "
+                                                f"{error}"
+                                            )
+                                        error, node_type = (
+                                            cuda_runtime.cudaGraphNodeGetType(node)
+                                        )
+                                        if int(error) != 0:
+                                            raise RuntimeError(
+                                                "cudaGraphNodeGetType failed: "
+                                                f"{error}"
+                                            )
+                                        topo_id = topo_by_local_id.get(int(local_id))
+                                        if topo_id is None:
+                                            raise RuntimeError(
+                                                "DOT is missing CUDA graph node "
+                                                f"local_id={int(local_id)}"
+                                            )
+                                        if node_type in supported_types:
+                                            diagnostic_nodes.append((topo_id, node))
+                                        if (
+                                            topo_id < active_cutoff
+                                            and node_type in supported_types
+                                        ):
+                                            result = (
+                                                cuda_runtime.cudaGraphNodeSetEnabled(
+                                                    raw_graph_exec, node, 0
+                                                )
+                                            )
+                                            if int(result[0]) != 0:
+                                                raise RuntimeError(
+                                                    "cudaGraphNodeSetEnabled failed: "
+                                                    f"local_id={int(local_id)}, "
+                                                    f"topo_id={topo_id}, "
+                                                    f"error={result[0]}"
+                                                )
+                                            disabled += 1
+                                    logger.warning(
+                                        "P3 CUDA graph prefix diagnostic armed: "
+                                        "desc=%s cutoff=%d prefix_counts=%s "
+                                        "disabled=%d/%d",
+                                        desc,
+                                        active_cutoff,
+                                        self._p3_node_prefix_counts or None,
+                                        disabled,
+                                        actual_nodes,
+                                    )
+                                    self._p3_prefix_diagnostic_descs.add(desc)
+                                    self._p3_prefix_diagnostic_state[desc] = (
+                                        raw_graph_exec,
+                                        diagnostic_nodes,
+                                        actual_nodes,
+                                    )
+                            except Exception:
+                                logger.exception(
+                                    "P3 CUDA graph debug dump failed: desc=%s "
+                                    "path=%s",
+                                    desc,
+                                    dump_path,
+                                )
+                                if prefix_diagnostic_graph:
+                                    raise
                         compilation_counter.num_cudagraph_captured += 1
         self._graphs_captured = True
 
@@ -403,7 +720,70 @@ class CudaGraphManager:
         # cannot see. Without this, replay could overwrite static buffers
         # while those copies are still in flight.
         get_offloader().sync_prev_onload()
+        diagnose_p3_graph = (
+            self._p3_crash_diagnostic and desc.uniform_token_count == 3
+        )
+        sync_p3_graph = self._p3_global_sync and desc.uniform_token_count == 3
+        if sync_p3_graph:
+            torch.cuda.synchronize(self.device)
+        if diagnose_p3_graph:
+            logger.warning("P3 CUDA graph replay begin: desc=%s", desc)
+        prefix_diagnostic = (
+            desc in self._p3_prefix_diagnostic_descs
+        )
+        if prefix_diagnostic:
+            if self._p3_node_prefix_counts:
+                from cuda.bindings import runtime as cuda_runtime
+
+                raw_graph_exec, diagnostic_nodes, total_nodes = (
+                    self._p3_prefix_diagnostic_state[desc]
+                )
+                for prefix_count in self._p3_node_prefix_counts:
+                    active_cutoff = total_nodes - prefix_count
+                    for topo_id, node in diagnostic_nodes:
+                        result = cuda_runtime.cudaGraphNodeSetEnabled(
+                            raw_graph_exec,
+                            node,
+                            int(topo_id >= active_cutoff),
+                        )
+                        if int(result[0]) != 0:
+                            raise RuntimeError(
+                                "cudaGraphNodeSetEnabled failed during "
+                                "progressive replay: "
+                                f"topo_id={topo_id}, cutoff={active_cutoff}, "
+                                f"error={result[0]}"
+                            )
+                    logger.warning(
+                        "P3 CUDA graph progressive prefix begin: "
+                        "desc=%s prefix_nodes=%d cutoff=%d",
+                        desc,
+                        prefix_count,
+                        active_cutoff,
+                    )
+                    self.graphs[desc].replay()
+                    torch.cuda.synchronize(self.device)
+                    logger.warning(
+                        "P3 CUDA graph progressive prefix passed: "
+                        "desc=%s prefix_nodes=%d cutoff=%d",
+                        desc,
+                        prefix_count,
+                        active_cutoff,
+                    )
+            else:
+                self.graphs[desc].replay()
+                torch.cuda.synchronize(self.device)
+            raise RuntimeError(
+                "P3 CUDA graph prefix diagnostic completed without a CUDA "
+                "fault: "
+                f"cutoff={self._p3_node_cutoff}, "
+                f"prefix_counts={self._p3_node_prefix_counts or None}, "
+                f"desc={desc}"
+            )
         self.graphs[desc].replay()
+        if sync_p3_graph:
+            torch.cuda.synchronize(self.device)
+        if diagnose_p3_graph:
+            logger.warning("P3 CUDA graph replay end: desc=%s", desc)
 
     def init_breakable_cg_runner(self, model: nn.Module) -> None:
         if self.breakable_cg_runner is None:
@@ -429,6 +809,9 @@ class ModelCudaGraphManager(CudaGraphManager):
         cudagraph_mode: CUDAGraphMode,
         decode_query_len: int,
         lora_capture_cases: list[int] | None = None,
+        full_decode_query_lens: set[int] | None = None,
+        tp3_sd_phase_reduce: bool = False,
+        max_uniform_decode_reqs: int | None = None,
     ):
         super().__init__(
             vllm_config,
@@ -436,11 +819,15 @@ class ModelCudaGraphManager(CudaGraphManager):
             cudagraph_mode,
             decode_query_len,
             lora_capture_cases=lora_capture_cases,
+            full_decode_query_lens=full_decode_query_lens,
+            max_uniform_decode_reqs=max_uniform_decode_reqs,
         )
         self.hidden_states: torch.Tensor | None = None
         self.aux_hidden_states: list[torch.Tensor] = []
+        self.aux_hidden_states_token_major: list[bool] = []
         self.use_aux_hidden_state_outputs = False
         self.intermediate_tensors: IntermediateTensors | None = None
+        self.tp3_sd_phase_reduce = tp3_sd_phase_reduce
 
     def capture(
         self,
@@ -501,16 +888,42 @@ class ModelCudaGraphManager(CudaGraphManager):
                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
             )
 
+            if envs.AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL:
+                layout = input_buffers.marlin_request_layout_cpu
+                if desc.cg_mode == CUDAGraphMode.FULL:
+                    # FULL graphs are replayed only for uniform decode lanes.
+                    # Capture the original single batched Marlin launch.
+                    layout[0] = num_reqs
+                    layout[1] = num_reqs
+                    layout[2 : num_reqs + 3].zero_()
+                else:
+                    # The op is cudagraph-unsafe in PIECEWISE mode and is
+                    # executed dynamically. This valid one-request layout is
+                    # only for compile/capture warmup.
+                    layout[0] = 1
+                    layout[1] = 0
+                    layout[2] = 0
+                    layout[3] = num_tokens
+
             # Capture with dummy rows marked as padding.
             input_buffers.is_padding.fill_(True)
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
+                # FULL graph capture calls this closure with cg_mode NONE.
+                # Use the target manager's static role plus the descriptor,
+                # never graph mode, to mark the qlen1 target-decode lane.
+                tp3_sd_phase_reduce = (
+                    self.tp3_sd_phase_reduce
+                    and desc.cg_mode == CUDAGraphMode.FULL
+                    and desc.uniform_token_count == 1
+                )
                 batch_descriptor = None
                 if cg_mode == CUDAGraphMode.PIECEWISE:
                     batch_descriptor = BatchDescriptor(
                         num_tokens=num_tokens,
                         has_lora=has_lora,
                         num_active_loras=desc.num_active_loras,
+                        tp3_sd_phase_reduce=tp3_sd_phase_reduce,
                     )
                 with set_forward_context(
                     attn_metadata,
@@ -521,6 +934,12 @@ class ModelCudaGraphManager(CudaGraphManager):
                     slot_mapping=slot_mappings,
                     batch_descriptor=batch_descriptor,
                     is_padding=input_buffers.is_padding[:num_tokens],
+                    tp3_sd_phase_reduce=tp3_sd_phase_reduce,
+                    marlin_request_layout_cpu=(
+                        input_buffers.marlin_request_layout_cpu
+                        if envs.AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL
+                        else None
+                    ),
                 ):
                     if cg_mode == CUDAGraphMode.PIECEWISE:
                         # PIECEWISE graph (compiled PW or breakable, chosen inside
@@ -548,8 +967,22 @@ class ModelCudaGraphManager(CudaGraphManager):
                         self.aux_hidden_states = [
                             torch.empty_like(x) for x in aux_hidden_states
                         ]
-                    for i, aux in enumerate(aux_hidden_states):
-                        self.aux_hidden_states[i][:num_tokens] = aux
+                        self.aux_hidden_states_token_major = [
+                            aux.ndim > 0 and aux.shape[0] == num_tokens
+                            for aux in aux_hidden_states
+                        ]
+                    for destination, aux, token_major in zip(
+                        self.aux_hidden_states,
+                        aux_hidden_states,
+                        self.aux_hidden_states_token_major,
+                        strict=True,
+                    ):
+                        copy_aux_hidden_state(
+                            destination,
+                            aux,
+                            num_tokens=num_tokens,
+                            token_major=token_major,
+                        )
                 else:
                     # Non-last PP rank.
                     assert isinstance(model_output, IntermediateTensors)
@@ -578,7 +1011,18 @@ class ModelCudaGraphManager(CudaGraphManager):
         hidden_states = self.hidden_states[: desc.num_tokens]
         if not self.use_aux_hidden_state_outputs:
             return hidden_states
-        return hidden_states, [x[: desc.num_tokens] for x in self.aux_hidden_states]
+        return hidden_states, [
+            view_aux_hidden_state(
+                tensor,
+                num_tokens=desc.num_tokens,
+                token_major=token_major,
+            )
+            for tensor, token_major in zip(
+                self.aux_hidden_states,
+                self.aux_hidden_states_token_major,
+                strict=True,
+            )
+        ]
 
 
 def prepare_inputs_to_capture(

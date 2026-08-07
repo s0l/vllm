@@ -8,7 +8,11 @@ import pytest
 
 from tests.v1.core.utils import create_requests, create_scheduler
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+from vllm.v1.spec_decode.dynamic.utils import (
+    apply_force_non_speculative_override,
+    build_dynamic_sd_schedule_lookup,
+    parse_force_non_speculative_xarg,
+)
 from vllm.v1.structured_output import StructuredOutputManager
 
 
@@ -49,6 +53,28 @@ def _make_scheduler_with_dynamic_sd(
         log_stats=True,
         structured_output_manager=StructuredOutputManager(base_scheduler.vllm_config),
     )
+
+
+def test_force_non_speculative_xarg_is_bounded_and_default_off():
+    assert not parse_force_non_speculative_xarg(None, enabled=False)
+    assert parse_force_non_speculative_xarg(
+        {"ag2_force_non_speculative": 1}, enabled=True
+    )
+    with pytest.raises(ValueError, match="must be exactly 1"):
+        parse_force_non_speculative_xarg(
+            {"ag2_force_non_speculative": 2}, enabled=True
+        )
+    with pytest.raises(ValueError, match="requires"):
+        parse_force_non_speculative_xarg(
+            {"ag2_force_non_speculative": 1}, enabled=False
+        )
+
+
+def test_force_non_speculative_conservatively_reduces_scheduled_batch():
+    assert apply_force_non_speculative_override(2, [False, False]) == 2
+    assert apply_force_non_speculative_override(2, [True]) == 0
+    assert apply_force_non_speculative_override(2, [True, True]) == 0
+    assert apply_force_non_speculative_override(2, [True, False]) == 0
 
 
 def _add_requests_and_schedule(
@@ -187,6 +213,64 @@ def test_scheduler_falls_back_to_static_k_when_dsd_not_configured():
 
     assert scheduler.dynamic_sd_lookup is None
     assert output.num_spec_tokens_to_schedule == 3
+
+
+def test_phase_policy_disables_speculation_for_prefill():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 3)],
+        max_num_seqs=4,
+        runtime_num_speculative_tokens=3,
+    )
+    speculative_config = scheduler.vllm_config.speculative_config
+    assert speculative_config is not None
+    speculative_config.disable_speculation_on_non_decode = True
+
+    output = _add_requests_and_schedule(scheduler, 4)
+
+    assert len(output.num_scheduled_tokens) == 4
+    assert output.num_spec_tokens_to_schedule == 0
+
+
+def test_phase_policy_allows_speculation_for_prefill_when_not_disabled():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 3)],
+        max_num_seqs=4,
+        runtime_num_speculative_tokens=3,
+    )
+    speculative_config = scheduler.vllm_config.speculative_config
+    assert speculative_config is not None
+    speculative_config.disable_speculation_on_non_decode = False
+
+    output = _add_requests_and_schedule(scheduler, 4)
+
+    assert len(output.num_scheduled_tokens) == 4
+    assert output.num_spec_tokens_to_schedule == 3
+    assert not output.is_pure_decode_step
+
+
+def test_phase_policy_recognizes_only_uniform_decode_rows():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 3)],
+        max_num_seqs=2,
+        runtime_num_speculative_tokens=3,
+    )
+    requests = create_requests(num_requests=2, num_tokens=10)
+    for request in requests:
+        scheduler.add_request(request)
+
+    req0, req1 = requests
+    req0.num_computed_tokens = req0.num_prompt_tokens
+    req1.num_computed_tokens = req1.num_prompt_tokens
+    scheduled = {req0.request_id: 1, req1.request_id: 3}
+    drafts = {req1.request_id: [11, 12]}
+    assert scheduler._is_pure_decode_step(scheduled, drafts)
+
+    req1.num_computed_tokens -= 1
+    assert not scheduler._is_pure_decode_step(scheduled, drafts)
+
+    req1.num_computed_tokens = req1.num_prompt_tokens
+    scheduled[req1.request_id] = 2
+    assert not scheduler._is_pure_decode_step(scheduled, drafts)
 
 
 def test_dynamic_sd_is_disabled_with_data_parallel(caplog_vllm):

@@ -42,6 +42,7 @@ def _fused_post_conv_kernel(
     L,
     H: tl.constexpr,
     HV: tl.constexpr,
+    INPUT_H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     APPLY_L2NORM: tl.constexpr,
@@ -61,8 +62,6 @@ def _fused_post_conv_kernel(
     i_tb = tl.program_id(0)
     i_head = tl.program_id(1)
 
-    HK: tl.constexpr = H * K
-
     offs_t = i_tb * BLOCK_T + tl.arange(0, BLOCK_T)  # [BLOCK_T]
     mask_t = offs_t < L
 
@@ -77,8 +76,16 @@ def _fused_post_conv_kernel(
         q_offsets = offs_t[:, None] * stride_x_tok + i_h * K + offs_k[None, :]
         q_f32 = tl.load(mixed_qkv_ptr + q_offsets, mask=mask_2d, other=0).to(tl.float32)
 
-        # Load K features: mixed_qkv[t, HK + i_h*K + k]
-        k_offsets = offs_t[:, None] * stride_x_tok + HK + i_h * K + offs_k[None, :]
+        # The TP3 input projection is padded to the largest rank-local head
+        # count. Output H/HV are the real local counts, while INPUT_H owns the
+        # packed input offsets. Keeping those contracts separate avoids a
+        # full-token compacting torch.cat before this kernel.
+        INPUT_HK: tl.constexpr = INPUT_H * K
+
+        # Load K features: mixed_qkv[t, INPUT_H*K + i_h*K + k]
+        k_offsets = (
+            offs_t[:, None] * stride_x_tok + INPUT_HK + i_h * K + offs_k[None, :]
+        )
         k_f32 = tl.load(mixed_qkv_ptr + k_offsets, mask=mask_2d, other=0).to(tl.float32)
 
         if APPLY_L2NORM:
@@ -112,7 +119,7 @@ def _fused_post_conv_kernel(
         mask_v = offs_v < V
         mask_2d = mask_t[:, None] & mask_v[None, :]  # [BLOCK_T, BV]
 
-        V_OFFSET: tl.constexpr = 2 * H * K
+        V_OFFSET: tl.constexpr = 2 * INPUT_H * K
 
         # Load V features: mixed_qkv[t, 2*H*K + i_hv*V + v]
         v_offsets = (
@@ -160,6 +167,8 @@ def fused_post_conv_prep(
     head_v_dim: int,
     apply_l2norm: bool = True,
     output_g_exp: bool = False,
+    input_num_k_heads: int | None = None,
+    input_num_v_heads: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused post-conv1d prep: split + l2norm + gating in one kernel.
 
@@ -174,6 +183,10 @@ def fused_post_conv_prep(
         head_v_dim: dimension per V head (V)
         apply_l2norm: whether to L2-normalize q and k
         output_g_exp: if True, output exp(g) instead of g (for FlashInfer)
+        input_num_k_heads: padded K-head count in the packed input. Defaults to
+            ``num_k_heads`` for the ordinary compact layout.
+        input_num_v_heads: padded V-head count in the packed input. Defaults to
+            the real local V-head count inferred from ``A_log``.
 
     Returns:
         q: [L, H, K] contiguous, optionally l2-normalized
@@ -188,11 +201,18 @@ def fused_post_conv_prep(
     K = head_k_dim
     V = head_v_dim
     HV = A_log.shape[0]
+    INPUT_H = H if input_num_k_heads is None else input_num_k_heads
+    INPUT_HV = HV if input_num_v_heads is None else input_num_v_heads
     dtype = conv_output.dtype
     device = conv_output.device
 
-    assert qkv_dim == 2 * H * K + HV * V, (
-        f"qkv_dim={qkv_dim} != 2*H*K + HV*V = {2 * H * K + HV * V}"
+    assert INPUT_H >= H and INPUT_HV >= HV, (
+        f"padded input heads ({INPUT_H}, {INPUT_HV}) must cover "
+        f"output heads ({H}, {HV})"
+    )
+    assert qkv_dim == 2 * INPUT_H * K + INPUT_HV * V, (
+        f"qkv_dim={qkv_dim} != 2*INPUT_H*K + INPUT_HV*V = "
+        f"{2 * INPUT_H * K + INPUT_HV * V}"
     )
 
     # Allocate outputs in target contiguous layout
@@ -232,6 +252,7 @@ def fused_post_conv_prep(
         L=L,
         H=H,
         HV=HV,
+        INPUT_H=INPUT_H,
         K=K,
         V=V,
         APPLY_L2NORM=apply_l2norm,

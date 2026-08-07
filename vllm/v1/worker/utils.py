@@ -562,8 +562,25 @@ def bind_kv_cache(
         forward_context[layer_name].bind_kv_cache(kv_cache)
 
 
+@dataclass(frozen=True)
+class KVCacheBlockCopyRegion:
+    """One block-major byte region used by attention copy-on-write.
+
+    Elastic VMM allocations reserve a quantum-rounded virtual storage whose
+    trailing padding is not part of any logical KV block.  Keeping the logical
+    stride explicit prevents that padding from being distributed across blocks
+    when the raw storage is reshaped.
+    """
+
+    tensor: torch.Tensor
+    num_blocks: int
+    block_stride_bytes: int
+
+
 def copy_kv_cache_blocks_inplace(
-    kv_caches: Iterable[torch.Tensor | list[torch.Tensor]],
+    kv_caches: Iterable[
+        torch.Tensor | list[torch.Tensor] | KVCacheBlockCopyRegion
+    ],
     num_blocks: int,
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
 ) -> None:
@@ -571,8 +588,16 @@ def copy_kv_cache_blocks_inplace(
         return
 
     storage_tensors: list[torch.Tensor] = []
+    copy_regions: list[KVCacheBlockCopyRegion] = []
     seen_storage: set[int] = set()
     for entry in kv_caches:
+        if isinstance(entry, KVCacheBlockCopyRegion):
+            ptr = entry.tensor.untyped_storage().data_ptr()
+            if ptr in seen_storage:
+                continue
+            seen_storage.add(ptr)
+            copy_regions.append(entry)
+            continue
         # Mamba layers hold a list of state tensors; attention layers a single
         # tensor. Both alias the shared block-major backing storage.
         tensors = entry if isinstance(entry, (list, tuple)) else (entry,)
@@ -583,12 +608,40 @@ def copy_kv_cache_blocks_inplace(
             seen_storage.add(ptr)
             storage_tensors.append(tensor)
 
-    if not storage_tensors:
+    if not storage_tensors and not copy_regions:
         return
-    device = storage_tensors[0].device
+    first_tensor = (
+        copy_regions[0].tensor if copy_regions else storage_tensors[0]
+    )
+    device = first_tensor.device
     indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
     indices = async_tensor_h2d(indices_np, device=device)
     src_indices, dst_indices = indices.unbind(dim=1)
+
+    for region in copy_regions:
+        tensor = region.tensor
+        if region.num_blocks != num_blocks:
+            raise ValueError(
+                "KV block-copy region disagrees with worker block count: "
+                f"{region.num_blocks=} {num_blocks=}"
+            )
+        if region.block_stride_bytes <= 0:
+            raise ValueError("KV block-copy stride must be positive")
+        logical_bytes = region.num_blocks * region.block_stride_bytes
+        if tensor.untyped_storage().nbytes() < logical_bytes:
+            raise ValueError(
+                "KV block-copy region exceeds its backing storage: "
+                f"{logical_bytes=} storage_bytes="
+                f"{tensor.untyped_storage().nbytes()}"
+            )
+        blocks = torch.empty(0, dtype=torch.uint8, device=device)
+        blocks.set_(
+            tensor.untyped_storage(),
+            storage_offset=0,
+            size=(region.num_blocks, region.block_stride_bytes),
+            stride=(region.block_stride_bytes, 1),
+        )
+        blocks[dst_indices] = blocks[src_indices]
 
     for tensor in storage_tensors:
         assert tensor.device == device
@@ -599,6 +652,66 @@ def copy_kv_cache_blocks_inplace(
         assert blocks.numel() % num_blocks == 0
         blocks = blocks.view(num_blocks, -1)
         blocks[dst_indices] = blocks[src_indices]
+
+
+def get_kv_caches_for_block_copy(
+    runner_kv_caches: list[torch.Tensor | list[torch.Tensor]],
+    kv_caches_by_layer: dict[str, Any],
+    kv_cache_config: KVCacheConfig,
+) -> list[torch.Tensor | list[torch.Tensor] | KVCacheBlockCopyRegion]:
+    """Select backing storages addressed by attention block IDs.
+
+    In the normal shared-pool layout a CoW block copy deliberately covers the
+    complete packed backing, so preserve the existing runner list.  A
+    separate-pool Mamba/GDN layout has an independent block-ID namespace and
+    page geometry, however.  Applying an attention ``(src, dst)`` pair to that
+    backing can write an unrelated or unmapped VMM range.  In that case copy
+    only non-Mamba layer views; recurrent state is restored by its checkpoint
+    manager, not by attention CoW.
+    """
+    separate_mamba_layers = {
+        layer_name
+        for group in kv_cache_config.kv_cache_groups
+        if isinstance(group.kv_cache_spec, MambaSpec)
+        and group.kv_cache_spec.separate_pool
+        for layer_name in group.layer_names
+    }
+    if not separate_mamba_layers:
+        return runner_kv_caches
+
+    elastic_attention_regions: list[KVCacheBlockCopyRegion] = []
+    seen_backings: set[str] = set()
+    for tensor_config in kv_cache_config.kv_cache_tensors:
+        if (
+            not tensor_config.mapping_quantum
+            or not tensor_config.backing_id.startswith("elastic-attention-")
+            or tensor_config.backing_id in seen_backings
+        ):
+            continue
+        if tensor_config.num_blocks <= 0 or tensor_config.logical_block_size <= 0:
+            raise ValueError(
+                "elastic attention CoW requires explicit logical geometry"
+            )
+        layer_name = tensor_config.shared_by[0]
+        tensor = kv_caches_by_layer[layer_name]
+        if isinstance(tensor, (list, tuple)):
+            raise TypeError("elastic attention cache must be a single tensor view")
+        elastic_attention_regions.append(
+            KVCacheBlockCopyRegion(
+                tensor=tensor,
+                num_blocks=tensor_config.num_blocks,
+                block_stride_bytes=tensor_config.logical_block_size,
+            )
+        )
+        seen_backings.add(tensor_config.backing_id)
+    if elastic_attention_regions:
+        return elastic_attention_regions
+
+    return [
+        kv_cache
+        for layer_name, kv_cache in kv_caches_by_layer.items()
+        if layer_name not in separate_mamba_layers
+    ]
 
 
 def is_residual_scattered_for_sp(

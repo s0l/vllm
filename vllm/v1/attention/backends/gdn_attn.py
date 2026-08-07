@@ -37,6 +37,13 @@ class GDNAttentionBackend(AttentionBackend):
     def is_ssm(cls) -> bool:
         return True
 
+    @classmethod
+    def get_state_update_chunk_alignment(cls) -> int:
+        # The FLA/CuTeDSL GDN prefill scan groups recurrence updates in
+        # 64-token chunks. A resumed prefill is numerically identical to the
+        # uninterrupted scan only when its artificial split is on this grid.
+        return 64
+
 
 @dataclass
 class GDNAttentionMetadata:
@@ -60,6 +67,7 @@ class GDNAttentionMetadata:
         None  # shape: [batch - num_spec_decodes,]
     )
     spec_sequence_masks: torch.Tensor | None = None  # shape: [batch,]
+    spec_batch_indices: torch.Tensor | None = None  # compact spec row -> batch row
     spec_token_indx: torch.Tensor | None = None
     non_spec_token_indx: torch.Tensor | None = None
 
@@ -109,6 +117,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         else:
             self.num_spec = 0
         self.use_spec_decode: bool = self.num_spec > 0
+        self.use_mtp_replay_commit = bool(
+            vllm_config.additional_config.get("gdn_mtp_replay_commit", False)
+        )
+        if self.use_mtp_replay_commit:
+            assert self.use_spec_decode
+            assert self.kv_cache_spec.separate_pool
+            assert self.kv_cache_spec.num_speculative_blocks == 0
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
 
         self.use_full_cuda_graph: bool = (
@@ -137,6 +152,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self.spec_sequence_masks: torch.Tensor = torch.empty(
             (self.decode_cudagraph_max_bs,),
             dtype=torch.bool,
+            device=device,
+        )
+        self.spec_batch_indices: torch.Tensor = torch.empty(
+            (self.decode_cudagraph_max_bs,),
+            dtype=torch.int32,
             device=device,
         )
         self.spec_token_indx: torch.Tensor = torch.empty(
@@ -185,8 +205,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.kv_cache_spec,
             self.vllm_config.cache_config.mamba_cache_mode,
         )
+        if self.use_mtp_replay_commit:
+            # The physical topology has one committed state per request. Keep
+            # the verifier's existing [request, token] metadata contract by
+            # presenting repeated aliases; its recurrent path is no-store.
+            block_table_tensor = block_table_tensor[:, :1].expand(
+                -1, self.num_spec + 1
+            )
 
         spec_sequence_masks_cpu: torch.Tensor | None = None
+        spec_batch_indices: torch.Tensor | None = None
         if (
             not self.use_spec_decode
             or num_decode_draft_tokens_cpu is None
@@ -206,6 +234,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             else:
                 spec_sequence_masks = async_tensor_h2d(
                     spec_sequence_masks_cpu, device=query_start_loc.device
+                )
+                spec_batch_indices = async_tensor_h2d(
+                    torch.nonzero(spec_sequence_masks_cpu, as_tuple=False)
+                    .flatten()
+                    .to(torch.int32),
+                    device=query_start_loc.device,
                 )
 
         if spec_sequence_masks is None:
@@ -437,6 +471,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_sequence_masks = self.spec_sequence_masks[:batch_size]
             spec_sequence_masks[num_spec_decodes:].fill_(False)
 
+            assert spec_batch_indices is not None
+            self.spec_batch_indices[:num_spec_decodes].copy_(
+                spec_batch_indices, non_blocking=True
+            )
+            spec_batch_indices = self.spec_batch_indices[:batch_size]
+            spec_batch_indices[num_spec_decodes:].fill_(0)
+
             assert non_spec_token_indx is not None and spec_token_indx is not None
             self.non_spec_token_indx[: non_spec_token_indx.size(0)].copy_(
                 non_spec_token_indx, non_blocking=True
@@ -503,6 +544,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_state_indices_tensor=spec_state_indices_tensor,
             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
             spec_sequence_masks=spec_sequence_masks,
+            spec_batch_indices=spec_batch_indices,
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,

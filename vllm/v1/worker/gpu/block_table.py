@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
 
+import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -46,12 +47,19 @@ class BlockTables:
 
         # num_kv_cache_groups x [max_num_reqs, max_num_blocks]
         self.block_tables: list[StagedWriteTensor] = []
+        self.host_block_tables: list[np.ndarray] = []
         for i in range(self.num_kv_cache_groups):
             max_num_blocks = max_num_blocks_per_group[i] * self.blocks_per_kv_block[i]
             block_table = StagedWriteTensor(
                 (self.max_num_reqs, max_num_blocks), dtype=torch.int32, device=device
             )
             self.block_tables.append(block_table)
+            # A small authoritative host mirror used by fail-closed diagnostics.
+            # Reading the GPU table back immediately before graph replay would
+            # insert a device synchronization and perturb distributed execution.
+            self.host_block_tables.append(
+                np.zeros((self.max_num_reqs, max_num_blocks), dtype=np.int32)
+            )
 
         self.num_blocks = UvaBackedTensor(
             (self.num_kv_cache_groups, self.max_num_reqs),
@@ -117,7 +125,9 @@ class BlockTables:
             if bpk > 1:
                 block_ids = [b * bpk + k for b in block_ids for k in range(bpk)]
             self.block_tables[i].stage_write(req_index, start, block_ids)
-            self.num_blocks.np[i, req_index] = start + len(block_ids)
+            end = start + len(block_ids)
+            self.host_block_tables[i][req_index, start:end] = block_ids
+            self.num_blocks.np[i, req_index] = end
 
     def apply_staged_writes(self) -> None:
         if self.num_kv_cache_groups == 0:
