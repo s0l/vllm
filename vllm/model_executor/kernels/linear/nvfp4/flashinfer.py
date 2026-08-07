@@ -25,6 +25,7 @@ from vllm.utils.flashinfer import (
     has_flashinfer_b12x_gemm,
 )
 
+from .arc import ag2_nvfp4_arc_quantize
 from .base import NvFp4LinearKernel, NvFp4LinearLayerConfig
 
 
@@ -344,12 +345,18 @@ class FlashInferB12xNvFp4LinearKernel(NvFp4LinearKernel):
         output_dtype = x.dtype
         output_shape = [*x.shape[:-1], output_size]
 
-        x_fp4, x_blockscale = scaled_fp4_quant(
-            x,
-            layer.input_global_scale_inv,
-            is_sf_swizzled_layout=True,
-            backend="b12x",
-        )
+        selected = getattr(layer, "_ag2_nvfp4_arc_selected", None)
+        if selected is not None:
+            x_fp4, x_blockscale = ag2_nvfp4_arc_quantize(
+                x, layer.input_global_scale_inv, selected
+            )
+        else:
+            x_fp4, x_blockscale = scaled_fp4_quant(
+                x,
+                layer.input_global_scale_inv,
+                is_sf_swizzled_layout=True,
+                backend="b12x",
+            )
 
         x_fp4 = pad_nvfp4_activation_for_cutlass(
             x_fp4, getattr(layer, "weights_padding_cols", 0)

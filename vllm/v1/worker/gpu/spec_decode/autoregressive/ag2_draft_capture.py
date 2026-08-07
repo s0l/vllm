@@ -38,11 +38,19 @@ _SCHEMA = "ag2-draft-capture-v6"
 
 
 class Ag2DraftCapture:
-    def __init__(self, output: str, max_steps: int, topk: int, flush_every: int):
+    def __init__(
+        self,
+        output: str,
+        max_steps: int,
+        topk: int,
+        flush_every: int,
+        request_prefix: str = "",
+    ):
         self.output = output
         self.max_steps = max_steps
         self.topk = topk
         self.flush_every = flush_every
+        self.request_prefix = request_prefix
         self.records: list[dict] = []
         self.steps_captured = 0
         self.parts_written = 0
@@ -59,6 +67,7 @@ class Ag2DraftCapture:
                     "max_steps": max_steps,
                     "topk": topk,
                     "flush_every": flush_every,
+                    "request_prefix": request_prefix,
                 },
                 indent=2,
             )
@@ -78,7 +87,8 @@ class Ag2DraftCapture:
             raise ValueError(
                 "AG2_VLLM_DRAFT_CAPTURE_{STEPS,TOPK,FLUSH} must be positive"
             )
-        return cls(output, max_steps, topk, flush_every)
+        request_prefix = os.environ.get("AG2_VLLM_DRAFT_CAPTURE_REQUEST_PREFIX", "")
+        return cls(output, max_steps, topk, flush_every, request_prefix)
 
     def stage_target_lm_head_inputs(
         self,
@@ -91,6 +101,12 @@ class Ag2DraftCapture:
         if self.done or rank != 0:
             return
         num_reqs = input_batch.num_reqs
+        if self.request_prefix and not any(
+            str(req_id).startswith(self.request_prefix)
+            for req_id in input_batch.req_ids[:num_reqs]
+        ):
+            self.pending_target = {"skip": True}
+            return
         num_logits = int(input_batch.cu_num_logits_np[num_reqs])
         if hidden_states.shape[0] != num_logits:
             raise RuntimeError(
@@ -156,6 +172,8 @@ class Ag2DraftCapture:
                 "AG2 draft capture is missing the exact target lm_head input; "
                 "stage it immediately before target compute_logits"
             )
+        if target.get("skip"):
+            return
         if draft_logits is None and not self.warned_target_only:
             self.warned_target_only = True
             import logging

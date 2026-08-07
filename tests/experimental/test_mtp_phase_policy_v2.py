@@ -15,6 +15,7 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.distributed.parallel_state import _is_tp3_sd_phase_reduce
+from vllm.distributed.parallel_state import _should_use_tp3_mtp_device_ce
 from vllm.forward_context import BatchDescriptor, override_forward_context
 from vllm.model_executor.models.qwen3_5 import (
     _ag2_layer0_trace_match_row,
@@ -149,6 +150,84 @@ def _scheduler_output(
 
 
 class TestMTPPhasePolicyV2(unittest.TestCase):
+    def test_mtp_device_ce_requires_explicit_owner_and_exact_geometry(self):
+        base = {
+            "explicit_mtp_lane": True,
+            "tensor_dim": 2,
+            "rows": 31,
+            "hidden_size": 5120,
+            "tp_world_size": 3,
+        }
+        self.assertTrue(_should_use_tp3_mtp_device_ce(**base))
+        for field, value in (
+            ("explicit_mtp_lane", False),
+            ("tensor_dim", 1),
+            ("rows", 0),
+            ("hidden_size", 4096),
+            ("tp_world_size", 2),
+        ):
+            candidate = dict(base)
+            candidate[field] = value
+            self.assertFalse(_should_use_tp3_mtp_device_ce(**candidate))
+
+    def test_mtp_device_ce_dispatch_does_not_change_target_lane(self):
+        tensor = torch.ones((3, 5120), dtype=torch.bfloat16)
+        default = MagicMock(return_value=torch.full_like(tensor, 9))
+        group = SimpleNamespace(
+            world_size=3,
+            _all_reduce_out_place=default,
+        )
+        candidate = torch.full_like(tensor, 7)
+        env = {
+            "AG2_VLLM_MTP_DEVICE_CE": "1",
+            "AG2_VLLM_TP3_PIECEWISE_DEVICE_CE": "0",
+            "VLLM_TP3_CE_REDUCE": "0",
+            "VLLM_TP3_SD_PHASE_REDUCE": "0",
+            "VLLM_TP3_SD_DETERMINISTIC_REDUCE": "0",
+            "VLLM_TP3_SD_CANONICAL_REDUCE": "0",
+        }
+        with (
+            patch.dict(parallel_state._groups, {"ag2-test": lambda: group}, clear=True),
+            patch.dict("os.environ", env, clear=False),
+            patch.object(
+                parallel_state,
+                "_tp3_device_ce_reduce",
+                return_value=candidate,
+            ) as reduce,
+            override_forward_context(
+                SimpleNamespace(
+                    cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                    num_tokens_unpadded=3,
+                    tp3_ce_reduce=False,
+                    tp3_mtp_device_ce=True,
+                    tp3_sd_phase_reduce=False,
+                )
+            ),
+        ):
+            output = parallel_state.all_reduce(tensor, "ag2-test")
+        self.assertIs(output, candidate)
+        reduce.assert_called_once_with(tensor, group)
+        default.assert_not_called()
+
+        with (
+            patch.dict(parallel_state._groups, {"ag2-test": lambda: group}, clear=True),
+            patch.dict("os.environ", env, clear=False),
+            patch.object(parallel_state, "_tp3_device_ce_reduce") as reduce,
+            override_forward_context(
+                SimpleNamespace(
+                    cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                    num_tokens_unpadded=3,
+                    tp3_ce_reduce=False,
+                    tp3_mtp_device_ce=False,
+                    tp3_sd_phase_reduce=False,
+                )
+            ),
+        ):
+            output = parallel_state.all_reduce(tensor, "ag2-test")
+        torch.testing.assert_close(output, torch.full_like(tensor, 9))
+        reduce.assert_not_called()
+        default.assert_called_once_with(tensor)
+
     def test_phase_reduce_requires_explicit_forward_lane(self):
         with override_forward_context(
             SimpleNamespace(tp3_sd_phase_reduce=True)
@@ -189,7 +268,15 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
         with (
             patch.dict(parallel_state._groups, {"ag2-test": lambda: group}, clear=True),
             patch.dict("os.environ", env, clear=False),
-            override_forward_context(SimpleNamespace(tp3_sd_phase_reduce=True)),
+            override_forward_context(
+                SimpleNamespace(
+                    cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                    num_tokens_unpadded=1,
+                    tp3_ce_reduce=False,
+                    tp3_mtp_device_ce=False,
+                    tp3_sd_phase_reduce=True,
+                )
+            ),
         ):
             reduced = parallel_state.all_reduce(tensor, "ag2-test")
         torch.testing.assert_close(reduced, torch.full_like(tensor, 6))
@@ -198,7 +285,15 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
         with (
             patch.dict(parallel_state._groups, {"ag2-test": lambda: group}, clear=True),
             patch.dict("os.environ", env, clear=False),
-            override_forward_context(SimpleNamespace(tp3_sd_phase_reduce=False)),
+            override_forward_context(
+                SimpleNamespace(
+                    cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                    num_tokens_unpadded=1,
+                    tp3_ce_reduce=False,
+                    tp3_mtp_device_ce=False,
+                    tp3_sd_phase_reduce=False,
+                )
+            ),
         ):
             reduced = parallel_state.all_reduce(tensor, "ag2-test")
         torch.testing.assert_close(reduced, torch.full_like(tensor, 9))

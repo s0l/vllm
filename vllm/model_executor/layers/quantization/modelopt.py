@@ -13,6 +13,7 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
+    PerTensorTorchFP8ScaledMMLinearKernel,
     init_fp8_linear_kernel,
     init_mxfp8_linear_kernel,
     init_nvfp4_linear_kernel,
@@ -69,6 +70,9 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     MXFP8_SCALE_DTYPE,
     MXFP8_VALUE_DTYPE,
+)
+from vllm.model_executor.layers.quantization.utils.ag2_nvfp4_arc import (
+    maybe_apply_ag2_nvfp4_arc_sidecar,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -510,6 +514,11 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             input_dtype=self.input_dtype,
             out_dtype=self.out_dtype,
             module_name=self.__class__.__name__,
+            force_kernel=(
+                PerTensorTorchFP8ScaledMMLinearKernel
+                if os.environ.get("AG2_VLLM_FP8_FORCE_TORCH_SCALED_MM", "0") == "1"
+                else None
+            ),
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -1056,6 +1065,32 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
         return [torch.bfloat16, torch.half, torch.float8_e4m3fn]
 
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> "QuantizeMethodBase | None":
+        selective_a16 = tuple(
+            pattern.strip()
+            for pattern in os.environ.get(
+                "AG2_VLLM_NVFP4_A16_PREFIXES", ""
+            ).split(",")
+            if pattern.strip()
+        )
+        if (
+            self.quant_method == "NVFP4"
+            and isinstance(layer, (LinearBase, ParallelLMHead))
+            and any(fnmatch(prefix, pattern) for pattern in selective_a16)
+        ):
+            logger.warning(
+                "AG2 selective NVFP4 dispatch: %s uses W4A16 while other "
+                "NVFP4 layers retain W4A4",
+                prefix,
+            )
+            return ModelOptNvFp4W4A16LinearMethod(self)
+        quant_method = super().get_quant_method(layer, prefix)
+        if isinstance(quant_method, ModelOptNvFp4LinearMethod):
+            quant_method.layer_prefix = prefix
+        return quant_method
+
     @classmethod
     def get_min_capability(cls) -> int:
         return 75
@@ -1135,6 +1170,7 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         self.quant_config = quant_config
         self.marlin_input_dtype = None
         self.kernel = init_nvfp4_linear_kernel()
+        self.layer_prefix: str | None = None
 
     def create_weights(
         self,
@@ -1241,6 +1277,8 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         layer.input_global_scale_inv = Parameter(
             (1.0 / layer.input_global_scale).to(torch.float32), requires_grad=False
         )
+
+        maybe_apply_ag2_nvfp4_arc_sidecar(layer, self.layer_prefix)
 
         # Convert layer to NVFP4 linear kernel format
         self.kernel.process_weights_after_loading(layer)

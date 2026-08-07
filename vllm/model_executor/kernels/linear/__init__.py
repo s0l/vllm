@@ -907,6 +907,10 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
     if nvfp4_batch_invariant:
         if use_a16 and envs.AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE:
             bi_kernel = MarlinNvFp4LinearKernel
+        elif not use_a16 and linear_backend == "flashinfer_b12x":
+            # Explicit SM120 opt-in after target-model packed/singleton and
+            # one-call/split invariance controls have passed.
+            bi_kernel = FlashInferB12xNvFp4LinearKernel
         else:
             bi_kernel = (
                 HummingNvFp4LinearKernel if use_a16 else CutlassNvFp4LinearKernel
@@ -920,7 +924,11 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
                     else "humming"
                 )
             else:
-                bi_backend = "cutlass"
+                bi_backend = (
+                    "flashinfer_b12x"
+                    if bi_kernel is FlashInferB12xNvFp4LinearKernel
+                    else "cutlass"
+                )
             if linear_backend not in ("auto", bi_backend):
                 logger.warning_once(
                     "NVFP4 batch invariance overrides --linear-backend=%s; "

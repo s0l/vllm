@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only Qwen3.5 Series compatible with HuggingFace weights."""
 
+import json
 import os
 from collections.abc import Iterable
 from pathlib import Path
@@ -78,11 +79,15 @@ from .interfaces import (
 )
 from .qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from .qwen3_next import (
+    AG2_COMPACT_GDN_STAGE_ORDER,
+    AG2_COMPACT_MLP_STAGE_ORDER,
     Qwen3NextAttention,
     Qwen3NextDecoderLayer,
     Qwen3NextModel,
     Qwen3NextSparseMoeBlock,
     QwenNextMixtureOfExperts,
+    _ag2_internal_trace_layer_enabled,
+    _ag2_selected_stages,
     _is_shared_expert_fse_compatible,
 )
 from .qwen3_vl import (
@@ -161,6 +166,28 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
 
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
+        sequence_boundary_layers = {
+            int(value)
+            for value in os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_SEQUENCE_BOUNDARY_LAYERS",
+                "",
+            ).split(",")
+            if value
+        }
+        self._ag2_aux_sequence_boundary_enabled = (
+            self.layer_idx in sequence_boundary_layers
+        )
+        self._ag2_aux_all_internal_boundaries = (
+            _ag2_internal_trace_layer_enabled(self.layer_idx)
+        )
+        self._ag2_aux_compact_gdn_stages = _ag2_selected_stages(
+            "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_GDN_STAGES",
+            AG2_COMPACT_GDN_STAGE_ORDER,
+        )
+        self._ag2_aux_compact_mlp_stages = _ag2_selected_stages(
+            "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_MLP_STAGES",
+            AG2_COMPACT_MLP_STAGE_ORDER,
+        )
         # Qwen3_5 intentionally bypasses Qwen3NextDecoderLayer.__init__, while
         # inheriting its forward. Keep diagnostic forward attributes explicit.
         self._ag2_aux_compact_boundary_enabled = (
@@ -193,11 +220,14 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         )
         self._ag2_aux_compact_gdn_boundaries_enabled = (
             layer_type == "linear_attention"
-            and self.layer_idx
-            == int(
-                os.environ.get(
-                    "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_GDN_BOUNDARY_LAYER",
-                    "-1",
+            and (
+                self._ag2_aux_all_internal_boundaries
+                or self.layer_idx
+                == int(
+                    os.environ.get(
+                        "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_GDN_BOUNDARY_LAYER",
+                        "-1",
+                    )
                 )
             )
         )
@@ -216,6 +246,8 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 gqa_interleaved_layout=False,
                 reduce_results=not self.use_attn_reduce_scatter_for_moe,
             )
+            if self._ag2_aux_all_internal_boundaries:
+                self.linear_attn.ag2_enable_compact_trace()
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3NextAttention(
                 config,
@@ -245,6 +277,24 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             )
         else:
             raise ValueError(f"Invalid model_type {config.model_type}")
+        if self._ag2_aux_all_internal_boundaries:
+            if not isinstance(self.mlp, Qwen3NextMLP):
+                raise NotImplementedError(
+                    "Full internal trace currently requires the dense Qwen MLP"
+                )
+            self.mlp._ag2_aux_compact_trace_enabled = True
+            self.mlp.down_proj._ag2_aux_output_parallel_enabled = True
+            if self.layer_type == "full_attention":
+                self.self_attn.ag2_enable_compact_full_trace()
+        if self._ag2_aux_sequence_boundary_enabled:
+            if not isinstance(self.mlp, Qwen3NextMLP):
+                raise NotImplementedError(
+                    "Sequence boundary trace currently requires the dense Qwen MLP"
+                )
+            self.mlp._ag2_aux_full_trace_enabled = True
+            self.mlp.down_proj._ag2_aux_output_parallel_enabled = True
+            if self.layer_type == "full_attention":
+                self.self_attn.ag2_enable_sequence_full_trace()
 
         self.input_layernorm = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -252,6 +302,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         self.post_attention_layernorm = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self._ag2_enable_projection_calibration_capture(model_config.dtype)
 
         self.layer_scale = getattr(config, "layer_scale", False)
         if self.layer_scale:
@@ -285,16 +336,23 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             )
         )
         self._ag2_aux_gdn_boundaries_enabled = (
-            os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_GDN_BOUNDARIES", "0")
-            == "1"
-            and self.layer_idx
-            == int(
-                os.environ.get(
-                    "AG2_VLLM_AUX_HIDDEN_TRACE_GDN_BOUNDARY_LAYER",
-                    "0",
+            self.layer_type == "linear_attention"
+            and (
+                self._ag2_aux_sequence_boundary_enabled
+                or (
+                    os.environ.get(
+                        "AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_GDN_BOUNDARIES", "0"
+                    )
+                    == "1"
+                    and self.layer_idx
+                    == int(
+                        os.environ.get(
+                            "AG2_VLLM_AUX_HIDDEN_TRACE_GDN_BOUNDARY_LAYER",
+                            "0",
+                        )
+                    )
                 )
             )
-            and self.layer_type == "linear_attention"
         )
         self._ag2_aux_gdn_replay_enabled = (
             os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_GDN_REPLAY_ONLY", "0")
@@ -544,6 +602,12 @@ class Qwen3_5ForCausalLMBase(
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def compute_local_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, int]:
+        return self.logits_processor.get_local_logits(self.lm_head, hidden_states)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
@@ -581,6 +645,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
     }
+
+    def compute_local_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, int]:
+        return self.language_model.compute_local_logits(hidden_states)
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
         # protocols have not __init__ method, so we need to use nn.Module.__init__
@@ -655,6 +725,205 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
                 "Layer trace requires query lengths in {1,3}, "
                 "a token id and an absolute position"
             )
+        self._ag2_projection_calibration_output = os.environ.get(
+            "AG2_VLLM_PROJECTION_CALIBRATION_OUTPUT", ""
+        )
+        self._ag2_projection_calibration_prefix = os.environ.get(
+            "AG2_VLLM_PROJECTION_CALIBRATION_REQUEST_PREFIX", ""
+        )
+        self._ag2_projection_calibration_positions = tuple(
+            dict.fromkeys(
+                int(value)
+                for value in os.environ.get(
+                    "AG2_VLLM_PROJECTION_CALIBRATION_POSITIONS", ""
+                ).split(",")
+                if value
+            )
+        )
+        self._ag2_projection_calibration_max_matches = int(
+            os.environ.get("AG2_VLLM_PROJECTION_CALIBRATION_MAX_MATCHES", "16")
+        )
+        self._ag2_projection_calibration_saved = 0
+        if self._ag2_projection_calibration_output:
+            if not self._ag2_projection_calibration_prefix:
+                raise ValueError("projection calibration requires request prefix")
+            if not self._ag2_projection_calibration_positions:
+                raise ValueError("projection calibration requires positions")
+            if self._ag2_projection_calibration_max_matches < 1:
+                raise ValueError("projection calibration max matches must be positive")
+            self._write_ag2_projection_calibration_manifest("initialized")
+
+    def _write_ag2_projection_calibration_manifest(self, state: str) -> None:
+        if not self._ag2_projection_calibration_output:
+            return
+        rank = get_tp_group().rank_in_group
+        path = Path(
+            f"{self._ag2_projection_calibration_output}.rank{rank}.manifest.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        layers = self.language_model.model.layers
+        buffer_bytes = 0
+        for layer in layers:
+            buffer_bytes += (
+                layer._ag2_projection_capture_rows.numel()
+                * layer._ag2_projection_capture_rows.element_size()
+            )
+            buffer_bytes += (
+                layer._ag2_projection_capture_attention_input.numel()
+                * layer._ag2_projection_capture_attention_input.element_size()
+            )
+            buffer_bytes += (
+                layer._ag2_projection_capture_mlp_input.numel()
+                * layer._ag2_projection_capture_mlp_input.element_size()
+            )
+            operator = (
+                layer.self_attn._ag2_projection_capture_gated
+                if layer.layer_type == "full_attention"
+                else layer.linear_attn._ag2_projection_capture_gated_norm
+            )
+            mlp = layer.mlp._ag2_projection_capture_activation
+            buffer_bytes += operator.numel() * operator.element_size()
+            buffer_bytes += mlp.numel() * mlp.element_size()
+        temporary.write_text(
+            json.dumps(
+                {
+                    "schema": "ag2-projection-calibration-fixed-buffer-v2",
+                    "state": state,
+                    "rank": rank,
+                    "positions": list(self._ag2_projection_calibration_positions),
+                    "request_prefix": self._ag2_projection_calibration_prefix,
+                    "max_matches": self._ag2_projection_calibration_max_matches,
+                    "saved_matches": self._ag2_projection_calibration_saved,
+                    "layers": len(layers),
+                    "buffer_bytes": buffer_bytes,
+                    "model_outputs": 0,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+
+    def maybe_save_ag2_projection_calibration(
+        self,
+        *,
+        input_batch: object,
+        query_len: int,
+        cudagraph_mode: str,
+    ) -> None:
+        output = self._ag2_projection_calibration_output
+        if not output or self._ag2_projection_calibration_saved >= (
+            self._ag2_projection_calibration_max_matches
+        ):
+            return
+        num_reqs = int(input_batch.num_reqs)
+        req_ids = [str(value) for value in input_batch.req_ids[:num_reqs]]
+        starts = [
+            int(value)
+            for value in input_batch.query_start_loc[: num_reqs + 1]
+            .detach()
+            .cpu()
+            .tolist()
+        ]
+        if len(starts) != num_reqs + 1 or starts[-1] != query_len:
+            raise RuntimeError("projection calibration request boundaries disagree")
+        flat_positions = input_batch.positions
+        if flat_positions.ndim == 2:
+            flat_positions = flat_positions[0]
+        position_values = flat_positions[:query_len].detach().cpu().tolist()
+        token_values = input_batch.input_ids[:query_len].detach().cpu().tolist()
+        matches: list[tuple[int, int, str, int]] = []
+        selected_positions = set(self._ag2_projection_calibration_positions)
+        for req_index, req_id in enumerate(req_ids):
+            if not req_id.startswith(self._ag2_projection_calibration_prefix):
+                continue
+            for row in range(starts[req_index], starts[req_index + 1]):
+                if int(position_values[row]) in selected_positions:
+                    matches.append((row, req_index, req_id, int(position_values[row])))
+        if not matches:
+            return
+
+        torch.cuda.current_stream().synchronize()
+        layers = self.language_model.model.layers
+        rank = get_tp_group().rank_in_group
+        for row, req_index, req_id, position in matches:
+            if self._ag2_projection_calibration_saved >= (
+                self._ag2_projection_calibration_max_matches
+            ):
+                break
+            reference_rows = layers[0]._ag2_projection_capture_rows
+            slots = reference_rows.eq(row).nonzero(as_tuple=False)
+            if slots.numel() != 1:
+                raise RuntimeError(
+                    "projection calibration row was not retained: "
+                    f"row={row} rows={reference_rows.detach().cpu().tolist()}"
+                )
+            slot = int(slots[0].item())
+            stages: dict[str, torch.Tensor] = {}
+            layer_types: dict[str, str] = {}
+            for layer_index, layer in enumerate(layers):
+                if not torch.equal(
+                    layer._ag2_projection_capture_rows, reference_rows
+                ):
+                    raise RuntimeError(
+                        f"projection calibration row identity split at layer {layer_index}"
+                    )
+                operator = (
+                    layer.self_attn._ag2_projection_capture_gated
+                    if layer.layer_type == "full_attention"
+                    else layer.linear_attn._ag2_projection_capture_gated_norm
+                )
+                mlp = layer.mlp._ag2_projection_capture_activation
+                attention_input = layer._ag2_projection_capture_attention_input
+                mlp_input = layer._ag2_projection_capture_mlp_input
+                if any(
+                    value.dtype != torch.bfloat16
+                    for value in (attention_input, operator, mlp_input, mlp)
+                ):
+                    raise RuntimeError("projection calibration requires BF16 buffers")
+                stages[f"attention_input_projection_input.{layer_index}"] = (
+                    attention_input[slot].detach().cpu().clone()
+                )
+                stages[f"operator_projection_input.{layer_index}"] = (
+                    operator[slot].detach().cpu().clone()
+                )
+                stages[f"mlp_gate_up_projection_input.{layer_index}"] = (
+                    mlp_input[slot].detach().cpu().clone()
+                )
+                stages[f"mlp_down_projection_input.{layer_index}"] = (
+                    mlp[slot].detach().cpu().clone()
+                )
+                layer_types[str(layer_index)] = str(layer.layer_type)
+            if not all(torch.isfinite(value).all() for value in stages.values()):
+                raise RuntimeError("projection calibration captured non-finite data")
+            match = self._ag2_projection_calibration_saved
+            path = Path(f"{output}.match{match:04d}.rank{rank}.pt")
+            if path.exists():
+                raise RuntimeError(f"refusing to overwrite projection capture: {path}")
+            payload = {
+                "schema": "ag2-projection-calibration-fixed-buffer-v2",
+                "rank": rank,
+                "match": match,
+                "req_id": req_id,
+                "req_index": req_index,
+                "query_len": query_len,
+                "cudagraph_mode": cudagraph_mode,
+                "row": row,
+                "slot": slot,
+                "position": position,
+                "token_id": int(token_values[row]),
+                "positions": list(self._ag2_projection_calibration_positions),
+                "layer_types": layer_types,
+                "stages": stages,
+            }
+            temporary = Path(f"{path}.tmp")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(payload, temporary)
+            os.replace(temporary, path)
+            self._ag2_projection_calibration_saved += 1
+            self._write_ag2_projection_calibration_manifest("active")
 
     def maybe_save_ag2_layer0_trace(
         self,

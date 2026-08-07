@@ -16,8 +16,10 @@ from tests.quantization.utils import is_quant_method_supported
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.model import ModelConfig
 from vllm.model_executor.kernels.linear import (
+    FlashInferB12xNvFp4LinearKernel,
     HummingNvFp4LinearKernel,
     MarlinNvFp4LinearKernel,
+    init_nvfp4_linear_kernel,
 )
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.modelopt import (
@@ -112,6 +114,52 @@ def test_modelopt_nvfp4_quantizes_parallel_lm_head():
         method = config.get_quant_method(_mock_lm_head(), prefix="lm_head")
 
     assert isinstance(method, ModelOptNvFp4LinearMethod)
+    assert method.layer_prefix == "lm_head"
+
+
+def test_modelopt_nvfp4_selective_a16_prefix(monkeypatch):
+    from vllm.model_executor.layers.linear import LinearBase
+
+    config = ModelOptNvFp4Config(
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=[],
+    )
+    fake_layer = MagicMock(spec=LinearBase)
+    monkeypatch.setenv(
+        "AG2_VLLM_NVFP4_A16_PREFIXES",
+        "*.layers.49.mlp.gate_up_proj,*.layers.60.mlp.gate_up_proj",
+    )
+    with patch(
+        "vllm.model_executor.layers.quantization.modelopt.init_nvfp4_linear_kernel"
+    ):
+        selected = config.get_quant_method(
+            fake_layer, "language_model.model.layers.60.mlp.gate_up_proj"
+        )
+        unselected = config.get_quant_method(
+            fake_layer, "language_model.model.layers.61.mlp.gate_up_proj"
+        )
+
+    assert isinstance(selected, ModelOptNvFp4W4A16LinearMethod)
+    assert isinstance(unselected, ModelOptNvFp4LinearMethod)
+
+
+def test_nvfp4_batch_invariant_allows_explicit_b12x(monkeypatch):
+    import vllm.envs as envs
+    import vllm.model_executor.kernels.linear as linear_kernels
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    monkeypatch.setattr(envs, "AG2_VLLM_NVFP4_BATCH_INVARIANT", False)
+    monkeypatch.setattr(linear_kernels, "_get_linear_backend", lambda: "flashinfer_b12x")
+    monkeypatch.setattr(
+        FlashInferB12xNvFp4LinearKernel,
+        "is_supported",
+        classmethod(lambda cls, compute_capability=None: (True, None)),
+    )
+
+    kernel = init_nvfp4_linear_kernel(use_a16=False)
+
+    assert isinstance(kernel, FlashInferB12xNvFp4LinearKernel)
 
 
 def test_modelopt_nvfp4_leaves_excluded_parallel_lm_head_unquantized():
@@ -471,6 +519,9 @@ def test_modelopt_nvfp4_config_dispatches_w4a4_method():
     )
     assert config.LinearMethodCls is ModelOptNvFp4LinearMethod
     assert config.quant_method == "NVFP4"
+    assert unselected.layer_prefix == (
+        "language_model.model.layers.61.mlp.gate_up_proj"
+    )
 
 
 def test_modelopt_nvfp4_config_dispatches_w4a16_method():

@@ -572,6 +572,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             num_tokens_across_dp=num_tokens_across_dp,
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
+            # Every call in this model is owned by the MTP drafter. Keep the
+            # identity explicit and graph-static so FULL capture cannot alias
+            # it with an equal-shaped target decode or short prefill.
+            tp3_mtp_device_ce=(
+                os.environ.get("AG2_VLLM_MTP_DEVICE_CE", "0") == "1"
+            ),
         ):
             inputs_embeds = None
             if self.supports_mm_inputs:

@@ -169,6 +169,29 @@ class LogitsProcessor(PluggableLayer):
             logits = logits[..., : self.org_vocab_size]
         return logits
 
+    def get_local_logits(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        embedding_bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, int]:
+        """Return this TP rank's logits and global vocabulary start.
+
+        This is a sampling-layer seam: callers must either perform an exact
+        distributed selection or fall back to ``_gather_logits`` before using
+        the result as ordinary full-vocabulary logits.
+        """
+        logits = self._apply_head(lm_head, hidden_states, embedding_bias)
+        if self.soft_cap is not None:
+            logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+        if self.scale != 1.0:
+            logits = logits * self.scale
+
+        num_pad = lm_head.shard_indices.num_org_vocab_padding
+        if num_pad > 0:
+            logits[..., -num_pad:] = -float("inf")
+        return logits, lm_head.shard_indices.org_vocab_start_index
+
     def get_top_tokens(
         self,
         lm_head: VocabParallelEmbedding,

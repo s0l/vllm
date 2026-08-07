@@ -176,6 +176,22 @@ class Qwen2MoeMLP(nn.Module):
             persistent=False,
         )
 
+    def ag2_enable_projection_calibration_capture(
+        self, capacity: int, dtype: torch.dtype
+    ) -> None:
+        if capacity < 1:
+            raise ValueError("projection capture capacity must be positive")
+        self._ag2_projection_capture_enabled = True
+        self.register_buffer(
+            "_ag2_projection_capture_activation",
+            torch.full(
+                (capacity, self.down_proj.input_size_per_partition),
+                torch.nan,
+                dtype=dtype,
+            ),
+            persistent=False,
+        )
+
     def enable_bf16_gate_up_scratch(
         self,
         max_num_tokens: int,
@@ -243,10 +259,49 @@ class Qwen2MoeMLP(nn.Module):
     def forward(self, x):
         gate_up = self._gate_up(x)
         out = self.act_fn(gate_up)
+        if getattr(self, "_ag2_aux_full_trace_enabled", False):
+            self._ag2_aux_full_gate_up = gate_up
+            self._ag2_aux_full_activation = out
+        if getattr(self, "_ag2_aux_compact_trace_enabled", False):
+            row_indices = self._ag2_aux_compact_row_indices
+
+            def compact(value: torch.Tensor) -> torch.Tensor:
+                valid = row_indices >= 0
+                safe = torch.where(valid, row_indices, torch.zeros_like(row_indices))
+                selected = torch.index_select(value, 0, safe)
+                return torch.where(
+                    valid.unsqueeze(-1), selected, torch.zeros_like(selected)
+                )
+
+            self._ag2_aux_compact_gate_up = compact(gate_up)
+            self._ag2_aux_compact_activation = compact(out)
+        if getattr(self, "_ag2_projection_capture_enabled", False):
+            row_indices = self._ag2_projection_capture_row_indices
+            valid = row_indices >= 0
+            safe = torch.where(valid, row_indices, torch.zeros_like(row_indices))
+            selected = torch.index_select(out, 0, safe)
+            selected = torch.where(
+                valid.unsqueeze(-1), selected, torch.zeros_like(selected)
+            )
+            self._ag2_projection_capture_activation.copy_(selected)
         out, _ = self.down_proj(out)
+
+        if getattr(self, "_ag2_aux_full_trace_enabled", False):
+            self._ag2_aux_full_down_parallel = (
+                self.down_proj._ag2_aux_output_parallel
+            )
+
+        if getattr(self, "_ag2_aux_compact_trace_enabled", False):
+            self._ag2_aux_compact_down_parallel = compact(
+                self.down_proj._ag2_aux_output_parallel
+            )
+            self._ag2_aux_compact_output = compact(out)
 
         if self.expert_gate is not None:
             out = F.sigmoid(self.expert_gate(x)[0]) * out
+
+        if getattr(self, "_ag2_aux_full_trace_enabled", False):
+            self._ag2_aux_full_output = out
 
         return out
 

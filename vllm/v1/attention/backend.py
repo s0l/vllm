@@ -477,6 +477,20 @@ class CommonAttentionMetadata:
     (num_computed_tokens < num_prompt_tokens). Used by some backends to
     distinguish actual decodes from short extends."""
 
+    request_ids: tuple[str | None, ...] | None = None
+    """Optional semantic request ids for bounded route provenance."""
+
+    num_scheduled_tokens_cpu: torch.Tensor | None = None
+    """Optional per-request scheduled-token counts for route provenance."""
+
+    num_computed_tokens_provenance_cpu: torch.Tensor | None = None
+    """Optional per-request computed-token counts for route provenance."""
+
+    num_prompt_tokens_cpu: torch.Tensor | None = None
+    """Optional per-request semantic prompt lengths. Unlike ``seq_lens``, this
+    does not include generated/speculative tokens and lets prompt-only routes
+    distinguish an aligned intermediate boundary from a natural final tail."""
+
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
     """(batch_size,) number of valid speculative draft tokens for each decode
     row, or -1 for rows that are not exact speculative-decode verification.
@@ -617,6 +631,16 @@ class CommonAttentionMetadata:
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
+            request_ids=self.request_ids[:num_actual_reqs]
+            if self.request_ids is not None
+            else None,
+            num_scheduled_tokens_cpu=maybe_slice_reqs(
+                self.num_scheduled_tokens_cpu
+            ),
+            num_computed_tokens_provenance_cpu=maybe_slice_reqs(
+                self.num_computed_tokens_provenance_cpu
+            ),
+            num_prompt_tokens_cpu=maybe_slice_reqs(self.num_prompt_tokens_cpu),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
             replayssm_decode_base_cpu=maybe_slice_reqs(self.replayssm_decode_base_cpu),
         )

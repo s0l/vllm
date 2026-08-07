@@ -57,6 +57,266 @@ def test_compact_checkpoint_trace_accepts_layer_zero(monkeypatch) -> None:
     assert trace.layers == (0, 4)
 
 
+def test_request_chunk_trace_requires_complete_causal_contract(monkeypatch) -> None:
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_OUTPUT", "/tmp/trace")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_LAYERS", "4,5")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_TOKEN_ID", "-1")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_POSITION", "1512")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_REQUEST_PREFIX", "causal-")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_REQUEST_CHUNKS", "1")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_GDN_BOUNDARIES", "1")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_GDN_BOUNDARY_LAYER", "4")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_FINGERPRINT_OUTPUTS", "1")
+
+    trace = AuxHiddenTrace.from_env()
+
+    assert trace.request_chunks is True
+    assert trace.token_id == -1
+    assert trace.position == 1512
+    assert trace.first_gdn_boundaries is True
+
+
+def test_request_chunk_trace_accepts_complete_layer_checkpoints(monkeypatch) -> None:
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_OUTPUT", "/tmp/trace")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_LAYERS", "0,1,2")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_TOKEN_ID", "-1")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_POSITION", "1512")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_REQUEST_PREFIX", "coarse-")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_REQUEST_CHUNKS", "1")
+    monkeypatch.setenv(
+        "AG2_VLLM_AUX_HIDDEN_TRACE_FINGERPRINT_OUTPUTS", "1"
+    )
+
+    trace = AuxHiddenTrace.from_env()
+
+    assert trace.request_chunks is True
+    assert trace.output_labels() == ("layer.0", "layer.1", "layer.2")
+
+
+def test_request_chunk_trace_saves_invocation_and_trims_replay_buffers(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        trace_module,
+        "get_tp_group",
+        lambda: SimpleNamespace(rank_in_group=0),
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _FakeStream())
+
+    trace = AuxHiddenTrace(
+        output=str(tmp_path / "trace"),
+        layers=(4, 5),
+        token_id=-1,
+        position=2,
+        max_matches_per_query_len=4,
+        first_gdn_boundaries=True,
+        gdn_boundary_layer=4,
+        fingerprint_outputs=True,
+        request_prefix="causal-",
+        request_chunks=True,
+    )
+    labels = trace.output_labels()
+    meta = torch.full((512,), -1, dtype=torch.int64)
+    meta[0] = 1
+    meta[1:6] = torch.tensor([2, 3, 4, 5, 6])
+    meta[6] = 4
+    meta[38:42] = torch.tensor([4, 4, 1, 0])
+    meta[42] = 3
+    meta[43] = 20
+    meta[44:48] = torch.tensor([1, 3, 1, 1])
+    meta[48] = 1
+    hidden_states = []
+    for label in labels:
+        if label == "gdn_replay_float.4":
+            hidden_states.append(torch.arange(64, dtype=torch.float32))
+        elif label == "gdn_replay_state.4":
+            hidden_states.append(torch.arange(32, dtype=torch.float32))
+        elif label == "gdn_replay_meta.4":
+            hidden_states.append(meta)
+        else:
+            hidden_states.append(torch.arange(36, dtype=torch.int64).reshape(4, 9))
+
+    trace.maybe_save(
+        input_ids=torch.tensor([10, 11, 10, 11]),
+        positions=torch.tensor([0, 1, 2, 3]),
+        query_len=4,
+        cudagraph_mode="FULL",
+        aux_hidden_states=hidden_states,
+        req_ids=["causal-00", "other-00"],
+        query_start_loc=[0, 2, 4],
+        num_scheduled_tokens=[2, 2],
+        num_computed_tokens=[0, 0],
+        slot_mappings_by_layer={"layer4": torch.tensor([9, 10, 11, 12])},
+    )
+
+    artifact = torch.load(
+        tmp_path / "trace.inv000000.rank0.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert artifact["schema"] == "ag2-gdn-sequence-causal-packet-v1"
+    assert artifact["selected_request_indices"] == [0]
+    assert artifact["requests"][0]["slot_mappings"]["layer4"] == [9, 10]
+    assert artifact["layers"]["gdn_replay_float.4"].numel() == 20
+    assert artifact["layers"]["gdn_replay_state.4"].numel() == 18
+    assert int(artifact["layers"]["gdn_replay_meta.4"][43]) == 12
+
+
+def test_full_internal_trace_declares_every_dense_qwen_boundary(monkeypatch) -> None:
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_OUTPUT", "/tmp/trace")
+    monkeypatch.setenv(
+        "AG2_VLLM_AUX_HIDDEN_TRACE_LAYERS",
+        ",".join(str(layer) for layer in range(65)),
+    )
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_TOKEN_ID", "198")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_POSITION", "1512")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_ROWS", "1")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_ALL_BOUNDARIES", "1")
+    monkeypatch.setenv(
+        "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_BOUNDARY_MAX_LAYER", "63"
+    )
+    monkeypatch.setenv(
+        "AG2_VLLM_AUX_HIDDEN_TRACE_ALL_INTERNAL_BOUNDARIES", "1"
+    )
+    monkeypatch.setenv(
+        "AG2_VLLM_AUX_HIDDEN_TRACE_REQUEST_PREFIX", "chatcmpl-ag2-fr-v52-"
+    )
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_FINGERPRINT_OUTPUTS", "1")
+
+    trace = AuxHiddenTrace.from_env()
+    trace._layer_types = {
+        layer: "full_attention" if (layer + 1) % 4 == 0 else "linear_attention"
+        for layer in range(64)
+    }
+    labels = trace.output_labels()
+
+    # 580 coarse layer/checkpoint fields + 720 internal fields:
+    # 48 GDN*6 + 16 full-attention*11 + 64 MLP*4. The six large raw DCP/KV
+    # history tensors remain a targeted replay facility; broad tracing keeps
+    # exact DCP local/combined outputs and LSE without changing residency.
+    assert len(labels) == 1300
+    assert "compact_gdn_qkvz.0" in labels
+    assert "compact_full_qkv.3" in labels
+    assert "compact_mlp_down_parallel.63" in labels
+    assert trace.request_prefix == "chatcmpl-ag2-fr-v52-"
+    assert trace.fingerprint_outputs is True
+
+
+def test_full_internal_trace_can_omit_unavailable_canonical_dcp_packs(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_OUTPUT", "/tmp/trace")
+    monkeypatch.setenv(
+        "AG2_VLLM_AUX_HIDDEN_TRACE_LAYERS",
+        ",".join(str(layer) for layer in range(65)),
+    )
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_TOKEN_ID", "1833")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_POSITION", "1343")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_ROWS", "1")
+    monkeypatch.setenv(
+        "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_ALL_BOUNDARIES", "1"
+    )
+    monkeypatch.setenv(
+        "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_BOUNDARY_MAX_LAYER", "63"
+    )
+    monkeypatch.setenv(
+        "AG2_VLLM_AUX_HIDDEN_TRACE_ALL_INTERNAL_BOUNDARIES", "1"
+    )
+    monkeypatch.setenv(
+        "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_FULL_ATTENTION_STAGES",
+        "qkv,q,k,v,gate,core,gated,output_parallel,output",
+    )
+
+    trace = AuxHiddenTrace.from_env()
+    trace._layer_types = {
+        layer: "full_attention" if (layer + 1) % 4 == 0 else "linear_attention"
+        for layer in range(64)
+    }
+    labels = trace.output_labels()
+
+    assert len(labels) == 1268
+    assert "compact_full_core.3" in labels
+    assert not any("dcp_output_pack" in label for label in labels)
+    assert not any("dcp_lse_pack" in label for label in labels)
+
+
+def test_compact_full_attention_stage_selection_rejects_invalid_sets(
+    monkeypatch,
+) -> None:
+    base = {
+        "AG2_VLLM_AUX_HIDDEN_TRACE_OUTPUT": "/tmp/trace",
+        "AG2_VLLM_AUX_HIDDEN_TRACE_LAYERS": "0,1",
+        "AG2_VLLM_AUX_HIDDEN_TRACE_TOKEN_ID": "1833",
+        "AG2_VLLM_AUX_HIDDEN_TRACE_POSITION": "1343",
+    }
+    for stages, message in (
+        ("qkv,unknown", "Unknown compact"),
+        ("qkv,dcp_output_pack", "must be requested together"),
+    ):
+        for key, value in base.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setenv(
+            "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_FULL_ATTENTION_STAGES",
+            stages,
+        )
+        with pytest.raises(ValueError, match=message):
+            AuxHiddenTrace.from_env()
+
+
+def test_selected_internal_trace_covers_early_layers_without_full_model_capture(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_OUTPUT", "/tmp/trace")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_LAYERS", "0,1,2,3,4,5")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_TOKEN_ID", "1833")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_POSITION", "1343")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_ROWS", "1")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_ALL_BOUNDARIES", "1")
+    monkeypatch.setenv(
+        "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_BOUNDARY_MAX_LAYER", "4"
+    )
+    monkeypatch.setenv(
+        "AG2_VLLM_AUX_HIDDEN_TRACE_INTERNAL_BOUNDARY_LAYERS", "0,1,2,3,4"
+    )
+
+    trace = AuxHiddenTrace.from_env()
+    trace._layer_types = {
+        layer: "full_attention" if layer == 3 else "linear_attention"
+        for layer in range(5)
+    }
+    labels = trace.output_labels()
+
+    # 49 coarse checkpoint/boundary fields, 5*4 MLP fields, four GDN
+    # layers*6 fields and one full-attention layer*11 fields.
+    assert len(labels) == 104
+    assert trace.internal_boundary_layers == (0, 1, 2, 3, 4)
+    assert "compact_gdn_qkvz.0" in labels
+    assert "compact_full_dcp_lse_pack.3" in labels
+    assert "compact_mlp_output.4" in labels
+    assert "compact_mlp_output.5" not in labels
+
+
+def test_selected_internal_trace_rejects_layer_without_following_checkpoint(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_OUTPUT", "/tmp/trace")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_LAYERS", "0,1,2,3,4,5")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_TOKEN_ID", "1833")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_POSITION", "1343")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_ROWS", "1")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_ALL_BOUNDARIES", "1")
+    monkeypatch.setenv(
+        "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_BOUNDARY_MAX_LAYER", "4"
+    )
+    monkeypatch.setenv(
+        "AG2_VLLM_AUX_HIDDEN_TRACE_INTERNAL_BOUNDARY_LAYERS", "5"
+    )
+
+    with pytest.raises(ValueError, match="following auxiliary checkpoint"):
+        AuxHiddenTrace.from_env()
+
+
 def test_compact_checkpoint_trace_rejects_internal_boundaries(monkeypatch) -> None:
     monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_OUTPUT", "/tmp/trace")
     monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_LAYERS", "3,4")

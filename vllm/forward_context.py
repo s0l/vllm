@@ -175,6 +175,11 @@ class ForwardContext:
     # same physical shape as K0/K2 decode.
     tp3_sd_phase_reduce: bool = False
 
+    # Explicit ownership by the MTP draft model. The speculator uses a
+    # separate graph manager, so this value is static for every one of its
+    # captures and cannot alias an equal-shaped target-model graph.
+    tp3_mtp_device_ce: bool = False
+
     ubatch_slices: UBatchSlices | None = None
 
     # Boolean mask over the token axis: True for padding rows that are not real
@@ -249,6 +254,7 @@ def create_forward_context(
     is_padding: torch.Tensor | None = None,
     num_tokens_unpadded: int | None = None,
     tp3_sd_phase_reduce: bool = False,
+    tp3_mtp_device_ce: bool = False,
     marlin_request_layout_cpu: torch.Tensor | None = None,
 ):
     if vllm_config.compilation_config.fast_moe_cold_start:
@@ -275,6 +281,7 @@ def create_forward_context(
             and vllm_config.additional_config.get("tp3_ce_reduce", False)
         ),
         tp3_sd_phase_reduce=tp3_sd_phase_reduce,
+        tp3_mtp_device_ce=tp3_mtp_device_ce,
     )
 
 
@@ -307,6 +314,7 @@ def set_forward_context(
     is_padding: torch.Tensor | None = None,
     num_tokens_unpadded: int | None = None,
     tp3_sd_phase_reduce: bool = False,
+    tp3_mtp_device_ce: bool = False,
     marlin_request_layout_cpu: torch.Tensor | None = None,
 ):
     """A context manager that stores the current forward context,
@@ -379,6 +387,7 @@ def set_forward_context(
         is_padding=is_padding,
         num_tokens_unpadded=num_tokens_unpadded,
         tp3_sd_phase_reduce=tp3_sd_phase_reduce,
+        tp3_mtp_device_ce=tp3_mtp_device_ce,
         marlin_request_layout_cpu=marlin_request_layout_cpu,
     )
 

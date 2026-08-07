@@ -74,6 +74,13 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+def _nonnegative_env_int(name: str, default: int = 0) -> int:
+    value = int(os.environ.get(name, str(default)))
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return value
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -332,6 +339,21 @@ class Scheduler(SchedulerInterface):
                 self.max_num_running_reqs,
             ),
         )
+        self.long_prefill_cap_min_prompt_tokens = _nonnegative_env_int(
+            "AG2_VLLM_LONG_PREFILL_CAP_MIN_PROMPT_TOKENS"
+        )
+        if self.long_prefill_cap_min_prompt_tokens > 0:
+            if self.scheduler_config.long_prefill_token_threshold <= 0:
+                raise ValueError(
+                    "AG2_VLLM_LONG_PREFILL_CAP_MIN_PROMPT_TOKENS requires "
+                    "long_prefill_token_threshold > 0"
+                )
+            logger.info(
+                "Long-prefill cap eligibility POC enabled: min_prompt_tokens=%d, "
+                "chunk_cap=%d",
+                self.long_prefill_cap_min_prompt_tokens,
+                self.scheduler_config.long_prefill_token_threshold,
+            )
         self.prefill_admission_delay_s = max(
             0.0,
             float(os.environ.get("AG2_VLLM_PREFILL_ADMISSION_DELAY_MS", "0")) / 1000.0,
@@ -356,12 +378,15 @@ class Scheduler(SchedulerInterface):
         self.canonical_prefill_admission = (
             os.environ.get("AG2_VLLM_CANONICAL_PREFILL_ADMISSION", "0") == "1"
         )
-        self.num_canonical_prefill_deferrals_since_last_stats = 0
         if self.canonical_prefill_admission:
-            logger.info(
-                "Canonical waiting-prefill admission POC enabled: residual "
-                "token budget cannot introduce an extra aligned split."
+            raise ValueError(
+                "AG2_VLLM_CANONICAL_PREFILL_ADMISSION is retired: with K3, "
+                "decode consumes 4 tokens from a 4096-token scheduler budget, "
+                "so the 4096-token canonical waiting-prefill requirement "
+                "serializes long-prefill workloads at x1. Fix shape-dependent "
+                "math or routing without suppressing valid concurrency."
             )
+        self.num_canonical_prefill_deferrals_since_last_stats = 0
         self.kv_tail_handoff_enabled = (
             os.environ.get("AG2_VLLM_KV_TAIL_HANDOFF", "0") == "1"
         )
@@ -585,7 +610,7 @@ class Scheduler(SchedulerInterface):
         # allow sub-block progress and re-align at the next reachable boundary.
         if end < last_cache_position:
             max_prefill_tokens = self.max_num_scheduled_tokens
-            long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
+            long_prefill_threshold = self._long_prefill_chunk_cap(request)
             if long_prefill_threshold > 0:
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
             aligned_end = end // block_size * block_size
@@ -690,6 +715,18 @@ class Scheduler(SchedulerInterface):
         ):
             return prefill_chunk_cap
         return num_new_tokens
+
+    def _long_prefill_chunk_cap(self, request: Request) -> int:
+        """Return the cap only for prompts in the configured long domain."""
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if threshold <= 0:
+            return 0
+        if (
+            self.long_prefill_cap_min_prompt_tokens > 0
+            and request.num_prompt_tokens < self.long_prefill_cap_min_prompt_tokens
+        ):
+            return 0
+        return threshold
 
     def _should_delay_waiting_prefill_admission(self) -> bool:
         """Briefly wait for an initial burst without delaying it indefinitely."""
@@ -826,8 +863,9 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = self._cap_prefill_chunk(
                 request, num_new_tokens, prefill_chunk_cap
             )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            long_prefill_chunk_cap = self._long_prefill_chunk_cap(request)
+            if 0 < long_prefill_chunk_cap < num_new_tokens:
+                num_new_tokens = long_prefill_chunk_cap
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
@@ -1246,7 +1284,7 @@ class Scheduler(SchedulerInterface):
                             break
                         pad_spec_decode = True
 
-                    threshold = self.scheduler_config.long_prefill_token_threshold
+                    threshold = self._long_prefill_chunk_cap(request)
                     num_new_tokens = self._cap_prefill_chunk(
                         request, num_new_tokens, prefill_chunk_cap
                     )

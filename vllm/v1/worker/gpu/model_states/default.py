@@ -169,6 +169,23 @@ class DefaultModelState(ModelState):
                 mm_features=self.encoder_cache.mm_features,
                 sliding_window=self.model_config.get_sliding_window(),
             )
+        request_ids: tuple[str | None, ...] = tuple(input_batch.req_ids)
+        if num_reqs > input_batch.num_reqs:
+            request_ids += (None,) * (num_reqs - input_batch.num_reqs)
+        num_scheduled_tokens_cpu = torch.zeros(num_reqs, dtype=torch.int32)
+        num_scheduled_tokens_cpu[: input_batch.num_reqs] = torch.from_numpy(
+            input_batch.num_scheduled_tokens
+        )
+        num_computed_tokens_provenance_cpu = torch.zeros(
+            num_reqs, dtype=torch.int32
+        )
+        num_computed_tokens_provenance_cpu[: input_batch.num_reqs] = torch.from_numpy(
+            input_batch.num_computed_tokens_np
+        )
+        num_prompt_tokens_cpu = torch.zeros(num_reqs, dtype=torch.int32)
+        num_prompt_tokens_cpu[: input_batch.num_reqs] = torch.from_numpy(
+            input_batch.prefill_len_np
+        )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
@@ -185,6 +202,12 @@ class DefaultModelState(ModelState):
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             positions=input_batch.positions,
             is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
+            request_ids=request_ids,
+            num_scheduled_tokens_cpu=num_scheduled_tokens_cpu,
+            num_computed_tokens_provenance_cpu=(
+                num_computed_tokens_provenance_cpu
+            ),
+            num_prompt_tokens_cpu=num_prompt_tokens_cpu,
             mm_req_doc_ranges=req_doc_ranges,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,

@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 import torch
 
-_SCHEMA = "ag2-rejection-capture-v1"
+_SCHEMA = "ag2-rejection-capture-v2"
 
 
 class Ag2RejectionCapture:
@@ -90,6 +90,8 @@ class Ag2RejectionCapture:
         seeds: torch.Tensor,
         use_fp64: bool,
         use_block_verification: bool,
+        sampling_stages: dict[str, torch.Tensor] | None = None,
+        sampling_state: dict[str, Any] | None = None,
     ) -> None:
         if rank != 0 or self.records_written >= self.max_records:
             return
@@ -127,6 +129,8 @@ class Ag2RejectionCapture:
             "seeds": seeds.detach().cpu(),
             "use_fp64": use_fp64,
             "use_block_verification": use_block_verification,
+            "sampling_stages": sampling_stages,
+            "sampling_state": sampling_state,
         }
         path = Path(f"{self.output}.rank{rank}.record{self.records_written:04d}.pt")
         tmp = path.with_suffix(path.suffix + ".tmp")
@@ -134,3 +138,9 @@ class Ag2RejectionCapture:
         tmp.replace(path)
         self.records_written += 1
 
+    def should_capture(self, *, rank: int, positions: torch.Tensor) -> bool:
+        if rank != 0 or self.records_written >= self.max_records:
+            return False
+        return bool(
+            ((positions >= self.pos_min) & (positions <= self.pos_max)).any().item()
+        )

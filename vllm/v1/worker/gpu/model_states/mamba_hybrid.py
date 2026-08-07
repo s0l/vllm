@@ -351,6 +351,23 @@ class MambaHybridModelState(DefaultModelState):
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
         )
+        request_ids: tuple[str | None, ...] = tuple(input_batch.req_ids)
+        if num_reqs > input_batch.num_reqs:
+            request_ids += (None,) * (num_reqs - input_batch.num_reqs)
+        num_scheduled_tokens_cpu = torch.zeros(num_reqs, dtype=torch.int32)
+        num_scheduled_tokens_cpu[: input_batch.num_reqs] = torch.from_numpy(
+            input_batch.num_scheduled_tokens
+        )
+        num_computed_tokens_provenance_cpu = torch.zeros(
+            num_reqs, dtype=torch.int32
+        )
+        num_computed_tokens_provenance_cpu[: input_batch.num_reqs] = torch.from_numpy(
+            input_batch.num_computed_tokens_np
+        )
+        num_prompt_tokens_cpu = torch.zeros(num_reqs, dtype=torch.int32)
+        num_prompt_tokens_cpu[: input_batch.num_reqs] = torch.from_numpy(
+            input_batch.prefill_len_np
+        )
         return build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
@@ -365,6 +382,12 @@ class MambaHybridModelState(DefaultModelState):
             kv_cache_config=kv_cache_config,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
+            request_ids=request_ids,
+            num_scheduled_tokens_cpu=num_scheduled_tokens_cpu,
+            num_computed_tokens_provenance_cpu=(
+                num_computed_tokens_provenance_cpu
+            ),
+            num_prompt_tokens_cpu=num_prompt_tokens_cpu,
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,

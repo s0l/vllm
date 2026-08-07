@@ -128,6 +128,7 @@ _tp3_ce_large_shapes_logged: set[tuple[int, bool]] = set()
 _tp3_ce_first_known_dispatch_logged = False
 _tp3_ce_first_active_dispatch_logged = False
 _tp3_piecewise_device_ce_logged = False
+_tp3_mtp_device_ce_logged = False
 _tp3_prefill_canonical_logged = False
 _tp3_embedding_nccl_logged = False
 
@@ -173,6 +174,7 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     global _tp3_ce_first_context_logged
     global _tp3_ce_first_known_dispatch_logged
     global _tp3_piecewise_device_ce_logged
+    global _tp3_mtp_device_ce_logged
     global _tp3_prefill_canonical_logged
 
     assert group_name in _groups, f"Group {group_name} is not found."
@@ -192,6 +194,32 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
         if forward_context is not None
         else None
     )
+    if (
+        os.environ.get("AG2_VLLM_MTP_DEVICE_CE", "0") == "1"
+        and _should_use_tp3_mtp_device_ce(
+            explicit_mtp_lane=(
+                forward_context is not None
+                and forward_context.tp3_mtp_device_ce
+            ),
+            tensor_dim=tensor.dim(),
+            rows=tensor.shape[0] if tensor.dim() == 2 else 0,
+            hidden_size=tensor.shape[-1] if tensor.dim() else 0,
+            tp_world_size=group.world_size,
+        )
+    ):
+        if not _tp3_mtp_device_ce_logged:
+            logger.warning(
+                "MTP-owned TP3 device compressed all-reduce active: "
+                "shape=%s cudagraph_mode=%s packed_one_gather=%s",
+                tuple(tensor.shape),
+                cudagraph_mode,
+                os.environ.get(
+                    "AG2_VLLM_TP3_PIECEWISE_DEVICE_CE_PACKED", "0"
+                )
+                == "1",
+            )
+            _tp3_mtp_device_ce_logged = True
+        return _tp3_device_ce_reduce(tensor, group)
     if (
         os.environ.get("AG2_VLLM_TP3_PIECEWISE_DEVICE_CE", "0") == "1"
         and _should_use_tp3_piecewise_device_ce(
@@ -404,6 +432,24 @@ def _should_use_tp3_piecewise_device_ce(
     )
     return (
         selected_shape
+        and tensor_dim == 2
+        and rows > 0
+        and hidden_size == 5120
+        and tp_world_size == 3
+    )
+
+
+def _should_use_tp3_mtp_device_ce(
+    *,
+    explicit_mtp_lane: bool,
+    tensor_dim: int,
+    rows: int,
+    hidden_size: int,
+    tp_world_size: int,
+) -> bool:
+    """Select per-row device CE only for an explicitly owned MTP forward."""
+    return (
+        explicit_mtp_lane
         and tensor_dim == 2
         and rows > 0
         and hidden_size == 5120

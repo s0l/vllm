@@ -113,9 +113,9 @@ def main() -> None:
             beta=beta[:, split:],
             initial_state=first_state,
         )
-        # Production defaults mamba_ssm_cache_dtype=auto to the BF16 model
-        # dtype.  The FLA kernel returns FP32 final state, but the cache write
-        # rounds it to BF16 before a later chunk gathers it again.
+        # Counterfactual low-precision cache handoff.  Cache dtype is
+        # model-specific: Qwen3.5 declares mamba_ssm_dtype=float32, and vLLM's
+        # auto policy preserves FP32 for that model rather than using this lane.
         cached_first_state = first_state.to(dtype)
         cached_second_output, cached_resumed_state = _run(
             q=q[:, split:],

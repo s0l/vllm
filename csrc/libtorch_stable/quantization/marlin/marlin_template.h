@@ -393,7 +393,9 @@ __global__ void Marlin(
       // floating-point reduction tree when unrelated M rows are packed.
       // Prefill already exposes enough MN tiles to occupy the device, so give
       // each block a complete K slice and allow excess blocks in the final
-      // round to remain idle.  Decode retains the original split-K path.
+      // round to remain idle.  Every caller that requires shape-invariant
+      // arithmetic must retain this complete-K route for every physical M;
+      // M-tile geometry is an independent performance choice.
       if (part2_mn_tiles == 0) part2_mn_tiles = gridDim.x;
     } else if (part2_mn_tiles * 3 <= gridDim.x) {
       part2_mn_tiles += gridDim.x;

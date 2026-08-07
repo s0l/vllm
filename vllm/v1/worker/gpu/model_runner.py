@@ -131,6 +131,7 @@ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
+from vllm.v1.worker.gpu.target_boundary_capture import TargetBoundaryCapture
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import (
     KVBlockZeroer,
@@ -176,6 +177,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.is_encoder_decoder = self.model_config.is_encoder_decoder
 
         self.output_copy_stream = torch.cuda.Stream(self.device)
+        self.target_boundary_capture = TargetBoundaryCapture.from_env()
 
         # Pipeline parallelism.
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -277,7 +279,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
         )
         self.marlin_gate_up_scratch: torch.Tensor | None = None
-        if envs.AG2_VLLM_NVFP4_MARLIN_GATE_UP_SCRATCH:
+        if (
+            envs.AG2_VLLM_NVFP4_MARLIN_GATE_UP_SCRATCH
+            or envs.AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH
+        ):
             # Qwen3.5/3.6 TP3 gate+up physical width: 2 * 5824.  Allocate the
             # largest destination before model/KV profiling so its ownership
             # and HBM cost are explicit instead of depending on runtime
@@ -322,6 +327,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 set_nvfp4_marlin_gate_up_scratch,
             )
 
+            # The historical accessor is also the early, model-runner-owned
+            # workspace handoff to MTP.  DCP prefill needs that lifetime even
+            # when the selected target linear backend is not Marlin.
             set_nvfp4_marlin_gate_up_scratch(self.marlin_gate_up_scratch)
             if envs.AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH:
                 from vllm.v1.attention.backends.flashinfer import (
@@ -1338,6 +1346,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
+        slot_mappings_by_layer: dict[str, torch.Tensor] | None = None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         if self.speculator is not None and hasattr(
@@ -1346,18 +1355,47 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.speculator.capture_target_lm_head_inputs(
                 sample_hidden_states, input_batch
             )
-        logits = self.model.compute_logits(sample_hidden_states)
-        if grammar_output is not None:
-            # Apply grammar bitmask to the logits in-place.
-            assert self.structured_outputs_worker is not None
-            self.structured_outputs_worker.apply_grammar_bitmask(
-                logits,
-                input_batch,
-                grammar_output.structured_output_request_ids,
-                grammar_output.grammar_bitmask,
+        use_sparse_target_topk = (
+            input_batch.num_draft_tokens > 0
+            and self.rejection_sampler is not None
+            and grammar_output is None
+            and self.target_boundary_capture is None
+            and hasattr(self.model, "compute_local_logits")
+            and self.rejection_sampler.can_use_sparse_target_topk(input_batch)
+        )
+        if use_sparse_target_topk:
+            local_logits, vocab_start = self.model.compute_local_logits(
+                sample_hidden_states
             )
+            assert self.speculator is not None
+            sampler_output = self.rejection_sampler.sample_sparse_target_topk(
+                local_logits,
+                vocab_start,
+                input_batch,
+                self.speculator.draft_logits,
+            )
+        else:
+            logits = self.model.compute_logits(sample_hidden_states)
+            if self.target_boundary_capture is not None:
+                self.target_boundary_capture.capture(
+                    sample_hidden_states,
+                    logits,
+                    input_batch,
+                    slot_mappings_by_layer,
+                )
+            if grammar_output is not None:
+                # Apply grammar bitmask to the logits in-place.
+                assert self.structured_outputs_worker is not None
+                self.structured_outputs_worker.apply_grammar_bitmask(
+                    logits,
+                    input_batch,
+                    grammar_output.structured_output_request_ids,
+                    grammar_output.grammar_bitmask,
+                )
 
-        if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
+        if use_sparse_target_topk:
+            pass
+        elif input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
             assert self.sampler is not None
             sampler_output = self.sampler(logits, input_batch)
         else:
@@ -1706,6 +1744,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         model_output = self.model(**model_inputs)
 
         if not dummy_run:
+            save_projection_calibration = getattr(
+                self.model, "maybe_save_ag2_projection_calibration", None
+            )
+            if save_projection_calibration is not None:
+                save_projection_calibration(
+                    input_batch=input_batch,
+                    query_len=scheduler_output.total_num_scheduled_tokens,
+                    cudagraph_mode=batch_desc.cg_mode.name,
+                )
             save_layer0_trace = getattr(self.model, "maybe_save_ag2_layer0_trace", None)
             if save_layer0_trace is not None:
                 save_layer0_trace(
@@ -1720,6 +1767,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 assert isinstance(model_output, tuple)
                 hidden_states, aux_hidden_states = model_output
                 if self.aux_hidden_trace.enabled:
+                    released_raw_refs = self.aux_hidden_trace.release_raw_model_refs(
+                        self.model
+                    )
+                    if dummy_run and released_raw_refs:
+                        logger.info_once(
+                            "Released %d raw auxiliary trace references before "
+                            "MTP proposer lifecycle",
+                            released_raw_refs,
+                            scope="local",
+                        )
                     if not dummy_run:
                         self.aux_hidden_trace.maybe_save(
                             input_ids=input_batch.input_ids,
@@ -1838,7 +1895,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         with record_function_or_nullcontext("ag2.target_sample_or_reject"):
             sampler_output, num_sampled, num_rejected = self.sample(
-                hidden_states, input_batch, grammar_output
+                hidden_states,
+                input_batch,
+                grammar_output,
+                slot_mappings_by_layer,
             )
 
         if self.pp_handler is not None:

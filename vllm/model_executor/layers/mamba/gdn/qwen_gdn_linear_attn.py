@@ -580,7 +580,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             activation=output_gate_type,
             device=current_platform.current_device(),
         )
-        self._ag2_aux_boundaries_enabled = (
+        sequence_boundary_layers = {
+            int(value)
+            for value in os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_SEQUENCE_BOUNDARY_LAYERS",
+                "",
+            ).split(",")
+            if value
+        }
+        sequence_boundary_enabled = any(
+            prefix.endswith(f".layers.{layer}.linear_attn")
+            for layer in sequence_boundary_layers
+        )
+        first_gdn_boundary_enabled = (
             os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_GDN_BOUNDARIES", "0")
             == "1"
             and prefix.endswith(
@@ -592,7 +604,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 + ".linear_attn"
             )
         )
-        self._ag2_aux_replay_enabled = self._ag2_aux_boundaries_enabled or (
+        self._ag2_aux_boundaries_enabled = (
+            first_gdn_boundary_enabled or sequence_boundary_enabled
+        )
+        # Sequence fingerprinting must not allocate the large raw replay
+        # buffers.  Raw replay remains an explicitly selected follow-up after
+        # the bounded packet has localized one operator.
+        self._ag2_aux_replay_enabled = first_gdn_boundary_enabled or (
             os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_GDN_REPLAY_ONLY", "0")
             == "1"
             and prefix.endswith(
@@ -604,14 +622,23 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 + ".linear_attn"
             )
         )
-        self._ag2_aux_compact_boundaries_enabled = prefix.endswith(
-            ".layers."
-            + os.environ.get(
-                "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_GDN_BOUNDARY_LAYER",
-                "-1",
+        self._ag2_aux_compact_boundaries_enabled = (
+            os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_ALL_INTERNAL_BOUNDARIES",
+                "0",
             )
-            + ".linear_attn"
+            == "1"
+            or prefix.endswith(
+                ".layers."
+                + os.environ.get(
+                    "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_GDN_BOUNDARY_LAYER",
+                    "-1",
+                )
+                + ".linear_attn"
+            )
         )
+        self._ag2_replay_conv_offset = 0
+        self._ag2_replay_conv_capacity = 0
         if self._ag2_aux_replay_enabled:
             per_token_elements = (
                 2 * self.local_key_dim
@@ -624,6 +651,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 * self.head_v_dim
                 * self.head_k_dim
             )
+            conv_elements = (
+                _AG2_GDN_REPLAY_MAX_SEQS
+                * self.padded_local_conv_dim
+                * (self.conv_kernel_size - 1 + self.num_spec)
+            )
+            self._ag2_replay_conv_offset = 4 * state_elements
+            self._ag2_replay_conv_capacity = 2 * conv_elements
             self.register_buffer(
                 "_ag2_replay_float_buffer",
                 torch.zeros(
@@ -636,7 +670,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.register_buffer(
                 "_ag2_replay_state_buffer",
                 torch.zeros(
-                    4 * state_elements,
+                    self._ag2_replay_conv_offset
+                    + self._ag2_replay_conv_capacity,
                     dtype=torch.float32,
                     device=current_platform.current_device(),
                 ),
@@ -841,6 +876,27 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+
+    def ag2_enable_compact_trace(self) -> None:
+        """Enable every producer needed by the compact GDN trace."""
+        self._ag2_aux_compact_boundaries_enabled = True
+        self.out_proj._ag2_aux_output_parallel_enabled = True
+
+    def ag2_enable_projection_calibration_capture(
+        self, capacity: int, dtype: torch.dtype
+    ) -> None:
+        if capacity < 1:
+            raise ValueError("projection capture capacity must be positive")
+        self._ag2_projection_capture_enabled = True
+        self.register_buffer(
+            "_ag2_projection_capture_gated_norm",
+            torch.full(
+                (capacity, self.padded_local_value_dim),
+                torch.nan,
+                dtype=dtype,
+            ),
+            persistent=False,
+        )
 
     def _record_mtp_replay_journal(
         self,
@@ -1296,6 +1352,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         core_attn_out = self._pad_local_value_flat(core_attn_out)
+        if getattr(self, "_ag2_projection_capture_enabled", False):
+            selected = _ag2_compact_select_rows(
+                core_attn_out,
+                self._ag2_projection_capture_row_indices,
+            )
+            self._ag2_projection_capture_gated_norm.copy_(selected)
         if self._ag2_aux_boundaries_enabled:
             self._ag2_aux_gated_norm = core_attn_out
         if self._ag2_aux_compact_boundaries_enabled:
@@ -1781,7 +1843,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         chunk_indices: torch.Tensor,
         chunk_offsets: torch.Tensor,
         prefill_state_indices: torch.Tensor,
+        prefill_has_initial_state: torch.Tensor,
         pre_decode_state_length: int,
+        conv_state_initial: torch.Tensor | None,
+        conv_state_final: torch.Tensor | None,
+        conv_state_offset: int,
+        conv_state_capacity: int,
         replay_float_out: torch.Tensor | None,
         replay_state_out: torch.Tensor | None,
         replay_meta_out: torch.Tensor | None,
@@ -1798,7 +1865,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         - [8:28]: q/k/v/g/beta shapes, four dimensions each
         - [28:32]: initial-state shape
         - [32:36]: cu/chunk-index/chunk-offset lengths and chunk-index columns
-        - [64...]: concatenated integer addressing metadata
+        - [42:49]: conv-state length/offset/shape and initial-state-mask length
+        - [64...]: concatenated integer addressing metadata and state mask
         """
         if (
             replay_float_out is None
@@ -1812,11 +1880,27 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         float_required = sum(lengths)
         state_required = initial_state.numel()
         state_index_required = prefill_state_indices.numel()
+        state_mask_required = prefill_has_initial_state.numel()
+        conv_state_required = (
+            int(conv_state_initial.numel()) if conv_state_initial is not None else 0
+        )
+        conv_state_valid = (
+            (conv_state_initial is None and conv_state_final is None)
+            or (
+                conv_state_initial is not None
+                and conv_state_final is not None
+                and conv_state_initial.shape == conv_state_final.shape
+                and 2 * conv_state_required <= conv_state_capacity
+                and conv_state_offset + 2 * conv_state_required
+                <= replay_state_out.numel()
+            )
+        )
         integer_required = (
             cu_seqlens.numel()
             + chunk_indices.numel()
             + chunk_offsets.numel()
             + state_index_required
+            + state_mask_required
         )
         fits_float = (
             q.shape[1] <= _AG2_GDN_REPLAY_MAX_TOKENS
@@ -1825,6 +1909,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         fits_state_meta = (
             3 * state_required + pre_decode_state_length <= replay_state_out.numel()
             and 64 + integer_required <= replay_meta_out.numel()
+            and conv_state_valid
         )
         replay_meta_out.fill_(-1)
         # A long packed prefill can exceed the deliberately small q/k/v
@@ -1846,6 +1931,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 )
                 offset += length
         replay_state_out[:state_required].copy_(initial_state.reshape(-1).float())
+        if conv_state_required:
+            assert conv_state_initial is not None
+            assert conv_state_final is not None
+            replay_state_out[
+                conv_state_offset : conv_state_offset + conv_state_required
+            ].copy_(conv_state_initial.reshape(-1).float())
+            replay_state_out[
+                conv_state_offset
+                + conv_state_required : conv_state_offset
+                + 2 * conv_state_required
+            ].copy_(conv_state_final.reshape(-1).float())
 
         replay_meta_out[1:8].copy_(
             torch.tensor(
@@ -1911,12 +2007,30 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 device=replay_meta_out.device,
             )
         )
+        conv_shape = (
+            (*conv_state_initial.shape, 1, 1, 1, 1)[:4]
+            if conv_state_initial is not None
+            else (0, 0, 0, 0)
+        )
+        replay_meta_out[42:49].copy_(
+            torch.tensor(
+                (
+                    conv_state_required,
+                    conv_state_offset,
+                    *conv_shape,
+                    state_mask_required,
+                ),
+                dtype=torch.int64,
+                device=replay_meta_out.device,
+            )
+        )
         integer_offset = 64
         for tensor in (
             cu_seqlens,
             chunk_indices,
             chunk_offsets,
             prefill_state_indices,
+            prefill_has_initial_state,
         ):
             length = tensor.numel()
             replay_meta_out[integer_offset : integer_offset + length].copy_(
@@ -1989,6 +2103,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             if self.gdn_explicit_partition
             else ssm_state
         )
+        replay_conv_state_indices = None
+        replay_conv_initial = None
+        replay_conv_final = None
+        if self._ag2_aux_replay_enabled and attn_metadata.num_prefills > 0:
+            replay_conv_state_indices = attn_metadata.prefill_state_indices
+            assert replay_conv_state_indices is not None
+            replay_conv_initial = conv_state.index_select(
+                0, replay_conv_state_indices.to(dtype=torch.long)
+            )
         if self._ag2_layer0_trace_enabled:
             traced_indices = (
                 spec_state_indices_tensor.reshape(-1)
@@ -2100,6 +2223,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
         else:
             mixed_qkv_non_spec = None
+
+        if replay_conv_state_indices is not None:
+            replay_conv_final = conv_state.index_select(
+                0, replay_conv_state_indices.to(dtype=torch.long)
+            )
 
         # The packed projection input has been consumed by the convolution
         # paths above. Drop this reference before recurrent prefill; the
@@ -2364,7 +2492,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_indices=attn_metadata.chunk_indices,
                 chunk_offsets=attn_metadata.chunk_offsets,
                 prefill_state_indices=prefill_state_indices,
+                prefill_has_initial_state=prefill_has_initial_state,
                 pre_decode_state_length=pre_decode_state_length,
+                conv_state_initial=replay_conv_initial,
+                conv_state_final=replay_conv_final,
+                conv_state_offset=self._ag2_replay_conv_offset,
+                conv_state_capacity=self._ag2_replay_conv_capacity,
                 replay_float_out=replay_float_out,
                 replay_state_out=replay_state_out,
                 replay_meta_out=replay_meta_out,
