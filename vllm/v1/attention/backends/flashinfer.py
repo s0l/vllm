@@ -99,6 +99,20 @@ trtllm_workspace_buffer = None
 _ag2_dcp_prefill_query_scratch: torch.Tensor | None = None
 
 
+def _run_k3_elastic_communication(operation):
+    import sys
+
+    from vllm.v1.worker.gpu.k3_elastic_handoff import (
+        run_k3_elastic_communication,
+    )
+
+    caller = sys._getframe(1)
+    return run_k3_elastic_communication(
+        operation,
+        label=f"flashinfer.py:{caller.f_lineno}",
+    )
+
+
 def get_query_scale_for_flashinfer(
     q_scale: float,
     query_dtype: torch.dtype,
@@ -1541,6 +1555,14 @@ class BatchDCPPrefillWrapper:
             self._local_kv_head_index_tensors[key] = tensor
         return tensor
 
+    def prime_dcp_local_kv_head_indices(
+        self,
+        local_kv_head_indices: list[int] | tuple[int, ...],
+        device: torch.device,
+    ) -> None:
+        """Materialize capture-unsafe DCP index state before graph capture."""
+        self._get_local_kv_head_index_tensor(local_kv_head_indices, device)
+
     def plan(
         self,
         qo_indptr_cpu: torch.Tensor,
@@ -2530,9 +2552,11 @@ class BatchDCPPseudoPrefillWrapper:
         kv_cache_tuple: tuple[torch.Tensor, torch.Tensor],
         out: torch.Tensor,
     ) -> torch.Tensor:
-        query_across_dcp = get_dcp_group().all_gather(
-            query.contiguous(),
-            dim=1,
+        query_across_dcp = _run_k3_elastic_communication(
+            lambda: get_dcp_group().all_gather(
+                query.contiguous(),
+                dim=1,
+            )
         )
         output_tmp, lse = self._paged.run(
             query_across_dcp,
@@ -2547,10 +2571,12 @@ class BatchDCPPseudoPrefillWrapper:
         )
         del query_across_dcp
         out.copy_(
-            self._dcp_combine(
-                output_tmp,
-                lse,
-                get_dcp_group(),
+            _run_k3_elastic_communication(
+                lambda: self._dcp_combine(
+                    output_tmp,
+                    lse,
+                    get_dcp_group(),
+                )
             )
         )
         return out
@@ -2637,9 +2663,11 @@ class BatchDCPBatchedDecodeWrapper:
                 f"batched DCP decode expected {self._num_rows} rows, "
                 f"received {query.shape[0]}"
             )
-        query_across_dcp = get_dcp_group().all_gather(
-            query.contiguous(),
-            dim=1,
+        query_across_dcp = _run_k3_elastic_communication(
+            lambda: get_dcp_group().all_gather(
+                query.contiguous(),
+                dim=1,
+            )
         )
         output_tmp, lse = self._decode.run(
             query_across_dcp,
@@ -2654,10 +2682,12 @@ class BatchDCPBatchedDecodeWrapper:
         )
         del query_across_dcp
         out.copy_(
-            self._dcp_combine(
-                output_tmp,
-                lse,
-                get_dcp_group(),
+            _run_k3_elastic_communication(
+                lambda: self._dcp_combine(
+                    output_tmp,
+                    lse,
+                    get_dcp_group(),
+                )
             )
         )
         return out
@@ -2787,9 +2817,11 @@ class BatchDCPSequentialDecodeWrapper:
             .contiguous()
             .view(expected_rows, *query.shape[1:])
         )
-        query_across_dcp = get_dcp_group().all_gather(
-            phase_major_query,
-            dim=1,
+        query_across_dcp = _run_k3_elastic_communication(
+            lambda: get_dcp_group().all_gather(
+                phase_major_query,
+                dim=1,
+            )
         )
         phase_outputs = []
         phase_lses = []
@@ -2810,10 +2842,12 @@ class BatchDCPSequentialDecodeWrapper:
             phase_outputs.append(output_tmp)
             phase_lses.append(lse_tmp)
         del query_across_dcp
-        phase_major_output = self._dcp_combine(
-            torch.cat(phase_outputs),
-            torch.cat(phase_lses),
-            get_dcp_group(),
+        phase_major_output = _run_k3_elastic_communication(
+            lambda: self._dcp_combine(
+                torch.cat(phase_outputs),
+                torch.cat(phase_lses),
+                get_dcp_group(),
+            )
         )
         out.copy_(
             phase_major_output.view(
@@ -5437,8 +5471,10 @@ class FlashInferImpl(AttentionImpl):
                         match_fp8_new_tokens=False,
                         sm_scale=self.scale,
                     )
-                    decode_query = get_dcp_group().all_gather(
-                        decode_query.contiguous(), dim=-2
+                    decode_query = _run_k3_elastic_communication(
+                        lambda: get_dcp_group().all_gather(
+                            decode_query.contiguous(), dim=-2
+                        )
                     )
                     output_tmp = torch.empty_like(decode_query)
                     lse = torch.empty(
@@ -5483,11 +5519,15 @@ class FlashInferImpl(AttentionImpl):
                         dcp_observer_meta=dcp_observer_meta,
                     )
                     if getattr(layer, "_ag2_dcp_trace_enabled", False):
-                        combined_output, combined_lse = self.dcp_combine(
-                            output_tmp,
-                            lse,
-                            get_dcp_group(),
-                            return_lse=True,
+                        combined_output, combined_lse = (
+                            _run_k3_elastic_communication(
+                                lambda: self.dcp_combine(
+                                    output_tmp,
+                                    lse,
+                                    get_dcp_group(),
+                                    return_lse=True,
+                                )
+                            )
                         )
                         _copy_ag2_dcp_trace(
                             layer, "decode_combined_output", combined_output
@@ -5516,11 +5556,15 @@ class FlashInferImpl(AttentionImpl):
                         output[:num_decode_tokens] = combined_output
                     else:
                         if dcp_output_pack is not None:
-                            combined_output, combined_lse = self.dcp_combine(
-                                output_tmp,
-                                lse,
-                                get_dcp_group(),
-                                return_lse=True,
+                            combined_output, combined_lse = (
+                                _run_k3_elastic_communication(
+                                    lambda: self.dcp_combine(
+                                        output_tmp,
+                                        lse,
+                                        get_dcp_group(),
+                                        return_lse=True,
+                                    )
+                                )
                             )
                             _write_ag2_dcp_aux_pack(
                                 layer,
@@ -5544,10 +5588,14 @@ class FlashInferImpl(AttentionImpl):
                             )
                             output[:num_decode_tokens] = combined_output
                         else:
-                            output[:num_decode_tokens] = self.dcp_combine(
-                                output_tmp,
-                                lse,
-                                get_dcp_group(),
+                            output[:num_decode_tokens] = (
+                                _run_k3_elastic_communication(
+                                    lambda: self.dcp_combine(
+                                        output_tmp,
+                                        lse,
+                                        get_dcp_group(),
+                                    )
+                                )
                             )
                 else:
                     decode_wrapper.run(
@@ -5603,8 +5651,10 @@ class FlashInferImpl(AttentionImpl):
                             "DCP decode with FlashInfer trtllm-gen does not support "
                             "FP4 attention output yet."
                         )
-                    decode_query = get_dcp_group().all_gather(
-                        decode_query.contiguous(), dim=-2
+                    decode_query = _run_k3_elastic_communication(
+                        lambda: get_dcp_group().all_gather(
+                            decode_query.contiguous(), dim=-2
+                        )
                     )
                     decode_query = canonicalize_singleton_dim_strides(decode_query)
 
@@ -5708,11 +5758,15 @@ class FlashInferImpl(AttentionImpl):
                         request_row_stride=decode_query_len_per_req,
                     )
                     if getattr(layer, "_ag2_dcp_trace_enabled", False):
-                        combined_output, combined_lse = self.dcp_combine(
-                            out,
-                            lse,
-                            get_dcp_group(),
-                            return_lse=True,
+                        combined_output, combined_lse = (
+                            _run_k3_elastic_communication(
+                                lambda: self.dcp_combine(
+                                    out,
+                                    lse,
+                                    get_dcp_group(),
+                                    return_lse=True,
+                                )
+                            )
                         )
                         _copy_ag2_dcp_trace(
                             layer, "decode_combined_output", combined_output
@@ -5739,11 +5793,15 @@ class FlashInferImpl(AttentionImpl):
                         output[:num_decode_tokens] = combined_output
                     else:
                         if dcp_output_pack is not None:
-                            combined_output, combined_lse = self.dcp_combine(
-                                out,
-                                lse,
-                                get_dcp_group(),
-                                return_lse=True,
+                            combined_output, combined_lse = (
+                                _run_k3_elastic_communication(
+                                    lambda: self.dcp_combine(
+                                        out,
+                                        lse,
+                                        get_dcp_group(),
+                                        return_lse=True,
+                                    )
+                                )
                             )
                             _write_ag2_dcp_aux_pack(
                                 layer,
@@ -5765,10 +5823,14 @@ class FlashInferImpl(AttentionImpl):
                             )
                             output[:num_decode_tokens] = combined_output
                         else:
-                            output[:num_decode_tokens] = self.dcp_combine(
-                                out,
-                                lse,
-                                get_dcp_group(),
+                            output[:num_decode_tokens] = (
+                                _run_k3_elastic_communication(
+                                    lambda: self.dcp_combine(
+                                        out,
+                                        lse,
+                                        get_dcp_group(),
+                                    )
+                                )
                             )
                 elif needs_fp8_out:
                     output[:num_decode_tokens].copy_(out.to(output.dtype))

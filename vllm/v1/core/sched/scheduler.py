@@ -1722,6 +1722,7 @@ class Scheduler(SchedulerInterface):
             gdn_checkpoint_save=gdn_checkpoint_save or None,
             gdn_checkpoint_restore=gdn_checkpoint_restore or None,
             elastic_kv_transition=elastic_kv_transition,
+            kv_cache_usage=self.kv_cache_manager.usage,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
 

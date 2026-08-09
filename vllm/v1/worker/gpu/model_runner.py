@@ -117,6 +117,10 @@ from vllm.v1.worker.gpu.kv_connector import (
     KVConnector,
     get_kv_connector,
 )
+from vllm.v1.worker.gpu.k3_elastic_runtime import (
+    K3ElasticPreparedStep,
+    K3ElasticRuntime,
+)
 from vllm.v1.worker.gpu.lora_utils import (
     LoraState,
     create_lora_capture_hook,
@@ -189,6 +193,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.output_copy_stream = torch.cuda.Stream(self.device)
         self.target_boundary_capture = TargetBoundaryCapture.from_env()
+        self.k3_elastic_runtime = (
+            K3ElasticRuntime(
+                envs.AG2_VLLM_K3_ELASTIC_GRAPH_PLAN,
+                vllm_config,
+                device,
+            )
+            if envs.AG2_VLLM_K3_ELASTIC_GRAPH_PLAN
+            else None
+        )
 
         # Pipeline parallelism.
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -1633,6 +1646,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 block_tables = None
                 slot_mappings = None
 
+        k3_elastic_prepared: K3ElasticPreparedStep | None = None
         attn_metadata = None
         slot_mappings_by_layer = None
         if not (dummy_run and skip_attn_for_dummy_run):
@@ -1644,19 +1658,42 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             with record_function_or_nullcontext(
                 "ag2.target_prepare_attention_metadata"
             ):
-                attn_metadata = self.model_state.prepare_attn(
-                    input_batch,
-                    batch_desc.cg_mode,
-                    block_tables,
-                    slot_mappings,
-                    self.attn_groups,
-                    self.kv_cache_config,
-                    # FULL replay reads capture-time metadata buffers. Re-stage them
-                    # from zeroed dummy block tables instead of retaining state
-                    # indices from the previous real batch.
-                    for_capture=dummy_run
-                    and batch_desc.cg_mode == CUDAGraphMode.FULL,
+                selection = (
+                    None
+                    if dummy_run or self.k3_elastic_runtime is None
+                    else self.k3_elastic_runtime.select(
+                        scheduler_output,
+                        input_batch,
+                        batch_desc,
+                        self.decode_query_len,
+                    )
                 )
+                if selection is None:
+                    attn_metadata = self.model_state.prepare_attn(
+                        input_batch,
+                        batch_desc.cg_mode,
+                        block_tables,
+                        slot_mappings,
+                        self.attn_groups,
+                        self.kv_cache_config,
+                        # FULL replay reads capture-time metadata buffers. Re-stage
+                        # them from zeroed dummy block tables instead of retaining
+                        # state indices from the previous real batch.
+                        for_capture=dummy_run
+                        and batch_desc.cg_mode == CUDAGraphMode.FULL,
+                    )
+                else:
+                    plan, slices = selection
+                    k3_elastic_prepared = self.k3_elastic_runtime.prepare(
+                        plan,
+                        slices,
+                        input_batch,
+                        block_tables,
+                        slot_mappings,
+                        self.model_state,
+                        self.attn_groups,
+                        self.kv_cache_config,
+                    )
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
@@ -1733,7 +1770,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
         # Run model.
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
+        if k3_elastic_prepared is not None:
+            assert self.k3_elastic_runtime is not None
+            self.kv_connector.pre_forward(scheduler_output)
+            with record_function_or_nullcontext("ag2.target_forward.k3_elastic"):
+                model_output = self.k3_elastic_runtime.run(
+                    k3_elastic_prepared,
+                    self.model,
+                    model_inputs,
+                    input_batch,
+                )
+        elif batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.

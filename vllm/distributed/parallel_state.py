@@ -462,6 +462,21 @@ def _tp3_device_ce_reduce(
     group: "GroupCoordinator",
 ) -> torch.Tensor:
     """Compress per row, all-gather exact payloads, then sum in fixed order."""
+    from vllm.v1.worker.gpu.k3_elastic_handoff import (
+        run_k3_elastic_communication,
+    )
+
+    return run_k3_elastic_communication(
+        lambda: _tp3_device_ce_reduce_impl(tensor, group),
+        label="parallel_state.py:tp3_device_ce_reduce",
+    )
+
+
+def _tp3_device_ce_reduce_impl(
+    tensor: torch.Tensor,
+    group: "GroupCoordinator",
+) -> torch.Tensor:
+    """Run one TP3 compressed reduction on the current CUDA stream."""
     from .device_communicators.tp3_ce_all_reduce import (
         _dequant_sum_i8_block,
         _quantize_i8_block,

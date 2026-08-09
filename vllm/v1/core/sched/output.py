@@ -282,6 +282,9 @@ class SchedulerOutput:
     # Physical mapped-prefix sizes for (attention, GDN) stable-VA arenas.
     elastic_kv_transition: tuple[int, int] | None = None
 
+    # Scheduler-owned KV pressure at the exact admission boundary for this step.
+    kv_cache_usage: float = 0.0
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
