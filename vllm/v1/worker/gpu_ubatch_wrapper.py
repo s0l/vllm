@@ -117,15 +117,21 @@ class UBatchWrapper:
         vllm_config: VllmConfig,
         runtime_mode: CUDAGraphMode,
         device: torch.cuda.device,
+        num_ubatches_override: int | None = None,
     ):
         self.runnable = runnable
         self.vllm_config = vllm_config
         self.compilation_config = vllm_config.compilation_config
         self.comm_stream = torch.cuda.Stream(device=device)
-        # Ubatch threads plus the main thread
-        self.ready_barrier = threading.Barrier(
-            self.vllm_config.parallel_config.num_ubatches + 1
+        self.num_ubatches = (
+            vllm_config.parallel_config.num_ubatches
+            if num_ubatches_override is None
+            else num_ubatches_override
         )
+        if self.num_ubatches < 2:
+            raise ValueError("UBatchWrapper requires at least two microbatches")
+        # Ubatch threads plus the main thread.
+        self.ready_barrier = threading.Barrier(self.num_ubatches + 1)
 
         self.cudagraphs: dict[int, CUDAGraphMetaData] = {}
 
@@ -304,17 +310,27 @@ class UBatchWrapper:
 
     def _run_ubatches(self, ubatch_metadata, model) -> torch.Tensor:
         @torch.inference_mode()
-        def _ubatch_thread(results, model, ubatch_metadata):
-            with ubatch_metadata.context:
-                model_output = model(
-                    input_ids=ubatch_metadata.input_ids,
-                    positions=ubatch_metadata.positions,
-                    intermediate_tensors=ubatch_metadata.intermediate_tensors,
-                    inputs_embeds=ubatch_metadata.inputs_embeds,
-                )
-            results.append((ubatch_metadata.context.id, model_output))
+        def _ubatch_thread(results, errors, model, metadata):
+            try:
+                with metadata.context:
+                    model_output = model(
+                        input_ids=metadata.input_ids,
+                        positions=metadata.positions,
+                        intermediate_tensors=metadata.intermediate_tensors,
+                        inputs_embeds=metadata.inputs_embeds,
+                    )
+                results.append((metadata.context.id, model_output))
+            except BaseException as exc:
+                errors.append(exc)
+                # A peer can be asleep at a yield point when this wave fails.
+                # Wake every CPU waiter and break a not-yet-complete startup
+                # barrier so the worker fails closed instead of hanging.
+                for peer in ubatch_metadata:
+                    peer.context.cpu_wait_event.set()
+                self.ready_barrier.abort()
 
         results: list[tuple[int, torch.Tensor]] = []
+        errors: list[BaseException] = []
 
         # Ubatch threads will manually manage the forward context, so we
         # override it to None here so we can have it restored correctly
@@ -326,16 +342,31 @@ class UBatchWrapper:
                     target=_ubatch_thread,
                     args=(
                         results,
+                        errors,
                         model,
                         metadata,
                     ),
+                    daemon=True,
                 )
                 ubatch_threads.append(thread)
                 thread.start()
-            self.ready_barrier.wait()  # Wait for all ubatch threads to be ready
+            try:
+                self.ready_barrier.wait(timeout=30)
+            except threading.BrokenBarrierError as exc:
+                if errors:
+                    raise errors[0]
+                raise RuntimeError("microbatch startup barrier failed") from exc
             ubatch_metadata[0].context.cpu_wait_event.set()
             for thread in ubatch_threads:
-                thread.join()
+                thread.join(timeout=30)
+            if errors:
+                raise errors[0]
+            if any(thread.is_alive() for thread in ubatch_threads):
+                for metadata in ubatch_metadata:
+                    metadata.context.cpu_wait_event.set()
+                raise RuntimeError("microbatch conveyor failed to make progress")
+            if len(results) != len(ubatch_metadata):
+                raise RuntimeError("microbatch conveyor returned incomplete output")
         sorted_results = [value for position, value in sorted(results)]
         result = _cat_ubatch_outputs(sorted_results)
         return result
@@ -368,6 +399,9 @@ class UBatchWrapper:
                     batch_descriptor=batch_descriptor,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     slot_mapping=slot_mapping[i] if has_slot_mapping else None,
+                    additional_kwargs={
+                        "ag2_ubatch_request_offset": ubatch_slice.request_slice.start,
+                    },
                 )
             )
 
@@ -474,21 +508,27 @@ class UBatchWrapper:
 
         dp_metadata = forward_context.dp_metadata
 
-        # We shouldn't be here unless we are running with multiple DP ranks
-        assert dp_metadata is not None
-        ubatch_dp_metadata = []
-        for ubatch_slice in ubatch_slices:
-            dp_size = self.vllm_config.parallel_config.data_parallel_size
-            ubatch_num_tokens_across_dp = torch.tensor(
-                [ubatch_slice.num_tokens] * dp_size, device="cpu", dtype=torch.int32
-            )
-            ubatch_dp_metadata.append(
-                DPMetadata.make(
-                    self.vllm_config.parallel_config,
-                    ubatch_slice.num_tokens,
-                    ubatch_num_tokens_across_dp,
+        ubatch_dp_metadata: list[DPMetadata | None] = []
+        if dp_metadata is None:
+            # Dense TP-only conveyor: no DP padding or EP metadata exists.
+            # Preserve None in each independent forward context rather than
+            # manufacturing a DP contract that downstream code does not use.
+            ubatch_dp_metadata = [None] * len(ubatch_slices)
+        else:
+            for ubatch_slice in ubatch_slices:
+                dp_size = self.vllm_config.parallel_config.data_parallel_size
+                ubatch_num_tokens_across_dp = torch.tensor(
+                    [ubatch_slice.num_tokens] * dp_size,
+                    device="cpu",
+                    dtype=torch.int32,
                 )
-            )
+                ubatch_dp_metadata.append(
+                    DPMetadata.make(
+                        self.vllm_config.parallel_config,
+                        ubatch_slice.num_tokens,
+                        ubatch_num_tokens_across_dp,
+                    )
+                )
 
         if (
             num_tokens not in self.cudagraphs

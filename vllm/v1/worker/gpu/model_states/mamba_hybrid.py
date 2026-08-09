@@ -144,6 +144,7 @@ class MambaHybridModelState(DefaultModelState):
                 "gdn_mtp_replay_commit is enabled but no compatible GDN layers exist"
             )
         self._gdn_mtp_replay_num_reqs = 0
+        self._gdn_mtp_replay_conveyor_step = False
         self._gdn_mtp_replay_accepted = torch.empty(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
@@ -166,6 +167,21 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
+
+    def begin_mtp_replay_step(self, conveyor: bool) -> None:
+        """Select monolithic or per-wave journal ownership for this step."""
+        if not self._gdn_mtp_replay_commit:
+            return
+        self._gdn_mtp_replay_conveyor_step = conveyor
+        for layer in self._gdn_mtp_replay_layers:
+            layer._ag2_mtp_journal_conveyor_step = conveyor
+            if not conveyor:
+                continue
+            if layer._ag2_mtp_journal_banks == 1:
+                layer._ag2_mtp_journal_num_reqs = 0
+            else:
+                for bank in range(layer._ag2_mtp_journal_banks):
+                    layer._ag2_mtp_journal_num_reqs[bank] = 0
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -296,6 +312,7 @@ class MambaHybridModelState(DefaultModelState):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
+        metadata_builder_idx: int = 0,
     ) -> dict[str, Any]:
         if cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs = input_batch.num_reqs_after_padding
@@ -391,6 +408,7 @@ class MambaHybridModelState(DefaultModelState):
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
+            metadata_builder_idx=metadata_builder_idx,
         )
 
     def postprocess_state(
@@ -431,23 +449,68 @@ class MambaHybridModelState(DefaultModelState):
                 if self._separate_mamba_pool:
                     if self._gdn_mtp_replay_commit:
                         # Sampling has chosen the accepted prefix. Advance every
-                        # FP32 recurrent state first, then shift the extended
-                        # convolution window, and reset acceptance only after
-                        # both parts of the logical commit are enqueued.
+                        # FP32 recurrent state bank first, then shift the
+                        # extended convolution window. The conveyor journals
+                        # two request-disjoint waves; their batch indices are
+                        # globalized at capture time, so acceptance is gathered
+                        # from the original full batch without reordering.
                         first_layer = self._gdn_mtp_replay_layers[0]
-                        replay_accepted = gather_gdn_replay_acceptance(
-                            first_layer._ag2_mtp_journal_batch_indices,
-                            idx_mapping,
-                            self.num_accepted_tokens_gpu,
-                            first_layer._ag2_mtp_journal_query_start,
-                            self._gdn_mtp_replay_accepted,
-                            self._gdn_mtp_replay_num_reqs,
-                        )
-                        for layer in self._gdn_mtp_replay_layers:
-                            layer.commit_mtp_replay_journal(
-                                replay_accepted,
+                        if (
+                            first_layer._ag2_mtp_journal_banks == 1
+                            or not self._gdn_mtp_replay_conveyor_step
+                        ):
+                            journal_batch_indices = (
+                                first_layer._ag2_mtp_journal_batch_indices
+                                if first_layer._ag2_mtp_journal_banks == 1
+                                else first_layer._ag2_mtp_journal_batch_indices[0]
+                            )
+                            journal_query_start = (
+                                first_layer._ag2_mtp_journal_query_start
+                                if first_layer._ag2_mtp_journal_banks == 1
+                                else first_layer._ag2_mtp_journal_query_start[0]
+                            )
+                            replay_accepted = gather_gdn_replay_acceptance(
+                                journal_batch_indices,
+                                idx_mapping,
+                                self.num_accepted_tokens_gpu,
+                                journal_query_start,
+                                self._gdn_mtp_replay_accepted,
                                 self._gdn_mtp_replay_num_reqs,
                             )
+                            for layer in self._gdn_mtp_replay_layers:
+                                layer.commit_mtp_replay_journal(
+                                    replay_accepted,
+                                    self._gdn_mtp_replay_num_reqs,
+                                    bank=0,
+                                )
+                        else:
+                            for bank, replay_num_reqs in enumerate(
+                                first_layer._ag2_mtp_journal_num_reqs
+                            ):
+                                if replay_num_reqs == 0:
+                                    continue
+                                replay_accepted = gather_gdn_replay_acceptance(
+                                    first_layer._ag2_mtp_journal_batch_indices[bank],
+                                    idx_mapping,
+                                    self.num_accepted_tokens_gpu,
+                                    first_layer._ag2_mtp_journal_query_start[bank],
+                                    self._gdn_mtp_replay_accepted,
+                                    replay_num_reqs,
+                                )
+                                for layer in self._gdn_mtp_replay_layers:
+                                    if (
+                                        layer._ag2_mtp_journal_num_reqs[bank]
+                                        != replay_num_reqs
+                                    ):
+                                        raise RuntimeError(
+                                            "GDN conveyor replay journal row count "
+                                            f"diverged at bank {bank}"
+                                        )
+                                    layer.commit_mtp_replay_journal(
+                                        replay_accepted,
+                                        replay_num_reqs,
+                                        bank=bank,
+                                    )
                     self._mamba_ctx.run_fused_postprocess_separate(
                         num_reqs,
                         self.num_accepted_tokens_gpu,
@@ -455,6 +518,7 @@ class MambaHybridModelState(DefaultModelState):
                         conv_only=self._gdn_mtp_replay_commit,
                     )
                     self._gdn_mtp_replay_num_reqs = 0
+                    self._gdn_mtp_replay_conveyor_step = False
                 else:
                     self._mamba_ctx.run_fused_postprocess_align(
                         num_reqs,

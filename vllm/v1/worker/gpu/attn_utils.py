@@ -7,6 +7,7 @@ from typing import Any, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import (
     VllmConfig,
     get_layers_from_vllm_config,
@@ -153,19 +154,21 @@ def init_attn_backend(
         if kv_cache_group_id < len(kernel_block_sizes):
             kernel_block_size = kernel_block_sizes[kv_cache_group_id]
         for group in groups:
+            num_metadata_builders = 2 if envs.AG2_VLLM_TP3_CONVEYOR else 1
             group.create_metadata_builders(
                 vllm_config=vllm_config,
                 device=device,
                 kernel_block_size=kernel_block_size,
-                num_metadata_builders=1,
+                num_metadata_builders=num_metadata_builders,
             )
-            builder = group.get_metadata_builder(0)
-            if attn_backend_workspace is None:
-                if hasattr(builder, "_get_workspace_buffer"):
-                    attn_backend_workspace = builder._get_workspace_buffer()
-            else:
-                if hasattr(builder, "set_workspace_buffer"):
+            for builder_idx in range(num_metadata_builders):
+                builder = group.get_metadata_builder(builder_idx)
+                if attn_backend_workspace is None:
+                    if hasattr(builder, "_get_workspace_buffer"):
+                        attn_backend_workspace = builder._get_workspace_buffer()
+                elif hasattr(builder, "set_workspace_buffer"):
                     builder.set_workspace_buffer(attn_backend_workspace)
+            builder = group.get_metadata_builder(0)
             # Check cudagraph support for the attention backend
             cg_support = builder.get_cudagraph_support(
                 vllm_config,
@@ -178,6 +181,33 @@ def init_attn_backend(
     attn_cg_support_info = AttentionCGSupportInfo(
         min_cg_support=min_cg_support, min_cg_attn_backend=min_cg_attn_backend
     )
+    if envs.AG2_VLLM_TP3_CONVEYOR:
+        builders = [
+            group.get_metadata_builder(idx)
+            for groups in attn_groups
+            for group in groups
+            for idx in range(2)
+        ]
+        if any(
+            len(group.metadata_builders) != 2
+            for groups in attn_groups
+            for group in groups
+        ):
+            raise RuntimeError("TP3 conveyor requires two attention metadata builders")
+        workspace_owners = {
+            id(builder._workspace_buffer)
+            for builder in builders
+            if hasattr(builder, "_workspace_buffer")
+            and builder._workspace_buffer is not None
+        }
+        if len(workspace_owners) > 1:
+            raise RuntimeError("TP3 conveyor attention builders did not share workspace")
+        logger.warning(
+            "AG2 TP3 conveyor attention ownership initialized: builders_per_group=2 "
+            "groups=%d shared_workspace=%s",
+            sum(len(groups) for groups in attn_groups),
+            len(workspace_owners) == 1,
+        )
     return attn_groups, attn_cg_support_info, kernel_block_sizes
 
 
@@ -597,6 +627,7 @@ def build_attn_metadata(
     for_cudagraph_capture: bool = False,
     causal: bool | torch.Tensor | Mapping[int, bool] = True,
     rswa_prefix_lens: torch.Tensor | None = None,
+    metadata_builder_idx: int = 0,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -649,7 +680,9 @@ def build_attn_metadata(
         )
 
         for attn_group in attn_groups[i]:
-            attn_metadata_builder = attn_group.get_metadata_builder(0)
+            attn_metadata_builder = attn_group.get_metadata_builder(
+                metadata_builder_idx
+            )
             if for_cudagraph_capture:
                 metadata = attn_metadata_builder.build_for_cudagraph_capture(
                     common_attn_metadata

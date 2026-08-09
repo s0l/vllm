@@ -461,6 +461,27 @@ def _tp3_device_ce_reduce(
     tensor: torch.Tensor,
     group: "GroupCoordinator",
 ) -> torch.Tensor:
+    """Run device CE, yielding its stream-owned phase under the TP conveyor."""
+    if os.environ.get("AG2_VLLM_TP3_CONVEYOR", "0") == "1":
+        from vllm.v1.worker.ubatching import (
+            dbo_enabled,
+            dbo_yield_and_switch_from_comm_to_compute,
+            dbo_yield_and_switch_from_compute_to_comm,
+        )
+
+        if dbo_enabled():
+            dbo_yield_and_switch_from_compute_to_comm()
+            try:
+                return _tp3_device_ce_reduce_impl(tensor, group)
+            finally:
+                dbo_yield_and_switch_from_comm_to_compute()
+    return _tp3_device_ce_reduce_impl(tensor, group)
+
+
+def _tp3_device_ce_reduce_impl(
+    tensor: torch.Tensor,
+    group: "GroupCoordinator",
+) -> torch.Tensor:
     """Compress per row, all-gather exact payloads, then sum in fixed order."""
     from .device_communicators.tp3_ce_all_reduce import (
         _dequant_sum_i8_block,

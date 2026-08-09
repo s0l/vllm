@@ -3929,10 +3929,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 raise ValueError(
                     "AG2_VLLM_MTP_DCP_BATCHED_WORKSPACE_MIB must be positive"
                 )
-            self._dcp_batched_decode_workspace = torch.zeros(
-                self._dcp_batched_workspace_mib * 1024 * 1024,
-                dtype=torch.uint8,
-                device=self.device,
+            self._dcp_batched_decode_workspace = (
+                self._get_workspace_buffer()
+                if envs.AG2_VLLM_TP3_CONVEYOR
+                else torch.zeros(
+                    self._dcp_batched_workspace_mib * 1024 * 1024,
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
             )
             self._dcp_batched_decode_wrapper = BatchDCPBatchedDecodeWrapper(
                 workspace_buffer=self._dcp_batched_decode_workspace,

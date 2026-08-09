@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     VLLM_BATCH_INVARIANT: bool = False
     AG2_VLLM_NVFP4_BATCH_INVARIANT: bool = False
     AG2_VLLM_NVFP4_B12X: bool = False
+    AG2_VLLM_TP3_CONVEYOR: bool = False
     AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE: bool = False
     AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL: bool = False
     AG2_VLLM_NVFP4_MARLIN_WHOLE_SLICE_PREFILL: bool = False
@@ -629,6 +630,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "AG2_VLLM_NVFP4_B12X": lambda: bool(
         int(os.getenv("AG2_VLLM_NVFP4_B12X", "0"))
+    ),
+    "AG2_VLLM_TP3_CONVEYOR": lambda: bool(
+        int(os.getenv("AG2_VLLM_TP3_CONVEYOR", "0"))
     ),
     "AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE": lambda: bool(
         int(os.getenv("AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE", "0"))

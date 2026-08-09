@@ -760,7 +760,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 raise ValueError("gdn_mtp_replay_commit requires speculative decoding")
             max_reqs = vllm_config.scheduler_config.max_num_seqs
             max_window = self.num_spec + 1
-            max_tokens = max_reqs * max_window
+            self._ag2_mtp_journal_banks = (
+                2
+                if os.environ.get("AG2_VLLM_TP3_CONVEYOR", "0") == "1"
+                else 1
+            )
+            self._ag2_mtp_journal_num_reqs = (
+                [0, 0] if self._ag2_mtp_journal_banks == 2 else 0
+            )
+            # Keep the original full-size allocation.  Conveyor decode views
+            # it as two disjoint halves, while monolithic/mixed steps retain
+            # the full request capacity.  A leading bank dimension would make
+            # the monolithic path incorrectly inherit half capacity.
+            self._ag2_mtp_journal_conveyor_step = False
+            wave_reqs = (max_reqs + 1) // 2
+            journal_reqs = max(max_reqs, 2 * wave_reqs)
+            max_tokens = journal_reqs * max_window
             activation_dtype = vllm_config.model_config.dtype
             self.register_buffer(
                 "_ag2_mtp_journal_k",
@@ -794,17 +809,26 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 )
             self.register_buffer(
                 "_ag2_mtp_journal_query_start",
-                torch.empty(max_reqs + 1, dtype=torch.int32),
+                torch.empty(
+                    max(max_reqs + 1, 2 * (wave_reqs + 1)),
+                    dtype=torch.int32,
+                ),
                 persistent=False,
             )
             self.register_buffer(
                 "_ag2_mtp_journal_state_ids",
-                torch.empty(max_reqs, dtype=torch.int32),
+                torch.empty(
+                    journal_reqs,
+                    dtype=torch.int32,
+                ),
                 persistent=False,
             )
             self.register_buffer(
                 "_ag2_mtp_journal_batch_indices",
-                torch.empty(max_reqs, dtype=torch.int32),
+                torch.empty(
+                    journal_reqs,
+                    dtype=torch.int32,
+                ),
                 persistent=False,
             )
         if self._ag2_layer0_trace_enabled:
@@ -911,6 +935,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         attn_metadata: GDNAttentionMetadata,
     ) -> None:
         """Capture raw recurrence inputs while leaving live FP32 state frozen."""
+        from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+        journal_banks = getattr(self, "_ag2_mtp_journal_banks", 1)
+        bank = dbo_current_ubatch_id()
+        if bank >= journal_banks:
+            raise RuntimeError(
+                f"GDN replay journal bank {bank} exceeds configured "
+                f"banks={journal_banks}"
+            )
+        request_offset = 0
+        if journal_banks > 1:
+            from vllm.forward_context import get_forward_context
+
+            request_offset = int(
+                get_forward_context().additional_kwargs.get(
+                    "ag2_ubatch_request_offset", 0
+                )
+            )
         num_reqs = attn_metadata.num_spec_decodes
         query_start = attn_metadata.spec_query_start_loc
         state_ids = attn_metadata.spec_state_indices_tensor
@@ -919,47 +961,84 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert query_start is not None
         assert state_ids is not None
         assert batch_indices is not None
+        def journal(tensor: torch.Tensor, *, query_start: bool = False) -> torch.Tensor:
+            if journal_banks == 1 or not self._ag2_mtp_journal_conveyor_step:
+                return tensor
+            half = tensor.shape[0] // 2
+            start = bank * half
+            return tensor[start : start + half]
+
         num_tokens = key.shape[1]
-        self._ag2_mtp_journal_k[:num_tokens].copy_(key.squeeze(0))
-        self._ag2_mtp_journal_v[:num_tokens].copy_(value.squeeze(0))
+        if num_reqs + 1 > journal(
+            self._ag2_mtp_journal_query_start, query_start=True
+        ).shape[0]:
+            raise RuntimeError(
+                f"GDN replay journal bank {bank} cannot hold {num_reqs} rows"
+            )
+        if num_tokens > journal(self._ag2_mtp_journal_k).shape[0]:
+            raise RuntimeError(
+                f"GDN replay journal bank {bank} cannot hold {num_tokens} tokens"
+            )
+        journal(self._ag2_mtp_journal_k)[:num_tokens].copy_(key.squeeze(0))
+        journal(self._ag2_mtp_journal_v)[:num_tokens].copy_(value.squeeze(0))
         # Match the exact rows consumed by the current recurrent verifier.
-        self._ag2_mtp_journal_a[:num_tokens].copy_(
+        journal(self._ag2_mtp_journal_a)[:num_tokens].copy_(
             a[:num_tokens, : self.local_num_v_heads]
         )
-        self._ag2_mtp_journal_b[:num_tokens].copy_(
+        journal(self._ag2_mtp_journal_b)[:num_tokens].copy_(
             b[:num_tokens, : self.local_num_v_heads]
         )
-        self._ag2_mtp_journal_query_start[: num_reqs + 1].copy_(
+        journal(
+            self._ag2_mtp_journal_query_start, query_start=True
+        )[: num_reqs + 1].copy_(
             query_start[: num_reqs + 1]
         )
-        self._ag2_mtp_journal_state_ids[:num_reqs].copy_(state_ids[:num_reqs, 0])
-        self._ag2_mtp_journal_batch_indices[:num_reqs].copy_(
-            batch_indices[:num_reqs]
+        journal(self._ag2_mtp_journal_state_ids)[:num_reqs].copy_(
+            state_ids[:num_reqs, 0]
         )
+        journal(self._ag2_mtp_journal_batch_indices)[:num_reqs].copy_(
+            batch_indices[:num_reqs] + request_offset
+        )
+        if journal_banks == 1:
+            self._ag2_mtp_journal_num_reqs = num_reqs
+        else:
+            self._ag2_mtp_journal_num_reqs[bank] = num_reqs
 
     def commit_mtp_replay_journal(
         self,
         accepted: torch.Tensor,
         num_reqs: int,
+        bank: int = 0,
     ) -> None:
         """Replay exactly the accepted raw-input prefix into the live state."""
         if not self._ag2_mtp_replay_commit:
             return
         if num_reqs == 0:
             return
-        source_cu = self._ag2_mtp_journal_query_start[: num_reqs + 1]
-        replay_ids = self._ag2_mtp_journal_state_ids[:num_reqs, None].expand(
-            -1, self.num_spec + 1
-        )
-        journal_k = self._ag2_mtp_journal_k.unsqueeze(0)
+        journal_banks = getattr(self, "_ag2_mtp_journal_banks", 1)
+
+        def journal(tensor: torch.Tensor, *, query_start: bool = False) -> torch.Tensor:
+            if journal_banks == 1 or not self._ag2_mtp_journal_conveyor_step:
+                return tensor
+            half = tensor.shape[0] // 2
+            start = bank * half
+            return tensor[start : start + half]
+
+        source_cu = journal(
+            self._ag2_mtp_journal_query_start, query_start=True
+        )[: num_reqs + 1]
+        replay_ids = journal(self._ag2_mtp_journal_state_ids)[
+            :num_reqs, None
+        ].expand(-1, self.num_spec + 1)
+        journal_k = journal(self._ag2_mtp_journal_k).unsqueeze(0)
         fused_sigmoid_gating_delta_rule_update(
             A_log=self.A_log[: self.local_num_v_heads],
-            a=self._ag2_mtp_journal_a,
-            b=self._ag2_mtp_journal_b,
+            a=journal(self._ag2_mtp_journal_a),
+            b=journal(self._ag2_mtp_journal_b),
             dt_bias=self.dt_bias[: self.local_num_v_heads],
             q=journal_k,
             k=journal_k,
-            v=self._ag2_mtp_journal_v.unsqueeze(0),
+            v=journal(self._ag2_mtp_journal_v).unsqueeze(0),
             initial_state=self.kv_cache[1],
             inplace_final_state=True,
             store_output=False,

@@ -138,6 +138,11 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.tp3_conveyor import (
+    make_tp3_decode_conveyor_slices,
+    slice_input_batch,
+)
+from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
@@ -520,6 +525,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Finalize offloaded storage only after model weights and any
         # post-loading transformations are complete.
         get_offloader().post_init()
+
+        if envs.AG2_VLLM_TP3_CONVEYOR:
+            parallel_config = self.vllm_config.parallel_config
+            if (
+                parallel_config.tensor_parallel_size != 3
+                or parallel_config.decode_context_parallel_size != 3
+                or parallel_config.pipeline_parallel_size != 1
+                or parallel_config.data_parallel_size != 1
+                or self.num_speculative_steps != 3
+            ):
+                raise ValueError(
+                    "AG2 TP3 conveyor requires TP3/DCP3/PP1/DP1, two "
+                    "microbatches and K3"
+                )
+            if not getattr(self.model_state, "_gdn_mtp_replay_commit", False):
+                raise ValueError(
+                    "AG2 TP3 conveyor requires transactional GDN MTP replay"
+                )
+            self.model = UBatchWrapper(
+                self.model,
+                self.vllm_config,
+                CUDAGraphMode.NONE,
+                self.device,
+                num_ubatches_override=2,
+            )
+            logger.warning(
+                "AG2 TP3 decode conveyor initialized for MRV2; mixed/prefill "
+                "and <=M128 steps retain the monolithic path"
+            )
 
     def get_model(self) -> nn.Module:
         return self.model
@@ -1635,6 +1669,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         attn_metadata = None
         slot_mappings_by_layer = None
+        forward_attn_metadata = None
+        forward_slot_mappings_by_layer = None
+        conveyor_slices = None
         if not (dummy_run and skip_attn_for_dummy_run):
             assert slot_mappings is not None
             slot_mappings_by_layer = build_slot_mappings_by_layer(
@@ -1657,6 +1694,54 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     for_capture=dummy_run
                     and batch_desc.cg_mode == CUDAGraphMode.FULL,
                 )
+            forward_attn_metadata = attn_metadata
+            forward_slot_mappings_by_layer = slot_mappings_by_layer
+
+            if not dummy_run and envs.AG2_VLLM_TP3_CONVEYOR:
+                conveyor_slices = make_tp3_decode_conveyor_slices(
+                    input_batch,
+                    batch_desc,
+                    self.decode_query_len,
+                )
+                if conveyor_slices is not None:
+                    wave_attn_metadata = []
+                    wave_slot_mappings = []
+                    for wave_idx, wave in enumerate(conveyor_slices):
+                        wave_input_batch = slice_input_batch(input_batch, wave)
+                        wave_block_tables = tuple(
+                            table[wave.request_slice] for table in block_tables
+                        )
+                        wave_slot_mapping = slot_mappings[:, wave.token_slice]
+                        wave_slot_mappings.append(
+                            build_slot_mappings_by_layer(
+                                wave_slot_mapping,
+                                self.kv_cache_config,
+                            )
+                        )
+                        wave_attn_metadata.append(
+                            self.model_state.prepare_attn(
+                                wave_input_batch,
+                                CUDAGraphMode.NONE,
+                                wave_block_tables,
+                                wave_slot_mapping,
+                                self.attn_groups,
+                                self.kv_cache_config,
+                                metadata_builder_idx=wave_idx,
+                            )
+                        )
+                    forward_attn_metadata = wave_attn_metadata
+                    forward_slot_mappings_by_layer = wave_slot_mappings
+                    logger.warning_once(
+                        "AG2 TP3 decode conveyor runtime path active: "
+                        "requests=%d rows=%d waves=%s",
+                        input_batch.num_reqs,
+                        input_batch.num_tokens,
+                        tuple(wave.num_tokens for wave in conveyor_slices),
+                        scope="local",
+                    )
+
+        if not dummy_run and envs.AG2_VLLM_TP3_CONVEYOR:
+            self.model_state.begin_mtp_replay_step(conveyor_slices is not None)
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
@@ -1775,13 +1860,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
             with set_forward_context(
-                attn_metadata,
+                forward_attn_metadata,
                 self.vllm_config,
                 num_tokens=input_batch.num_tokens_after_padding,
                 cudagraph_runtime_mode=batch_desc.cg_mode,
                 num_tokens_across_dp=num_tokens_across_dp,
                 batch_descriptor=batch_descriptor,
-                slot_mapping=slot_mappings_by_layer,
+                ubatch_slices=conveyor_slices,
+                slot_mapping=forward_slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
                 num_tokens_unpadded=input_batch.num_tokens,
@@ -1897,6 +1983,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             routed_experts = capturer.get_routed_experts(slot_mappings, num_toks)
 
         finished_req_ids = scheduler_output.finished_req_ids
+        if conveyor_slices is not None:
+            # Wave-local FlashInfer plans live in separate metadata builders.
+            # Restore builder 0 to the full-batch plan consumed by the MTP
+            # proposer after the target forward has joined both waves.
+            assert block_tables is not None and slot_mappings is not None
+            attn_metadata = self.model_state.prepare_attn(
+                input_batch,
+                batch_desc.cg_mode,
+                block_tables,
+                slot_mappings,
+                self.attn_groups,
+                self.kv_cache_config,
+                metadata_builder_idx=0,
+            )
         gdn_checkpoint_keys = (
             self.gdn_checkpoint_manager.save(
                 scheduler_output,
