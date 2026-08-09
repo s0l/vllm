@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_DCP_NATIVE_RS_MAX_ROWS: int = 0
     VLLM_TP3_CE_REDUCE: bool = False
+    AG2_VLLM_K3_ELASTIC_GRAPH_PLAN: str = ""
     VLLM_TP3_SD_CANONICAL_REDUCE: bool = False
     VLLM_TP3_SD_DETERMINISTIC_REDUCE: bool = False
     VLLM_TP3_SD_PHASE_REDUCE: bool = False
@@ -907,6 +908,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("VLLM_DCP_NATIVE_RS_MAX_ROWS", "0")
     ),
     "VLLM_TP3_CE_REDUCE": lambda: os.environ.get("VLLM_TP3_CE_REDUCE", "0") == "1",
+    "AG2_VLLM_K3_ELASTIC_GRAPH_PLAN": lambda: os.environ.get(
+        "AG2_VLLM_K3_ELASTIC_GRAPH_PLAN", ""
+    ),
     "VLLM_TP3_SD_CANONICAL_REDUCE": lambda: os.environ.get(
         "VLLM_TP3_SD_CANONICAL_REDUCE", "0"
     )

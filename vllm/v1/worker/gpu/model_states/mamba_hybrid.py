@@ -144,6 +144,7 @@ class MambaHybridModelState(DefaultModelState):
                 "gdn_mtp_replay_commit is enabled but no compatible GDN layers exist"
             )
         self._gdn_mtp_replay_num_reqs = 0
+        self._gdn_mtp_replay_joined_step = False
         self._gdn_mtp_replay_accepted = torch.empty(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
@@ -166,6 +167,14 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
+
+    def begin_joined_mtp_replay_step(self, num_reqs: int) -> None:
+        if not self._gdn_mtp_replay_commit:
+            raise RuntimeError("joined GDN replay requires replay-commit mode")
+        if num_reqs <= 0 or num_reqs > self.max_num_reqs:
+            raise ValueError("joined GDN replay request count is invalid")
+        self._gdn_mtp_replay_num_reqs = num_reqs
+        self._gdn_mtp_replay_joined_step = True
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -296,6 +305,7 @@ class MambaHybridModelState(DefaultModelState):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
+        metadata_builder_idx: int = 0,
     ) -> dict[str, Any]:
         if cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs = input_batch.num_reqs_after_padding
@@ -391,6 +401,7 @@ class MambaHybridModelState(DefaultModelState):
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
+            metadata_builder_idx=metadata_builder_idx,
         )
 
     def postprocess_state(
@@ -455,6 +466,7 @@ class MambaHybridModelState(DefaultModelState):
                         conv_only=self._gdn_mtp_replay_commit,
                     )
                     self._gdn_mtp_replay_num_reqs = 0
+                    self._gdn_mtp_replay_joined_step = False
                 else:
                     self._mamba_ctx.run_fused_postprocess_align(
                         num_reqs,

@@ -25,6 +25,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.head_partition import (
@@ -1861,6 +1862,66 @@ class Qwen3NextDecoderLayer(nn.Module):
             return hidden_states, residual, mtp_trace
         return hidden_states, residual
 
+    def ag2_dataflow_attention_stage(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Trace-free attention half used by a registered K3 graph plan."""
+        unsupported = (
+            self.use_attn_reduce_scatter_for_moe
+            or self._ag2_projection_capture_enabled
+            or self._ag2_aux_all_internal_boundaries
+            or self._ag2_aux_sequence_boundary_enabled
+            or self._ag2_aux_compact_boundary_enabled
+            or self._ag2_aux_gdn_boundaries_enabled
+            or self._ag2_aux_compact_gdn_boundaries_enabled
+            or self._ag2_aux_attention_boundary_enabled
+            or getattr(self, "_ag2_layer0_trace_enabled", False)
+        )
+        if unsupported:
+            raise RuntimeError(
+                "K3 dataflow attention does not support active trace/MoE state"
+            )
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        if self.layer_type == "linear_attention":
+            hidden_states = self.linear_attn(hidden_states=hidden_states)
+        elif self.layer_type == "full_attention":
+            hidden_states = self.self_attn(
+                hidden_states=hidden_states,
+                positions=positions,
+            )
+        else:
+            raise RuntimeError(f"unsupported K3 layer type: {self.layer_type}")
+        if self.layer_scale:
+            scale = self.attn_layer_scale.to(hidden_states.dtype)
+            hidden_states = hidden_states * (
+                scale[0] + 1 if hidden_states.ndim == 2 else scale + 1
+            )
+        return hidden_states, residual
+
+    def ag2_dataflow_mlp_stage(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Trace-free MLP half used by a registered K3 graph plan."""
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual
+        )
+        hidden_states = self.mlp(hidden_states)
+        if self.layer_scale:
+            scale = self.ffn_layer_scale.to(hidden_states.dtype)
+            hidden_states = hidden_states * (
+                scale[0] + 1 if hidden_states.ndim == 2 else scale + 1
+            )
+        return hidden_states, residual
+
 
 def _all_gather_hidden_and_residual(
     hidden_states: torch.Tensor,
@@ -1882,6 +1943,9 @@ def _all_gather_hidden_and_residual(
 
 @support_torch_compile
 class Qwen3NextModel(nn.Module, EagleModelMixin):
+    # Runtime identity marker used by the default-off K3 dataflow capture.
+    # Avoid importing this model class from the generic GPU runner.
+    ag2_dataflow_marker = True
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
             # weight_name: (param_name, shard_id)
@@ -2083,6 +2147,18 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        if is_forward_context_available():
+            execution = get_forward_context().additional_kwargs.get(
+                "k3_dataflow_execution"
+            )
+            if execution is not None:
+                return execution.run_core(
+                    self,
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                )
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds

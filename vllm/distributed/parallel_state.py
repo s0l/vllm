@@ -462,6 +462,20 @@ def _tp3_device_ce_reduce(
     group: "GroupCoordinator",
 ) -> torch.Tensor:
     """Compress per row, all-gather exact payloads, then sum in fixed order."""
+    from vllm.v1.worker.gpu.k3_dataflow_lane import (
+        run_k3_dataflow_communication,
+    )
+
+    return run_k3_dataflow_communication(
+        lambda: _tp3_device_ce_reduce_impl(tensor, group)
+    )
+
+
+def _tp3_device_ce_reduce_impl(
+    tensor: torch.Tensor,
+    group: "GroupCoordinator",
+) -> torch.Tensor:
+    """Run one TP3 compressed reduction on the selected CUDA stream."""
     from .device_communicators.tp3_ce_all_reduce import (
         _dequant_sum_i8_block,
         _quantize_i8_block,

@@ -911,6 +911,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         attn_metadata: GDNAttentionMetadata,
     ) -> None:
         """Capture raw recurrence inputs while leaving live FP32 state frozen."""
+        from vllm.forward_context import get_forward_context
+
+        forward_context = get_forward_context()
+        elastic_plan = forward_context.additional_kwargs.get(
+            "k3_elastic_graph_plan"
+        )
+        request_offset = int(
+            forward_context.additional_kwargs.get(
+                "k3_elastic_request_offset", 0
+            )
+        )
+        token_offset = int(
+            forward_context.additional_kwargs.get("k3_elastic_token_offset", 0)
+        )
         num_reqs = attn_metadata.num_spec_decodes
         query_start = attn_metadata.spec_query_start_loc
         state_ids = attn_metadata.spec_state_indices_tensor
@@ -920,21 +934,41 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert state_ids is not None
         assert batch_indices is not None
         num_tokens = key.shape[1]
-        self._ag2_mtp_journal_k[:num_tokens].copy_(key.squeeze(0))
-        self._ag2_mtp_journal_v[:num_tokens].copy_(value.squeeze(0))
+        request_stop = request_offset + num_reqs
+        token_stop = token_offset + num_tokens
+        if token_stop > self._ag2_mtp_journal_k.shape[0]:
+            raise RuntimeError("joined GDN journal token range exceeds capacity")
+        if request_stop > self._ag2_mtp_journal_state_ids.shape[0]:
+            raise RuntimeError("joined GDN journal request range exceeds capacity")
+        token_slice = slice(token_offset, token_stop)
+        request_slice = slice(request_offset, request_stop)
+        self._ag2_mtp_journal_k[token_slice].copy_(key.squeeze(0))
+        self._ag2_mtp_journal_v[token_slice].copy_(value.squeeze(0))
         # Match the exact rows consumed by the current recurrent verifier.
-        self._ag2_mtp_journal_a[:num_tokens].copy_(
+        self._ag2_mtp_journal_a[token_slice].copy_(
             a[:num_tokens, : self.local_num_v_heads]
         )
-        self._ag2_mtp_journal_b[:num_tokens].copy_(
+        self._ag2_mtp_journal_b[token_slice].copy_(
             b[:num_tokens, : self.local_num_v_heads]
         )
-        self._ag2_mtp_journal_query_start[: num_reqs + 1].copy_(
-            query_start[: num_reqs + 1]
+        if elastic_plan:
+            if request_offset == 0:
+                self._ag2_mtp_journal_query_start[: num_reqs + 1].copy_(
+                    query_start[: num_reqs + 1] + token_offset
+                )
+            else:
+                self._ag2_mtp_journal_query_start[
+                    request_offset + 1 : request_stop + 1
+                ].copy_(query_start[1 : num_reqs + 1] + token_offset)
+        else:
+            self._ag2_mtp_journal_query_start[: num_reqs + 1].copy_(
+                query_start[: num_reqs + 1]
+            )
+        self._ag2_mtp_journal_state_ids[request_slice].copy_(
+            state_ids[:num_reqs, 0]
         )
-        self._ag2_mtp_journal_state_ids[:num_reqs].copy_(state_ids[:num_reqs, 0])
-        self._ag2_mtp_journal_batch_indices[:num_reqs].copy_(
-            batch_indices[:num_reqs]
+        self._ag2_mtp_journal_batch_indices[request_slice].copy_(
+            batch_indices[:num_reqs] + request_offset
         )
 
     def commit_mtp_replay_journal(

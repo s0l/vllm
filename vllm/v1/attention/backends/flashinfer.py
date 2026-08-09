@@ -1541,6 +1541,14 @@ class BatchDCPPrefillWrapper:
             self._local_kv_head_index_tensors[key] = tensor
         return tensor
 
+    def prime_dcp_local_kv_head_indices(
+        self,
+        local_kv_head_indices: list[int] | tuple[int, ...],
+        device: torch.device,
+    ) -> None:
+        """Materialize capture-unsafe DCP index state before graph capture."""
+        self._get_local_kv_head_index_tensor(local_kv_head_indices, device)
+
     def plan(
         self,
         qo_indptr_cpu: torch.Tensor,
