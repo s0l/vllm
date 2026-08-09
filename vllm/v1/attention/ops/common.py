@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm import envs
 from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import next_power_of_2
@@ -217,6 +218,20 @@ def _cp_lse_common(
     return out, lse
 
 
+def _use_native_dcp_reduce_scatter(
+    out: torch.Tensor, cp_group: GroupCoordinator
+) -> bool:
+    max_rows = envs.VLLM_DCP_NATIVE_RS_MAX_ROWS
+    if max_rows < 0:
+        raise ValueError("VLLM_DCP_NATIVE_RS_MAX_ROWS must be non-negative")
+    return (
+        max_rows > 0
+        and out.dim() == 3
+        and out.shape[0] <= max_rows
+        and out.shape[1] % cp_group.world_size == 0
+    )
+
+
 def cp_lse_ag_out_rs(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
@@ -232,7 +247,10 @@ def cp_lse_ag_out_rs(
     out, lse = _cp_lse_common(
         cp_attn_out, cp_attn_lse, cp_group, ctx=ctx, is_lse_base_on_e=is_lse_base_on_e
     )
-    out = cp_group.reduce_scatter_chunked(out, dim=1)
+    if _use_native_dcp_reduce_scatter(out, cp_group):
+        out = cp_group.reduce_scatter(out, dim=1)
+    else:
+        out = cp_group.reduce_scatter_chunked(out, dim=1)
 
     if return_lse:
         cp_num_heads = lse.shape[1] // cp_group.world_size

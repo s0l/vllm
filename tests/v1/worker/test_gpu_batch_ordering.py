@@ -11,6 +11,7 @@ prefill.
 import torch
 
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.flashinfer import _ag2_semantic_prefill_split
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.worker.gpu.model_runner import sort_batch_req_ids
 
@@ -68,3 +69,99 @@ def test_spec_decodes_lead_short_prefill_tail():
     )
     assert (num_decodes, num_prefills) == (8, 1)
     assert (num_decode_tokens, num_prefill_tokens) == (16, 1)
+
+
+def test_lifecycle_order_prevents_short_prefill_between_decode_rows():
+    # Regression fixture from the fatal mixed Document Review wave. Shape-only
+    # sorting put the 4-token prompt chunk between 4-token target decode rows.
+    num_tokens_per_req = {
+        "decode-a": 4,
+        "prefill-10": 10,
+        "prefill-183": 183,
+        "prefill-4": 4,
+        "prefill-186": 186,
+        "prefill-81": 81,
+        "prefill-180": 180,
+        "decode-b": 4,
+    }
+    lifecycle = {
+        req_id: req_id.startswith("prefill-") for req_id in num_tokens_per_req
+    }
+
+    req_ids = sort_batch_req_ids(
+        num_tokens_per_req,
+        4,
+        is_prefilling_by_req=lifecycle,
+    )
+
+    assert req_ids == [
+        "decode-a",
+        "decode-b",
+        "prefill-4",
+        "prefill-10",
+        "prefill-81",
+        "prefill-180",
+        "prefill-183",
+        "prefill-186",
+    ]
+    assert [lifecycle[req_id] for req_id in req_ids] == [
+        False,
+        False,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+    ]
+    assert set(req_ids) == set(num_tokens_per_req)
+
+    common = _make_common_attn_metadata(
+        [num_tokens_per_req[req_id] for req_id in req_ids]
+    )
+    common.is_prefilling = torch.tensor(
+        [lifecycle[req_id] for req_id in req_ids], dtype=torch.bool
+    )
+    generic = split_decodes_and_prefills(
+        common,
+        decode_threshold=4,
+        require_uniform=True,
+    )
+    assert _ag2_semantic_prefill_split(common, generic) == (2, 6, 8, 644)
+
+    # The original shape-only order is the negative control: the short prompt
+    # row interrupts the decode cohort and must still fail closed in FlashInfer.
+    bad_req_ids = sort_batch_req_ids(num_tokens_per_req, 4)
+    bad_common = _make_common_attn_metadata(
+        [num_tokens_per_req[req_id] for req_id in bad_req_ids]
+    )
+    bad_common.is_prefilling = torch.tensor(
+        [lifecycle[req_id] for req_id in bad_req_ids], dtype=torch.bool
+    )
+    bad_generic = split_decodes_and_prefills(
+        bad_common,
+        decode_threshold=4,
+        require_uniform=True,
+    )
+    try:
+        _ag2_semantic_prefill_split(bad_common, bad_generic)
+    except RuntimeError as exc:
+        assert "not a contiguous suffix" in str(exc)
+    else:
+        raise AssertionError("Crash-shaped non-contiguous lifecycle was accepted")
+
+
+def test_lifecycle_order_rejects_request_identity_drift():
+    num_tokens_per_req = {"decode": 4, "prefill": 64}
+
+    try:
+        sort_batch_req_ids(
+            num_tokens_per_req,
+            4,
+            is_prefilling_by_req={"decode": False, "stale": True},
+        )
+    except ValueError as exc:
+        assert "missing=['prefill']" in str(exc)
+        assert "extra=['stale']" in str(exc)
+    else:
+        raise AssertionError("lifecycle/request identity drift was accepted")

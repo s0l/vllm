@@ -1059,6 +1059,23 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
             ).split(",")
             if pattern.strip()
         )
+        selective_a4 = tuple(
+            pattern.strip()
+            for pattern in os.environ.get(
+                "AG2_VLLM_NVFP4_A4_PREFIXES", ""
+            ).split(",")
+            if pattern.strip()
+        )
+        if selective_a16 and selective_a4:
+            raise ValueError(
+                "AG2 selective NVFP4 dispatch cannot combine A16 and A4 "
+                "prefix selectors in one runtime"
+            )
+        if selective_a4 and self.quant_method != "W4A16_NVFP4":
+            raise ValueError(
+                "AG2_VLLM_NVFP4_A4_PREFIXES requires a W4A16 base; for a "
+                "ModelOpt NVFP4 checkpoint set AG2_VLLM_NVFP4_FORCE_W4A16=1"
+            )
         if (
             self.quant_method == "NVFP4"
             and isinstance(layer, (LinearBase, ParallelLMHead))
@@ -1070,6 +1087,19 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
                 prefix,
             )
             return ModelOptNvFp4W4A16LinearMethod(self)
+        if (
+            self.quant_method == "W4A16_NVFP4"
+            and isinstance(layer, (LinearBase, ParallelLMHead))
+            and any(fnmatch(prefix, pattern) for pattern in selective_a4)
+        ):
+            logger.warning(
+                "AG2 selective NVFP4 dispatch: %s uses W4A4 while other "
+                "W4A16 layers retain W4A16",
+                prefix,
+            )
+            method = ModelOptNvFp4LinearMethod(self)
+            method.layer_prefix = prefix
+            return method
         quant_method = super().get_quant_method(layer, prefix)
         if isinstance(quant_method, ModelOptNvFp4LinearMethod):
             quant_method.layer_prefix = prefix

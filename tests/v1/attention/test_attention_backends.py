@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for v1 attention backends without GPUModelRunner dependency."""
 
+import ast
 from functools import partial
+import inspect
 
 import pytest
 import torch
@@ -721,7 +723,30 @@ def test_causal_backend_correctness(
     AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
     reason="FlashInfer is not available.",
 )
-def test_flashinfer_xqa_bmm1_scale_matches_decode_q_dtype():
+@pytest.mark.parametrize(
+    ("query_dtype", "expected"),
+    [
+        (torch.bfloat16, None),
+        (torch.float16, None),
+        (torch.float32, None),
+        (current_platform.fp8_dtype(), 2.0),
+        (torch.float8_e5m2, 2.0),
+    ],
+)
+def test_flashinfer_query_scale_matches_query_dtype(query_dtype, expected):
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    assert (
+        flashinfer_backend.get_query_scale_for_flashinfer(2.0, query_dtype)
+        == expected
+    )
+
+
+@pytest.mark.skipif(
+    AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
+    reason="FlashInfer is not available.",
+)
+def test_flashinfer_xqa_bmm1_scale_matches_query_dtype():
     """XQA decode should only apply q_scale when decode Q is FP8."""
     from vllm.v1.attention.backends import flashinfer as flashinfer_backend
 
@@ -734,7 +759,39 @@ def test_flashinfer_xqa_bmm1_scale_matches_decode_q_dtype():
     impl.kv_cache_dtype = "fp8"
 
     assert impl.get_xqa_bmm1_scale(MockLayer, torch.bfloat16) == 1.5
-    assert impl.get_xqa_bmm1_scale(MockLayer, torch.float8_e4m3fn) == 3.0
+    assert impl.get_xqa_bmm1_scale(MockLayer, current_platform.fp8_dtype()) == 3.0
+
+
+@pytest.mark.skipif(
+    AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
+    reason="FlashInfer is not available.",
+)
+def test_flashinfer_scaled_wrapper_calls_use_dtype_aware_query_scale():
+    """Every wrapper call carrying KV scales must gate its query scale."""
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    tree = ast.parse(inspect.getsource(flashinfer_backend))
+    query_scaled_calls = []
+    kv_scaled_calls = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        keyword_names = {keyword.arg for keyword in node.keywords}
+        if "q_scale" not in keyword_names:
+            continue
+        query_scaled_calls.append(node)
+        if {"k_scale", "v_scale"}.issubset(keyword_names):
+            kv_scaled_calls.append(node)
+        q_scale = next(
+            (keyword.value for keyword in node.keywords if keyword.arg == "q_scale"),
+            None,
+        )
+        assert isinstance(q_scale, ast.Call)
+        assert isinstance(q_scale.func, ast.Name)
+        assert q_scale.func.id == "get_query_scale_for_flashinfer"
+
+    assert len(query_scaled_calls) == 11
+    assert len(kv_scaled_calls) == 9
 
 
 @pytest.mark.skipif(

@@ -996,7 +996,22 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
     nvfp4_batch_invariant = (
         envs.VLLM_BATCH_INVARIANT or envs.AG2_VLLM_NVFP4_BATCH_INVARIANT
     )
-    if nvfp4_batch_invariant:
+    if envs.AG2_VLLM_NVFP4_B12X:
+        if use_a16:
+            raise ValueError(
+                "AG2_VLLM_NVFP4_B12X supports only W4A4 NVFP4 layers"
+            )
+        if linear_backend not in ("auto", "flashinfer_b12x"):
+            raise ValueError(
+                "AG2_VLLM_NVFP4_B12X requires --linear-backend=auto or "
+                "flashinfer_b12x"
+            )
+        force_kernel = FlashInferB12xNvFp4LinearKernel
+        logger.info_once(
+            "AG2 per-format NVFP4 routing selects the B12x CuTe-DSL backend; "
+            "non-NVFP4 schemes retain their independently selected backend."
+        )
+    elif nvfp4_batch_invariant:
         if use_a16 and envs.AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE:
             bi_kernel = MarlinNvFp4LinearKernel
         elif not use_a16 and linear_backend == "flashinfer_b12x":

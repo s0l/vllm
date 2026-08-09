@@ -14,8 +14,29 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from vllm.triton_utils import tl, triton
+from vllm.logger import init_logger
 
 _WORKSPACE: dict[str, object] | None = None
+logger = init_logger(__name__)
+
+
+def _workspace_layout(max_rows: int, cols: int, world_size: int) -> dict[str, int]:
+    if max_rows <= 0 or cols <= 0 or world_size <= 0:
+        raise ValueError("CE workspace dimensions must be positive")
+    quant_block = int(os.environ.get("VLLM_TP3_CE_QUANT_BLOCK", "8192"))
+    if quant_block <= 0:
+        raise ValueError("VLLM_TP3_CE_QUANT_BLOCK must be positive")
+    num_blocks = (cols + quant_block - 1) // quant_block
+    max_payload = max_rows * (cols + num_blocks * 4)
+    header_bytes = 4096
+    return {
+        "quant_block": quant_block,
+        "num_blocks": num_blocks,
+        "max_payload": max_payload,
+        "host_bytes": header_bytes + world_size * max_payload,
+        "gpu_bytes": world_size * max_payload,
+        "header_bytes": header_bytes,
+    }
 
 
 @triton.jit
@@ -80,19 +101,38 @@ def _wait_flags(
 
 
 def _workspace(
-    group: ProcessGroup, device: torch.device, cols: int
+    group: ProcessGroup,
+    device: torch.device,
+    cols: int,
+    *,
+    max_rows: int | None = None,
 ) -> dict[str, object]:
     global _WORKSPACE
     if _WORKSPACE is not None:
+        if int(_WORKSPACE["cols"]) != cols:
+            raise ValueError(
+                f"CE workspace cols={_WORKSPACE['cols']} do not match cols={cols}"
+            )
+        if max_rows is not None and int(_WORKSPACE["max_rows"]) != max_rows:
+            raise ValueError(
+                "CE workspace was initialized with a different row bound: "
+                f"{_WORKSPACE['max_rows']} != {max_rows}"
+            )
         return _WORKSPACE
     world_size = dist.get_world_size(group)
     rank = dist.get_rank(group)
-    max_rows = int(os.environ.get("VLLM_TP3_CE_MAX_ROWS", "12288"))
-    quant_block = int(os.environ.get("VLLM_TP3_CE_QUANT_BLOCK", "8192"))
-    num_blocks = (cols + quant_block - 1) // quant_block
-    max_payload = max_rows * (cols + num_blocks * 4)
-    header_bytes = 4096
-    total_bytes = header_bytes + world_size * max_payload
+    configured_max_rows = int(os.environ.get("VLLM_TP3_CE_MAX_ROWS", "12288"))
+    max_rows = configured_max_rows if max_rows is None else max_rows
+    if max_rows > configured_max_rows:
+        raise ValueError(
+            f"required CE rows={max_rows} exceed configured max={configured_max_rows}"
+        )
+    layout = _workspace_layout(max_rows, cols, world_size)
+    quant_block = layout["quant_block"]
+    num_blocks = layout["num_blocks"]
+    max_payload = layout["max_payload"]
+    header_bytes = layout["header_bytes"]
+    total_bytes = layout["host_bytes"]
     path = Path(os.environ.get("VLLM_TP3_CE_SHM_PATH", "/dev/shm/vllm-tp3-ce"))
     if rank == 0:
         with path.open("w+b") as handle:
@@ -112,6 +152,7 @@ def _workspace(
         "host_storage": host_storage,
         "host": host_storage[header_bytes:].view(world_size, max_payload),
         "max_rows": max_rows,
+        "cols": cols,
         "quant_block": quant_block,
         "num_blocks": num_blocks,
         "generation": 0,
@@ -122,6 +163,32 @@ def _workspace(
         "stream": torch.cuda.Stream(device=device),
     }
     return _WORKSPACE
+
+
+def initialize_tp3_ce_workspace(
+    group: ProcessGroup,
+    device: torch.device,
+    *,
+    cols: int,
+    max_rows: int,
+) -> dict[str, int]:
+    """Allocate the steady-state CE-owned buffers before KV cache sizing.
+
+    ``max_rows`` is the runner's physical token bound, not the model context
+    ceiling. Runtime calls remain fail-closed if a larger physical shape ever
+    reaches this process.
+    """
+    workspace = _workspace(group, device, cols, max_rows=max_rows)
+    layout = _workspace_layout(max_rows, cols, dist.get_world_size(group))
+    logger.info_once(
+        "Preinitialized TP3 compressed all-reduce workspace: rows=%d cols=%d "
+        "gpu_bytes=%d host_bytes=%d",
+        max_rows,
+        cols,
+        layout["gpu_bytes"],
+        layout["host_bytes"],
+    )
+    return layout
 
 
 def tp3_ce_all_reduce(input_: torch.Tensor, group: ProcessGroup) -> torch.Tensor:

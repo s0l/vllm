@@ -99,6 +99,21 @@ trtllm_workspace_buffer = None
 _ag2_dcp_prefill_query_scratch: torch.Tensor | None = None
 
 
+def get_query_scale_for_flashinfer(
+    q_scale: float,
+    query_dtype: torch.dtype,
+) -> float | None:
+    """Pass q_scale only when FlashInfer receives an FP8 query.
+
+    FlashInfer folds a supplied q_scale into the attention softmax scale.
+    Model-dtype queries were not divided by q_scale, so applying a calibrated
+    non-unit scale to BF16/FP16 queries changes the attention logits.
+    """
+    if query_dtype in (FP8_DTYPE, torch.float8_e5m2):
+        return q_scale
+    return None
+
+
 def set_ag2_dcp_prefill_query_scratch(scratch: torch.Tensor | None) -> None:
     global _ag2_dcp_prefill_query_scratch
     if scratch is not None and (scratch.dtype != torch.bfloat16 or not scratch.is_cuda):
@@ -2175,6 +2190,10 @@ class BatchDCPPrefillWrapper:
                 current_query,
                 current_key,
                 current_value,
+                q_scale=get_query_scale_for_flashinfer(
+                    layer._q_scale_float,
+                    current_query.dtype,
+                ),
                 return_lse=True,
             )
             segment_out = out[canonical_start:]
@@ -2196,6 +2215,10 @@ class BatchDCPPrefillWrapper:
                     self._absolute_segment_context.run(
                         context_query,
                         kv_cache_tuple,
+                        q_scale=get_query_scale_for_flashinfer(
+                            layer._q_scale_float,
+                            context_query.dtype,
+                        ),
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
                         return_lse=True,
@@ -2262,6 +2285,10 @@ class BatchDCPPrefillWrapper:
             canonical_output_tmp, canonical_lse_tmp = self._canonical_context.run(
                 prefill_query_across_dcp[canonical_start:],
                 kv_cache_tuple,
+                q_scale=get_query_scale_for_flashinfer(
+                    layer._q_scale_float,
+                    prefill_query_across_dcp.dtype,
+                ),
                 k_scale=layer._k_scale_float,
                 v_scale=layer._v_scale_float,
                 return_lse=True,
@@ -2287,6 +2314,10 @@ class BatchDCPPrefillWrapper:
         output_context_tmp, lse_context_tmp = self._context.run(
             prefill_query_across_dcp,
             kv_cache_tuple,
+            q_scale=get_query_scale_for_flashinfer(
+                layer._q_scale_float,
+                prefill_query_across_dcp.dtype,
+            ),
             k_scale=layer._k_scale_float,
             v_scale=layer._v_scale_float,
             return_lse=True,
@@ -2378,6 +2409,10 @@ class BatchDCPPrefillWrapper:
             prefill_query,
             key,
             value,
+            q_scale=get_query_scale_for_flashinfer(
+                layer._q_scale_float,
+                prefill_query.dtype,
+            ),
             return_lse=True,
         )
         lse_query = lse_query.transpose(0, 1).contiguous()
@@ -2502,6 +2537,10 @@ class BatchDCPPseudoPrefillWrapper:
         output_tmp, lse = self._paged.run(
             query_across_dcp,
             kv_cache_tuple,
+            q_scale=get_query_scale_for_flashinfer(
+                layer._q_scale_float,
+                query_across_dcp.dtype,
+            ),
             k_scale=layer._k_scale_float,
             v_scale=layer._v_scale_float,
             return_lse=True,
@@ -2605,6 +2644,10 @@ class BatchDCPBatchedDecodeWrapper:
         output_tmp, lse = self._decode.run(
             query_across_dcp,
             kv_cache_tuple,
+            q_scale=get_query_scale_for_flashinfer(
+                layer._q_scale_float,
+                query_across_dcp.dtype,
+            ),
             k_scale=layer._k_scale_float,
             v_scale=layer._v_scale_float,
             return_lse=True,
@@ -2756,6 +2799,10 @@ class BatchDCPSequentialDecodeWrapper:
             output_tmp, lse_tmp = wrapper.run(
                 query_across_dcp[row_start:row_end],
                 kv_cache_tuple,
+                q_scale=get_query_scale_for_flashinfer(
+                    layer._q_scale_float,
+                    query_across_dcp.dtype,
+                ),
                 k_scale=layer._k_scale_float,
                 v_scale=layer._v_scale_float,
                 return_lse=True,
@@ -4871,8 +4918,12 @@ class FlashInferImpl(AttentionImpl):
     def get_xqa_bmm1_scale(self, layer: torch.nn.Module, q_data_type: torch.dtype):
         bmm1_scale = self.scale
         if is_quantized_kv_cache(self.kv_cache_dtype):
-            if q_data_type in (torch.float8_e4m3fn, torch.float8_e5m2):
-                bmm1_scale *= layer._q_scale_float
+            q_scale = get_query_scale_for_flashinfer(
+                layer._q_scale_float,
+                q_data_type,
+            )
+            if q_scale is not None:
+                bmm1_scale *= q_scale
             bmm1_scale *= layer._k_scale_float
         return bmm1_scale
 
@@ -5193,7 +5244,10 @@ class FlashInferImpl(AttentionImpl):
                     prefill_wrapper.run(
                         prefill_query,
                         kv_cache_for_fi,
-                        q_scale=layer._q_scale_float,
+                        q_scale=get_query_scale_for_flashinfer(
+                            layer._q_scale_float,
+                            prefill_query.dtype,
+                        ),
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
                         out=out_prefill,
@@ -5395,7 +5449,10 @@ class FlashInferImpl(AttentionImpl):
                     decode_wrapper.run(
                         decode_query,
                         kv_cache_for_fi,
-                        q_scale=layer._q_scale_float,
+                        q_scale=get_query_scale_for_flashinfer(
+                            layer._q_scale_float,
+                            decode_query.dtype,
+                        ),
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
                         out=output_tmp,
@@ -5496,7 +5553,10 @@ class FlashInferImpl(AttentionImpl):
                     decode_wrapper.run(
                         decode_query,
                         kv_cache_for_fi,
-                        q_scale=layer._q_scale_float,
+                        q_scale=get_query_scale_for_flashinfer(
+                            layer._q_scale_float,
+                            decode_query.dtype,
+                        ),
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
                         out=out_decode,

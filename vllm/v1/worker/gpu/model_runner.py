@@ -1161,8 +1161,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_tokens_per_req = scheduler_output.num_scheduled_tokens
         num_reqs = len(num_tokens_per_req)
 
-        # batch_idx -> req_id
-        req_ids = sort_batch_req_ids(num_tokens_per_req, self.decode_query_len)
+        # batch_idx -> req_id. Shape alone cannot distinguish a short chunked
+        # prefill from target decode/spec verification. Keep every request in
+        # its existing stable shape order, but place completed-prefill rows
+        # before prompt-prefill rows so attention backends receive the semantic
+        # decode -> prefill lifecycle layout their split metadata describes.
+        computed_prefill_tokens = self.req_states.num_computed_prefill_tokens
+        prefill_lengths = self.req_states.prefill_len.np
+        is_prefilling_by_req = {
+            req_id: bool(
+                computed_prefill_tokens[self.req_states.req_id_to_index[req_id]]
+                < prefill_lengths[self.req_states.req_id_to_index[req_id]]
+            )
+            for req_id in num_tokens_per_req
+        }
+        req_ids = sort_batch_req_ids(
+            num_tokens_per_req,
+            self.decode_query_len,
+            is_prefilling_by_req=is_prefilling_by_req,
+        )
         numtoks_iter = map(num_tokens_per_req.__getitem__, req_ids)
         num_scheduled_tokens = np.fromiter(numtoks_iter, dtype=np.int32, count=num_reqs)
 
@@ -1390,7 +1407,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         use_sparse_target_topk = (
             input_batch.num_draft_tokens > 0
             and self.rejection_sampler is not None
-            and grammar_output is None
             and self.target_boundary_capture is None
             and hasattr(self.model, "compute_local_logits")
             and self.rejection_sampler.can_use_sparse_target_topk(input_batch)
@@ -1399,6 +1415,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             local_logits, vocab_start = self.model.compute_local_logits(
                 sample_hidden_states
             )
+            if grammar_output is not None:
+                self.structured_outputs_worker.apply_grammar_bitmask(
+                    local_logits,
+                    input_batch,
+                    grammar_output.structured_output_request_ids,
+                    grammar_output.grammar_bitmask,
+                    vocab_start=vocab_start,
+                )
             assert self.speculator is not None
             sampler_output = self.rejection_sampler.sample_sparse_target_topk(
                 local_logits,
@@ -2198,9 +2222,33 @@ class ExecuteModelState(NamedTuple):
 
 
 def sort_batch_req_ids(
-    num_tokens_per_req: dict[str, int], decode_query_len: int
+    num_tokens_per_req: dict[str, int],
+    decode_query_len: int,
+    *,
+    is_prefilling_by_req: dict[str, bool] | None = None,
 ) -> list[str]:
-    # Order decode -> short_extend -> prefill; split_decodes_and_prefills
-    # relies on uniform decodes (query_len == decode_query_len) leading.
-    key = lambda r: ((num := num_tokens_per_req[r]) != decode_query_len, num)
+    # Order completed-prefill requests before prompt-prefill requests, then
+    # retain the established shape order inside each lifecycle cohort.
+    # split_decodes_and_prefills relies on uniform target decodes
+    # (query_len == decode_query_len) leading, while semantic DCP prefill needs
+    # actual prompt rows to form one suffix even when a chunk is decode-sized.
+    if is_prefilling_by_req is not None:
+        missing = num_tokens_per_req.keys() - is_prefilling_by_req.keys()
+        extra = is_prefilling_by_req.keys() - num_tokens_per_req.keys()
+        if missing or extra:
+            raise ValueError(
+                "Batch lifecycle identity does not match scheduled requests: "
+                f"missing={sorted(missing)} extra={sorted(extra)}"
+            )
+
+    def key(req_id: str) -> tuple[bool, bool, int]:
+        num_tokens = num_tokens_per_req[req_id]
+        return (
+            False
+            if is_prefilling_by_req is None
+            else is_prefilling_by_req[req_id],
+            num_tokens != decode_query_len,
+            num_tokens,
+        )
+
     return sorted(num_tokens_per_req, key=key)

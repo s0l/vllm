@@ -691,6 +691,22 @@ class Attention(nn.Module, AttentionLayerBase):
         if not should_load_quant_weights(quant_method):
             set_default_quant_scales(self, register_buffer=False)
 
+        if any(
+            scale != 1.0
+            for scale in (
+                self._q_scale_float,
+                self._k_scale_float,
+                self._v_scale_float,
+            )
+        ):
+            logger.info(
+                "Loaded non-unit attention scales: layer=%s q=%s k=%s v=%s",
+                self.layer_name,
+                self._q_scale_float,
+                self._k_scale_float,
+                self._v_scale_float,
+            )
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
 

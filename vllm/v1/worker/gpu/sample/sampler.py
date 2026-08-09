@@ -214,6 +214,7 @@ class Sampler:
             idx_mapping_np,
             input_ids,
             expanded_local_pos,
+            vocab_start=vocab_start,
         )
 
         # Apply temperature in place.

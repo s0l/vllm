@@ -170,10 +170,6 @@ class RejectionSampler:
             return False
         if np.any(self.sampler.bad_words_state.num_bad_words.np[idx] > 0):
             return False
-        # Thinking-force token values are not yet injected into the local
-        # candidate set. Ordinary prompt-driven thinking does not use this state.
-        if self.sampler.thinking_budget_state.has_requests:
-            return False
         return True
 
     def _ag2_sparse_request_prefix_eligible(self, input_batch: InputBatch) -> bool:
@@ -542,6 +538,7 @@ class RejectionSampler:
         processed_local = self.sampler.apply_sampling_params(
             local_logits,
             input_batch.expanded_idx_mapping,
+            input_batch.idx_mapping,
             input_batch.idx_mapping_np,
             pos,
             draft_sampled,
@@ -567,10 +564,14 @@ class RejectionSampler:
                 input_batch.idx_mapping_np[0]
             ]
         )
-        clear = (
-            gathered_values[..., top_k - 1 : _SPARSE_LOCAL_CANDIDATES]
-            != gathered_values[..., top_k : _SPARSE_LOCAL_CANDIDATES + 1]
-        ).any(dim=-1)
+        left = gathered_values[..., top_k - 1 : _SPARSE_LOCAL_CANDIDATES]
+        right = gathered_values[..., top_k : _SPARSE_LOCAL_CANDIDATES + 1]
+        # Equal finite values may straddle the omitted local tail and require
+        # the exact full path. Equal -inf values carry zero probability, so an
+        # omitted -inf token cannot change top-p or rejection sampling.
+        clear = ((left != right) | (torch.isneginf(left) & torch.isneginf(right))).any(
+            dim=-1
+        )
 
         # Sampling runs outside model CUDA graphs. This one synchronization is
         # the fail-closed decision; every rank sees the same gathered tensor.
@@ -600,6 +601,7 @@ class RejectionSampler:
             oracle_processed = self.sampler.apply_sampling_params(
                 full_logits_oracle,
                 input_batch.expanded_idx_mapping,
+                input_batch.idx_mapping,
                 input_batch.idx_mapping_np,
                 pos,
                 draft_sampled,

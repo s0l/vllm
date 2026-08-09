@@ -87,6 +87,8 @@ from .utils import request_memory
 
 logger = init_logger(__name__)
 
+_KV_REDUNDANCY_BUFFER_BYTES = 150 * (1 << 20)
+
 if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -472,6 +474,19 @@ class Worker(WorkerBase):
         """
         maybe_apply_startup_plan(self)
 
+        additional_config = self.vllm_config.additional_config or {}
+        if additional_config.get("tp3_ce_reduce", False):
+            from vllm.distributed.device_communicators.tp3_ce_all_reduce import (
+                initialize_tp3_ce_workspace,
+            )
+
+            initialize_tp3_ce_workspace(
+                get_tp_group().device_group,
+                self.device,
+                cols=self.model_config.get_hidden_size(),
+                max_rows=self.model_runner.max_num_tokens,
+            )
+
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
@@ -546,6 +561,7 @@ class Worker(WorkerBase):
             self.requested_memory
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
+            - _KV_REDUNDANCY_BUFFER_BYTES
         )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
@@ -747,7 +763,7 @@ class Worker(WorkerBase):
             # empirically observed that the memory profiling may
             # slightly underestimate the memory consumption.
             # So leave a small buffer (=150MiB) to avoid OOM.
-            redundancy_buffer_memory = 150 * (1 << 20)
+            redundancy_buffer_memory = _KV_REDUNDANCY_BUFFER_BYTES
 
             non_kv_cache_memory = (
                 self.total_consumed

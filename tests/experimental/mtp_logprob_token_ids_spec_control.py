@@ -8,7 +8,7 @@ import json
 import numpy as np
 import torch
 
-from vllm import _C  # noqa: F401
+from vllm import _C_stable_libtorch  # noqa: F401
 from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.gpu.sample.logprob import LogprobTokenIdsState
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
