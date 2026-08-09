@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
+    VLLM_DCP_NATIVE_RS_MAX_ROWS: int = 0
     VLLM_TP3_CE_REDUCE: bool = False
     VLLM_TP3_SD_CANONICAL_REDUCE: bool = False
     VLLM_TP3_SD_DETERMINISTIC_REDUCE: bool = False
@@ -891,6 +892,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         bool(int(os.environ["VLLM_USE_FLASHINFER_SAMPLER"]))
         if "VLLM_USE_FLASHINFER_SAMPLER" in os.environ
         else True
+    ),
+    # Default-off decode-shape DCP reduce-scatter. Positive values select the
+    # native transpose + NCCL reduce-scatter path only up to this physical M;
+    # larger prefill shapes retain the memory-bounded chunked implementation.
+    "VLLM_DCP_NATIVE_RS_MAX_ROWS": lambda: int(
+        os.environ.get("VLLM_DCP_NATIVE_RS_MAX_ROWS", "0")
     ),
     "VLLM_TP3_CE_REDUCE": lambda: os.environ.get("VLLM_TP3_CE_REDUCE", "0") == "1",
     "VLLM_TP3_SD_CANONICAL_REDUCE": lambda: os.environ.get(

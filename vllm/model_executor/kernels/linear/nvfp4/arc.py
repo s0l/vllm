@@ -140,13 +140,16 @@ def _arc_quantize_impl(
     selected: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     selected_count = selected.shape[0] if selected.ndim == 1 else 0
+    k = x.shape[-1]
     if (
-        x.shape[-1] != 5120
+        k <= 0
+        or k % 64 != 0
         or selected_count not in (64, 256, 512)
         or selected.dtype != torch.int32
     ):
         raise ValueError(
-            "ARC requires BF16/FP16 [...,5120] and int32 selected[64|256|512]"
+            "ARC requires BF16/FP16 [...,K] with K divisible by 64 and "
+            "int32 selected[64|256|512]"
         )
     original_shape = x.shape
     x = x.reshape(-1, x.shape[-1])
@@ -163,8 +166,8 @@ def _arc_quantize_impl(
         input_global_scale_inv,
         packed,
         scales.view(torch.uint8),
-        k=x.shape[1],
-        augmented_k=x.shape[1] + selected_count,
+        k=k,
+        augmented_k=k + selected_count,
     )
     return packed.view(-1, (original_shape[-1] + selected_count) // 2), scales
 

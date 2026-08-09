@@ -62,13 +62,24 @@ def _load(directory: Path, rank: int, device: torch.device) -> _Sidecar:
         "ag2-k3-arc-variable-k-sidecar-manifest-v2": (
             "ag2-k3-arc-variable-k-sidecar-v2"
         ),
+        "ag2-k3-arc-hybrid-sidecar-manifest-v3": (
+            "ag2-k3-arc-hybrid-sidecar-v3"
+        ),
     }.get(manifest_schema)
+    record_count = manifest.get("record_count")
+    tensor_count = manifest.get("tensor_count")
+    expected_records = 241 if manifest_schema == "ag2-k3-arc-hybrid-sidecar-manifest-v3" else 128
+    runtime_prefix_root = manifest.get("runtime_prefix_root")
     if (
         tensor_schema is None
         or not manifest.get("ok")
         or manifest.get("tp_rank") != rank
-        or manifest.get("record_count") != 128
-        or manifest.get("tensor_count") != 384
+        or record_count != expected_records
+        or tensor_count != 3 * expected_records
+        or (
+            manifest_schema == "ag2-k3-arc-hybrid-sidecar-manifest-v3"
+            and runtime_prefix_root != "language_model.model."
+        )
     ):
         raise RuntimeError(f"invalid ARC sidecar manifest {manifest_path}")
     actual_sha = _sha256(sidecar_path)
@@ -81,12 +92,12 @@ def _load(directory: Path, rank: int, device: torch.device) -> _Sidecar:
         if (
             metadata.get("schema") != tensor_schema
             or metadata.get("tp_rank") != str(rank)
-            or len(list(handle.keys())) != 384
+            or len(list(handle.keys())) != tensor_count
         ):
             raise RuntimeError(f"invalid ARC safetensors metadata {sidecar_path}")
     tensors = load_file(sidecar_path, device=str(device))
     by_suffix = {record["runtime_suffix"]: record for record in manifest["records"]}
-    if len(by_suffix) != 128:
+    if len(by_suffix) != record_count:
         raise RuntimeError("ARC runtime suffix set is incomplete or duplicated")
     result = _Sidecar(manifest=manifest, by_suffix=by_suffix, tensors=tensors)
     _CACHE[cache_key] = result
@@ -111,6 +122,9 @@ def maybe_apply_ag2_nvfp4_arc_sidecar(
         raise RuntimeError("ARC sidecar enabled but NVFP4 layer prefix is missing")
     rank = _tp_rank()
     sidecar = _load(Path(directory_text), rank, layer.weight.device)
+    runtime_prefix_root = sidecar.manifest.get("runtime_prefix_root")
+    if runtime_prefix_root and not prefix.startswith(runtime_prefix_root):
+        return False
     matches = [
         (suffix, record)
         for suffix, record in sidecar.by_suffix.items()
@@ -139,6 +153,8 @@ def maybe_apply_ag2_nvfp4_arc_sidecar(
         != (record["output_features"], selected_count // 16)
         or selected.dtype != torch.int32
         or tuple(selected.shape) != (selected_count,)
+        or int(selected.min()) < 0
+        or int(selected.max()) >= record["base_k"]
     ):
         raise RuntimeError(f"ARC sidecar ABI mismatch for {prefix}")
     base_weight = layer.weight.data
