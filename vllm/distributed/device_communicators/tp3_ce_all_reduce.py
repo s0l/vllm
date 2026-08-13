@@ -137,7 +137,10 @@ def _workspace(
     if rank == 0:
         with path.open("w+b") as handle:
             handle.truncate(total_bytes)
-    dist.barrier(group=group)
+    # This subgroup is created after the default process group and does not
+    # inherit its eager device binding.  Make the barrier's NCCL device
+    # explicit so PyTorch never guesses it from the global rank.
+    dist.barrier(group=group, device_ids=[torch.cuda.current_device()])
     handle = path.open("r+b", buffering=0)
     mapping = mmap.mmap(handle.fileno(), total_bytes)
     host_storage = torch.frombuffer(mapping, dtype=torch.uint8)

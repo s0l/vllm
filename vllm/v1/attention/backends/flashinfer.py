@@ -128,6 +128,8 @@ def _resolve_decode_split_plan(
     fixed_split_size: int,
     disable_split_kv: bool,
     spec_target_only: bool,
+    qlen1_fixed_split_size: int = -1,
+    qlen1_disable_split_kv: bool = False,
 ) -> tuple[int, bool, bool]:
     """Resolve native-decode split policy and graph-wrapper eligibility.
 
@@ -145,6 +147,8 @@ def _resolve_decode_split_plan(
             f"{num_decode_tokens=} {num_decodes=}"
         )
     query_len = num_decode_tokens // num_decodes
+    if query_len == 1 and qlen1_fixed_split_size > 0:
+        return qlen1_fixed_split_size, qlen1_disable_split_kv, False
     if spec_target_only and query_len == 1:
         return -1, False, False
     force_non_graph_wrapper = spec_target_only and fixed_split_size > 0
@@ -333,6 +337,27 @@ def _dcp_causal_paged_custom_mask(
             )
         )
     return torch.cat(request_masks), local_seq_lens
+
+
+def _dcp_pseudo_block_table_capacity(
+    max_model_len: int,
+    max_num_batched_tokens: int,
+    page_size: int,
+    dcp_world_size: int,
+) -> int:
+    """Bound the worker's hybrid block-table width before graph capture."""
+    if min(max_model_len, max_num_batched_tokens, page_size, dcp_world_size) <= 0:
+        raise ValueError("pseudo-decode capacity inputs must be positive")
+    # History pages are DCP-local, but the scheduler tail is already expressed
+    # in kernel pages and must not be divided by DCP.  Keep one world-sized
+    # boundary/speculation guard, then mirror the worker's page alignment.
+    base_pages = cdiv(max_model_len, page_size * dcp_world_size)
+    scheduler_tail_pages = cdiv(max_num_batched_tokens, page_size)
+    capacity = base_pages + scheduler_tail_pages + dcp_world_size
+    if page_size <= 128:
+        alignment = 128 // page_size
+        capacity = cdiv(capacity, alignment) * alignment
+    return capacity
 
 
 @dataclass(frozen=True)
@@ -1440,6 +1465,14 @@ class BatchDCPPrefillWrapper:
         )
         if self._context_fixed_split_size == 0 or self._context_fixed_split_size < -1:
             raise ValueError("DCP context fixed split size must be -1 or positive")
+        self._absolute_segment_exact_rs = (
+            envs.VLLM_DCP_ABSOLUTE_PREFILL_EXACT_RS
+        )
+        if self._absolute_segment_exact_rs and dcp_a2a:
+            raise ValueError(
+                "Absolute-segment exact reduce-scatter is not implemented "
+                "for the DCP all-to-all combine"
+            )
         self._context = BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer,
             get_kv_cache_layout(),
@@ -1512,6 +1545,8 @@ class BatchDCPPrefillWrapper:
         self._ag2_window_left = -1
         self._ag2_dcp_world_size = 1
         self._ag2_sm_scale = 1.0
+        self._ag2_logits_soft_cap = 0.0
+        self._ag2_plan_ready = False
         self._canonical_paged = False
         self._canonical_paged_start_req = 0
         self._canonical_paged_start_token = 0
@@ -1568,6 +1603,7 @@ class BatchDCPPrefillWrapper:
         dcp_kv_cache_interleave_size: int | None = None,
     ):
         """Plan the prefill operation with given parameters."""
+        self._ag2_plan_ready = False
         self._canonical_paged = canonical_paged
         self._absolute_segmented = absolute_segmented
         self._canonical_paged_start_req = 0
@@ -1589,6 +1625,7 @@ class BatchDCPPrefillWrapper:
         self._ag2_window_left = window_left
         self._ag2_dcp_world_size = dcp_world_size
         self._ag2_sm_scale = sm_scale
+        self._ag2_logits_soft_cap = logits_soft_cap or 0.0
         trace_tail_rows = int(
             os.environ.get(
                 "AG2_VLLM_AUX_HIDDEN_TRACE_DCP_REQUEST_TAIL_ROWS",
@@ -1832,6 +1869,7 @@ class BatchDCPPrefillWrapper:
                 self._ag2_history_paged_kv_indptr_cpu = None
                 self._ag2_history_paged_kv_indices = None
                 self._ag2_history_last_page_len_cpu = None
+                self._ag2_plan_ready = True
                 return
 
             qo_indptr_cpu = qo_indptr_cpu[: canonical_paged_start_req + 1]
@@ -1997,6 +2035,7 @@ class BatchDCPPrefillWrapper:
                 self._ag2_history_paged_kv_indptr_cpu = None
                 self._ag2_history_paged_kv_indices = None
                 self._ag2_history_last_page_len_cpu = None
+                self._ag2_plan_ready = True
                 return
 
             # The prefix remains on the established paged-context + ragged-
@@ -2071,6 +2110,20 @@ class BatchDCPPrefillWrapper:
                 disable_split_kv or self._disable_split_kv_for_cuda_graph
             ),
         )
+        self._ag2_plan_ready = True
+
+    def assert_plan_contract(
+        self,
+        *,
+        window_left: int,
+        logits_soft_cap: float,
+        sm_scale: float,
+    ) -> None:
+        """Validate caller-owned plan state without FlashInfer private fields."""
+        assert self._ag2_plan_ready
+        assert self._ag2_window_left == window_left
+        assert self._ag2_logits_soft_cap == logits_soft_cap
+        assert self._ag2_sm_scale == sm_scale
 
     def run(
         self,
@@ -2229,6 +2282,7 @@ class BatchDCPPrefillWrapper:
                     context_lse_tmp,
                     get_dcp_group(),
                     return_lse=True,
+                    force_exact_reduce_scatter=self._absolute_segment_exact_rs,
                 )
                 selected_current_output = torch.index_select(
                     current_output,
@@ -2482,6 +2536,10 @@ class BatchDCPPseudoPrefillWrapper:
             workspace_buffer,
             get_kv_cache_layout(),
         )
+        self._ag2_window_left = -1
+        self._ag2_logits_soft_cap = 0.0
+        self._ag2_sm_scale = 1.0
+        self._ag2_plan_ready = False
 
     def plan(
         self,
@@ -2502,6 +2560,7 @@ class BatchDCPPseudoPrefillWrapper:
         prefill_fixed_split_size: int,
         disable_split_kv: bool,
     ) -> None:
+        self._ag2_plan_ready = False
         self._paged.plan(
             qo_indptr=qo_indptr_cpu,
             paged_kv_indptr=paged_kv_indptr_cpu,
@@ -2522,6 +2581,23 @@ class BatchDCPPseudoPrefillWrapper:
             fixed_split_size=prefill_fixed_split_size,
             disable_split_kv=disable_split_kv,
         )
+        self._ag2_window_left = window_left
+        self._ag2_logits_soft_cap = logits_soft_cap or 0.0
+        self._ag2_sm_scale = sm_scale
+        self._ag2_plan_ready = True
+
+    def assert_plan_contract(
+        self,
+        *,
+        window_left: int,
+        logits_soft_cap: float,
+        sm_scale: float,
+    ) -> None:
+        """Validate caller-owned plan state without FlashInfer private fields."""
+        assert self._ag2_plan_ready
+        assert self._ag2_window_left == window_left
+        assert self._ag2_logits_soft_cap == logits_soft_cap
+        assert self._ag2_sm_scale == sm_scale
 
     def run(
         self,
@@ -3162,6 +3238,32 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.decode_disable_split_kv = True
             self.decode_fixed_split_spec_target_only = False
         else:
+            self.qlen1_fixed_split_size = int(
+                os.environ.get(
+                    "AG2_VLLM_FLASHINFER_Q1_FIXED_SPLIT_SIZE",
+                    "-1",
+                )
+            )
+            self.qlen1_disable_split_kv = (
+                os.environ.get(
+                    "AG2_VLLM_FLASHINFER_Q1_DISABLE_SPLIT_KV",
+                    "0",
+                )
+                == "1"
+            )
+            if self.qlen1_fixed_split_size == 0 or self.qlen1_fixed_split_size < -1:
+                raise ValueError(
+                    "FlashInfer qlen1 fixed split size must be -1 or positive"
+                )
+            if self.qlen1_fixed_split_size > 0:
+                logger.warning_once(
+                    "Research POC: FlashInfer qlen1 fixed-split planning is "
+                    "enabled (fixed_split_size=%d, disable_split_kv=%s). "
+                    "FULL CUDA Graphs remain enabled; long-context graph "
+                    "portability is not yet accepted.",
+                    self.qlen1_fixed_split_size,
+                    self.qlen1_disable_split_kv,
+                )
             self.decode_fixed_split_size = int(
                 os.environ.get(
                     "AG2_VLLM_FLASHINFER_SPEC_TARGET_FIXED_SPLIT_SIZE",
@@ -3190,6 +3292,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     self.decode_fixed_split_size,
                     self.decode_disable_split_kv,
                 )
+        if envs.VLLM_BATCH_INVARIANT:
+            self.qlen1_fixed_split_size = -1
+            self.qlen1_disable_split_kv = False
         if prefill_batch_invariant:
             self.prefill_fixed_split_size = 4096
             self.prefill_disable_split_kv = True
@@ -3394,13 +3499,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # The metadata builder receives only the kernel-sized spec, not
             # the original hybrid storage geometry, so include one complete
             # scheduler batch as a conservative pre-capture bound.
-            max_local_blocks = cdiv(
-                self.model_config.max_model_len + self.max_num_batched_tokens,
-                self.page_size * self.dcp_world_size,
+            max_local_blocks = _dcp_pseudo_block_table_capacity(
+                self.model_config.max_model_len,
+                self.max_num_batched_tokens,
+                self.page_size,
+                self.dcp_world_size,
             )
-            if self.page_size <= 128:
-                alignment = 128 // self.page_size
-                max_local_blocks = cdiv(max_local_blocks, alignment) * alignment
             self._dcp_pseudo_decode_block_tables = torch.empty(
                 (self._dcp_pseudo_decode_max_rows, max_local_blocks),
                 dtype=torch.int32,
@@ -4731,6 +4835,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     fixed_split_size=self.decode_fixed_split_size,
                     disable_split_kv=self.decode_disable_split_kv,
                     spec_target_only=self.decode_fixed_split_spec_target_only,
+                    qlen1_fixed_split_size=self.qlen1_fixed_split_size,
+                    qlen1_disable_split_kv=self.qlen1_disable_split_kv,
                 )
                 pure_decode = num_prefills == 0
                 use_cudagraph = (
@@ -5163,12 +5269,11 @@ class FlashInferImpl(AttentionImpl):
                             out=output[num_decode_tokens:],
                         )
                     elif isinstance(prefill_wrapper, BatchDCPPseudoPrefillWrapper):
-                        assert prefill_wrapper._paged._window_left == self.window_left
-                        assert prefill_wrapper._paged._logits_soft_cap == (
-                            self.logits_soft_cap or 0.0
+                        prefill_wrapper.assert_plan_contract(
+                            window_left=self.window_left,
+                            logits_soft_cap=self.logits_soft_cap or 0.0,
+                            sm_scale=self.scale,
                         )
-                        assert prefill_wrapper._paged._sm_scale == self.scale
-                        assert not prefill_wrapper._paged._causal
                         prefill_wrapper.run(
                             layer,
                             prefill_query,
@@ -5177,20 +5282,11 @@ class FlashInferImpl(AttentionImpl):
                         )
                     else:
                         assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
-                        assert prefill_wrapper._context._window_left == self.window_left
-                        assert prefill_wrapper._context._logits_soft_cap == (
-                            self.logits_soft_cap or 0.0
+                        prefill_wrapper.assert_plan_contract(
+                            window_left=self.window_left,
+                            logits_soft_cap=self.logits_soft_cap or 0.0,
+                            sm_scale=self.scale,
                         )
-                        assert prefill_wrapper._context._sm_scale == self.scale
-                        assert not prefill_wrapper._context._causal
-                        assert (
-                            prefill_wrapper._new_tokens._window_left == self.window_left
-                        )
-                        assert prefill_wrapper._new_tokens._logits_soft_cap == (
-                            self.logits_soft_cap or 0.0
-                        )
-                        assert prefill_wrapper._new_tokens._sm_scale == self.scale
-                        assert prefill_wrapper._new_tokens._causal
 
                         prefill_wrapper.run(
                             layer,

@@ -15,6 +15,12 @@ from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import is_torch_equal_or_newer
 
 
+@torch.compiler.assume_constant_result
+def _num_compute_units_for_compiled_matmul(device_id: int) -> int:
+    """Resolve immutable launch geometry once while Dynamo traces the call."""
+    return num_compute_units(device_id)
+
+
 def _matmul_launch_metadata(
     grid: Callable[..., Any], kernel: Any, args: dict[str, Any]
 ) -> dict[str, Any]:
@@ -138,7 +144,7 @@ def matmul_persistent(
     assert bias is None or bias.dim() == 1, (
         "Currently assuming bias is 1D, let Horace know if you run into this"
     )
-    NUM_SMS = num_compute_units(a.device.index)
+    NUM_SMS = _num_compute_units_for_compiled_matmul(a.device.index)
     M, K = a.shape
     K, N = b.shape
     dtype = a.dtype
@@ -429,7 +435,7 @@ def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
     output = torch.empty_like(input_2d)
 
     # Choose block size based on the number of columns
-    BLOCK_SIZE = 1024
+    BLOCK_SIZE = 8192
 
     # Launch kernel with one block per row
     grid = (n_rows,)
@@ -824,6 +830,59 @@ def _rms_norm_kernel(
         tl.store(output_row_start_ptr + col_idx, output, mask=mask)
 
 
+@triton.jit
+def _fused_add_rms_norm_kernel(
+    input_ptr,
+    residual_ptr,
+    weight_ptr,
+    output_ptr,
+    residual_out_ptr,
+    input_row_stride,
+    residual_row_stride,
+    output_row_stride,
+    residual_out_row_stride,
+    n_cols,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+):
+    """Deterministic one-program-per-row BF16 residual add and RMSNorm."""
+    row_idx = tl.program_id(0).to(tl.int64)
+    input_row = input_ptr + row_idx * input_row_stride
+    residual_row = residual_ptr + row_idx * residual_row_stride
+    output_row = output_ptr + row_idx * output_row_stride
+    residual_out_row = residual_out_ptr + row_idx * residual_out_row_stride
+
+    sum_sq = tl.zeros([1], dtype=tl.float32)
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        input_value = tl.load(input_row + col_idx, mask=mask, other=0.0)
+        residual_value = tl.load(residual_row + col_idx, mask=mask, other=0.0)
+        # Match the native IR contract exactly: normalization consumes the
+        # unrounded FP32 sum, while only the returned residual is BF16.
+        combined_f32 = input_value.to(tl.float32) + residual_value.to(tl.float32)
+        tl.store(
+            residual_out_row + col_idx,
+            combined_f32.to(input_value.dtype),
+            mask=mask,
+        )
+        sum_sq += tl.sum(tl.where(mask, combined_f32 * combined_f32, 0.0))
+
+    inv_rms = tl.rsqrt(sum_sq / n_cols + eps)
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        input_value = tl.load(input_row + col_idx, mask=mask, other=0.0)
+        residual_value = tl.load(residual_row + col_idx, mask=mask, other=0.0)
+        combined_f32 = input_value.to(tl.float32) + residual_value.to(tl.float32)
+        output_f32 = combined_f32 * inv_rms
+        if HAS_WEIGHT:
+            weight = tl.load(weight_ptr + col_idx, mask=mask, other=1.0)
+            output_f32 *= weight.to(tl.float32)
+        tl.store(output_row + col_idx, output_f32.to(input_value.dtype), mask=mask)
+
+
 def rms_norm_batch_invariant(
     input: torch.Tensor,
     weight: torch.Tensor | None,
@@ -845,15 +904,6 @@ def rms_norm_batch_invariant(
         RMS normalized tensor, or ``(output, residual_out)`` when ``residual``
         is provided
     """
-    if residual is not None:
-        assert input.shape == residual.shape, (
-            f"Input shape {input.shape} must match residual shape {residual.shape}"
-        )
-        import vllm._custom_ops as ops
-
-        ops.fused_add_rms_norm(input, residual, weight, eps)
-        return input, residual
-
     if weight is not None:
         assert weight.dim() == 1, "Weight must be 1-dimensional"
         assert input.shape[-1] == weight.shape[0], (
@@ -872,6 +922,29 @@ def rms_norm_batch_invariant(
     output = torch.empty_like(input_2d)
     BLOCK_SIZE = 1024
     grid = (n_rows,)
+    if residual is not None:
+        assert input.shape == residual.shape, (
+            f"Input shape {input.shape} must match residual shape {residual.shape}"
+        )
+        residual_2d = residual.reshape(-1, residual.shape[-1]).contiguous()
+        residual_out = torch.empty_like(residual_2d)
+        _fused_add_rms_norm_kernel[grid](
+            input_2d,
+            residual_2d,
+            weight if weight is not None else input_2d,
+            output,
+            residual_out,
+            input_2d.stride(0),
+            residual_2d.stride(0),
+            output.stride(0),
+            residual_out.stride(0),
+            n_cols,
+            eps,
+            BLOCK_SIZE=BLOCK_SIZE,
+            HAS_WEIGHT=weight is not None,
+            num_warps=16,
+        )
+        return output.reshape(original_shape), residual_out.reshape(original_shape)
     _rms_norm_kernel[grid](
         input_2d,
         weight if weight is not None else input_2d,
@@ -882,6 +955,7 @@ def rms_norm_batch_invariant(
         eps,
         BLOCK_SIZE=BLOCK_SIZE,
         HAS_WEIGHT=weight is not None,
+        num_warps=16,
     )
     return output.reshape(original_shape)
 

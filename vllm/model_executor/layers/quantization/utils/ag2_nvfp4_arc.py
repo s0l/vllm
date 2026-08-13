@@ -105,7 +105,7 @@ def _load(directory: Path, rank: int, device: torch.device) -> _Sidecar:
         raise RuntimeError("ARC runtime suffix set is incomplete or duplicated")
     result = _Sidecar(manifest=manifest, by_suffix=by_suffix, tensors=tensors)
     _CACHE[cache_key] = result
-    logger.warning(
+    logger.info(
         "Loaded AG2 ARC sidecar rank=%d sha256=%s records=%d bytes=%d schema=%s",
         rank,
         actual_sha,

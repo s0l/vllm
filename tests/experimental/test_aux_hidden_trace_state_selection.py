@@ -530,6 +530,34 @@ def test_full_dcp_boundary_trace_requires_pack_capacity(monkeypatch) -> None:
         AuxHiddenTrace.from_env()
 
 
+def test_single_full_boundary_position_allows_wildcard_token(monkeypatch) -> None:
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_OUTPUT", "/tmp/trace")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_LAYERS", "3,4")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_TOKEN_ID", "-1")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_POSITION", "384")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_ATTENTION_BOUNDARY", "1")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_ATTENTION_BOUNDARY_LAYER", "3")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_FULL_ATTENTION_BOUNDARIES", "1")
+
+    trace = AuxHiddenTrace.from_env()
+
+    assert trace.token_id == -1
+    assert trace.positions == (384,)
+
+
+def test_multiple_full_boundary_positions_reject_wildcard_token(monkeypatch) -> None:
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_OUTPUT", "/tmp/trace")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_LAYERS", "3,4")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_TOKEN_ID", "-1")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_POSITIONS", "383,384")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_ATTENTION_BOUNDARY", "1")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_ATTENTION_BOUNDARY_LAYER", "3")
+    monkeypatch.setenv("AG2_VLLM_AUX_HIDDEN_TRACE_FULL_ATTENTION_BOUNDARIES", "1")
+
+    with pytest.raises(ValueError, match="Wildcard TOKEN_ID"):
+        AuxHiddenTrace.from_env()
+
+
 def test_per_request_gdn_boundaries_use_occurrence_not_token_row(
     tmp_path: Path,
     monkeypatch,

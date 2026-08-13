@@ -849,6 +849,103 @@ def test_ag2_concurrent_partial_prefill_disabled_by_default(
     assert list(scheduler.waiting) == requests[1:]
 
 
+@pytest.mark.parametrize(
+    ("num_requests", "expected_per_request", "expected_scheduled"),
+    [(1, 4096, 1), (5, 819, 5), (9, 512, 8)],
+)
+def test_ag2_adaptive_long_prefill_fills_pure_prefill_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    num_requests: int,
+    expected_per_request: int,
+    expected_scheduled: int,
+):
+    monkeypatch.setenv("AG2_VLLM_LONG_PREFILL_CAP_MIN_PROMPT_TOKENS", "8192")
+    monkeypatch.setenv("AG2_VLLM_ADAPTIVE_LONG_PREFILL_CAP", "1")
+    scheduler = create_scheduler(
+        max_num_batched_tokens=4096,
+        max_model_len=20000,
+        long_prefill_token_threshold=512,
+    )
+    scheduler.max_model_len = 20000
+    requests = create_requests(num_requests=num_requests, num_tokens=10000)
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.total_num_scheduled_tokens == (
+        expected_per_request * expected_scheduled
+    )
+    assert output.num_scheduled_tokens == {
+        request.request_id: expected_per_request
+        for request in requests[:expected_scheduled]
+    }
+
+
+def test_ag2_adaptive_long_prefill_preserves_decode_reserve(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("AG2_VLLM_LONG_PREFILL_CAP_MIN_PROMPT_TOKENS", "8192")
+    monkeypatch.setenv("AG2_VLLM_ADAPTIVE_LONG_PREFILL_CAP", "1")
+    scheduler = create_scheduler(
+        max_num_batched_tokens=4096,
+        max_model_len=20000,
+        long_prefill_token_threshold=512,
+    )
+    scheduler.max_model_len = 20000
+    decode = create_requests(
+        num_requests=1, num_tokens=10, req_ids=["decode"]
+    )[0]
+    scheduler.add_request(decode)
+    prefill_output = scheduler.schedule()
+    scheduler.update_from_output(
+        prefill_output,
+        ModelRunnerOutput(
+            req_ids=[decode.request_id],
+            req_id_to_index={decode.request_id: 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    prefills = create_requests(
+        num_requests=5,
+        num_tokens=10000,
+        req_ids=[f"prefill-{index}" for index in range(5)],
+    )
+    for request in prefills:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[decode.request_id] == 1
+    assert {
+        request.request_id: output.num_scheduled_tokens[request.request_id]
+        for request in prefills
+    } == {request.request_id: 512 for request in prefills}
+    assert output.total_num_scheduled_tokens == 2561
+
+
+def test_ag2_adaptive_long_prefill_disabled_preserves_fixed_cap(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("AG2_VLLM_LONG_PREFILL_CAP_MIN_PROMPT_TOKENS", "8192")
+    monkeypatch.delenv("AG2_VLLM_ADAPTIVE_LONG_PREFILL_CAP", raising=False)
+    scheduler = create_scheduler(
+        max_num_batched_tokens=4096,
+        max_model_len=20000,
+        long_prefill_token_threshold=512,
+    )
+    scheduler.max_model_len = 20000
+    request = create_requests(num_requests=1, num_tokens=10000)[0]
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {request.request_id: 512}
+
+
 def test_ag2_canonical_prefill_admission_defers_residual_chunk(
     monkeypatch: pytest.MonkeyPatch,
 ):

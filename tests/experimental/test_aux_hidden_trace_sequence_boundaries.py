@@ -36,10 +36,13 @@ def test_sequence_boundary_schema_is_ordered_and_bounded(tmp_path) -> None:
     trace = _trace(tmp_path)
     labels = trace.output_labels()
 
-    assert len(labels) == 60
-    assert labels[:4] == (
+    assert len(labels) == 72
+    assert labels[:7] == (
         "layer.0",
+        "sequence_input_hidden.0",
+        "sequence_input_residual.0",
         "sequence_input_norm.0",
+        "sequence_input_residual_out.0",
         "sequence_gdn_qkvz.0",
         "sequence_gdn_ba.0",
     )
@@ -51,7 +54,7 @@ def test_sequence_boundary_schema_is_ordered_and_bounded(tmp_path) -> None:
 
     max_query_len = 6656
     packet_bytes = len(labels) * max_query_len * 9 * torch.int64.itemsize
-    assert packet_bytes == 28_753_920
+    assert packet_bytes == 34_504_704
 
 
 def test_sequence_boundary_request_packet_uses_dedicated_schema(

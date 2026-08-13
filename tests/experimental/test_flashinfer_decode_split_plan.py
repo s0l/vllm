@@ -35,6 +35,27 @@ def test_global_batch_invariant_policy_keeps_existing_graph_contract() -> None:
     ) == (2048, True, False)
 
 
+def test_qlen1_policy_is_narrower_than_spec_target_policy() -> None:
+    assert _resolve_decode_split_plan(
+        num_decode_tokens=5,
+        num_decodes=5,
+        fixed_split_size=4096,
+        disable_split_kv=False,
+        spec_target_only=True,
+        qlen1_fixed_split_size=2048,
+        qlen1_disable_split_kv=True,
+    ) == (2048, True, False)
+    assert _resolve_decode_split_plan(
+        num_decode_tokens=20,
+        num_decodes=5,
+        fixed_split_size=4096,
+        disable_split_kv=False,
+        spec_target_only=True,
+        qlen1_fixed_split_size=2048,
+        qlen1_disable_split_kv=True,
+    ) == (4096, False, True)
+
+
 @pytest.mark.parametrize(
     ("num_decode_tokens", "num_decodes"),
     [(1, 0), (5, 2)],

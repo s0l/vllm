@@ -24,6 +24,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
+    tensor_model_parallel_unified_exact_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -393,6 +394,11 @@ class Qwen3NextAttention(nn.Module):
             config, "dual_chunk_attention_config", None
         )
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
+        self._ag2_tp3_unified_exact_reduce = (
+            os.environ.get("AG2_VLLM_TP3_UNIFIED_EXACT_REDUCE", "0") == "1"
+            and reduce_results
+            and tp_size == 3
+        )
 
         qkv_proj_cls = (
             QKVParallelLinearOverlappingGQA
@@ -419,7 +425,9 @@ class Qwen3NextAttention(nn.Module):
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             bias=False,
-            reduce_results=reduce_results,
+            reduce_results=(
+                reduce_results and not self._ag2_tp3_unified_exact_reduce
+            ),
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
@@ -949,6 +957,8 @@ class Qwen3NextAttention(nn.Module):
             trace = attn_output[:3]
             self._ag2_trace_gated_output[: trace.shape[0]].copy_(trace)
         output, _ = self.o_proj(attn_output)
+        if self._ag2_tp3_unified_exact_reduce:
+            output = tensor_model_parallel_unified_exact_all_reduce(output)
         if return_ag2_mtp_trace:
             mtp_trace["output_parallel"] = self.o_proj._ag2_aux_output_parallel
             mtp_trace["output"] = output
@@ -1576,11 +1586,26 @@ class Qwen3NextDecoderLayer(nn.Module):
             self._ag2_trace_input[: trace.shape[0]].copy_(trace)
         if return_ag2_mtp_trace:
             mtp_trace["layer_input"] = hidden_states
+        sequence_input_operands = None
+        if self._ag2_aux_sequence_boundary_enabled:
+            sequence_input_operands = (
+                _ag2_trace_packet(hidden_states),
+                _ag2_trace_packet(
+                    residual
+                    if residual is not None
+                    else torch.zeros_like(hidden_states)
+                ),
+            )
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        if sequence_input_operands is not None:
+            sequence_input_operands += (
+                _ag2_trace_packet(hidden_states),
+                _ag2_trace_packet(residual),
+            )
         if return_ag2_mtp_trace:
             mtp_trace["input_norm"] = hidden_states
         if self._ag2_projection_capture_enabled:
@@ -1658,6 +1683,7 @@ class Qwen3NextDecoderLayer(nn.Module):
                     hidden_states,
                 )
                 if self._ag2_aux_sequence_boundary_enabled:
+                    assert sequence_input_operands is not None
                     internal_names = (
                         "_ag2_aux_qkvz",
                         "_ag2_aux_ba",
@@ -1670,7 +1696,7 @@ class Qwen3NextDecoderLayer(nn.Module):
                         internal_names,
                     )
                     self._ag2_aux_sequence_operator_boundaries = (
-                        _ag2_trace_packet(operator_boundaries[0]),
+                        *sequence_input_operands,
                         *internal_packets,
                         _ag2_trace_packet(operator_boundaries[-1]),
                     )
@@ -1705,8 +1731,9 @@ class Qwen3NextDecoderLayer(nn.Module):
                     )
                 if capture_internal:
                     if self._ag2_aux_sequence_boundary_enabled:
+                        assert sequence_input_operands is not None
                         self._ag2_aux_sequence_operator_boundaries = (
-                            self._ag2_aux_gdn_input_norm,
+                            *sequence_input_operands,
                         ) + tuple(
                             _ag2_trace_packet(attention_trace[name])
                             for name in self.self_attn._ag2_aux_compact_full_stages

@@ -343,6 +343,9 @@ class Scheduler(SchedulerInterface):
         self.long_prefill_cap_min_prompt_tokens = _nonnegative_env_int(
             "AG2_VLLM_LONG_PREFILL_CAP_MIN_PROMPT_TOKENS"
         )
+        self.adaptive_long_prefill_cap = (
+            os.environ.get("AG2_VLLM_ADAPTIVE_LONG_PREFILL_CAP", "0") == "1"
+        )
         if self.long_prefill_cap_min_prompt_tokens > 0:
             if self.scheduler_config.long_prefill_token_threshold <= 0:
                 raise ValueError(
@@ -351,9 +354,10 @@ class Scheduler(SchedulerInterface):
                 )
             logger.info(
                 "Long-prefill cap eligibility POC enabled: min_prompt_tokens=%d, "
-                "chunk_cap=%d",
+                "chunk_cap=%d, adaptive_pure_prefill=%s",
                 self.long_prefill_cap_min_prompt_tokens,
                 self.scheduler_config.long_prefill_token_threshold,
+                self.adaptive_long_prefill_cap,
             )
         self.prefill_admission_delay_s = max(
             0.0,
@@ -730,6 +734,21 @@ class Scheduler(SchedulerInterface):
             return 0
         return threshold
 
+    def _long_prefill_step_cap(self) -> int:
+        """Fill the token budget only when no active decode needs protection."""
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if not self.adaptive_long_prefill_cap or threshold <= 0:
+            return threshold
+        if any(not self._is_prefill_request(request) for request in self.running):
+            return threshold
+        eligible = sum(
+            self._long_prefill_chunk_cap(request) > 0
+            for request in (*self.running, *self.waiting)
+        )
+        if eligible == 0:
+            return threshold
+        return max(threshold, self.max_num_scheduled_tokens // eligible)
+
     def _should_delay_waiting_prefill_admission(self) -> bool:
         """Briefly wait for an initial burst without delaying it indefinitely."""
         if (
@@ -805,6 +824,7 @@ class Scheduler(SchedulerInterface):
             token_budget = 0
         prefill_target_count = self._partial_prefill_target_count()
         prefill_chunk_cap = self._partial_prefill_chunk_cap(prefill_target_count)
+        long_prefill_step_cap = self._long_prefill_step_cap()
 
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -866,6 +886,10 @@ class Scheduler(SchedulerInterface):
                 request, num_new_tokens, prefill_chunk_cap
             )
             long_prefill_chunk_cap = self._long_prefill_chunk_cap(request)
+            if long_prefill_chunk_cap > 0:
+                long_prefill_chunk_cap = max(
+                    long_prefill_chunk_cap, long_prefill_step_cap
+                )
             if 0 < long_prefill_chunk_cap < num_new_tokens:
                 num_new_tokens = long_prefill_chunk_cap
             num_new_tokens = min(num_new_tokens, token_budget)
@@ -1295,6 +1319,8 @@ class Scheduler(SchedulerInterface):
                         pad_spec_decode = True
 
                     threshold = self._long_prefill_chunk_cap(request)
+                    if threshold > 0:
+                        threshold = max(threshold, long_prefill_step_cap)
                     num_new_tokens = self._cap_prefill_chunk(
                         request, num_new_tokens, prefill_chunk_cap
                     )

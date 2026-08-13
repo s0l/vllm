@@ -239,6 +239,7 @@ def cp_lse_ag_out_rs(
     ctx: CPTritonContext | None = None,
     return_lse: bool = False,
     is_lse_base_on_e=True,
+    force_exact_reduce_scatter: bool = False,
 ):
     """
     cp_attn_out: [ B, H, D ]
@@ -247,7 +248,24 @@ def cp_lse_ag_out_rs(
     out, lse = _cp_lse_common(
         cp_attn_out, cp_attn_lse, cp_group, ctx=ctx, is_lse_base_on_e=is_lse_base_on_e
     )
-    if _use_native_dcp_reduce_scatter(out, cp_group):
+    if force_exact_reduce_scatter:
+        if (
+            cp_group.world_size != 3
+            or out.dim() != 3
+            or out.dtype != torch.bfloat16
+            or out.shape[1] % cp_group.world_size
+        ):
+            raise ValueError(
+                "Exact DCP reduce-scatter requires TP3 BF16 "
+                f"[rows,heads,dim], got shape={tuple(out.shape)} "
+                f"dtype={out.dtype} world={cp_group.world_size}"
+            )
+        from vllm.distributed.device_communicators.tp3_exact_reduce import (
+            exact_head_owner_reduce_scatter,
+        )
+
+        out = exact_head_owner_reduce_scatter(out, cp_group.device_group)
+    elif _use_native_dcp_reduce_scatter(out, cp_group):
         out = cp_group.reduce_scatter(out, dim=1)
     else:
         out = cp_group.reduce_scatter_chunked(out, dim=1)

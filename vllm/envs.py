@@ -48,9 +48,14 @@ if TYPE_CHECKING:
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_DCP_NATIVE_RS_MAX_ROWS: int = 0
+    VLLM_DCP_ABSOLUTE_PREFILL_EXACT_RS: bool = False
     VLLM_TP3_CE_REDUCE: bool = False
+    VLLM_TP3_CE_MAX_ROWS: int = 12288
+    VLLM_TP3_LL_REDUCE: bool = False
+    VLLM_TP3_LL_MAX_ROWS: int = 16
     VLLM_TP3_SD_CANONICAL_REDUCE: bool = False
     VLLM_TP3_SD_DETERMINISTIC_REDUCE: bool = False
+    VLLM_TP3_SD_DETERMINISTIC_MAX_ROWS: int = 24
     VLLM_TP3_SD_PHASE_REDUCE: bool = False
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
@@ -91,6 +96,7 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
+    AG2_VLLM_GEMMA_DETERMINISTIC_RMS: bool = False
     AG2_VLLM_NVFP4_BATCH_INVARIANT: bool = False
     AG2_VLLM_NVFP4_B12X: bool = False
     AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE: bool = False
@@ -624,6 +630,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    "AG2_VLLM_GEMMA_DETERMINISTIC_RMS": lambda: bool(
+        int(os.getenv("AG2_VLLM_GEMMA_DETERMINISTIC_RMS", "0"))
+    ),
     "AG2_VLLM_NVFP4_BATCH_INVARIANT": lambda: bool(
         int(os.getenv("AG2_VLLM_NVFP4_BATCH_INVARIANT", "0"))
     ),
@@ -906,7 +915,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DCP_NATIVE_RS_MAX_ROWS": lambda: int(
         os.environ.get("VLLM_DCP_NATIVE_RS_MAX_ROWS", "0")
     ),
+    "VLLM_DCP_ABSOLUTE_PREFILL_EXACT_RS": lambda: os.environ.get(
+        "VLLM_DCP_ABSOLUTE_PREFILL_EXACT_RS", "0"
+    )
+    == "1",
     "VLLM_TP3_CE_REDUCE": lambda: os.environ.get("VLLM_TP3_CE_REDUCE", "0") == "1",
+    "VLLM_TP3_CE_MAX_ROWS": lambda: int(
+        os.environ.get("VLLM_TP3_CE_MAX_ROWS", "12288")
+    ),
+    "VLLM_TP3_LL_REDUCE": lambda: os.environ.get("VLLM_TP3_LL_REDUCE", "0") == "1",
+    "VLLM_TP3_LL_MAX_ROWS": lambda: int(
+        os.environ.get("VLLM_TP3_LL_MAX_ROWS", "16")
+    ),
     "VLLM_TP3_SD_CANONICAL_REDUCE": lambda: os.environ.get(
         "VLLM_TP3_SD_CANONICAL_REDUCE", "0"
     )
@@ -915,6 +935,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_TP3_SD_DETERMINISTIC_REDUCE", "0"
     )
     == "1",
+    "VLLM_TP3_SD_DETERMINISTIC_MAX_ROWS": lambda: int(
+        os.environ.get("VLLM_TP3_SD_DETERMINISTIC_MAX_ROWS", "24")
+    ),
     "VLLM_TP3_SD_PHASE_REDUCE": lambda: os.environ.get(
         "VLLM_TP3_SD_PHASE_REDUCE", "0"
     )

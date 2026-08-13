@@ -374,11 +374,17 @@ class AuxHiddenTrace:
             raise ValueError(
                 "Aux hidden trace requires nonnegative POSITION or POSITIONS"
             )
+        single_position_full_boundary = (
+            len(positions) == 1
+            and first_attention_boundary
+            and full_attention_boundaries
+        )
         if token_id < 0 and not request_chunks and not (
-            request_prefix and compact_rows
+            (request_prefix and compact_rows) or single_position_full_boundary
         ):
             raise ValueError(
-                "Wildcard TOKEN_ID requires request-filtered compact-row tracing"
+                "Wildcard TOKEN_ID requires request-filtered compact-row tracing "
+                "or one explicit full-attention boundary position"
             )
         if request_chunks and position < 0:
             raise ValueError(
@@ -843,7 +849,14 @@ class AuxHiddenTrace:
         for decoder_layer in range(max(self.layers)):
             if decoder_layer in self.sequence_boundary_layers:
                 layer_type = self._layer_types.get(decoder_layer)
-                labels.append(f"sequence_input_norm.{decoder_layer}")
+                labels.extend(
+                    (
+                        f"sequence_input_hidden.{decoder_layer}",
+                        f"sequence_input_residual.{decoder_layer}",
+                        f"sequence_input_norm.{decoder_layer}",
+                        f"sequence_input_residual_out.{decoder_layer}",
+                    )
+                )
                 if layer_type == "full_attention":
                     labels.extend(
                         f"sequence_full_{stage}.{decoder_layer}"

@@ -147,6 +147,32 @@ class GemmaRMSNorm(CustomOp):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
+        if envs.AG2_VLLM_GEMMA_DETERMINISTIC_RMS:
+            logger.warning_once(
+                "AG2 deterministic Gemma RMSNorm enabled for both native "
+                "compile and CUDA custom-op dispatch"
+            )
+
+    def _forward_deterministic(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        weight = self.weight.float() + 1.0
+        if residual is None:
+            return rms_norm_batch_invariant(
+                x,
+                weight,
+                self.variance_epsilon,
+            )
+        # Keep one program per semantic row and materialize the BF16 residual
+        # inside the same fixed-decomposition kernel as the RMS reduction.
+        return rms_norm_batch_invariant(
+            x,
+            weight,
+            self.variance_epsilon,
+            residual=residual,
+        )
 
     def forward_native(
         self,
@@ -154,6 +180,8 @@ class GemmaRMSNorm(CustomOp):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
+        if envs.AG2_VLLM_GEMMA_DETERMINISTIC_RMS:
+            return self._forward_deterministic(x, residual)
         weight = self.weight.float() + 1.0
         if residual is None:
             return ir.ops.rms_norm(x, weight, self.variance_epsilon)
@@ -164,6 +192,8 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if envs.AG2_VLLM_GEMMA_DETERMINISTIC_RMS:
+            return self._forward_deterministic(x, residual)
         return self.forward_native(x, residual)
 
     def forward_native_output_only(
