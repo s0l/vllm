@@ -114,6 +114,7 @@ class AuxHiddenTrace:
     fingerprint_outputs: bool = False
     request_prefix: str = ""
     request_chunks: bool = False
+    reduction_map: bool = False
     sequence_boundary_layers: tuple[int, ...] = ()
     _layer_types: dict[int, str] = field(default_factory=dict)
     _saved_matches: dict[int, int] = field(default_factory=dict)
@@ -357,6 +358,13 @@ class AuxHiddenTrace:
             )
             == "1"
         )
+        reduction_map = (
+            os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_REDUCTION_MAP",
+                "0",
+            )
+            == "1"
+        )
         sequence_boundary_layers_raw = os.environ.get(
             "AG2_VLLM_AUX_HIDDEN_TRACE_SEQUENCE_BOUNDARY_LAYERS",
             "",
@@ -368,6 +376,11 @@ class AuxHiddenTrace:
                 if value
             )
         )
+        if first_gdn_boundaries and gdn_boundary_layer in sequence_boundary_layers:
+            raise ValueError(
+                "Aux hidden trace cannot combine sequence and first-GDN "
+                f"boundaries for layer {gdn_boundary_layer}"
+            )
         if not layers or any(layer < 0 for layer in layers):
             raise ValueError("Aux hidden trace layers must be nonnegative")
         if (not positions or any(value < 0 for value in positions)) and not request_chunks:
@@ -389,8 +402,17 @@ class AuxHiddenTrace:
             raise ValueError("Request-chunk trace requires REQUEST_PREFIX")
         if request_chunks and not fingerprint_outputs:
             raise ValueError("Request-chunk trace requires fingerprint outputs")
-        if request_chunks and compact_rows:
+        if request_chunks and compact_rows and not reduction_map:
             raise ValueError("Request-chunk trace and compact-row trace are exclusive")
+        if reduction_map and not (
+            request_chunks and compact_rows and fingerprint_outputs
+        ):
+            raise ValueError(
+                "Reduction map requires request chunks, compact rows and "
+                "fingerprint outputs"
+            )
+        if reduction_map and compact_capacity < 2:
+            raise ValueError("Reduction map requires compact capacity >= 2")
         if any(layer < 0 for layer in sequence_boundary_layers):
             raise ValueError("Sequence boundary layers must be nonnegative")
         if sequence_boundary_layers and not request_chunks:
@@ -586,6 +608,7 @@ class AuxHiddenTrace:
             fingerprint_outputs=fingerprint_outputs,
             request_prefix=request_prefix,
             request_chunks=request_chunks,
+            reduction_map=reduction_map,
             sequence_boundary_layers=sequence_boundary_layers,
         )
 
@@ -694,6 +717,7 @@ class AuxHiddenTrace:
             for module in model.modules():
                 if getattr(module, "aux_hidden_state_layers", None) == self.layers:
                     module._ag2_aux_trace_request_chunks = True
+                    module._ag2_aux_trace_reduction_map = self.reduction_map
                     configured_request_models.append(type(module).__name__)
             if not configured_request_models:
                 raise RuntimeError(
@@ -710,11 +734,12 @@ class AuxHiddenTrace:
             self.all_internal_boundaries
             or self.internal_boundary_layers
             or self.sequence_boundary_layers
+            or self.reduction_map
         ):
             expected = set(range(max(self.layers)))
             required = (
                 expected
-                if self.all_internal_boundaries
+                if self.all_internal_boundaries or self.reduction_map
                 else set(self.internal_boundary_layers).union(
                     self.sequence_boundary_layers
                 )
@@ -794,6 +819,7 @@ class AuxHiddenTrace:
                     "positions": list(self.positions),
                     "request_prefix": self.request_prefix,
                     "request_chunks": self.request_chunks,
+                    "reduction_map": self.reduction_map,
                     "sequence_boundary_layers": list(
                         self.sequence_boundary_layers
                     ),
@@ -806,9 +832,13 @@ class AuxHiddenTrace:
                     "compact_gdn_stages": list(self.compact_gdn_stages),
                     "compact_mlp_stages": list(self.compact_mlp_stages),
                     "representation": (
-                        "exact_bit_fingerprint_v1"
-                        if self.fingerprint_outputs
-                        else "raw"
+                        "mixed_reduction_map_v1"
+                        if self.reduction_map
+                        else (
+                            "exact_bit_fingerprint_v1"
+                            if self.fingerprint_outputs
+                            else "raw"
+                        )
                     ),
                     "labels": list(self.output_labels()),
                     "scopes": self.output_scopes(),
@@ -826,6 +856,16 @@ class AuxHiddenTrace:
         os.replace(temporary, path)
 
     def output_labels(self) -> tuple[str, ...]:
+        if self.reduction_map:
+            return (
+                "reduction_map.row_indices",
+                "reduction_map.layer_inputs",
+                "reduction_map.attention_partials",
+                "reduction_map.attention_outputs",
+                "reduction_map.mlp_inputs",
+                "reduction_map.mlp_partials",
+                "reduction_map.mlp_outputs",
+            )
         labels: list[str] = []
         compact_boundary_max_layer = self.compact_boundary_max_layer
         if self.compact_all_boundaries and compact_boundary_max_layer < 0:
@@ -952,15 +992,10 @@ class AuxHiddenTrace:
                 )
                 and decoder_layer == self.compact_gdn_boundary_layer
             ):
+                labels.append(f"compact_gdn_row_indices.{decoder_layer}")
                 labels.extend(
-                    (
-                        f"compact_gdn_qkvz.{decoder_layer}",
-                        f"compact_gdn_ba.{decoder_layer}",
-                        f"compact_gdn_core.{decoder_layer}",
-                        f"compact_gdn_gated_norm.{decoder_layer}",
-                        f"compact_gdn_output_parallel.{decoder_layer}",
-                        f"compact_gdn_output.{decoder_layer}",
-                    )
+                    f"compact_gdn_{stage}.{decoder_layer}"
+                    for stage in self.compact_gdn_stages
                 )
             checkpoint = decoder_layer + 1
             if checkpoint in self.layers:
@@ -976,6 +1011,16 @@ class AuxHiddenTrace:
         return tuple(labels)
 
     def output_scopes(self) -> dict[str, str]:
+        if self.reduction_map:
+            return {
+                "reduction_map.row_indices": "global",
+                "reduction_map.layer_inputs": "global",
+                "reduction_map.attention_partials": "rank_local",
+                "reduction_map.attention_outputs": "global",
+                "reduction_map.mlp_inputs": "rank_local",
+                "reduction_map.mlp_partials": "rank_local",
+                "reduction_map.mlp_outputs": "global",
+            }
         return {
             label: (
                 "rank_local"
@@ -1160,7 +1205,11 @@ class AuxHiddenTrace:
                 provenance: dict[str, object] | None,
             ) -> torch.Tensor:
                 if label.startswith(
-                    ("layer_row_indices.", "compact_boundary_row_indices.")
+                    (
+                        "layer_row_indices.",
+                        "compact_boundary_row_indices.",
+                        "compact_gdn_row_indices.",
+                    )
                 ):
                     return hidden
                 if (
@@ -1183,10 +1232,10 @@ class AuxHiddenTrace:
                 ):
                     checkpoint = label.rsplit(".", 1)[1]
                     row_label = (
-                        f"compact_boundary_row_indices.{checkpoint}"
-                        if label.startswith(
-                            ("compact_gdn_", "compact_full_", "compact_mlp_")
-                        )
+                        f"compact_gdn_row_indices.{checkpoint}"
+                        if label.startswith("compact_gdn_")
+                        else f"compact_boundary_row_indices.{checkpoint}"
+                        if label.startswith(("compact_full_", "compact_mlp_"))
                         or label.startswith(
                             (
                                 "input_norm.",
@@ -1433,9 +1482,13 @@ class AuxHiddenTrace:
             {
                 "schema_version": AG2_AUX_TRACE_SCHEMA_VERSION,
                 "schema": (
-                    "ag2-upstream-sequence-fingerprint-v1"
-                    if self.sequence_boundary_layers
-                    else "ag2-gdn-sequence-causal-packet-v1"
+                    "ag2-reduction-noise-map-v1"
+                    if self.reduction_map
+                    else (
+                        "ag2-upstream-sequence-fingerprint-v1"
+                        if self.sequence_boundary_layers
+                        else "ag2-gdn-sequence-causal-packet-v1"
+                    )
                 ),
                 "rank": rank,
                 "invocation": invocation,

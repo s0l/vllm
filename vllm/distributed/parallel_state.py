@@ -131,6 +131,10 @@ _tp3_piecewise_device_ce_logged = False
 _tp3_mtp_device_ce_logged = False
 _tp3_prefill_canonical_logged = False
 _tp3_embedding_nccl_logged = False
+_tp3_gdn_decode_fixed_logged = False
+_tp3_mlp_decode_fixed_logged = False
+_tp3_attention_decode_fixed_logged = False
+_tp3_mixed_semantic_row_fixed_logged = False
 
 
 def _register_group(group: "GroupCoordinator") -> None:
@@ -539,8 +543,56 @@ def _tp3_device_ce_reduce(
     return output
 
 
+def _should_use_tp3_mixed_semantic_row_fixed_reduce(
+    *,
+    enabled: bool,
+    backend: str,
+    row_mask: torch.Tensor | None,
+    tensor_dim: int,
+    hidden_size: int,
+    tp_world_size: int,
+) -> bool:
+    """Select diagnostic row-owned Exact repair for mixed target packets."""
+    return (
+        os.environ.get("AG2_VLLM_FIXED_REDUCE_MIXED_ROW_MASK", "0") == "1"
+        and enabled
+        and backend == "exact_fp32"
+        and row_mask is not None
+        and tensor_dim == 2
+        and hidden_size == 5120
+        and tp_world_size == 3
+    )
+
+
+def _tp3_mixed_semantic_row_fixed_reduce(
+    tensor: torch.Tensor,
+    base_output: torch.Tensor,
+    row_mask: torch.Tensor,
+    group: "GroupCoordinator",
+) -> torch.Tensor:
+    """Keep the packet reducer, replacing only owned decode-prefix rows."""
+    prefix_capacity = int(
+        os.environ.get("AG2_VLLM_FIXED_REDUCE_MIXED_PREFIX_ROWS", "64")
+    )
+    prefix_rows = min(tensor.shape[0], prefix_capacity)
+    local_prefix = tensor[:prefix_rows]
+    if prefix_rows < prefix_capacity:
+        local_prefix = torch.nn.functional.pad(
+            local_prefix, (0, 0, 0, prefix_capacity - prefix_rows)
+        )
+    exact_prefix = _tp3_sd_deterministic_reduce(local_prefix, group)[:prefix_rows]
+    repaired_prefix = torch.where(
+        row_mask[:prefix_rows, None],
+        exact_prefix,
+        base_output[:prefix_rows],
+    )
+    return torch.cat((repaired_prefix, base_output[prefix_rows:]), dim=0)
+
+
 def gdn_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     """Use a row-invariant compressed reduction for PIECEWISE GDN."""
+    global _tp3_gdn_decode_fixed_logged
+    global _tp3_mixed_semantic_row_fixed_logged
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
@@ -559,6 +611,65 @@ def gdn_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
         if forward_context is not None
         else None
     )
+    if _should_use_tp3_gdn_decode_fixed_reduce(
+        enabled=(
+            os.environ.get("AG2_VLLM_GDN_DECODE_FIXED_REDUCE", "0") == "1"
+        ),
+        target_decode_lane=(
+            forward_context is not None
+            and forward_context.tp3_sd_phase_reduce
+        ),
+        tensor_dim=tensor.dim(),
+        rows=tensor.shape[0] if tensor.dim() == 2 else 0,
+        hidden_size=tensor.shape[-1] if tensor.dim() else 0,
+        tp_world_size=group.world_size,
+    ):
+        backend = _tp3_gdn_decode_fixed_backend()
+        if not _tp3_gdn_decode_fixed_logged:
+            logger.warning(
+                "Diagnostic operator-owned GDN fixed reduction active: "
+                "shape=%s cudagraph_mode=%s backend=%s",
+                tuple(tensor.shape),
+                cudagraph_mode,
+                backend,
+            )
+            _tp3_gdn_decode_fixed_logged = True
+        if backend == "exact_fp32":
+            return _tp3_sd_deterministic_reduce(tensor, group)
+        if backend == "device_ce":
+            return _tp3_device_ce_reduce(tensor, group)
+        return _tp3_gdn_row_nccl_reduce(tensor, group._all_reduce_out_place)
+    gdn_backend = _tp3_gdn_decode_fixed_backend()
+    if _should_use_tp3_mixed_semantic_row_fixed_reduce(
+        enabled=os.environ.get("AG2_VLLM_GDN_DECODE_FIXED_REDUCE", "0") == "1",
+        backend=gdn_backend,
+        row_mask=(
+            forward_context.tp3_target_decode_row_mask
+            if forward_context is not None
+            else None
+        ),
+        tensor_dim=tensor.dim(),
+        hidden_size=tensor.shape[-1] if tensor.dim() else 0,
+        tp_world_size=group.world_size,
+    ):
+        if not _tp3_mixed_semantic_row_fixed_logged:
+            logger.warning(
+                "Diagnostic TP3 semantic-row Exact repair active: shape=%s "
+                "prefix_capacity=%s cudagraph_mode=%s",
+                tuple(tensor.shape),
+                os.environ.get("AG2_VLLM_FIXED_REDUCE_MIXED_PREFIX_ROWS", "64"),
+                cudagraph_mode,
+            )
+            _tp3_mixed_semantic_row_fixed_logged = True
+        base_output = all_reduce(tensor, group_name)
+        assert forward_context is not None
+        assert forward_context.tp3_target_decode_row_mask is not None
+        return _tp3_mixed_semantic_row_fixed_reduce(
+            tensor,
+            base_output,
+            forward_context.tp3_target_decode_row_mask,
+            group,
+        )
     if _should_use_tp3_piecewise_device_ce(
         cudagraph_mode=cudagraph_mode,
         tensor_dim=tensor.dim(),
@@ -568,6 +679,275 @@ def gdn_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     ):
         return _tp3_device_ce_reduce(tensor, group)
     return all_reduce(tensor, group_name)
+
+
+def mlp_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    """Use a fixed-association reduction for bounded target-decode MLP rows."""
+    global _tp3_mlp_decode_fixed_logged
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+
+    from vllm.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+
+    forward_context = (
+        get_forward_context() if is_forward_context_available() else None
+    )
+    cudagraph_mode = (
+        forward_context.cudagraph_runtime_mode
+        if forward_context is not None
+        else None
+    )
+    if _should_use_tp3_mlp_decode_fixed_reduce(
+        enabled=(
+            os.environ.get("AG2_VLLM_MLP_DECODE_FIXED_REDUCE", "0") == "1"
+        ),
+        target_decode_lane=(
+            forward_context is not None and forward_context.tp3_sd_phase_reduce
+        ),
+        tensor_dim=tensor.dim(),
+        rows=tensor.shape[0] if tensor.dim() == 2 else 0,
+        hidden_size=tensor.shape[-1] if tensor.dim() else 0,
+        tp_world_size=group.world_size,
+    ):
+        backend = _tp3_mlp_decode_fixed_backend()
+        if not _tp3_mlp_decode_fixed_logged:
+            logger.warning(
+                "Diagnostic operator-owned MLP fixed reduction active: "
+                "shape=%s cudagraph_mode=%s backend=%s",
+                tuple(tensor.shape),
+                cudagraph_mode,
+                backend,
+            )
+            _tp3_mlp_decode_fixed_logged = True
+        if backend == "exact_fp32":
+            return _tp3_sd_deterministic_reduce(tensor, group)
+        if backend == "device_ce":
+            return _tp3_device_ce_reduce(tensor, group)
+        return _tp3_gdn_row_nccl_reduce(tensor, group._all_reduce_out_place)
+    mlp_backend = _tp3_mlp_decode_fixed_backend()
+    if _should_use_tp3_mixed_semantic_row_fixed_reduce(
+        enabled=os.environ.get("AG2_VLLM_MLP_DECODE_FIXED_REDUCE", "0") == "1",
+        backend=mlp_backend,
+        row_mask=(
+            forward_context.tp3_target_decode_row_mask
+            if forward_context is not None
+            else None
+        ),
+        tensor_dim=tensor.dim(),
+        hidden_size=tensor.shape[-1] if tensor.dim() else 0,
+        tp_world_size=group.world_size,
+    ):
+        base_output = all_reduce(tensor, group_name)
+        assert forward_context is not None
+        assert forward_context.tp3_target_decode_row_mask is not None
+        return _tp3_mixed_semantic_row_fixed_reduce(
+            tensor,
+            base_output,
+            forward_context.tp3_target_decode_row_mask,
+            group,
+        )
+    return all_reduce(tensor, group_name)
+
+
+def attention_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    """Use a fixed-association reduction for full-attention output rows."""
+    global _tp3_attention_decode_fixed_logged
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+
+    from vllm.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+
+    forward_context = (
+        get_forward_context() if is_forward_context_available() else None
+    )
+    cudagraph_mode = (
+        forward_context.cudagraph_runtime_mode
+        if forward_context is not None
+        else None
+    )
+    if _should_use_tp3_attention_decode_fixed_reduce(
+        enabled=(
+            os.environ.get("AG2_VLLM_ATTENTION_DECODE_FIXED_REDUCE", "0")
+            == "1"
+        ),
+        target_decode_lane=(
+            forward_context is not None and forward_context.tp3_sd_phase_reduce
+        ),
+        tensor_dim=tensor.dim(),
+        rows=tensor.shape[0] if tensor.dim() == 2 else 0,
+        hidden_size=tensor.shape[-1] if tensor.dim() else 0,
+        tp_world_size=group.world_size,
+    ):
+        backend = _tp3_attention_decode_fixed_backend()
+        if not _tp3_attention_decode_fixed_logged:
+            logger.warning(
+                "Diagnostic operator-owned full-attention fixed reduction "
+                "active: shape=%s cudagraph_mode=%s backend=%s",
+                tuple(tensor.shape),
+                cudagraph_mode,
+                backend,
+            )
+            _tp3_attention_decode_fixed_logged = True
+        if backend == "exact_fp32":
+            return _tp3_sd_deterministic_reduce(tensor, group)
+        if backend == "device_ce":
+            return _tp3_device_ce_reduce(tensor, group)
+        return _tp3_gdn_row_nccl_reduce(tensor, group._all_reduce_out_place)
+    attention_backend = _tp3_attention_decode_fixed_backend()
+    if _should_use_tp3_mixed_semantic_row_fixed_reduce(
+        enabled=(
+            os.environ.get("AG2_VLLM_ATTENTION_DECODE_FIXED_REDUCE", "0") == "1"
+        ),
+        backend=attention_backend,
+        row_mask=(
+            forward_context.tp3_target_decode_row_mask
+            if forward_context is not None
+            else None
+        ),
+        tensor_dim=tensor.dim(),
+        hidden_size=tensor.shape[-1] if tensor.dim() else 0,
+        tp_world_size=group.world_size,
+    ):
+        base_output = all_reduce(tensor, group_name)
+        assert forward_context is not None
+        assert forward_context.tp3_target_decode_row_mask is not None
+        return _tp3_mixed_semantic_row_fixed_reduce(
+            tensor,
+            base_output,
+            forward_context.tp3_target_decode_row_mask,
+            group,
+        )
+    return all_reduce(tensor, group_name)
+
+
+def _should_use_tp3_gdn_decode_fixed_reduce(
+    *,
+    enabled: bool,
+    target_decode_lane: bool,
+    tensor_dim: int,
+    rows: int,
+    hidden_size: int,
+    tp_world_size: int,
+) -> bool:
+    """Select the bounded operator-owned diagnostic GDN reduction."""
+    max_rows = int(os.environ.get("AG2_VLLM_GDN_DECODE_FIXED_MAX_ROWS", "8"))
+    return (
+        enabled
+        and (
+            target_decode_lane
+            or os.environ.get("AG2_VLLM_FIXED_REDUCE_ALLOW_MIXED_STEP", "0")
+            == "1"
+        )
+        and tensor_dim == 2
+        and 1 <= rows <= max_rows
+        and hidden_size == 5120
+        and tp_world_size == 3
+    )
+
+
+def is_tp3_gdn_decode_fixed_enabled() -> bool:
+    """Return whether target-decode GDN Exact dispatch is requested."""
+    return os.environ.get("AG2_VLLM_GDN_DECODE_FIXED_REDUCE", "0") == "1"
+
+
+def _should_use_tp3_mlp_decode_fixed_reduce(
+    *,
+    enabled: bool,
+    target_decode_lane: bool,
+    tensor_dim: int,
+    rows: int,
+    hidden_size: int,
+    tp_world_size: int,
+) -> bool:
+    """Select the bounded operator-owned diagnostic dense-MLP reduction."""
+    max_rows = int(os.environ.get("AG2_VLLM_MLP_DECODE_FIXED_MAX_ROWS", "8"))
+    return (
+        enabled
+        and (
+            target_decode_lane
+            or os.environ.get("AG2_VLLM_FIXED_REDUCE_ALLOW_MIXED_STEP", "0")
+            == "1"
+        )
+        and tensor_dim == 2
+        and 1 <= rows <= max_rows
+        and hidden_size == 5120
+        and tp_world_size == 3
+    )
+
+
+def _should_use_tp3_attention_decode_fixed_reduce(
+    *,
+    enabled: bool,
+    target_decode_lane: bool,
+    tensor_dim: int,
+    rows: int,
+    hidden_size: int,
+    tp_world_size: int,
+) -> bool:
+    """Select the bounded operator-owned full-attention diagnostic reduce."""
+    max_rows = int(
+        os.environ.get("AG2_VLLM_ATTENTION_DECODE_FIXED_MAX_ROWS", "8")
+    )
+    return (
+        enabled
+        and (
+            target_decode_lane
+            or os.environ.get("AG2_VLLM_FIXED_REDUCE_ALLOW_MIXED_STEP", "0")
+            == "1"
+        )
+        and tensor_dim == 2
+        and 1 <= rows <= max_rows
+        and hidden_size == 5120
+        and tp_world_size == 3
+    )
+
+
+def _tp3_attention_decode_fixed_backend() -> str:
+    backend = os.environ.get(
+        "AG2_VLLM_ATTENTION_DECODE_FIXED_BACKEND", "exact_fp32"
+    )
+    if backend not in {"exact_fp32", "device_ce", "row_nccl"}:
+        raise ValueError(f"Unknown attention decode fixed backend: {backend}")
+    return backend
+
+
+def _tp3_mlp_decode_fixed_backend() -> str:
+    backend = os.environ.get(
+        "AG2_VLLM_MLP_DECODE_FIXED_BACKEND", "exact_fp32"
+    )
+    if backend not in {"exact_fp32", "device_ce", "row_nccl"}:
+        raise ValueError(f"Unknown MLP decode fixed backend: {backend}")
+    return backend
+
+
+def _tp3_gdn_decode_fixed_backend() -> str:
+    backend = os.environ.get(
+        "AG2_VLLM_GDN_DECODE_FIXED_BACKEND", "exact_fp32"
+    )
+    if backend not in {"exact_fp32", "device_ce", "row_nccl"}:
+        raise ValueError(f"Unknown GDN decode fixed backend: {backend}")
+    return backend
+
+
+def _tp3_gdn_row_nccl_reduce(
+    tensor: torch.Tensor,
+    reduce_fn: Callable[[torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """Apply the accepted single-row collective contract to every row."""
+    return torch.cat(
+        [reduce_fn(row) for row in tensor.split(1, dim=0)],
+        dim=0,
+    )
 
 
 def _should_use_tp3_embedding_ce(
@@ -950,6 +1330,18 @@ direct_register_custom_op(
 direct_register_custom_op(
     op_name="gdn_all_reduce",
     op_func=gdn_all_reduce,
+    fake_impl=all_reduce_fake,
+)
+
+direct_register_custom_op(
+    op_name="mlp_all_reduce",
+    op_func=mlp_all_reduce,
+    fake_impl=all_reduce_fake,
+)
+
+direct_register_custom_op(
+    op_name="attention_all_reduce",
+    op_func=attention_all_reduce,
     fake_impl=all_reduce_fake,
 )
 

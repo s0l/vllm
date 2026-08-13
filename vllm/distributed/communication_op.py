@@ -43,6 +43,38 @@ def tensor_model_parallel_gdn_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     return gdn_all_reduce(input_, group.unique_name)
 
 
+def tensor_model_parallel_mlp_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """Use the dense-MLP-specific runtime reduction policy."""
+    group = get_tp_group()
+    if group.world_size == 1:
+        return input_
+    if group.use_custom_op_call:
+        return torch.ops.vllm.mlp_all_reduce(
+            input_,
+            group_name=group.unique_name,
+        )
+    from .parallel_state import mlp_all_reduce
+
+    return mlp_all_reduce(input_, group.unique_name)
+
+
+def tensor_model_parallel_attention_all_reduce(
+    input_: torch.Tensor,
+) -> torch.Tensor:
+    """Use the full-attention output-specific runtime reduction policy."""
+    group = get_tp_group()
+    if group.world_size == 1:
+        return input_
+    if group.use_custom_op_call:
+        return torch.ops.vllm.attention_all_reduce(
+            input_,
+            group_name=group.unique_name,
+        )
+    from .parallel_state import attention_all_reduce
+
+    return attention_all_reduce(input_, group.unique_name)
+
+
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:

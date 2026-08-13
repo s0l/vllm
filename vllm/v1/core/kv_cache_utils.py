@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    use_exp11_head_owner_996,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -231,6 +232,11 @@ class KVCacheBlock:
     # the full block boundary; partial entries can end inside a cache block.
     _block_hash_num_tokens: int | None = None
 
+    # Default-off DCP physical identity. `block_id` remains the scheduler's
+    # logical/cache identity; exactly one rank owns the physical page.
+    _rank_block_ids: tuple[int | None, ...] | None = None
+    _physical_generation: int = 0
+
     # Used to construct a doubly linked list for free blocks.
     # These two attributes should only be manipulated by FreeKVCacheBlockQueue.
     prev_free_block: "KVCacheBlock | None" = None
@@ -246,6 +252,52 @@ class KVCacheBlock:
     @property
     def block_hash_num_tokens(self) -> int | None:
         return self._block_hash_num_tokens
+
+    @property
+    def is_rank_projected(self) -> bool:
+        return self._rank_block_ids is not None
+
+    @property
+    def rank_block_ids(self) -> tuple[int | None, ...] | None:
+        return self._rank_block_ids
+
+    @property
+    def physical_generation(self) -> int:
+        return self._physical_generation
+
+    def set_rank_block_id(
+        self,
+        *,
+        owner_rank: int,
+        physical_block_id: int,
+        world_size: int,
+        generation: int,
+    ) -> None:
+        if self._rank_block_ids is not None:
+            raise ValueError("rank-projected physical identity is already set")
+        if world_size <= 1 or not 0 <= owner_rank < world_size:
+            raise ValueError("invalid rank-projected owner/world")
+        if physical_block_id < 0 or generation < 0:
+            raise ValueError("physical block ID and generation must be non-negative")
+        ids: list[int | None] = [None] * world_size
+        ids[owner_rank] = physical_block_id
+        self._rank_block_ids = tuple(ids)
+        self._physical_generation = generation
+
+    def physical_block_id(self, rank: int, world_size: int) -> int | None:
+        if not 0 <= rank < world_size:
+            raise ValueError("rank outside physical identity world")
+        if self._rank_block_ids is None:
+            return self.block_id
+        if len(self._rank_block_ids) != world_size:
+            raise ValueError("physical identity world size mismatch")
+        return self._rank_block_ids[rank]
+
+    def reset_rank_block_id(self) -> None:
+        if self.ref_cnt != 0:
+            raise ValueError("cannot reset physical identity while block is referenced")
+        self._rank_block_ids = None
+        self._physical_generation = 0
 
     def set_block_hash(
         self,
@@ -273,6 +325,8 @@ class KVCacheBlock:
             f"ref_cnt={self.ref_cnt}, "
             f"_block_hash={self._block_hash!r}, "
             f"_block_hash_num_tokens={self._block_hash_num_tokens}, "
+            f"_rank_block_ids={self._rank_block_ids}, "
+            f"_physical_generation={self._physical_generation}, "
             f"prev_free_block={prev_block_id}, "
             f"next_free_block={next_block_id})"
         )
@@ -726,14 +780,15 @@ def resolve_kv_cache_block_sizes(
     """
     cache_config = vllm_config.cache_config
     dcp = vllm_config.parallel_config.decode_context_parallel_size
+    attention_dcp = 1 if use_exp11_head_owner_996(vllm_config) else dcp
     groups = kv_cache_config.kv_cache_groups
 
     if len(groups) <= 1:
-        bs = cache_config.block_size * dcp
+        bs = cache_config.block_size * attention_dcp
         return bs, bs
 
     group_block_sizes = [
-        g.kv_cache_spec.block_size * dcp
+        g.kv_cache_spec.block_size * attention_dcp
         if isinstance(g.kv_cache_spec, AttentionSpec)
         else g.kv_cache_spec.block_size
         for g in groups
@@ -1809,6 +1864,7 @@ def _promote_local_kv_cache_specs(
                     kv_quant_mode=spec.kv_quant_mode,
                     sliding_window=spec.sliding_window,
                     page_size_padded=promoted_page_size_padded(spec, block_size),
+                    dcp_full_history=spec.dcp_full_history,
                 )
             elif isinstance(spec, ChunkedLocalAttentionSpec):
                 block_size = full_attention_block_size or spec.block_size
@@ -1819,6 +1875,7 @@ def _promote_local_kv_cache_specs(
                     dtype=spec.dtype,
                     attention_chunk_size=spec.attention_chunk_size,
                     page_size_padded=promoted_page_size_padded(spec, block_size),
+                    dcp_full_history=spec.dcp_full_history,
                 )
 
     if not (
@@ -2191,6 +2248,7 @@ def generate_scheduler_kv_cache_config(
     kv_cache_configs: list[KVCacheConfig],
     configured_max_num_seqs: int | None = None,
     enable_auto_resident_cap: bool = False,
+    rank_projected_dcp_world_size: int | None = None,
 ) -> KVCacheConfig:
     """
     Generate the KV cache configuration for the scheduler.
@@ -2201,6 +2259,19 @@ def generate_scheduler_kv_cache_config(
     # All workers have the same kv_cache_config except layer names, so use
     # an arbitrary one to initialize the scheduler.
     cfg = copy.deepcopy(kv_cache_configs[0])
+    if rank_projected_dcp_world_size is not None:
+        if rank_projected_dcp_world_size != 3:
+            raise ValueError("Exp11 rank-projected KV scheduler requires DCP3")
+        physical_num_blocks = cfg.num_blocks
+        cfg.num_blocks = physical_num_blocks // 2
+        if cfg.num_blocks < 2:
+            raise ValueError("Exp11 packed scheduler KV capacity is too small")
+        logger.warning(
+            "Exp11 packed-superblock POC: scheduler logical blocks=%d, "
+            "worker physical blocks=%d; KV capacity is intentionally reduced",
+            cfg.num_blocks,
+            physical_num_blocks,
+        )
     elastic_configs = [
         worker_cfg
         for worker_cfg in kv_cache_configs

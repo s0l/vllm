@@ -23,6 +23,9 @@ class InputBuffers:
         self.input_ids = torch.zeros(max_num_tokens, dtype=torch.int32, device=device)
         self.positions = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
         self.is_padding = torch.zeros(max_num_tokens, dtype=torch.bool, device=device)
+        self.tp3_target_decode_row_mask = torch.zeros(
+            max_num_tokens, dtype=torch.bool, device=device
+        )
         self.query_start_loc = torch.zeros(
             max_num_reqs + 1, dtype=torch.int32, device=device
         )

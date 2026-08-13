@@ -344,6 +344,14 @@ class EngineCore:
             enable_auto_resident_cap=(
                 os.environ.get("AG2_VLLM_ELASTIC_AUTO_RESIDENT_CAP", "0") == "1"
             ),
+            rank_projected_dcp_world_size=(
+                vllm_config.parallel_config.decode_context_parallel_size
+                if isinstance(vllm_config.additional_config, dict)
+                and vllm_config.additional_config.get(
+                    "exp11_rank_projected_kv", False
+                )
+                else None
+            ),
         )
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups

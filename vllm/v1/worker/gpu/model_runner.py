@@ -35,6 +35,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
+    is_tp3_gdn_decode_fixed_enabled,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -64,15 +65,20 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheConfig,
+    MambaSpec,
+    use_exp11_head_owner_996,
+)
 from vllm.v1.outputs import (
     DraftTokenIds,
     ModelRunnerOutput,
     RoutedExpertsTensors,
     make_empty_encoder_model_runner_output,
 )
-from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
@@ -152,6 +158,25 @@ from vllm.v1.worker.utils import (
 logger = init_logger(__name__)
 
 
+def _expand_rank_projected_zero_ids(block_ids: list[int]) -> list[int]:
+    return [
+        physical_id
+        for block_id in block_ids
+        for physical_id in (block_id * 2, block_id * 2 + 1)
+    ]
+
+
+def _expand_rank_projected_block_copies(block_copies: list[Any]) -> list[Any]:
+    return [
+        type(block_copy)(
+            block_copy.src_block_id * 2 + slot,
+            block_copy.dst_block_id * 2 + slot,
+        )
+        for block_copy in block_copies
+        for slot in range(2)
+    ]
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -220,6 +245,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.use_dcp = self.dcp_size > 1
         self.dcp_rank = get_dcp_group().rank_in_group if self.use_dcp else 0
         self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
+        additional_config = self.vllm_config.additional_config
+        self.rank_projected_dcp = bool(
+            isinstance(additional_config, dict)
+            and additional_config.get("exp11_rank_projected_kv", False)
+        )
+        if self.rank_projected_dcp and (
+            self.dcp_size != 3 or self.cp_interleave != 1
+        ):
+            raise ValueError("Exp11 rank-projected KV requires DCP3/interleave1")
+        self.head_owner_996 = use_exp11_head_owner_996(self.vllm_config)
+        if self.head_owner_996:
+            if self.rank_projected_dcp:
+                raise ValueError(
+                    "Exp11 9/9/6 full-history KV is mutually exclusive with "
+                    "rank-projected history ownership"
+                )
+            if self.dcp_size != 3 or self.cp_interleave != 1:
+                raise ValueError("Exp11 9/9/6 requires DCP3/interleave1")
 
         # Multimodal
         self.mm_registry = MULTIMODAL_REGISTRY
@@ -579,8 +622,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # When using DCP, each request's KV cache is sharded among different ranks.
             # As a result, one block on the current rank covers `block_size * cp_size`
             # tokens in the full, global (unsharded) sequence.
+            cache_shards = (
+                1
+                if self.head_owner_996 and isinstance(spec, AttentionSpec)
+                else self.dcp_size
+            )
             max_num_blocks = cdiv(
-                block_table_max_model_len, spec.block_size * self.dcp_size
+                block_table_max_model_len, spec.block_size * cache_shards
             )
             # For Mamba/Hybrid Model, KVCaches need extra blocks for speculative tokens
             if isinstance(spec, MambaSpec):
@@ -610,6 +658,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
+            rank_projected_groups=(
+                [not isinstance(group.kv_cache_spec, MambaSpec)
+                 for group in kv_cache_config.kv_cache_groups]
+                if self.rank_projected_dcp
+                else None
+            ),
+            full_history_groups=(
+                [
+                    isinstance(group.kv_cache_spec, AttentionSpec)
+                    for group in kv_cache_config.kv_cache_groups
+                ]
+                if self.head_owner_996
+                else None
+            ),
         )
         self.pcp_manager = pcp.maybe_build_pcp_manager(
             self.vllm_config,
@@ -684,7 +746,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             decode_query_len=self.decode_query_len,
             lora_capture_cases=self.lora_capture_cases,
             full_decode_query_lens=full_decode_query_lens,
-            tp3_sd_phase_reduce=envs.VLLM_TP3_SD_PHASE_REDUCE,
+            tp3_sd_phase_reduce=(
+                envs.VLLM_TP3_SD_PHASE_REDUCE
+                or is_tp3_gdn_decode_fixed_enabled()
+            ),
             max_uniform_decode_reqs=(
                 self.kv_cache_config.effective_max_resident_seqs or self.max_num_reqs
             ),
@@ -1052,6 +1117,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.postprocess_sampled(**outputs)
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+        rank_update = scheduler_output.rank_projected_kv_update
         for new_req_data in scheduler_output.scheduled_new_reqs:
             assert new_req_data.prompt_token_ids is not None
             assert new_req_data.prefill_token_ids is not None
@@ -1086,9 +1152,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.encoder_cache.add_request(req_id, new_req_data.mm_features)
 
             self.model_state.add_request(req_index, new_req_data)
-            self.block_tables.append_block_ids(
-                req_index, new_req_data.block_ids, overwrite=True
+            block_ids = (
+                new_req_data.block_ids
+                if rank_update is None
+                else rank_update.block_ids_for(req_id, self.dcp_rank)
             )
+            self.block_tables.append_block_ids(req_index, block_ids, overwrite=True)
             self.lora_state.add_request(req_id, req_index, new_req_data.lora_request)
 
             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
@@ -1112,6 +1181,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
+        rank_update = scheduler_output.rank_projected_kv_update
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
         for req_id, num_computed_tokens, req_new_block_ids in zip(
             reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
@@ -1119,6 +1189,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_index = self.req_states.req_id_to_index[req_id]
             num_computed_tokens_np[req_index] = num_computed_tokens
             if req_new_block_ids is not None:
+                if rank_update is not None:
+                    req_new_block_ids = rank_update.block_ids_for(req_id, self.dcp_rank)
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
                 )
@@ -1132,17 +1204,36 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
-        if scheduler_output.new_block_ids_to_zero:
+        new_block_ids_to_zero = (
+            scheduler_output.new_block_ids_to_zero
+            if rank_update is None
+            else rank_update.zero_ids_for(self.dcp_rank)
+        )
+        if self.rank_projected_dcp and new_block_ids_to_zero:
+            new_block_ids_to_zero = _expand_rank_projected_zero_ids(
+                new_block_ids_to_zero
+            )
+        if new_block_ids_to_zero:
             assert self.kv_block_zeroer is not None
-            self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            self.kv_block_zeroer.zero_block_ids(new_block_ids_to_zero)
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.
-        if scheduler_output.kv_cache_block_copies:
+        kv_cache_block_copies = (
+            scheduler_output.kv_cache_block_copies
+            if rank_update is None
+            else rank_update.copies_for(self.dcp_rank)
+        )
+        if self.rank_projected_dcp and kv_cache_block_copies:
+            raise ValueError(
+                "Exp11 packed-superblock POC cannot disambiguate attention "
+                "and GDN CoW copies; partial-hit CoW is not admitted"
+            )
+        if kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
                 self.kv_caches_for_block_copy,
                 self.kv_cache_config.num_blocks,
-                scheduler_output.kv_cache_block_copies,
+                kv_cache_block_copies,
             )
 
     def prepare_inputs(
@@ -1238,6 +1329,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens
         num_computed_prefill_tokens_np = computed_prefill_tokens_np[idx_mapping_np]
         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
+        target_decode_rows = int(num_scheduled_tokens[~is_prefilling_np].sum())
+        if (
+            os.environ.get("AG2_VLLM_FIXED_REDUCE_MIXED_ROW_MASK", "0") == "1"
+            and target_decode_rows
+            > int(os.environ.get("AG2_VLLM_FIXED_REDUCE_MIXED_PREFIX_ROWS", "64"))
+        ):
+            raise RuntimeError(
+                "TP3 semantic-row Exact prefix overflow: "
+                f"decode_rows={target_decode_rows}"
+            )
+        target_decode_mask = self.input_buffers.tp3_target_decode_row_mask
+        target_decode_mask[:target_decode_rows].fill_(True)
+        target_decode_mask[target_decode_rows:num_tokens_after_padding].fill_(False)
         if envs.AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL:
             prefill_indices = np.flatnonzero(is_prefilling_np)
             num_decodes = int(prefill_indices[0]) if prefill_indices.size else num_reqs
@@ -1287,6 +1391,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.dcp_size,
                 self.dcp_rank,
                 self.cp_interleave,
+                self.block_tables.rank_projected_owner_lut,
+                self.block_tables.rank_projected_prefix_counts,
+                self.block_tables.rank_projected_page_size,
+                full_history=self.head_owner_996,
             )
             dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[:num_reqs_padded]
 
@@ -1508,6 +1616,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
+            if rank_update := scheduler_output.rank_projected_kv_update:
+                if rank_update.world_size != self.dcp_size:
+                    raise ValueError(
+                        "rank-projected KV world size does not match model runner DCP"
+                    )
+                rank_update.validate(scheduler_output)
             with record_function_or_nullcontext("ag2.elastic_kv_transition"):
                 self.elastic_kv_controller.apply(
                     scheduler_output.elastic_kv_transition
@@ -1765,7 +1879,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             # For piecewise and eager mode, just call model().
             tp3_sd_phase_reduce = (
-                envs.VLLM_TP3_SD_PHASE_REDUCE and scheduler_output.is_pure_decode_step
+                (
+                    envs.VLLM_TP3_SD_PHASE_REDUCE
+                    or is_tp3_gdn_decode_fixed_enabled()
+                )
+                and scheduler_output.is_pure_decode_step
             )
             batch_descriptor = BatchDescriptor(
                 num_tokens=input_batch.num_tokens_after_padding,
@@ -1786,6 +1904,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 is_padding=input_batch.is_padding,
                 num_tokens_unpadded=input_batch.num_tokens,
                 tp3_sd_phase_reduce=tp3_sd_phase_reduce,
+                tp3_target_decode_row_mask=self.input_buffers.tp3_target_decode_row_mask[
+                    : input_batch.num_tokens_after_padding
+                ],
                 marlin_request_layout_cpu=(
                     self.input_buffers.marlin_request_layout_cpu
                     if envs.AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL

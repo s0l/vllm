@@ -44,6 +44,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     SlidingWindowSpec,
     get_kv_quant_mode,
+    use_exp11_head_owner_996,
 )
 
 if TYPE_CHECKING:
@@ -774,6 +775,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
                 tq_slot_size=tq_config.slot_size_aligned,
+                dcp_full_history=use_exp11_head_owner_996(vllm_config),
             )
         else:
             return FullAttentionSpec(
@@ -783,6 +785,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
+                dcp_full_history=use_exp11_head_owner_996(vllm_config),
             )
 
 

@@ -960,12 +960,68 @@ def get_dcp_local_seq_lens(
     dcp_size: int = 1,
     dcp_rank: int | None = None,
     cp_kv_cache_interleave_size: int = 1,
+    rank_projected: bool = False,
+    rank_projected_page_size: int = 16,
+    full_history: bool = False,
 ) -> torch.Tensor:
     """While using dcp, kv_cache size stored on each rank may be different,
     use this function to calculate split decode seq_lens of each dcp rank.
     Only consider dcp now, we can extend the case of cp based on this.
     """
     seq_lens_i32 = seq_lens.to(torch.int32)
+    if rank_projected and full_history:
+        raise ValueError(
+            "rank-projected and replicated full-history lengths are mutually "
+            "exclusive"
+        )
+    if full_history:
+        return seq_lens_i32.clone()
+    if rank_projected:
+        from vllm.v1.core.rank_projected_owner import ElasticPageOwnerPolicy
+
+        if dcp_size != 3 or cp_kv_cache_interleave_size != 1:
+            raise ValueError("Exp11 rank-projected KV requires DCP3/interleave1")
+        if dcp_rank is None:
+            return torch.stack(
+                [
+                    get_dcp_local_seq_lens(
+                        seq_lens_i32,
+                        dcp_size,
+                        rank,
+                        cp_kv_cache_interleave_size,
+                        rank_projected=True,
+                        rank_projected_page_size=rank_projected_page_size,
+                    )
+                    for rank in range(dcp_size)
+                ],
+                dim=-1,
+            )
+        if not 0 <= dcp_rank < dcp_size:
+            raise ValueError("DCP rank outside rank-projected world")
+        if seq_lens_i32.numel() == 0:
+            return seq_lens_i32.clone()
+        if rank_projected_page_size <= 0:
+            raise ValueError("rank-projected page size must be positive")
+        max_pages = (
+            int(seq_lens_i32.max().item()) + rank_projected_page_size - 1
+        ) // rank_projected_page_size
+        max_pages = max(max_pages, 1)
+        owners, _, prefix_counts = ElasticPageOwnerPolicy(
+            page_size=rank_projected_page_size
+        ).build_luts(max_pages)
+        owner_lut = torch.tensor(owners, dtype=torch.int64, device=seq_lens.device)
+        prefix_lut = torch.tensor(
+            prefix_counts[dcp_rank], dtype=torch.int32, device=seq_lens.device
+        )
+        full_pages = seq_lens_i32 // rank_projected_page_size
+        remainder = seq_lens_i32 % rank_projected_page_size
+        local = prefix_lut[full_pages] * rank_projected_page_size
+        partial_owner = owner_lut[
+            full_pages.to(torch.int64).clamp_max(owner_lut.numel() - 1)
+        ]
+        return local + torch.where(
+            (remainder > 0) & (partial_owner == dcp_rank), remainder, 0
+        )
     if dcp_rank is None:
         rank_offsets = torch.arange(
             dcp_size,

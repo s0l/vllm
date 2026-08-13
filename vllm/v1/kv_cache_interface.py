@@ -25,6 +25,15 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def use_exp11_head_owner_996(vllm_config: VllmConfig) -> bool:
+    """Whether attention KV is full-history for the Exp11 9/9/6 POC."""
+    additional = vllm_config.additional_config
+    return bool(
+        isinstance(additional, dict)
+        and additional.get("exp11_head_owner_996", False)
+    )
+
+
 # ---------------------------------------------------------------------------
 # KV cache quantization mode
 # ---------------------------------------------------------------------------
@@ -188,6 +197,7 @@ class AttentionSpec(KVCacheSpec):
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
     page_size_padded: int | None = None
     indexes_kv_by_block_stride: bool = False
+    dcp_full_history: bool = False
 
     @property
     def unpadded_page_size_bytes(self) -> int:
@@ -227,7 +237,11 @@ class AttentionSpec(KVCacheSpec):
 
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         parallel_config = vllm_config.parallel_config
-        kv_shard_count = parallel_config.decode_context_parallel_size
+        kv_shard_count = (
+            1
+            if use_exp11_head_owner_996(vllm_config)
+            else parallel_config.decode_context_parallel_size
+        )
         return cdiv(max_len, self.block_size * kv_shard_count)
 
 
@@ -265,7 +279,11 @@ class FullAttentionSpec(AttentionSpec):
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
-        dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        dcp_world_size = (
+            1
+            if use_exp11_head_owner_996(vllm_config)
+            else vllm_config.parallel_config.decode_context_parallel_size
+        )
         if dcp_world_size > 1:
             max_model_len = cdiv(max_model_len, dcp_world_size)
         return cdiv(max_model_len, self.block_size) * self.page_size_bytes
@@ -312,6 +330,7 @@ class FullAttentionSpec(AttentionSpec):
             kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
             indexes_kv_by_block_stride=specs[0].indexes_kv_by_block_stride,
+            dcp_full_history=specs[0].dcp_full_history,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
             # If any layer in the group is non-causal, treat the group as

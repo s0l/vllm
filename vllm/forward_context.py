@@ -57,6 +57,7 @@ class BatchDescriptor:
     to be properly captured.
     """
     tp3_sd_phase_reduce: bool = False
+
     """
     Whether this graph belongs to the target-model pure-decode lane that uses
     the fixed TP3 speculative-decoding reduction. This is part of graph
@@ -175,6 +176,11 @@ class ForwardContext:
     # same physical shape as K0/K2 decode.
     tp3_sd_phase_reduce: bool = False
 
+    # Stable GPU mask over model rows owned by completed-prompt target decode
+    # requests. Unlike tp3_sd_phase_reduce, this remains meaningful when a
+    # scheduler step mixes decode rows with prompt-prefill rows.
+    tp3_target_decode_row_mask: torch.Tensor | None = None
+
     # Explicit ownership by the MTP draft model. The speculator uses a
     # separate graph manager, so this value is static for every one of its
     # captures and cannot alias an equal-shaped target-model graph.
@@ -254,6 +260,7 @@ def create_forward_context(
     is_padding: torch.Tensor | None = None,
     num_tokens_unpadded: int | None = None,
     tp3_sd_phase_reduce: bool = False,
+    tp3_target_decode_row_mask: torch.Tensor | None = None,
     tp3_mtp_device_ce: bool = False,
     marlin_request_layout_cpu: torch.Tensor | None = None,
 ):
@@ -281,6 +288,7 @@ def create_forward_context(
             and vllm_config.additional_config.get("tp3_ce_reduce", False)
         ),
         tp3_sd_phase_reduce=tp3_sd_phase_reduce,
+        tp3_target_decode_row_mask=tp3_target_decode_row_mask,
         tp3_mtp_device_ce=tp3_mtp_device_ce,
     )
 
@@ -314,6 +322,7 @@ def set_forward_context(
     is_padding: torch.Tensor | None = None,
     num_tokens_unpadded: int | None = None,
     tp3_sd_phase_reduce: bool = False,
+    tp3_target_decode_row_mask: torch.Tensor | None = None,
     tp3_mtp_device_ce: bool = False,
     marlin_request_layout_cpu: torch.Tensor | None = None,
 ):
@@ -387,6 +396,7 @@ def set_forward_context(
         is_padding=is_padding,
         num_tokens_unpadded=num_tokens_unpadded,
         tp3_sd_phase_reduce=tp3_sd_phase_reduce,
+        tp3_target_decode_row_mask=tp3_target_decode_row_mask,
         tp3_mtp_device_ce=tp3_mtp_device_ce,
         marlin_request_layout_cpu=marlin_request_layout_cpu,
     )

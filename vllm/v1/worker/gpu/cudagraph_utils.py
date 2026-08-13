@@ -907,6 +907,7 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             # Capture with dummy rows marked as padding.
             input_buffers.is_padding.fill_(True)
+            input_buffers.tp3_target_decode_row_mask.fill_(False)
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
                 # FULL graph capture calls this closure with cg_mode NONE.
@@ -935,6 +936,9 @@ class ModelCudaGraphManager(CudaGraphManager):
                     batch_descriptor=batch_descriptor,
                     is_padding=input_buffers.is_padding[:num_tokens],
                     tp3_sd_phase_reduce=tp3_sd_phase_reduce,
+                    tp3_target_decode_row_mask=input_buffers.tp3_target_decode_row_mask[
+                        :num_tokens
+                    ],
                     marlin_request_layout_cpu=(
                         input_buffers.marlin_request_layout_cpu
                         if envs.AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL
@@ -1051,6 +1055,9 @@ def prepare_inputs_to_capture(
             block_tables.cp_size,
             block_tables.cp_rank,
             block_tables.cp_interleave,
+            block_tables.rank_projected_owner_lut,
+            block_tables.rank_projected_prefix_counts,
+            block_tables.rank_projected_page_size,
         )
         input_batch.dcp_local_seq_lens = input_buffers.dcp_local_seq_lens[:num_reqs]
 

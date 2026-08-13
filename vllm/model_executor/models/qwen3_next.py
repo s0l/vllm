@@ -23,6 +23,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_attention_all_reduce,
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.logger import init_logger
@@ -393,6 +394,12 @@ class Qwen3NextAttention(nn.Module):
             config, "dual_chunk_attention_config", None
         )
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
+        self._ag2_attention_decode_fixed_reduce = (
+            os.environ.get("AG2_VLLM_ATTENTION_DECODE_FIXED_REDUCE", "0")
+            == "1"
+            and reduce_results
+            and tp_size == 3
+        )
 
         qkv_proj_cls = (
             QKVParallelLinearOverlappingGQA
@@ -419,7 +426,9 @@ class Qwen3NextAttention(nn.Module):
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             bias=False,
-            reduce_results=reduce_results,
+            reduce_results=(
+                reduce_results and not self._ag2_attention_decode_fixed_reduce
+            ),
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
@@ -949,6 +958,8 @@ class Qwen3NextAttention(nn.Module):
             trace = attn_output[:3]
             self._ag2_trace_gated_output[: trace.shape[0]].copy_(trace)
         output, _ = self.o_proj(attn_output)
+        if self._ag2_attention_decode_fixed_reduce:
+            output = tensor_model_parallel_attention_all_reduce(output)
         if return_ag2_mtp_trace:
             mtp_trace["output_parallel"] = self.o_proj._ag2_aux_output_parallel
             mtp_trace["output"] = output
@@ -1305,8 +1316,16 @@ class Qwen3NextDecoderLayer(nn.Module):
         self._ag2_aux_sequence_boundary_enabled = (
             self.layer_idx in sequence_boundary_layers
         )
+        self._ag2_aux_reduction_map_enabled = (
+            os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_REDUCTION_MAP",
+                "0",
+            )
+            == "1"
+        )
         self._ag2_aux_all_internal_boundaries = (
             _ag2_internal_trace_layer_enabled(self.layer_idx)
+            or self._ag2_aux_reduction_map_enabled
         )
         self._ag2_aux_compact_gdn_stages = _ag2_selected_stages(
             "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_GDN_STAGES",
@@ -1349,6 +1368,8 @@ class Qwen3NextDecoderLayer(nn.Module):
             )
         )
         self._ag2_aux_compact_boundary_enabled = (
+            self._ag2_aux_reduction_map_enabled
+            or (
             os.environ.get(
                 "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_ALL_BOUNDARIES",
                 "0",
@@ -1374,6 +1395,7 @@ class Qwen3NextDecoderLayer(nn.Module):
                     "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_GDN_BOUNDARY_LAYER",
                     "-1",
                 )
+            )
             )
         )
         self._ag2_aux_compact_gdn_boundaries_enabled = (
@@ -1423,7 +1445,10 @@ class Qwen3NextDecoderLayer(nn.Module):
                 gqa_interleaved_layout=True,
                 reduce_results=not self.use_attn_reduce_scatter_for_moe,
             )
-            if self._ag2_aux_all_internal_boundaries:
+            if (
+                self._ag2_aux_all_internal_boundaries
+                or self._ag2_aux_compact_gdn_boundaries_enabled
+            ):
                 self.linear_attn.ag2_enable_compact_trace()
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3NextAttention(
@@ -1601,9 +1626,9 @@ class Qwen3NextDecoderLayer(nn.Module):
         if self._ag2_aux_compact_boundary_enabled:
             configured_positions = tuple(
                 int(value)
-                for value in os.environ.get(
-                    "AG2_VLLM_AUX_HIDDEN_TRACE_POSITIONS",
-                    os.environ["AG2_VLLM_AUX_HIDDEN_TRACE_POSITION"],
+                for value in (
+                    os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_POSITIONS")
+                    or os.environ["AG2_VLLM_AUX_HIDDEN_TRACE_POSITION"]
                 ).split(",")
                 if value
             )
@@ -2095,9 +2120,55 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
             residual = intermediate_tensors["residual"]
 
         full_num_tokens = positions.shape[-1]
-        aux_hidden_states = self._maybe_add_ag2_aux_hidden_state(
-            [], 0, hidden_states, residual, positions
+        reduction_map_enabled = getattr(
+            self,
+            "_ag2_aux_trace_reduction_map",
+            False,
         )
+        reduction_map_rows: torch.Tensor | None = None
+        reduction_map_layer_inputs: list[torch.Tensor] = []
+        reduction_map_attention_partials: list[torch.Tensor] = []
+        reduction_map_attention_outputs: list[torch.Tensor] = []
+        reduction_map_mlp_inputs: list[torch.Tensor] = []
+        reduction_map_mlp_partials: list[torch.Tensor] = []
+        reduction_map_mlp_outputs: list[torch.Tensor] = []
+
+        def reduction_map_layer_input_packet() -> torch.Tensor:
+            assert reduction_map_rows is not None
+            combined = (
+                hidden_states
+                if residual is None
+                else hidden_states + residual
+            )
+            return _ag2_trace_packet(
+                _ag2_compact_select(combined, reduction_map_rows)
+            )
+
+        if reduction_map_enabled:
+            configured_positions = tuple(
+                int(value)
+                for value in (
+                    os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_POSITIONS")
+                    or os.environ["AG2_VLLM_AUX_HIDDEN_TRACE_POSITION"]
+                ).split(",")
+                if value
+            )
+            reduction_map_rows = _ag2_compact_row_indices(
+                positions,
+                configured_positions,
+                int(
+                    os.environ.get(
+                        "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_CAPACITY",
+                        "2",
+                    )
+                ),
+            )
+            aux_hidden_states: list[torch.Tensor] = []
+            reduction_map_layer_inputs.append(reduction_map_layer_input_packet())
+        else:
+            aux_hidden_states = self._maybe_add_ag2_aux_hidden_state(
+                [], 0, hidden_states, residual, positions
+            )
         for layer_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -2117,6 +2188,43 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                 hidden_states=hidden_states,
                 residual=residual,
             )
+            if reduction_map_enabled:
+                if layer.layer_type == "full_attention":
+                    attention_boundaries = dict(
+                        zip(
+                            layer.self_attn._ag2_aux_compact_full_stages,
+                            layer._ag2_aux_compact_full_boundaries,
+                            strict=True,
+                        )
+                    )
+                    reduction_map_attention_partials.append(
+                        attention_boundaries["output_parallel"]
+                    )
+                    reduction_map_attention_outputs.append(
+                        attention_boundaries["output"]
+                    )
+                else:
+                    reduction_map_attention_partials.append(
+                        layer.linear_attn._ag2_aux_compact_output_parallel
+                    )
+                    reduction_map_attention_outputs.append(
+                        layer.linear_attn._ag2_aux_compact_output
+                    )
+                reduction_map_mlp_inputs.append(
+                    _ag2_trace_packet(
+                        layer._ag2_aux_compact_post_attention_norm
+                    )
+                )
+                reduction_map_mlp_partials.append(
+                    layer.mlp._ag2_aux_compact_down_parallel
+                )
+                reduction_map_mlp_outputs.append(
+                    layer.mlp._ag2_aux_compact_output
+                )
+                reduction_map_layer_inputs.append(
+                    reduction_map_layer_input_packet()
+                )
+
             all_boundaries_enabled = getattr(
                 self,
                 "_ag2_aux_trace_compact_all_boundaries",
@@ -2136,7 +2244,10 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                     layer_idx,
                     layer,
                 )
-            if getattr(layer, "_ag2_aux_all_internal_boundaries", False):
+            if (
+                not reduction_map_enabled
+                and getattr(layer, "_ag2_aux_all_internal_boundaries", False)
+            ):
                 if layer.layer_type == "full_attention":
                     aux_hidden_states.extend(
                         _ag2_trace_packet(value)
@@ -2206,7 +2317,18 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                 not getattr(layer, "_ag2_aux_all_internal_boundaries", False)
                 and getattr(layer, "_ag2_aux_compact_gdn_boundaries_enabled", False)
             ):
-                aux_hidden_states.extend(layer.linear_attn._ag2_aux_compact_boundaries)
+                aux_hidden_states.append(
+                    _ag2_trace_packet(layer._ag2_aux_compact_row_indices)
+                )
+                aux_hidden_states.extend(
+                    _ag2_trace_packet(value)
+                    for stage, value in zip(
+                        AG2_COMPACT_GDN_STAGE_ORDER,
+                        layer.linear_attn._ag2_aux_compact_boundaries,
+                        strict=True,
+                    )
+                    if stage in layer._ag2_aux_compact_gdn_stages
+                )
             if (layer_idx + 1) in self.aux_hidden_state_layers and hidden_states.shape[
                 0
             ] != full_num_tokens:
@@ -2216,14 +2338,57 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                     full_num_tokens,
                     self.config.hidden_size,
                 )
-            self._maybe_add_ag2_aux_hidden_state(
-                aux_hidden_states,
-                layer_idx + 1,
-                hidden_states,
-                residual,
-                positions,
-            )
+            if not reduction_map_enabled:
+                self._maybe_add_ag2_aux_hidden_state(
+                    aux_hidden_states,
+                    layer_idx + 1,
+                    hidden_states,
+                    residual,
+                    positions,
+                )
             _ag2_release_layer_trace_refs(layer)
+
+        if reduction_map_enabled:
+            assert reduction_map_rows is not None
+            expected_layers = self.end_layer - self.start_layer
+            if not (
+                len(reduction_map_layer_inputs) == expected_layers + 1
+                and len(reduction_map_attention_partials) == expected_layers
+                and len(reduction_map_attention_outputs) == expected_layers
+                and len(reduction_map_mlp_inputs) == expected_layers
+                and len(reduction_map_mlp_partials) == expected_layers
+                and len(reduction_map_mlp_outputs) == expected_layers
+            ):
+                raise RuntimeError("Incomplete AG2 reduction noise map")
+            attention_partials = torch.stack(reduction_map_attention_partials)
+            attention_outputs = torch.stack(reduction_map_attention_outputs)
+            mlp_inputs = torch.stack(reduction_map_mlp_inputs)
+            mlp_partials = torch.stack(reduction_map_mlp_partials)
+            mlp_outputs = torch.stack(reduction_map_mlp_outputs)
+
+            def fixed_layer_stack(value: torch.Tensor) -> torch.Tensor:
+                # CUDA Graph output ownership historically infers token-major
+                # tensors from shape[0] == the first capture size (M64). Give
+                # every map tensor the non-capture layer-checkpoint extent 65
+                # so M64 -> M56 capture cannot reinterpret a fixed output.
+                return torch.cat((value, torch.zeros_like(value[:1])), dim=0)
+
+            row_matrix = torch.full(
+                (expected_layers + 1, reduction_map_rows.shape[0]),
+                -1,
+                dtype=reduction_map_rows.dtype,
+                device=reduction_map_rows.device,
+            )
+            row_matrix[0].copy_(reduction_map_rows)
+            aux_hidden_states = [
+                row_matrix,
+                torch.stack(reduction_map_layer_inputs),
+                fixed_layer_stack(attention_partials),
+                fixed_layer_stack(attention_outputs),
+                fixed_layer_stack(mlp_inputs),
+                fixed_layer_stack(mlp_partials),
+                fixed_layer_stack(mlp_outputs),
+            ]
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(

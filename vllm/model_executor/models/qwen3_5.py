@@ -182,8 +182,16 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         self._ag2_aux_sequence_boundary_enabled = (
             self.layer_idx in sequence_boundary_layers
         )
+        self._ag2_aux_reduction_map_enabled = (
+            os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_REDUCTION_MAP",
+                "0",
+            )
+            == "1"
+        )
         self._ag2_aux_all_internal_boundaries = (
             _ag2_internal_trace_layer_enabled(self.layer_idx)
+            or self._ag2_aux_reduction_map_enabled
         )
         self._ag2_aux_compact_gdn_stages = _ag2_selected_stages(
             "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_GDN_STAGES",
@@ -196,6 +204,8 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         # Qwen3_5 intentionally bypasses Qwen3NextDecoderLayer.__init__, while
         # inheriting its forward. Keep diagnostic forward attributes explicit.
         self._ag2_aux_compact_boundary_enabled = (
+            self._ag2_aux_reduction_map_enabled
+            or (
             os.environ.get(
                 "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_ALL_BOUNDARIES",
                 "0",
@@ -221,6 +231,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                     "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_GDN_BOUNDARY_LAYER",
                     "-1",
                 )
+            )
             )
         )
         self._ag2_aux_compact_gdn_boundaries_enabled = (
@@ -251,7 +262,10 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 gqa_interleaved_layout=False,
                 reduce_results=not self.use_attn_reduce_scatter_for_moe,
             )
-            if self._ag2_aux_all_internal_boundaries:
+            if (
+                self._ag2_aux_all_internal_boundaries
+                or self._ag2_aux_compact_gdn_boundaries_enabled
+            ):
                 self.linear_attn.ag2_enable_compact_trace()
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3NextAttention(

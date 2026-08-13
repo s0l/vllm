@@ -89,7 +89,35 @@ class KVCacheBlocks:
         """
         if allow_none and all(len(group) == 0 for group in self.blocks):
             return None
+        if any(block.is_rank_projected for group in self.blocks for block in group):
+            raise ValueError(
+                "rank-projected KV blocks require get_rank_projected_block_ids()"
+            )
         return tuple([blk.block_id for blk in group] for group in self.blocks)
+
+    def get_rank_projected_block_ids(
+        self,
+        world_size: int,
+    ) -> tuple[tuple[list[int], ...], ...]:
+        """Return one compact group block table for each DCP rank.
+
+        Scalar groups (for example Mamba/GDN) remain replicated. A projected
+        attention page appears only in its owner rank's compact table.
+        """
+        if world_size <= 1:
+            raise ValueError("rank projection requires world size > 1")
+        projected: list[tuple[list[int], ...]] = []
+        for rank in range(world_size):
+            rank_groups: list[list[int]] = []
+            for group in self.blocks:
+                ids = []
+                for block in group:
+                    physical_id = block.physical_block_id(rank, world_size)
+                    if physical_id is not None:
+                        ids.append(physical_id)
+                rank_groups.append(ids)
+            projected.append(tuple(rank_groups))
+        return tuple(projected)
 
     def get_unhashed_block_ids(self) -> list[int]:
         """Get block_ids of unhashed blocks from KVCacheBlocks instance."""

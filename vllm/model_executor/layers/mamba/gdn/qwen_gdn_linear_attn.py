@@ -702,6 +702,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and reduce_results
             and self.tp_size == 3
         )
+        self._ag2_gdn_decode_fixed_reduce = (
+            os.environ.get("AG2_VLLM_GDN_DECODE_FIXED_REDUCE", "0") == "1"
+            and reduce_results
+            and self.tp_size == 3
+        )
         if (
             self._ag2_gdn_prefill_batch_invariant_reduce
             and prefix.endswith(".layers.0.linear_attn")
@@ -710,8 +715,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 "Enabled experimental TP3 batch-invariant reduction for "
                 "short GDN prefills"
             )
-        out_proj_reduce_results = (
-            reduce_results and not self._ag2_gdn_prefill_batch_invariant_reduce
+        out_proj_reduce_results = reduce_results and not (
+            self._ag2_gdn_prefill_batch_invariant_reduce
+            or self._ag2_gdn_decode_fixed_reduce
         )
 
         if self.gdn_explicit_partition:
@@ -1372,7 +1378,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             trace = core_attn_out[:3]
             self._ag2_trace_gated_norm[: trace.shape[0]].copy_(trace)
         output, _ = self.out_proj(core_attn_out)
-        if self._ag2_gdn_prefill_batch_invariant_reduce:
+        if (
+            self._ag2_gdn_prefill_batch_invariant_reduce
+            or self._ag2_gdn_decode_fixed_reduce
+        ):
             output = tensor_model_parallel_gdn_all_reduce(output)
         if self._ag2_aux_boundaries_enabled:
             self._ag2_aux_output_parallel = self.out_proj._ag2_aux_output_parallel

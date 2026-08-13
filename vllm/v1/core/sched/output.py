@@ -190,6 +190,81 @@ class ScheduledEncoderInputStats:
 
 
 @dataclass
+class RankProjectedKVCacheUpdate:
+    """Atomic per-DCP-rank KV update carried by one scheduler broadcast.
+
+    This envelope is intentionally default-off. When present, request block
+    IDs, zeroing IDs, and CoW copies are selected from the same rank projection
+    so a worker cannot observe a new block table with stale scalar lifecycle
+    commands.
+    """
+
+    policy_version: str
+    world_size: int
+    request_block_ids: dict[str, tuple[tuple[list[int], ...], ...]]
+    new_block_ids_to_zero: tuple[list[int] | None, ...]
+    kv_cache_block_copies: tuple[list[KVCacheBlockCopy] | None, ...]
+
+    def validate(self, scheduler_output: "SchedulerOutput") -> None:
+        if self.policy_version != "exp11-884-776-equal-v1":
+            raise ValueError("unknown rank-projected KV policy version")
+        if self.world_size <= 1:
+            raise ValueError("rank-projected KV requires DCP world size > 1")
+        if len(self.new_block_ids_to_zero) != self.world_size:
+            raise ValueError("rank-projected zeroing world size mismatch")
+        if len(self.kv_cache_block_copies) != self.world_size:
+            raise ValueError("rank-projected CoW world size mismatch")
+        if scheduler_output.new_block_ids_to_zero is not None:
+            raise ValueError("rank-projected and scalar zeroing cannot coexist")
+        if scheduler_output.kv_cache_block_copies is not None:
+            raise ValueError("rank-projected and scalar CoW cannot coexist")
+
+        required: dict[str, tuple[list[int], ...]] = {
+            request.req_id: request.block_ids
+            for request in scheduler_output.scheduled_new_reqs
+        }
+        required.update(
+            (request_id, block_ids)
+            for request_id, block_ids in zip(
+                scheduler_output.scheduled_cached_reqs.req_ids,
+                scheduler_output.scheduled_cached_reqs.new_block_ids,
+            )
+            if block_ids is not None
+        )
+        if self.request_block_ids.keys() != required.keys():
+            raise ValueError("rank-projected request coverage mismatch")
+        for request_id, rank_values in self.request_block_ids.items():
+            if len(rank_values) != self.world_size:
+                raise ValueError(
+                    f"rank-projected request {request_id!r} world size mismatch"
+                )
+            expected_groups = len(required[request_id])
+            if any(len(value) != expected_groups for value in rank_values):
+                raise ValueError(
+                    f"rank-projected request {request_id!r} group count mismatch"
+                )
+
+    def block_ids_for(
+        self,
+        request_id: str,
+        rank: int,
+    ) -> tuple[list[int], ...]:
+        if not 0 <= rank < self.world_size:
+            raise ValueError("DCP rank outside rank-projected KV world")
+        return self.request_block_ids[request_id][rank]
+
+    def zero_ids_for(self, rank: int) -> list[int] | None:
+        if not 0 <= rank < self.world_size:
+            raise ValueError("DCP rank outside rank-projected KV world")
+        return self.new_block_ids_to_zero[rank]
+
+    def copies_for(self, rank: int) -> list[KVCacheBlockCopy] | None:
+        if not 0 <= rank < self.world_size:
+            raise ValueError("DCP rank outside rank-projected KV world")
+        return self.kv_cache_block_copies[rank]
+
+
+@dataclass
 class SchedulerOutput:
     # list of the requests that are scheduled for the first time.
     # We cache the request's data in each worker process, so that we don't
@@ -257,6 +332,10 @@ class SchedulerOutput:
 
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
+
+    # Default-off Exp11 atomic per-rank attention-KV update. The scalar fields
+    # above must be None when this envelope is present.
+    rank_projected_kv_update: RankProjectedKVCacheUpdate | None = None
 
     # Producer partial-tail offload hand-off for external KV connectors:
     # {request_id: [(group_id, block_id, boundary_tokens), ...]} pointing at

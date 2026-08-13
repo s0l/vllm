@@ -23,10 +23,17 @@ _SCHEMA = "ag2-target-boundary-capture-v1"
 
 
 class TargetBoundaryCapture:
-    def __init__(self, output: str, request_prefix: str, max_requests: int):
+    def __init__(
+        self,
+        output: str,
+        request_prefix: str,
+        max_requests: int,
+        target_position: int = -1,
+    ):
         self.output = Path(output)
         self.request_prefix = request_prefix
         self.max_requests = max_requests
+        self.target_position = target_position
         self.seen: set[str] = set()
         self.invocation = 0
         self.parts_written = 0
@@ -56,7 +63,10 @@ class TargetBoundaryCapture:
             raise ValueError(
                 "AG2_VLLM_TARGET_BOUNDARY_CAPTURE_REQUESTS must be positive"
             )
-        return cls(output, request_prefix, max_requests)
+        target_position = int(
+            os.environ.get("AG2_VLLM_TARGET_BOUNDARY_CAPTURE_POSITION", "-1")
+        )
+        return cls(output, request_prefix, max_requests, target_position)
 
     def _write_manifest(self, state: str) -> None:
         manifest = Path(f"{self.output}.manifest.json")
@@ -69,6 +79,7 @@ class TargetBoundaryCapture:
                     "state": state,
                     "request_prefix": self.request_prefix,
                     "max_requests": self.max_requests,
+                    "target_position": self.target_position,
                     "seen_requests": len(self.seen),
                     "parts_written": self.parts_written,
                     "invocations": self.invocation,
@@ -129,7 +140,12 @@ class TargetBoundaryCapture:
                 or len(self.seen) >= self.max_requests
             ):
                 continue
-            rows = list(range(start, end))
+            rows = [
+                row
+                for row in range(start, end)
+                if self.target_position < 0
+                or int(positions[row]) == self.target_position
+            ]
             selected_requests.append(
                 {
                     "req_id": req_id,
@@ -141,8 +157,11 @@ class TargetBoundaryCapture:
                     "prefill_len": prefill_lens[req_idx],
                 }
             )
-            selected_rows.extend(rows)
-            self.seen.add(req_id)
+            if rows:
+                selected_rows.extend(rows)
+                self.seen.add(req_id)
+            else:
+                selected_requests.pop()
 
         if not selected_rows:
             self._write_manifest(

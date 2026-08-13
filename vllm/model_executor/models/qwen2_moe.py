@@ -25,6 +25,7 @@
 # limitations under the License.
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
+import os
 from collections.abc import Iterable
 from itertools import islice
 from typing import Any
@@ -36,7 +37,11 @@ from transformers import Qwen2MoeConfig
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_mlp_all_reduce,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
@@ -123,6 +128,15 @@ class Qwen2MoeMLP(nn.Module):
     ) -> None:
         super().__init__()
         tp_size = get_tensor_model_parallel_world_size()
+        self._ag2_mlp_decode_fixed_reduce = (
+            os.environ.get("AG2_VLLM_MLP_DECODE_FIXED_REDUCE", "0") == "1"
+            and reduce_results
+            and not is_sequence_parallel
+            and tp_size == 3
+        )
+        down_reduce_results = (
+            reduce_results and not self._ag2_mlp_decode_fixed_reduce
+        )
         needs_padding = not is_sequence_parallel and intermediate_size % tp_size != 0
         if needs_padding:
             padded_intermediate_size = _ceil_to_multiple(
@@ -143,7 +157,7 @@ class Qwen2MoeMLP(nn.Module):
                 hidden_size,
                 bias=False,
                 quant_config=quant_config,
-                reduce_results=reduce_results,
+                reduce_results=down_reduce_results,
                 prefix=f"{prefix}.down_proj",
             )
         else:
@@ -160,7 +174,7 @@ class Qwen2MoeMLP(nn.Module):
                 hidden_size,
                 bias=False,
                 quant_config=quant_config,
-                reduce_results=reduce_results,
+                reduce_results=down_reduce_results,
                 disable_tp=is_sequence_parallel,
                 prefix=f"{prefix}.down_proj",
             )
@@ -285,6 +299,8 @@ class Qwen2MoeMLP(nn.Module):
             )
             self._ag2_projection_capture_activation.copy_(selected)
         out, _ = self.down_proj(out)
+        if self._ag2_mlp_decode_fixed_reduce:
+            out = tensor_model_parallel_mlp_all_reduce(out)
 
         if getattr(self, "_ag2_aux_full_trace_enabled", False):
             self._ag2_aux_full_down_parallel = (

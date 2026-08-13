@@ -16,6 +16,7 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_block_hashes,
 )
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
     FullAttentionSpec,
@@ -75,6 +76,12 @@ class SingleTypeKVCacheManager(ABC):
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
+        if (
+            isinstance(kv_cache_spec, AttentionSpec)
+            and kv_cache_spec.dcp_full_history
+        ):
+            dcp_world_size = 1
+            self.dcp_world_size = 1
         if dcp_world_size > 1:
             self.block_size *= dcp_world_size
         self.kv_cache_spec = kv_cache_spec
@@ -698,6 +705,8 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             "and chunked local attention groups"
         )
         block_size = kv_cache_spec.block_size
+        if kv_cache_spec.dcp_full_history:
+            dcp_world_size = 1
         if dcp_world_size > 1:
             # DCP shards each block's KV across ranks; hashes must be viewed at
             # the sharded block size.

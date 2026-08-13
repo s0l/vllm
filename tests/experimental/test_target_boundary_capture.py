@@ -90,3 +90,28 @@ def test_partial_prefill_is_not_mislabeled_as_first_emission(tmp_path, monkeypat
     capture.capture(torch.ones(1, 4), torch.ones(1, 7), final)
     assert capture.seen == {"wanted-a"}
     assert (tmp_path / "target.part0000.pt").exists()
+
+
+def test_target_position_waits_for_requested_decode_row(tmp_path, monkeypatch):
+    monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+    capture = module.TargetBoundaryCapture(
+        str(tmp_path / "target"), "wanted-", 1, target_position=129
+    )
+    first = _batch(["wanted-a"], [1])
+    first.positions = torch.tensor([128])
+    capture.capture(torch.ones(1, 4), torch.ones(1, 7), first)
+    assert capture.seen == set()
+    assert not (tmp_path / "target.part0000.pt").exists()
+
+    second = _batch(["wanted-a"], [1])
+    second.positions = torch.tensor([129])
+    hidden = torch.full((1, 4), 2.0)
+    logits = torch.full((1, 7), 3.0)
+    capture.capture(hidden, logits, second)
+    payload = torch.load(
+        tmp_path / "target.part0000.pt", map_location="cpu", weights_only=False
+    )
+    assert capture.seen == {"wanted-a"}
+    assert payload["positions"].tolist() == [129]
+    assert torch.equal(payload["hidden_states"], hidden)
+    assert torch.equal(payload["raw_logits"], logits)

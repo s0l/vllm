@@ -7,6 +7,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.core.rank_projected_owner import ElasticPageOwnerPolicy
 from vllm.v1.worker.gpu.buffer_utils import (
     FusedStagedWriter,
     StagedWriteTensor,
@@ -27,6 +28,8 @@ class BlockTables:
         cp_size: int = 1,
         cp_rank: int = 0,
         cp_interleave: int = 1,
+        rank_projected_groups: list[bool] | None = None,
+        full_history_groups: list[bool] | None = None,
     ):
         self.block_sizes = block_sizes
         self.kernel_block_sizes = kernel_block_sizes
@@ -37,19 +40,115 @@ class BlockTables:
         self.cp_size = cp_size
         self.cp_rank = cp_rank
         self.cp_interleave = cp_interleave
+        self.rank_projected_groups = rank_projected_groups
+        self.full_history_groups = full_history_groups
 
-        self.num_kv_cache_groups = len(self.block_sizes)
-        assert len(max_num_blocks_per_group) == self.num_kv_cache_groups
+        if rank_projected_groups is not None and full_history_groups is not None:
+            raise ValueError(
+                "rank-projected and replicated full-history groups are mutually "
+                "exclusive"
+            )
 
+        if any(bs % kbs for bs, kbs in zip(block_sizes, kernel_block_sizes)):
+            raise ValueError("KV block size must be divisible by kernel page size")
         self.blocks_per_kv_block = [
             bs // kbs for bs, kbs in zip(block_sizes, kernel_block_sizes)
         ]
+
+        self.num_kv_cache_groups = len(self.block_sizes)
+        assert len(max_num_blocks_per_group) == self.num_kv_cache_groups
+        if full_history_groups is not None:
+            if cp_size != 3 or cp_interleave != 1:
+                raise ValueError("Exp11 9/9/6 full history requires DCP3/interleave1")
+            if len(full_history_groups) != self.num_kv_cache_groups:
+                raise ValueError("full-history KV group mask length mismatch")
+            if not any(full_history_groups):
+                raise ValueError("full-history KV requires an attention group")
+            self.full_history_group_mask = torch.tensor(
+                full_history_groups, dtype=torch.int8, device=device
+            )
+        else:
+            self.full_history_group_mask = None
+        if rank_projected_groups is not None:
+            if cp_size != 3 or cp_interleave != 1:
+                raise ValueError("Exp11 rank-projected KV requires DCP3/interleave1")
+            if len(rank_projected_groups) != self.num_kv_cache_groups:
+                raise ValueError("rank-projected KV group mask length mismatch")
+            if not any(rank_projected_groups):
+                raise ValueError("rank-projected KV requires an attention group")
+            projected_page_sizes = {
+                kernel_page_size
+                for kernel_page_size, projected in zip(
+                    kernel_block_sizes, rank_projected_groups, strict=True
+                )
+                if projected
+            }
+            if len(projected_page_sizes) != 1:
+                raise ValueError(
+                    "rank-projected attention groups require one kernel page size"
+                )
+            self.rank_projected_page_size = projected_page_sizes.pop()
+            max_global_pages = max(
+                value * pages_per_block * cp_size
+                for value, pages_per_block, projected in zip(
+                    max_num_blocks_per_group,
+                    self.blocks_per_kv_block,
+                    rank_projected_groups,
+                    strict=True,
+                )
+                if projected
+            )
+            owners, ordinals, prefix_counts = ElasticPageOwnerPolicy(
+                page_size=self.rank_projected_page_size
+            ).build_luts(max_global_pages)
+            self.rank_projected_owner_lut_host = owners
+            self.rank_projected_owner_lut = torch.tensor(
+                owners, dtype=torch.uint8, device=device
+            )
+            self.rank_projected_ordinal_lut = torch.tensor(
+                ordinals, dtype=torch.int32, device=device
+            )
+            self.rank_projected_prefix_counts = torch.tensor(
+                prefix_counts, dtype=torch.int32, device=device
+            )
+            self.rank_projected_group_mask = torch.tensor(
+                rank_projected_groups, dtype=torch.int8, device=device
+            )
+        else:
+            self.rank_projected_page_size = None
+            self.rank_projected_owner_lut_host = None
+            self.rank_projected_owner_lut = None
+            self.rank_projected_ordinal_lut = None
+            self.rank_projected_prefix_counts = None
+            self.rank_projected_group_mask = None
+
+        if rank_projected_groups is not None:
+            for blocks_per_kv_block, projected in zip(
+                self.blocks_per_kv_block,
+                rank_projected_groups,
+                strict=True,
+            ):
+                if projected and blocks_per_kv_block <= 0:
+                    raise ValueError(
+                        "rank-projected attention requires at least one kernel "
+                        "page per worker KV block"
+                    )
 
         # num_kv_cache_groups x [max_num_reqs, max_num_blocks]
         self.block_tables: list[StagedWriteTensor] = []
         self.host_block_tables: list[np.ndarray] = []
         for i in range(self.num_kv_cache_groups):
-            max_num_blocks = max_num_blocks_per_group[i] * self.blocks_per_kv_block[i]
+            physical_blocks_per_logical = (
+                2
+                if rank_projected_groups is not None
+                and rank_projected_groups[i]
+                else 1
+            )
+            max_num_blocks = (
+                max_num_blocks_per_group[i]
+                * self.blocks_per_kv_block[i]
+                * physical_blocks_per_logical
+            )
             block_table = StagedWriteTensor(
                 (self.max_num_reqs, max_num_blocks), dtype=torch.int32, device=device
             )
@@ -64,6 +163,9 @@ class BlockTables:
         self.num_blocks = UvaBackedTensor(
             (self.num_kv_cache_groups, self.max_num_reqs),
             dtype=torch.int32,
+        )
+        self.logical_num_blocks = np.zeros(
+            (self.num_kv_cache_groups, self.max_num_reqs), dtype=np.int32
         )
         self.fused_writer: FusedStagedWriter | None = None
         if self.num_kv_cache_groups > 1:
@@ -122,8 +224,48 @@ class BlockTables:
             start = self.num_blocks.np[i, req_index] if not overwrite else 0
             block_ids = new_block_ids[i]
             bpk = self.blocks_per_kv_block[i]
-            if bpk > 1:
+            rank_projected = bool(
+                self.rank_projected_groups is not None
+                and self.rank_projected_groups[i]
+            )
+            if rank_projected:
+                global_pages_per_block = bpk * self.cp_size
+                logical_start = (
+                    0 if overwrite else int(self.logical_num_blocks[i, req_index])
+                )
+                owners = self.rank_projected_owner_lut_host
+                assert owners is not None
+                expanded: list[int] = []
+                for logical_offset, block_id in enumerate(block_ids):
+                    global_page_start = (
+                        logical_start + logical_offset
+                    ) * global_pages_per_block
+                    local_slot = 0
+                    for page in range(
+                        global_page_start,
+                        global_page_start + global_pages_per_block,
+                    ):
+                        if owners[page] == self.cp_rank:
+                            expanded.append(block_id * 2 * bpk + local_slot)
+                            local_slot += 1
+                    if local_slot > 2 * bpk:
+                        raise ValueError(
+                            "rank-projected packed superblock exceeds two worker "
+                            "KV blocks"
+                        )
+                block_ids = expanded
+                self.logical_num_blocks[i, req_index] = logical_start + len(
+                    new_block_ids[i]
+                )
+            elif bpk > 1:
                 block_ids = [b * bpk + k for b in block_ids for k in range(bpk)]
+                self.logical_num_blocks[i, req_index] = (
+                    0 if overwrite else self.logical_num_blocks[i, req_index]
+                ) + len(new_block_ids[i])
+            else:
+                self.logical_num_blocks[i, req_index] = (
+                    0 if overwrite else self.logical_num_blocks[i, req_index]
+                ) + len(new_block_ids[i])
             self.block_tables[i].stage_write(req_index, start, block_ids)
             end = start + len(block_ids)
             self.host_block_tables[i][req_index, start:end] = block_ids
@@ -209,8 +351,22 @@ class BlockTables:
             slot_mappings,
             slot_mappings.stride(0),
             self.cp_rank,
+            self.rank_projected_owner_lut
+            if self.rank_projected_owner_lut is not None
+            else positions,
+            self.rank_projected_ordinal_lut
+            if self.rank_projected_ordinal_lut is not None
+            else positions,
+            self.rank_projected_group_mask
+            if self.rank_projected_group_mask is not None
+            else positions,
+            self.full_history_group_mask
+            if self.full_history_group_mask is not None
+            else positions,
             CP_SIZE=self.cp_size,
             CP_INTERLEAVE=self.cp_interleave,
+            RANK_PROJECTED=self.rank_projected_groups is not None,
+            FULL_HISTORY=self.full_history_groups is not None,
             PAD_ID=PAD_SLOT_ID,
             TRITON_BLOCK_SIZE=1024,  # type: ignore
         )
@@ -280,8 +436,14 @@ def _compute_slot_mappings_kernel(
     slot_mappings_ptr,  # [num_kv_cache_groups, max_num_tokens]
     slot_mappings_stride,
     cp_rank,
+    rank_projected_owner_lut,
+    rank_projected_ordinal_lut,
+    rank_projected_group_mask,
+    full_history_group_mask,
     CP_SIZE: tl.constexpr,
     CP_INTERLEAVE: tl.constexpr,
+    RANK_PROJECTED: tl.constexpr,
+    FULL_HISTORY: tl.constexpr,
     PAD_ID: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
@@ -329,5 +491,38 @@ def _compute_slot_mappings_kernel(
             local_offsets = rounds * CP_INTERLEAVE + remainder
             slot_ids = block_numbers * block_size + local_offsets
             slot_ids = tl.where(is_local, slot_ids, PAD_ID)
+
+            if RANK_PROJECTED:
+                use_rank_projection = (
+                    tl.load(rank_projected_group_mask + group_id) != 0
+                )
+                global_pages = positions // block_size
+                page_offsets = positions % block_size
+                owners = tl.load(rank_projected_owner_lut + global_pages)
+                local_ordinals = tl.load(
+                    rank_projected_ordinal_lut + global_pages
+                )
+                projected_block_numbers = tl.load(
+                    block_table_ptr
+                    + req_state_idx * block_table_stride
+                    + local_ordinals
+                )
+                projected_slots = projected_block_numbers * block_size + page_offsets
+                projected_slots = tl.where(
+                    owners == cp_rank, projected_slots, PAD_ID
+                )
+                slot_ids = tl.where(use_rank_projection, projected_slots, slot_ids)
+
+            if FULL_HISTORY:
+                use_full_history = tl.load(full_history_group_mask + group_id) != 0
+                full_block_indices = positions // block_size
+                full_offsets = positions % block_size
+                full_block_numbers = tl.load(
+                    block_table_ptr
+                    + req_state_idx * block_table_stride
+                    + full_block_indices
+                )
+                full_slots = full_block_numbers * block_size + full_offsets
+                slot_ids = tl.where(use_full_history, full_slots, slot_ids)
 
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
