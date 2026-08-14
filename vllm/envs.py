@@ -103,9 +103,14 @@ if TYPE_CHECKING:
     AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL: bool = False
     AG2_VLLM_NVFP4_MARLIN_WHOLE_SLICE_PREFILL: bool = False
     AG2_VLLM_NVFP4_MARLIN_GATE_UP_SCRATCH: bool = False
+    AG2_VLLM_NVFP4_B12X_GATE_UP_SCRATCH: bool = False
     AG2_VLLM_MTP_BF16_GATE_UP_SCRATCH: bool = False
     AG2_VLLM_MTP_FC_BATCH_INVARIANT: bool = False
     AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH: bool = False
+    AG2_VLLM_TP3_OWNER_PREQUANT: bool = False
+    AG2_VLLM_TP3_OWNER_REPLAY_GATE: bool = False
+    AG2_VLLM_TP3_OWNER_REPLAY_GATE_MAX_ROWS: int = 256
+    AG2_VLLM_TP3_OWNER_MIN_ROWS: int = 64
     AG2_VLLM_NVFP4_HUMMING_STABLE_K64: bool = False
     AG2_VLLM_NVFP4_HUMMING_NARROW_PAD64: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
@@ -636,9 +641,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AG2_VLLM_NVFP4_BATCH_INVARIANT": lambda: bool(
         int(os.getenv("AG2_VLLM_NVFP4_BATCH_INVARIANT", "0"))
     ),
-    "AG2_VLLM_NVFP4_B12X": lambda: bool(
-        int(os.getenv("AG2_VLLM_NVFP4_B12X", "0"))
-    ),
+    "AG2_VLLM_NVFP4_B12X": lambda: bool(int(os.getenv("AG2_VLLM_NVFP4_B12X", "0"))),
     "AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE": lambda: bool(
         int(os.getenv("AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE", "0"))
     ),
@@ -651,6 +654,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "AG2_VLLM_NVFP4_MARLIN_GATE_UP_SCRATCH": lambda: bool(
         int(os.getenv("AG2_VLLM_NVFP4_MARLIN_GATE_UP_SCRATCH", "0"))
     ),
+    "AG2_VLLM_NVFP4_B12X_GATE_UP_SCRATCH": lambda: bool(
+        int(os.getenv("AG2_VLLM_NVFP4_B12X_GATE_UP_SCRATCH", "0"))
+    ),
     "AG2_VLLM_MTP_BF16_GATE_UP_SCRATCH": lambda: bool(
         int(os.getenv("AG2_VLLM_MTP_BF16_GATE_UP_SCRATCH", "0"))
     ),
@@ -659,6 +665,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH": lambda: bool(
         int(os.getenv("AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH", "0"))
+    ),
+    "AG2_VLLM_TP3_OWNER_PREQUANT": lambda: bool(
+        int(os.getenv("AG2_VLLM_TP3_OWNER_PREQUANT", "0"))
+    ),
+    "AG2_VLLM_TP3_OWNER_REPLAY_GATE": lambda: bool(
+        int(os.getenv("AG2_VLLM_TP3_OWNER_REPLAY_GATE", "0"))
+    ),
+    "AG2_VLLM_TP3_OWNER_REPLAY_GATE_MAX_ROWS": lambda: int(
+        os.getenv("AG2_VLLM_TP3_OWNER_REPLAY_GATE_MAX_ROWS", "256")
+    ),
+    "AG2_VLLM_TP3_OWNER_MIN_ROWS": lambda: int(
+        os.getenv("AG2_VLLM_TP3_OWNER_MIN_ROWS", "64")
     ),
     "AG2_VLLM_NVFP4_HUMMING_STABLE_K64": lambda: bool(
         int(os.getenv("AG2_VLLM_NVFP4_HUMMING_STABLE_K64", "0"))
@@ -915,33 +933,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DCP_NATIVE_RS_MAX_ROWS": lambda: int(
         os.environ.get("VLLM_DCP_NATIVE_RS_MAX_ROWS", "0")
     ),
-    "VLLM_DCP_ABSOLUTE_PREFILL_EXACT_RS": lambda: os.environ.get(
-        "VLLM_DCP_ABSOLUTE_PREFILL_EXACT_RS", "0"
-    )
-    == "1",
+    "VLLM_DCP_ABSOLUTE_PREFILL_EXACT_RS": lambda: (
+        os.environ.get("VLLM_DCP_ABSOLUTE_PREFILL_EXACT_RS", "0") == "1"
+    ),
     "VLLM_TP3_CE_REDUCE": lambda: os.environ.get("VLLM_TP3_CE_REDUCE", "0") == "1",
     "VLLM_TP3_CE_MAX_ROWS": lambda: int(
         os.environ.get("VLLM_TP3_CE_MAX_ROWS", "12288")
     ),
     "VLLM_TP3_LL_REDUCE": lambda: os.environ.get("VLLM_TP3_LL_REDUCE", "0") == "1",
-    "VLLM_TP3_LL_MAX_ROWS": lambda: int(
-        os.environ.get("VLLM_TP3_LL_MAX_ROWS", "16")
+    "VLLM_TP3_LL_MAX_ROWS": lambda: int(os.environ.get("VLLM_TP3_LL_MAX_ROWS", "16")),
+    "VLLM_TP3_SD_CANONICAL_REDUCE": lambda: (
+        os.environ.get("VLLM_TP3_SD_CANONICAL_REDUCE", "0") == "1"
     ),
-    "VLLM_TP3_SD_CANONICAL_REDUCE": lambda: os.environ.get(
-        "VLLM_TP3_SD_CANONICAL_REDUCE", "0"
-    )
-    == "1",
-    "VLLM_TP3_SD_DETERMINISTIC_REDUCE": lambda: os.environ.get(
-        "VLLM_TP3_SD_DETERMINISTIC_REDUCE", "0"
-    )
-    == "1",
+    "VLLM_TP3_SD_DETERMINISTIC_REDUCE": lambda: (
+        os.environ.get("VLLM_TP3_SD_DETERMINISTIC_REDUCE", "0") == "1"
+    ),
     "VLLM_TP3_SD_DETERMINISTIC_MAX_ROWS": lambda: int(
         os.environ.get("VLLM_TP3_SD_DETERMINISTIC_MAX_ROWS", "24")
     ),
-    "VLLM_TP3_SD_PHASE_REDUCE": lambda: os.environ.get(
-        "VLLM_TP3_SD_PHASE_REDUCE", "0"
-    )
-    == "1",
+    "VLLM_TP3_SD_PHASE_REDUCE": lambda: (
+        os.environ.get("VLLM_TP3_SD_PHASE_REDUCE", "0") == "1"
+    ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
     # (CPU backend only) CPU key-value cache space.

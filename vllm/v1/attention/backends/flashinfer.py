@@ -121,6 +121,88 @@ def set_ag2_dcp_prefill_query_scratch(scratch: torch.Tensor | None) -> None:
     _ag2_dcp_prefill_query_scratch = scratch
 
 
+def _index_select_dcp_context_query(
+    source: torch.Tensor,
+    indices: torch.Tensor,
+    workspace: torch.Tensor | None,
+) -> torch.Tensor:
+    """Select context rows into dead DCP all-gather scratch storage.
+
+    The caller-owned DCP workspace has two disjoint halves.  Once
+    ``all_gather_into`` has reordered the raw collective output into the second
+    half, the first half is dead.  Reusing it here removes a large late
+    allocation from the fragmented eager attention pool without changing row
+    order or attention arithmetic.
+    """
+    if workspace is None:
+        return torch.index_select(source, 0, indices)
+    if not source.is_contiguous() or not workspace.is_contiguous():
+        raise ValueError("DCP context-query source/workspace must be contiguous")
+    if source.dtype != workspace.dtype or source.device != workspace.device:
+        raise ValueError(
+            "DCP context-query workspace dtype/device must match source: "
+            f"{workspace.dtype}/{workspace.device} != "
+            f"{source.dtype}/{source.device}"
+        )
+    output_shape = (indices.numel(), *source.shape[1:])
+    output_elements = indices.numel() * source[0].numel()
+    if workspace.numel() < output_elements:
+        raise RuntimeError(
+            "DCP context-query workspace is too small: "
+            f"need={output_elements} available={workspace.numel()}"
+        )
+    output = workspace.view(-1)[:output_elements].view(output_shape)
+    if source.untyped_storage().data_ptr() == output.untyped_storage().data_ptr():
+        source_start = source.storage_offset()
+        source_end = source_start + source.numel()
+        output_start = output.storage_offset()
+        output_end = output_start + output.numel()
+        if not (output_end <= source_start or source_end <= output_start):
+            raise ValueError("DCP context-query source and output must not overlap")
+    torch.index_select(source, 0, indices, out=output)
+    return output
+
+
+def _reuse_dcp_context_query_for_merged_output(
+    context_query: torch.Tensor,
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    """View dead context-query storage as the merged attention output.
+
+    FlashInfer has consumed ``context_query`` before this helper is called.
+    The absolute-segment path needs only one third as many local output heads,
+    so the dead contiguous query storage is large enough for the merge result.
+    Reusing it removes a second late allocation from the same fragmented pool.
+    """
+    if not context_query.is_contiguous() or not reference.is_contiguous():
+        raise ValueError(
+            "DCP context query and merged-output reference must be contiguous"
+        )
+    if (
+        context_query.dtype != reference.dtype
+        or context_query.device != reference.device
+    ):
+        raise ValueError(
+            "DCP merged-output storage dtype/device must match reference: "
+            f"{context_query.dtype}/{context_query.device} != "
+            f"{reference.dtype}/{reference.device}"
+        )
+    if context_query.numel() < reference.numel():
+        raise RuntimeError(
+            "DCP context-query storage is too small for merged output: "
+            f"need={reference.numel()} available={context_query.numel()}"
+        )
+    output = context_query.view(-1)[: reference.numel()].view_as(reference)
+    if output.untyped_storage().data_ptr() == reference.untyped_storage().data_ptr():
+        reference_start = reference.storage_offset()
+        reference_end = reference_start + reference.numel()
+        output_start = output.storage_offset()
+        output_end = output_start + output.numel()
+        if not (output_end <= reference_start or reference_end <= output_start):
+            raise ValueError("DCP merged output must not overlap its reference input")
+    return output
+
+
 def _resolve_decode_split_plan(
     *,
     num_decode_tokens: int,
@@ -1449,7 +1531,8 @@ class BatchDCPPrefillWrapper:
         self._use_cuda_graph = use_cuda_graph
         self._disable_split_kv_for_cuda_graph = (
             use_cuda_graph
-            and os.environ.get("AG2_VLLM_FLASHINFER_DCP_PREFILL_NO_SPLIT", "0") == "1"
+            and os.environ.get("AG2_VLLM_FLASHINFER_DCP_PREFILL_NO_SPLIT", "0")
+            == "1"
         )
         self._ragged_fixed_split_size = int(
             os.environ.get(
@@ -2164,6 +2247,7 @@ class BatchDCPPrefillWrapper:
             )
             dcp_observer_meta[:request_count, 19] = self._ag2_dcp_world_size
             dcp_observer_meta[:request_count, 21] = self._ag2_window_left
+        context_query_workspace: torch.Tensor | None = None
         if envs.AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH:
             query = prefill_query.contiguous()
             dcp_group = get_dcp_group()
@@ -2196,6 +2280,10 @@ class BatchDCPPrefillWrapper:
             dcp_group.all_gather_into(
                 query, raw_output, prefill_query_across_dcp, dim=1
             )
+            # The raw collective half is dead after the reorder above.  Keep a
+            # view so absolute-segment context selection can reuse it instead
+            # of requesting a new contiguous allocation late in prefill.
+            context_query_workspace = raw_output
         else:
             prefill_query_across_dcp = get_dcp_group().all_gather(
                 prefill_query.contiguous(), dim=1
@@ -2259,10 +2347,10 @@ class BatchDCPPrefillWrapper:
                     raise RuntimeError(
                         "Absolute-segment DCP prefill has no context wrapper"
                     )
-                context_query = torch.index_select(
+                context_query = _index_select_dcp_context_query(
                     prefill_query_across_dcp[canonical_start:],
-                    0,
                     context_indices,
+                    context_query_workspace,
                 )
                 context_output_tmp, context_lse_tmp = (
                     self._absolute_segment_context.run(
@@ -2284,6 +2372,10 @@ class BatchDCPPrefillWrapper:
                     return_lse=True,
                     force_exact_reduce_scatter=self._absolute_segment_exact_rs,
                 )
+                # The combine has consumed FlashInfer's full-head temporary.
+                # Drop the Python references before subsequent allocations so
+                # its 3x-local-head storage can return to the current stream.
+                del context_output_tmp, context_lse_tmp
                 selected_current_output = torch.index_select(
                     current_output,
                     0,
@@ -2294,7 +2386,10 @@ class BatchDCPPrefillWrapper:
                     0,
                     context_indices,
                 )
-                merged_output = torch.empty_like(context_output)
+                merged_output = _reuse_dcp_context_query_for_merged_output(
+                    context_query,
+                    context_output,
+                )
                 context_lse = context_lse.transpose(0, 1).contiguous()
                 selected_current_lse = (
                     selected_current_lse.transpose(0, 1).contiguous()
@@ -2527,6 +2622,13 @@ class BatchDCPPseudoPrefillWrapper:
         self,
         workspace_buffer: torch.Tensor | None = None,
         dcp_a2a: bool = False,
+        *,
+        use_cuda_graph: bool = False,
+        qo_indptr_buffer: torch.Tensor | None = None,
+        paged_kv_indptr_buffer: torch.Tensor | None = None,
+        paged_kv_indices_buffer: torch.Tensor | None = None,
+        paged_kv_last_page_len_buffer: torch.Tensor | None = None,
+        int_workspace_buffer: torch.Tensor | None = None,
     ):
         if dcp_a2a:
             self._dcp_combine = partial(dcp_a2a_lse_reduce, is_lse_base_on_e=False)
@@ -2535,6 +2637,31 @@ class BatchDCPPseudoPrefillWrapper:
         self._paged = BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer,
             get_kv_cache_layout(),
+            use_cuda_graph=use_cuda_graph,
+            qo_indptr_buf=qo_indptr_buffer,
+            paged_kv_indptr_buf=paged_kv_indptr_buffer,
+            paged_kv_indices_buf=paged_kv_indices_buffer,
+            paged_kv_last_page_len_buf=paged_kv_last_page_len_buffer,
+        )
+        if use_cuda_graph:
+            if int_workspace_buffer is None:
+                raise ValueError(
+                    "DCP pseudo-prefill CUDA graph mode requires a persistent "
+                    "integer workspace"
+                )
+            self._paged.reset_workspace_buffer(
+                workspace_buffer, int_workspace_buffer
+            )
+        self._use_cuda_graph = use_cuda_graph
+        self._disable_split_kv_for_cuda_graph = (
+            use_cuda_graph
+            and os.environ.get("AG2_VLLM_FLASHINFER_DCP_PREFILL_NO_SPLIT", "0")
+            == "1"
+        )
+        self._graph_rows = (
+            int(qo_indptr_buffer.numel() - 1)
+            if qo_indptr_buffer is not None
+            else None
         )
         self._ag2_window_left = -1
         self._ag2_logits_soft_cap = 0.0
@@ -2560,6 +2687,12 @@ class BatchDCPPseudoPrefillWrapper:
         prefill_fixed_split_size: int,
         disable_split_kv: bool,
     ) -> None:
+        rows = int(qo_indptr_cpu.numel() - 1)
+        if self._graph_rows is not None and rows != self._graph_rows:
+            raise ValueError(
+                "DCP pseudo-prefill graph row count changed: "
+                f"captured={self._graph_rows} planned={rows}"
+            )
         self._ag2_plan_ready = False
         self._paged.plan(
             qo_indptr=qo_indptr_cpu,
@@ -2579,12 +2712,18 @@ class BatchDCPPseudoPrefillWrapper:
             q_data_type=q_data_type,
             kv_data_type=kv_cache_dtype,
             fixed_split_size=prefill_fixed_split_size,
-            disable_split_kv=disable_split_kv,
+            disable_split_kv=(
+                disable_split_kv or self._disable_split_kv_for_cuda_graph
+            ),
         )
         self._ag2_window_left = window_left
         self._ag2_logits_soft_cap = logits_soft_cap or 0.0
         self._ag2_sm_scale = sm_scale
         self._ag2_plan_ready = True
+
+    def graph_state_signature(self) -> tuple[object, ...]:
+        """Expose stable wrapper ownership for lifecycle controls."""
+        return (self._use_cuda_graph, self._graph_rows, id(self._paged))
 
     def assert_plan_contract(
         self,
@@ -3211,7 +3350,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             os.environ.get("AG2_VLLM_FLASHINFER_DCP_PREFILL_CUDAGRAPH", "0") == "1"
         )
         self._dcp_prefill_wrappers_cudagraph: dict[int, BatchDCPPrefillWrapper] = {}
-        self._dcp_prefill_captured_wrappers: dict[int, BatchDCPPrefillWrapper] = {}
+        self._dcp_pseudo_prefill_wrappers_cudagraph: dict[
+            int, BatchDCPPseudoPrefillWrapper
+        ] = {}
+        self._dcp_prefill_captured_wrappers: dict[
+            int, BatchDCPPrefillWrapper | BatchDCPPseudoPrefillWrapper
+        ] = {}
         self._dcp_prefill_qo_indptr_buffer: torch.Tensor | None = None
         self._dcp_prefill_context_int_workspace: torch.Tensor | None = None
         self._dcp_prefill_new_tokens_int_workspace: torch.Tensor | None = None
@@ -3397,7 +3541,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     "CUDA graph mode."
                 )
             self._dcp_prefill_qo_indptr_buffer = torch.empty(
-                max_num_reqs + 1,
+                max(max_num_reqs, self.max_num_batched_tokens) + 1,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -3986,18 +4130,49 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             for_cudagraph_capture=True,
         )
 
-    def _get_dcp_pseudo_prefill_wrapper(self) -> BatchDCPPseudoPrefillWrapper:
-        if self._dcp_pseudo_prefill_wrapper is None:
-            self._dcp_pseudo_prefill_wrapper = BatchDCPPseudoPrefillWrapper(
+    def _get_dcp_pseudo_prefill_wrapper(
+        self,
+        cudagraph_batch_size: int | None = None,
+    ) -> BatchDCPPseudoPrefillWrapper:
+        if cudagraph_batch_size is None:
+            if self._dcp_pseudo_prefill_wrapper is None:
+                self._dcp_pseudo_prefill_wrapper = BatchDCPPseudoPrefillWrapper(
+                    workspace_buffer=self._get_workspace_buffer(),
+                    dcp_a2a=self.dcp_a2a,
+                )
+            return self._dcp_pseudo_prefill_wrapper
+
+        wrapper = self._dcp_pseudo_prefill_wrappers_cudagraph.get(
+            cudagraph_batch_size
+        )
+        if wrapper is None:
+            qo_indptr = self._dcp_prefill_qo_indptr_buffer
+            int_workspace = self._dcp_prefill_context_int_workspace
+            assert qo_indptr is not None
+            assert int_workspace is not None
+            wrapper = BatchDCPPseudoPrefillWrapper(
                 workspace_buffer=self._get_workspace_buffer(),
                 dcp_a2a=self.dcp_a2a,
+                use_cuda_graph=True,
+                qo_indptr_buffer=qo_indptr[: cudagraph_batch_size + 1],
+                paged_kv_indptr_buffer=self.paged_kv_indptr.gpu[
+                    : cudagraph_batch_size + 1
+                ],
+                paged_kv_indices_buffer=self.paged_kv_indices.gpu,
+                paged_kv_last_page_len_buffer=self.paged_kv_last_page_len.gpu[
+                    :cudagraph_batch_size
+                ],
+                int_workspace_buffer=int_workspace,
             )
-        return self._dcp_pseudo_prefill_wrapper
+            self._dcp_pseudo_prefill_wrappers_cudagraph[
+                cudagraph_batch_size
+            ] = wrapper
+        return wrapper
 
     def _verify_dcp_prefill_cudagraph_wrapper_identity(
         self,
         batch_size: int,
-        wrapper: BatchDCPPrefillWrapper,
+        wrapper: BatchDCPPrefillWrapper | BatchDCPPseudoPrefillWrapper,
         *,
         for_cudagraph_capture: bool,
     ) -> None:
@@ -4684,7 +4859,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         else (
                             self._get_dcp_sequential_decode_wrapper()
                             if self._dcp_sequential_decode_enabled
-                            else self._get_dcp_pseudo_prefill_wrapper()
+                            else self._get_dcp_pseudo_prefill_wrapper(
+                                dcp_prefill_cudagraph_batch_size
+                            )
                         )
                     )
                     if use_dcp_pseudo_decode
@@ -4694,7 +4871,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     )
                 )
                 if dcp_prefill_cudagraph_batch_size is not None:
-                    assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
+                    assert isinstance(
+                        prefill_wrapper,
+                        BatchDCPPrefillWrapper | BatchDCPPseudoPrefillWrapper,
+                    )
                     self._verify_dcp_prefill_cudagraph_wrapper_identity(
                         dcp_prefill_cudagraph_batch_size,
                         prefill_wrapper,

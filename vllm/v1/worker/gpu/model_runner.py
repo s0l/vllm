@@ -293,7 +293,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.marlin_gate_up_scratch: torch.Tensor | None = None
         if (
             envs.AG2_VLLM_NVFP4_MARLIN_GATE_UP_SCRATCH
+            or envs.AG2_VLLM_NVFP4_B12X_GATE_UP_SCRATCH
             or envs.AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH
+            or envs.AG2_VLLM_TP3_OWNER_PREQUANT
         ):
             # Qwen3.5/3.6 TP3 gate+up physical width: 2 * 5824.  Allocate the
             # largest destination before model/KV profiling so its ownership
@@ -343,6 +345,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # workspace handoff to MTP.  DCP prefill needs that lifetime even
             # when the selected target linear backend is not Marlin.
             set_nvfp4_marlin_gate_up_scratch(self.marlin_gate_up_scratch)
+            if envs.AG2_VLLM_NVFP4_B12X_GATE_UP_SCRATCH:
+                from vllm.utils.flashinfer import set_ag2_b12x_gate_up_scratch
+
+                set_ag2_b12x_gate_up_scratch(self.marlin_gate_up_scratch)
+            if envs.AG2_VLLM_TP3_OWNER_PREQUANT:
+                from vllm.distributed.device_communicators.tp3_owner_prequant import (
+                    set_tp3_owner_prequant_workspace,
+                )
+                from vllm.distributed.device_communicators.tp3_exact_reduce import (
+                    set_tp3_weighted_owner_workspace,
+                )
+                from vllm.v1.sample.ops.topk_topp_triton import (
+                    set_ag2_shared_topk_topp_buffer,
+                )
+
+                set_tp3_owner_prequant_workspace(self.marlin_gate_up_scratch)
+                set_tp3_weighted_owner_workspace(self.marlin_gate_up_scratch)
+                set_ag2_shared_topk_topp_buffer(self.marlin_gate_up_scratch)
             if envs.AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH:
                 from vllm.v1.attention.backends.flashinfer import (
                     set_ag2_dcp_prefill_query_scratch,

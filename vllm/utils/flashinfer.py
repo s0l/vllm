@@ -24,6 +24,26 @@ from vllm.utils.math_utils import cdiv
 
 logger = init_logger(__name__)
 
+_AG2_B12X_GATE_UP_SCRATCH: torch.Tensor | None = None
+
+
+def set_ag2_b12x_gate_up_scratch(scratch: torch.Tensor | None) -> None:
+    """Install opaque process-local storage for B12x gate/up results.
+
+    The tensor is deliberately not a custom-op argument. Exposing a mutated
+    graph input makes AOT functionalization allocate a fresh full output and
+    copy it back. The non-mutating custom-op abstraction instead returns this
+    storage as an opaque result. Callers must preserve sequential same-stream
+    gate/up -> activation/down -> next gate/up ordering.
+    """
+    global _AG2_B12X_GATE_UP_SCRATCH
+    if scratch is not None:
+        if scratch.ndim != 2 or scratch.shape[1] != 11648:
+            raise ValueError("B12x gate/up scratch must have shape (M, 11648)")
+        if scratch.dtype != torch.bfloat16 or not scratch.is_contiguous():
+            raise ValueError("B12x gate/up scratch must be contiguous BF16")
+    _AG2_B12X_GATE_UP_SCRATCH = scratch
+
 # This is the storage path for the cubins, it can be replaced
 # with a local path for testing.
 # Referenced from https://github.com/flashinfer-ai/flashinfer/blob/0c9a92c3d9a7e043ab6f3f7b2273269caf6ab044/flashinfer/jit/cubin_loader.py#L35  # noqa: E501
@@ -581,6 +601,46 @@ if has_flashinfer():
     ) -> torch.Tensor:
         from flashinfer import mm_fp4 as flashinfer_mm_fp4_
 
+        out = None
+        if (
+            envs.AG2_VLLM_NVFP4_B12X_GATE_UP_SCRATCH
+            and backend == "b12x"
+            and B.shape[1] == 11648
+        ):
+            scratch = _AG2_B12X_GATE_UP_SCRATCH
+            if scratch is None:
+                raise RuntimeError(
+                    "B12x gate/up scratch is enabled but not configured"
+                )
+            rows = A.shape[0]
+            if (
+                scratch.device != A.device
+                or scratch.dtype != dtype
+                or not scratch.is_contiguous()
+            ):
+                raise RuntimeError(
+                    "B12x gate/up scratch does not match output device/dtype/layout"
+                )
+            if rows > scratch.shape[0]:
+                raise RuntimeError(
+                    "B12x gate/up scratch is too small: "
+                    f"rows={rows} capacity={scratch.shape[0]}"
+                )
+            out = scratch[:rows]
+            output_storage = out.untyped_storage().data_ptr()
+            if output_storage in {
+                value.untyped_storage().data_ptr()
+                for value in (A, B, A_scale, B_scale, g_scale)
+            }:
+                raise RuntimeError("B12x gate/up scratch must not overlap an input")
+        kwargs = {
+            "block_size": block_size,
+            "use_8x4_sf_layout": use_8x4_sf_layout,
+            "use_nvfp4": use_nvfp4,
+            "backend": backend,
+        }
+        if out is not None:
+            kwargs["out"] = out
         return flashinfer_mm_fp4_(
             A,
             B,
@@ -588,10 +648,7 @@ if has_flashinfer():
             B_scale,
             g_scale,
             dtype,
-            block_size=block_size,
-            use_8x4_sf_layout=use_8x4_sf_layout,
-            use_nvfp4=use_nvfp4,
-            backend=backend,
+            **kwargs,
         )
 
     @torch.library.register_fake(

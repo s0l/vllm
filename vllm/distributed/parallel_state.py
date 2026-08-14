@@ -608,6 +608,125 @@ def tp3_unified_exact_reduce(
     return exact_weighted_owner_992_reduce(tensor, group.device_group)
 
 
+def tp3_owner_residual_arc_prequant(
+    contribution: torch.Tensor,
+    residual_owner: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale_inv: torch.Tensor,
+    selected_all: torch.Tensor,
+    route0: torch.Tensor,
+    route1: torch.Tensor,
+    route2: torch.Tensor,
+    inverse_order: torch.Tensor,
+    route_counts: list[int],
+    group_name: str,
+    eps: float,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    from .device_communicators.tp3_owner_prequant import (
+        owner_residual_arc_prequant,
+    )
+
+    return owner_residual_arc_prequant(
+        contribution,
+        residual_owner,
+        weight,
+        input_scale_inv,
+        selected_all,
+        route0,
+        route1,
+        route2,
+        inverse_order,
+        route_counts,
+        group.device_group,
+        eps,
+    )
+
+
+def tp3_owner_residual_arc_prequant_fake(
+    contribution: torch.Tensor,
+    residual_owner: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale_inv: torch.Tensor,
+    selected_all: torch.Tensor,
+    route0: torch.Tensor,
+    route1: torch.Tensor,
+    route2: torch.Tensor,
+    inverse_order: torch.Tensor,
+    route_counts: list[int],
+    group_name: str,
+    eps: float,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    del weight, input_scale_inv, route0, route1, route2, inverse_order
+    del route_counts, group_name, eps
+    from vllm._custom_ops import create_fp4_output_tensors
+
+    rows = contribution.shape[0]
+    selected_count = selected_all.shape[1]
+    q, sf = create_fp4_output_tensors(
+        rows,
+        contribution.shape[1],
+        contribution.device,
+        True,
+        padded_n=contribution.shape[1] + selected_count,
+    )
+    canonical_q, canonical_sf = create_fp4_output_tensors(
+        rows,
+        contribution.shape[1],
+        contribution.device,
+        True,
+    )
+    return (
+        q,
+        sf.view(torch.float8_e4m3fn),
+        canonical_q,
+        canonical_sf.view(torch.float8_e4m3fn),
+        torch.empty_like(residual_owner),
+    )
+
+
+def tp3_owner_terminal_norm(
+    contribution: torch.Tensor,
+    residual_owner: torch.Tensor,
+    weight: torch.Tensor,
+    group_name: str,
+    eps: float,
+) -> torch.Tensor:
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    from .device_communicators.tp3_owner_prequant import owner_terminal_norm
+
+    return owner_terminal_norm(
+        contribution, residual_owner, weight, group.device_group, eps
+    )
+
+
+def tp3_owner_terminal_norm_fake(
+    contribution: torch.Tensor,
+    residual_owner: torch.Tensor,
+    weight: torch.Tensor,
+    group_name: str,
+    eps: float,
+) -> torch.Tensor:
+    del residual_owner, weight, group_name, eps
+    return torch.empty_like(contribution)
+
+
 def gdn_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     """Use a row-invariant compressed reduction for PIECEWISE GDN."""
     assert group_name in _groups, f"Group {group_name} is not found."
@@ -1026,6 +1145,18 @@ direct_register_custom_op(
     op_name="tp3_unified_exact_reduce",
     op_func=tp3_unified_exact_reduce,
     fake_impl=all_reduce_fake,
+)
+
+direct_register_custom_op(
+    op_name="tp3_owner_residual_arc_prequant",
+    op_func=tp3_owner_residual_arc_prequant,
+    fake_impl=tp3_owner_residual_arc_prequant_fake,
+)
+
+direct_register_custom_op(
+    op_name="tp3_owner_terminal_norm",
+    op_func=tp3_owner_terminal_norm,
+    fake_impl=tp3_owner_terminal_norm_fake,
 )
 
 direct_register_custom_op(

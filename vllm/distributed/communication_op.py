@@ -59,6 +59,62 @@ def tensor_model_parallel_unified_exact_all_reduce(
     return tp3_unified_exact_reduce(input_, group.unique_name)
 
 
+def tensor_model_parallel_owner_residual_arc_prequant(
+    contribution: torch.Tensor,
+    residual_owner: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale_inv: torch.Tensor,
+    selected_all: torch.Tensor,
+    route0: torch.Tensor,
+    route1: torch.Tensor,
+    route2: torch.Tensor,
+    inverse_order: torch.Tensor,
+    route_counts: list[int],
+    eps: float,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    group = get_tp_group()
+    if group.world_size != 3:
+        raise ValueError("owner residual prequant requires TP3")
+    return torch.ops.vllm.tp3_owner_residual_arc_prequant(
+        contribution,
+        residual_owner,
+        weight,
+        input_scale_inv,
+        selected_all,
+        route0,
+        route1,
+        route2,
+        inverse_order,
+        route_counts,
+        group.unique_name,
+        eps,
+    )
+
+
+def tensor_model_parallel_owner_terminal_norm(
+    contribution: torch.Tensor,
+    residual_owner: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    group = get_tp_group()
+    if group.world_size != 3:
+        raise ValueError("owner terminal norm requires TP3")
+    return torch.ops.vllm.tp3_owner_terminal_norm(
+        contribution,
+        residual_owner,
+        weight,
+        group.unique_name,
+        eps,
+    )
+
+
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:

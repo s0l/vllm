@@ -17,6 +17,50 @@ from vllm.utils.platform_utils import num_compute_units
 
 _TRITON_TABLE_CACHE: dict[tuple[torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
 _TRITON_BUFFER_CACHE: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
+_AG2_SHARED_TRITON_BUFFER: torch.Tensor | None = None
+
+
+def set_ag2_shared_topk_topp_buffer(scratch: torch.Tensor | None) -> None:
+    """Install runner-owned storage for the sampling kernel's private scratch."""
+    global _AG2_SHARED_TRITON_BUFFER
+    if scratch is not None:
+        if (
+            not scratch.is_contiguous()
+            or scratch.storage_offset() != 0
+            or scratch.data_ptr() % torch.empty((), dtype=torch.float32).element_size()
+        ):
+            raise ValueError(
+                "shared top-k/top-p workspace must be contiguous and float32-aligned"
+            )
+    _AG2_SHARED_TRITON_BUFFER = scratch
+
+
+def _ag2_shared_topk_topp_view(
+    logits: torch.Tensor,
+    rows: int,
+    vocab_size: int,
+) -> torch.Tensor:
+    scratch = _AG2_SHARED_TRITON_BUFFER
+    if scratch is None:
+        raise RuntimeError("shared top-k/top-p workspace is not configured")
+    required_elements = rows * vocab_size
+    required_bytes = required_elements * logits.element_size()
+    capacity_bytes = scratch.numel() * scratch.element_size()
+    if scratch.device != logits.device or required_bytes > capacity_bytes:
+        raise RuntimeError(
+            "shared top-k/top-p workspace mismatch: "
+            f"required_bytes={required_bytes} capacity_bytes={capacity_bytes} "
+            f"scratch_device={scratch.device} logits_device={logits.device}"
+        )
+    scratch_start = scratch.data_ptr()
+    scratch_end = scratch_start + capacity_bytes
+    logits_start = logits.data_ptr()
+    logits_end = logits_start + logits.numel() * logits.element_size()
+    if max(scratch_start, logits_start) < min(scratch_end, logits_end):
+        raise RuntimeError("shared top-k/top-p workspace must not overlap logits")
+    return scratch.view(torch.float32).view(-1)[:required_elements].view(
+        rows, vocab_size
+    )
 
 # fmt: off
 _NORMAL_CDF_TO_SIGMA_TABLE = [
@@ -906,13 +950,18 @@ def apply_top_k_top_p_triton(
     num_sm = num_compute_units(logits.device.index)
     NUM_PROGRAMS = min(num_sm, batch_size)
 
-    # Cache per-Triton Program buffer on each device.
+    # Cache per-Triton Program buffer on each device, or use the runner-owned
+    # sequential workspace when installed.  This is kernel-private scratch;
+    # returned logits never alias it.
     buf_key = (logits.device, logits.dtype, vocab_size)
     buffer = _TRITON_BUFFER_CACHE.get(buf_key)
     if buffer is None or buffer.shape[0] < NUM_PROGRAMS:
         size = min(next_power_of_2(NUM_PROGRAMS), num_sm)
-        buffer = logits.new_empty((size, vocab_size))
-        _TRITON_BUFFER_CACHE[buf_key] = buffer
+        if _AG2_SHARED_TRITON_BUFFER is not None:
+            buffer = _ag2_shared_topk_topp_view(logits, size, vocab_size)
+        else:
+            buffer = logits.new_empty((size, vocab_size))
+            _TRITON_BUFFER_CACHE[buf_key] = buffer
     if buffer.shape[0] > NUM_PROGRAMS:
         buffer = buffer[:NUM_PROGRAMS]
 

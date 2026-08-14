@@ -10,6 +10,22 @@ import triton.language as tl
 from torch.distributed import ProcessGroup
 
 
+_weighted_owner_workspace: torch.Tensor | None = None
+
+
+def set_tp3_weighted_owner_workspace(scratch: torch.Tensor | None) -> None:
+    """Install the runner-owned sequential workspace for weighted TP3 reduce."""
+    global _weighted_owner_workspace
+    if scratch is not None:
+        if (
+            scratch.ndim != 2
+            or scratch.dtype != torch.bfloat16
+            or not scratch.is_contiguous()
+        ):
+            raise ValueError("TP3 weighted-owner workspace must be contiguous 2D BF16")
+    _weighted_owner_workspace = scratch
+
+
 def fixed_tp3_sum(gathered: torch.Tensor) -> torch.Tensor:
     """Sum rank0, rank1, rank2 in FP32 and round to the input dtype once."""
     if gathered.shape[0] != 3:
@@ -53,6 +69,74 @@ def fixed_tp3_sum_fused(gathered: torch.Tensor) -> torch.Tensor:
         BLOCK_SIZE=256,
     )
     return output
+
+
+def fixed_tp3_sum_fused_into(
+    gathered: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Fixed FP32 TP3 sum into checked caller-owned, non-overlapping storage."""
+    if gathered.shape[0] != 3 or output.shape != gathered.shape[1:]:
+        raise ValueError(
+            f"invalid fixed-sum input/output shapes {gathered.shape}/{output.shape}"
+        )
+    if (
+        gathered.dtype != output.dtype
+        or gathered.device != output.device
+        or not gathered.is_contiguous()
+        or not output.is_contiguous()
+    ):
+        raise ValueError("fixed-sum input/output must be matching contiguous tensors")
+    gathered_start = gathered.data_ptr()
+    gathered_end = gathered_start + gathered.numel() * gathered.element_size()
+    output_start = output.data_ptr()
+    output_end = output_start + output.numel() * output.element_size()
+    if max(gathered_start, output_start) < min(gathered_end, output_end):
+        raise ValueError("fixed-sum input/output storage must not overlap")
+    n_elements = output.numel()
+    _fixed_tp3_sum_kernel[(triton.cdiv(n_elements, 256),)](
+        gathered,
+        output,
+        n_elements,
+        BLOCK_SIZE=256,
+    )
+    return output
+
+
+def _weighted_owner_workspace_layout(
+    tensor: torch.Tensor,
+    widths: tuple[int, int, int],
+    rank: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    scratch = _weighted_owner_workspace
+    if scratch is None:
+        raise RuntimeError("TP3 weighted-owner workspace is not configured")
+    if (
+        tensor.dtype != torch.bfloat16
+        or not tensor.is_contiguous()
+        or scratch.device != tensor.device
+        or scratch.dtype != tensor.dtype
+    ):
+        raise RuntimeError(
+            "TP3 weighted-owner workspace/input must be contiguous BF16 "
+            "on the same device"
+        )
+    rows, columns = tensor.shape
+    full_elements = rows * columns
+    owned_elements = rows * widths[rank]
+    required = full_elements + 3 * owned_elements
+    flat = scratch.view(-1)
+    if required > flat.numel():
+        raise RuntimeError(
+            "TP3 weighted-owner workspace is too small: "
+            f"required_elements={required} capacity_elements={flat.numel()} "
+            f"rows={rows} rank={rank} widths={widths}"
+        )
+    phase1_send = flat[:full_elements]
+    phase1_receive = flat[full_elements:required]
+    phase2_disseminate = flat[: 3 * owned_elements]
+    phase2_completed = flat[3 * owned_elements:required]
+    return phase1_send, phase1_receive, phase2_disseminate, phase2_completed
 
 
 def exact_all_gather_reduce(
@@ -348,6 +432,8 @@ def _exact_weighted_three_owner_reduce(
         )
     if dist.get_world_size(group) != 3:
         raise ValueError("weighted-owner exact reduction requires TP=3")
+    if _weighted_owner_workspace is not None:
+        return _exact_weighted_three_owner_reduce_workspace(tensor, group, widths)
     rank = dist.get_rank(group)
     rows, _ = tensor.shape
     owner_chunks = torch.split(tensor, widths, dim=1)
@@ -376,11 +462,74 @@ def _exact_weighted_three_owner_reduce(
         input_split_sizes=[owned_elements] * 3,
         group=group,
     )
-    chunks = [
-        chunk.view(rows, width)
-        for chunk, width in zip(completed.split(shard_elements), widths)
-    ]
-    return torch.cat(chunks, dim=1)
+    # The second collective has consumed the owner-local intermediates, and
+    # the first collective has long since consumed ``send``.  End those
+    # lifetimes before reassembly and reuse the fresh full-width send buffer as
+    # the result instead of allocating a third full-width tensor with cat.
+    del receive, owned, disseminate
+    output = send.view(rows, tensor.shape[1])
+    column_start = 0
+    for chunk, width in zip(completed.split(shard_elements), widths, strict=True):
+        output[:, column_start : column_start + width].copy_(
+            chunk.view(rows, width)
+        )
+        column_start += width
+    return output
+
+
+def _exact_weighted_three_owner_reduce_workspace(
+    tensor: torch.Tensor,
+    group: ProcessGroup,
+    widths: tuple[int, int, int],
+) -> torch.Tensor:
+    """Run both transport phases in persistent scratch, return fresh output."""
+    rank = dist.get_rank(group)
+    rows, columns = tensor.shape
+    shard_elements = [rows * width for width in widths]
+    owned_elements = shard_elements[rank]
+    send, receive, disseminate, completed = _weighted_owner_workspace_layout(
+        tensor, widths, rank
+    )
+
+    offset = 0
+    for chunk, element_count, width in zip(
+        torch.split(tensor, widths, dim=1), shard_elements, widths, strict=True
+    ):
+        send[offset : offset + element_count].view(rows, width).copy_(chunk)
+        offset += element_count
+    dist.all_to_all_single(
+        receive,
+        send,
+        output_split_sizes=[owned_elements] * 3,
+        input_split_sizes=shard_elements,
+        group=group,
+    )
+
+    owned = send[:owned_elements].view(rows, widths[rank])
+    fixed_tp3_sum_fused_into(
+        receive.view(3, rows, widths[rank]),
+        owned,
+    )
+    disseminate[owned_elements : 2 * owned_elements].copy_(owned.reshape(-1))
+    disseminate[2 * owned_elements :].copy_(owned.reshape(-1))
+    dist.all_to_all_single(
+        completed,
+        disseminate,
+        output_split_sizes=shard_elements,
+        input_split_sizes=[owned_elements] * 3,
+        group=group,
+    )
+
+    output = torch.empty_like(tensor)
+    column_start = 0
+    for chunk, width in zip(completed.split(shard_elements), widths, strict=True):
+        output[:, column_start : column_start + width].copy_(
+            chunk.view(rows, width)
+        )
+        column_start += width
+    if output.shape != (rows, columns):
+        raise RuntimeError("TP3 weighted-owner workspace output shape mismatch")
+    return output
 
 
 def exact_weighted_owner_884_reduce(

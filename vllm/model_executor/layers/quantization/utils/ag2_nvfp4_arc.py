@@ -26,6 +26,8 @@ class _Sidecar:
 
 
 _CACHE: dict[tuple[str, int, str], _Sidecar] = {}
+_OWNER_WIDTHS = (2048, 2048, 1024)
+_OWNER_OFFSETS = (0, 2048, 4096)
 
 
 def _sha256(path: Path) -> str:
@@ -175,6 +177,85 @@ def maybe_apply_ag2_nvfp4_arc_sidecar(
     layer.register_buffer(
         "_ag2_nvfp4_arc_selected", selected.contiguous(), persistent=False
     )
+    if os.environ.get("AG2_VLLM_TP3_OWNER_PREQUANT", "0") == "1":
+        selected_cpu: list[torch.Tensor] = []
+        for peer_rank in range(3):
+            peer_manifest_path = Path(directory_text) / f"rank{peer_rank}.manifest.json"
+            peer_sidecar_path = Path(directory_text) / f"rank{peer_rank}.safetensors"
+            peer_manifest = json.loads(peer_manifest_path.read_text(encoding="utf-8"))
+            peer_matches = [
+                item
+                for item in peer_manifest.get("records", ())
+                if item.get("runtime_suffix") == suffix
+            ]
+            if (
+                peer_manifest.get("tp_rank") != peer_rank
+                or len(peer_matches) != 1
+                or peer_matches[0].get("selected_count") != selected_count
+            ):
+                raise RuntimeError(
+                    f"ARC peer selected manifest mismatch for {prefix} rank={peer_rank}"
+                )
+            peer_record = peer_matches[0]
+            with safe_open(peer_sidecar_path, framework="pt", device="cpu") as handle:
+                peer_selected = handle.get_tensor(
+                    f"{peer_record['key']}.selected"
+                ).contiguous()
+            peer_digest = hashlib.sha256(peer_selected.numpy().tobytes()).hexdigest()
+            if (
+                peer_selected.dtype != torch.int32
+                or tuple(peer_selected.shape) != (selected_count,)
+                or peer_digest != peer_record.get("selected_sha256")
+            ):
+                raise RuntimeError(
+                    f"ARC peer selected tensor mismatch for {prefix} rank={peer_rank}"
+                )
+            selected_cpu.append(peer_selected)
+        selected_all_cpu = torch.stack(selected_cpu)
+        layer.register_buffer(
+            "_ag2_nvfp4_arc_selected_all",
+            selected_all_cpu.to(device=layer.weight.device),
+            persistent=False,
+        )
+        route_counts = [[0] * 3 for _ in range(3)]
+        destination_positions: list[list[torch.Tensor]] = []
+        for destination in range(3):
+            per_owner: list[torch.Tensor] = []
+            for owner in range(3):
+                start = _OWNER_OFFSETS[owner]
+                stop = start + _OWNER_WIDTHS[owner]
+                positions = torch.nonzero(
+                    (selected_all_cpu[destination] >= start)
+                    & (selected_all_cpu[destination] < stop),
+                    as_tuple=False,
+                ).flatten()
+                per_owner.append(positions)
+                route_counts[owner][destination] = positions.numel()
+            if sum(item.numel() for item in per_owner) != selected_count:
+                raise RuntimeError(f"ARC selected ownership incomplete for {prefix}")
+            destination_positions.append(per_owner)
+        for destination in range(3):
+            positions = destination_positions[destination][rank]
+            local_indices = (
+                selected_all_cpu[destination].index_select(0, positions)
+                - _OWNER_OFFSETS[rank]
+            ).to(torch.int64)
+            layer.register_buffer(
+                f"_ag2_nvfp4_arc_route_to_{destination}",
+                local_indices.to(device=layer.weight.device),
+                persistent=False,
+            )
+        inverse_order = torch.argsort(torch.cat(destination_positions[rank])).to(
+            torch.int64
+        )
+        layer.register_buffer(
+            "_ag2_nvfp4_arc_inverse_order",
+            inverse_order.to(device=layer.weight.device),
+            persistent=False,
+        )
+        layer._ag2_nvfp4_arc_route_counts = tuple(
+            value for owner in route_counts for value in owner
+        )
     layer._ag2_nvfp4_arc_runtime_suffix = suffix
     layer._ag2_nvfp4_arc_sidecar_sha256 = sidecar.manifest["sidecar_sha256"]
     logger.info(

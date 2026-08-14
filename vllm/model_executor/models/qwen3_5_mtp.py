@@ -3,6 +3,7 @@
 """Inference-only Qwen3_5 MTP model."""
 
 from collections.abc import Iterable
+import os
 
 import torch
 from torch import nn
@@ -31,6 +32,9 @@ from vllm.model_executor.models.ag2_fp8_draft_head import (
     Fp8DraftHead,
     install_shared_fp8_lm_head,
     shared_fp8_head_enabled,
+)
+from vllm.model_executor.models.ag2_folded_mtp import (
+    FoldedMTPNaturalTP2Predictor,
 )
 from vllm.model_executor.models.interfaces import LocalArgmaxMixin
 from vllm.model_executor.models.qwen3_5 import (
@@ -107,6 +111,28 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             self.vocab_size,
             config.hidden_size,
         )
+
+        self.natural_tp2 = os.environ.get("AG2_VLLM_MTP_NATURAL_TP2", "0") == "1"
+        self.natural_tp2_predictor: FoldedMTPNaturalTP2Predictor | None = None
+        if self.natural_tp2:
+            if not (get_pp_group().is_first_rank and get_pp_group().is_last_rank):
+                raise NotImplementedError("natural TP2 MTP currently requires PP1")
+            self.natural_tp2_predictor = FoldedMTPNaturalTP2Predictor(
+                vllm_config=vllm_config,
+                prefix=prefix,
+            )
+            self.fc_padded_output_size = self.config.hidden_size
+            self.layers = torch.nn.ModuleList()
+            self.make_empty_intermediate_tensors = (
+                make_empty_intermediate_tensors_factory(
+                    ["hidden_states", "residual"], config.hidden_size
+                )
+            )
+            logger.warning_once(
+                "Enabled experimental natural-TP2 MTP trunk on ranks 0/1 "
+                "with rank 2 as DCP3 Attention satellite."
+            )
+            return
 
         # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is
         # missing from hf_quant_config.json exclude_modules. Force unquantized.
@@ -214,6 +240,17 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         spec_step_idx: int = 0,
         return_ag2_mtp_trace: bool = False,
     ):
+        if self.natural_tp2:
+            if return_ag2_mtp_trace:
+                raise NotImplementedError("natural TP2 trace is not implemented")
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_input_ids(input_ids)
+            assert self.natural_tp2_predictor is not None
+            return self.natural_tp2_predictor(
+                positions,
+                hidden_states,
+                inputs_embeds,
+            )
         mtp_trace: dict[str, torch.Tensor] = {}
         if return_ag2_mtp_trace:
             mtp_trace["input_ids"] = input_ids
@@ -290,6 +327,21 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         return output
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if self.natural_tp2:
+            assert self.natural_tp2_predictor is not None
+            loaded: set[str] = set()
+            passthrough: list[tuple[str, torch.Tensor]] = []
+            for name, weight in weights:
+                mapped = name.removeprefix("mtp.")
+                if self.natural_tp2_predictor.load_weight(mapped, weight):
+                    loaded.add(name)
+                else:
+                    passthrough.append((name, weight))
+            self.natural_tp2_predictor.validate_loaded()
+            loader = AutoWeightsLoader(self)
+            return loaded | loader.load_weights(
+                passthrough, mapper=self.hf_to_vllm_mapper
+            )
         weights = maybe_fuse_shared_experts(
             weights,
             enabled=rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
@@ -518,6 +570,27 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if self.model.natural_tp2:
+            predictor = self.model.natural_tp2_predictor
+            assert predictor is not None
+            loaded: set[str] = set()
+            passthrough: list[tuple[str, torch.Tensor]] = []
+            for name, weight in weights:
+                if name.startswith("mtp.") and predictor.load_weight(
+                    name.removeprefix("mtp."), weight
+                ):
+                    loaded.add(name)
+                    continue
+                if "embed_tokens" in name:
+                    passthrough.append(
+                        (name.replace("language_model.", ""), weight)
+                    )
+                elif "lm_head" in name:
+                    passthrough.append((name, weight))
+            predictor.validate_loaded()
+            loader = AutoWeightsLoader(self)
+            return loaded | loader.load_weights(passthrough)
+
         def remap_weight_names(weights):
             for name, weight in weights:
                 if name.startswith("mtp."):
