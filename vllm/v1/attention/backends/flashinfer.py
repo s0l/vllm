@@ -128,6 +128,8 @@ def _resolve_decode_split_plan(
     fixed_split_size: int,
     disable_split_kv: bool,
     spec_target_only: bool,
+    qlen1_fixed_split_size: int = -1,
+    qlen1_disable_split_kv: bool = False,
 ) -> tuple[int, bool, bool]:
     """Resolve native-decode split policy and graph-wrapper eligibility.
 
@@ -145,6 +147,8 @@ def _resolve_decode_split_plan(
             f"{num_decode_tokens=} {num_decodes=}"
         )
     query_len = num_decode_tokens // num_decodes
+    if query_len == 1 and qlen1_fixed_split_size > 0:
+        return qlen1_fixed_split_size, qlen1_disable_split_kv, False
     if spec_target_only and query_len == 1:
         return -1, False, False
     force_non_graph_wrapper = spec_target_only and fixed_split_size > 0
@@ -3225,6 +3229,32 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.decode_disable_split_kv = True
             self.decode_fixed_split_spec_target_only = False
         else:
+            self.qlen1_fixed_split_size = int(
+                os.environ.get(
+                    "AG2_VLLM_FLASHINFER_Q1_FIXED_SPLIT_SIZE",
+                    "-1",
+                )
+            )
+            self.qlen1_disable_split_kv = (
+                os.environ.get(
+                    "AG2_VLLM_FLASHINFER_Q1_DISABLE_SPLIT_KV",
+                    "0",
+                )
+                == "1"
+            )
+            if self.qlen1_fixed_split_size == 0 or self.qlen1_fixed_split_size < -1:
+                raise ValueError(
+                    "FlashInfer qlen1 fixed split size must be -1 or positive"
+                )
+            if self.qlen1_fixed_split_size > 0:
+                logger.warning_once(
+                    "Research POC: FlashInfer qlen1 fixed-split planning is "
+                    "enabled (fixed_split_size=%d, disable_split_kv=%s). "
+                    "FULL CUDA Graphs remain enabled; long-context graph "
+                    "portability is not yet accepted.",
+                    self.qlen1_fixed_split_size,
+                    self.qlen1_disable_split_kv,
+                )
             self.decode_fixed_split_size = int(
                 os.environ.get(
                     "AG2_VLLM_FLASHINFER_SPEC_TARGET_FIXED_SPLIT_SIZE",
@@ -3253,6 +3283,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     self.decode_fixed_split_size,
                     self.decode_disable_split_kv,
                 )
+        if envs.VLLM_BATCH_INVARIANT:
+            self.qlen1_fixed_split_size = -1
+            self.qlen1_disable_split_kv = False
         if prefill_batch_invariant:
             self.prefill_fixed_split_size = 4096
             self.prefill_disable_split_kv = True
@@ -4793,6 +4826,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     fixed_split_size=self.decode_fixed_split_size,
                     disable_split_kv=self.decode_disable_split_kv,
                     spec_target_only=self.decode_fixed_split_spec_target_only,
+                    qlen1_fixed_split_size=self.qlen1_fixed_split_size,
+                    qlen1_disable_split_kv=self.qlen1_disable_split_kv,
                 )
                 pure_decode = num_prefills == 0
                 use_cudagraph = (
