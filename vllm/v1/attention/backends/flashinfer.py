@@ -1533,6 +1533,8 @@ class BatchDCPPrefillWrapper:
         self._ag2_window_left = -1
         self._ag2_dcp_world_size = 1
         self._ag2_sm_scale = 1.0
+        self._ag2_logits_soft_cap = 0.0
+        self._ag2_plan_ready = False
         self._canonical_paged = False
         self._canonical_paged_start_req = 0
         self._canonical_paged_start_token = 0
@@ -1589,6 +1591,7 @@ class BatchDCPPrefillWrapper:
         dcp_kv_cache_interleave_size: int | None = None,
     ):
         """Plan the prefill operation with given parameters."""
+        self._ag2_plan_ready = False
         self._canonical_paged = canonical_paged
         self._absolute_segmented = absolute_segmented
         self._canonical_paged_start_req = 0
@@ -1610,6 +1613,7 @@ class BatchDCPPrefillWrapper:
         self._ag2_window_left = window_left
         self._ag2_dcp_world_size = dcp_world_size
         self._ag2_sm_scale = sm_scale
+        self._ag2_logits_soft_cap = logits_soft_cap or 0.0
         trace_tail_rows = int(
             os.environ.get(
                 "AG2_VLLM_AUX_HIDDEN_TRACE_DCP_REQUEST_TAIL_ROWS",
@@ -1853,6 +1857,7 @@ class BatchDCPPrefillWrapper:
                 self._ag2_history_paged_kv_indptr_cpu = None
                 self._ag2_history_paged_kv_indices = None
                 self._ag2_history_last_page_len_cpu = None
+                self._ag2_plan_ready = True
                 return
 
             qo_indptr_cpu = qo_indptr_cpu[: canonical_paged_start_req + 1]
@@ -2018,6 +2023,7 @@ class BatchDCPPrefillWrapper:
                 self._ag2_history_paged_kv_indptr_cpu = None
                 self._ag2_history_paged_kv_indices = None
                 self._ag2_history_last_page_len_cpu = None
+                self._ag2_plan_ready = True
                 return
 
             # The prefix remains on the established paged-context + ragged-
@@ -2092,6 +2098,20 @@ class BatchDCPPrefillWrapper:
                 disable_split_kv or self._disable_split_kv_for_cuda_graph
             ),
         )
+        self._ag2_plan_ready = True
+
+    def assert_plan_contract(
+        self,
+        *,
+        window_left: int,
+        logits_soft_cap: float,
+        sm_scale: float,
+    ) -> None:
+        """Validate caller-owned plan state without FlashInfer private fields."""
+        assert self._ag2_plan_ready
+        assert self._ag2_window_left == window_left
+        assert self._ag2_logits_soft_cap == logits_soft_cap
+        assert self._ag2_sm_scale == sm_scale
 
     def run(
         self,
@@ -2503,6 +2523,10 @@ class BatchDCPPseudoPrefillWrapper:
             workspace_buffer,
             get_kv_cache_layout(),
         )
+        self._ag2_window_left = -1
+        self._ag2_logits_soft_cap = 0.0
+        self._ag2_sm_scale = 1.0
+        self._ag2_plan_ready = False
 
     def plan(
         self,
@@ -2523,6 +2547,7 @@ class BatchDCPPseudoPrefillWrapper:
         prefill_fixed_split_size: int,
         disable_split_kv: bool,
     ) -> None:
+        self._ag2_plan_ready = False
         self._paged.plan(
             qo_indptr=qo_indptr_cpu,
             paged_kv_indptr=paged_kv_indptr_cpu,
@@ -2543,6 +2568,23 @@ class BatchDCPPseudoPrefillWrapper:
             fixed_split_size=prefill_fixed_split_size,
             disable_split_kv=disable_split_kv,
         )
+        self._ag2_window_left = window_left
+        self._ag2_logits_soft_cap = logits_soft_cap or 0.0
+        self._ag2_sm_scale = sm_scale
+        self._ag2_plan_ready = True
+
+    def assert_plan_contract(
+        self,
+        *,
+        window_left: int,
+        logits_soft_cap: float,
+        sm_scale: float,
+    ) -> None:
+        """Validate caller-owned plan state without FlashInfer private fields."""
+        assert self._ag2_plan_ready
+        assert self._ag2_window_left == window_left
+        assert self._ag2_logits_soft_cap == logits_soft_cap
+        assert self._ag2_sm_scale == sm_scale
 
     def run(
         self,
@@ -5183,12 +5225,11 @@ class FlashInferImpl(AttentionImpl):
                             out=output[num_decode_tokens:],
                         )
                     elif isinstance(prefill_wrapper, BatchDCPPseudoPrefillWrapper):
-                        assert prefill_wrapper._paged._window_left == self.window_left
-                        assert prefill_wrapper._paged._logits_soft_cap == (
-                            self.logits_soft_cap or 0.0
+                        prefill_wrapper.assert_plan_contract(
+                            window_left=self.window_left,
+                            logits_soft_cap=self.logits_soft_cap or 0.0,
+                            sm_scale=self.scale,
                         )
-                        assert prefill_wrapper._paged._sm_scale == self.scale
-                        assert not prefill_wrapper._paged._causal
                         prefill_wrapper.run(
                             layer,
                             prefill_query,
@@ -5197,20 +5238,11 @@ class FlashInferImpl(AttentionImpl):
                         )
                     else:
                         assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
-                        assert prefill_wrapper._context._window_left == self.window_left
-                        assert prefill_wrapper._context._logits_soft_cap == (
-                            self.logits_soft_cap or 0.0
+                        prefill_wrapper.assert_plan_contract(
+                            window_left=self.window_left,
+                            logits_soft_cap=self.logits_soft_cap or 0.0,
+                            sm_scale=self.scale,
                         )
-                        assert prefill_wrapper._context._sm_scale == self.scale
-                        assert not prefill_wrapper._context._causal
-                        assert (
-                            prefill_wrapper._new_tokens._window_left == self.window_left
-                        )
-                        assert prefill_wrapper._new_tokens._logits_soft_cap == (
-                            self.logits_soft_cap or 0.0
-                        )
-                        assert prefill_wrapper._new_tokens._sm_scale == self.scale
-                        assert prefill_wrapper._new_tokens._causal
 
                         prefill_wrapper.run(
                             layer,
