@@ -24,6 +24,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
+    tensor_model_parallel_unified_exact_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -393,6 +394,11 @@ class Qwen3NextAttention(nn.Module):
             config, "dual_chunk_attention_config", None
         )
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
+        self._ag2_tp3_unified_exact_reduce = (
+            os.environ.get("AG2_VLLM_TP3_UNIFIED_EXACT_REDUCE", "0") == "1"
+            and reduce_results
+            and tp_size == 3
+        )
 
         qkv_proj_cls = (
             QKVParallelLinearOverlappingGQA
@@ -419,7 +425,9 @@ class Qwen3NextAttention(nn.Module):
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             bias=False,
-            reduce_results=reduce_results,
+            reduce_results=(
+                reduce_results and not self._ag2_tp3_unified_exact_reduce
+            ),
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )

@@ -131,6 +131,7 @@ _tp3_piecewise_device_ce_logged = False
 _tp3_mtp_device_ce_logged = False
 _tp3_prefill_canonical_logged = False
 _tp3_embedding_nccl_logged = False
+_tp3_unified_exact_logged: set[str] = set()
 
 
 def _register_group(group: "GroupCoordinator") -> None:
@@ -537,6 +538,74 @@ def _tp3_device_ce_reduce(
         quant_block,
     )
     return output
+
+
+def _tp3_unified_exact_backend(rows: int) -> str:
+    backend = os.environ.get("AG2_VLLM_TP3_UNIFIED_EXACT_BACKEND", "auto")
+    if backend not in {
+        "auto",
+        "all_gather",
+        "all_gather_fused",
+        "fast_pair_owner",
+        "direct_pair_owner",
+        "weighted_owner_992",
+    }:
+        raise ValueError(f"unknown TP3 unified exact backend: {backend}")
+    if backend == "auto":
+        threshold = int(
+            os.environ.get("AG2_VLLM_TP3_EXACT_OWNER_MIN_ROWS", "24")
+        )
+        if threshold < 1:
+            raise ValueError("TP3 exact owner row threshold must be positive")
+        return "weighted_owner_992" if rows >= threshold else "all_gather_fused"
+    return backend
+
+
+def tp3_unified_exact_reduce(
+    tensor: torch.Tensor,
+    group_name: str,
+) -> torch.Tensor:
+    """Apply one exact arithmetic contract to target, prefill and MTP rows."""
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    if (
+        tensor.ndim != 2
+        or tensor.shape[1] != 5120
+        or group.world_size != 3
+        or tensor.dtype != torch.bfloat16
+    ):
+        raise ValueError(
+            "TP3 unified exact reduction requires BF16 [rows,5120], TP=3; "
+            f"got shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+            f"tp={group.world_size}"
+        )
+    backend = _tp3_unified_exact_backend(tensor.shape[0])
+    if backend not in _tp3_unified_exact_logged:
+        logger.warning(
+            "Unified exact TP3 reduction active: backend=%s shape=%s",
+            backend,
+            tuple(tensor.shape),
+        )
+        _tp3_unified_exact_logged.add(backend)
+    from .device_communicators.tp3_exact_reduce import (
+        exact_all_gather_reduce,
+        exact_all_gather_fused_reduce,
+        exact_direct_pair_owner_reduce,
+        exact_fast_pair_owner_reduce,
+        exact_weighted_owner_992_reduce,
+    )
+
+    if backend == "all_gather":
+        return exact_all_gather_reduce(tensor, group.device_group)
+    if backend == "all_gather_fused":
+        return exact_all_gather_fused_reduce(tensor, group.device_group)
+    if backend == "fast_pair_owner":
+        return exact_fast_pair_owner_reduce(tensor, group.device_group)
+    if backend == "direct_pair_owner":
+        return exact_direct_pair_owner_reduce(tensor, group.device_group)
+    return exact_weighted_owner_992_reduce(tensor, group.device_group)
 
 
 def gdn_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
@@ -950,6 +1019,12 @@ direct_register_custom_op(
 direct_register_custom_op(
     op_name="gdn_all_reduce",
     op_func=gdn_all_reduce,
+    fake_impl=all_reduce_fake,
+)
+
+direct_register_custom_op(
+    op_name="tp3_unified_exact_reduce",
+    op_func=tp3_unified_exact_reduce,
     fake_impl=all_reduce_fake,
 )
 

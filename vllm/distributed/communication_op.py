@@ -43,6 +43,22 @@ def tensor_model_parallel_gdn_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     return gdn_all_reduce(input_, group.unique_name)
 
 
+def tensor_model_parallel_unified_exact_all_reduce(
+    input_: torch.Tensor,
+) -> torch.Tensor:
+    """Use the common exact TP3 arithmetic for every decoder reduction row."""
+    group = get_tp_group()
+    if group.world_size == 1:
+        return input_
+    if group.use_custom_op_call:
+        return torch.ops.vllm.tp3_unified_exact_reduce(
+            input_, group_name=group.unique_name
+        )
+    from .parallel_state import tp3_unified_exact_reduce
+
+    return tp3_unified_exact_reduce(input_, group.unique_name)
+
+
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:
