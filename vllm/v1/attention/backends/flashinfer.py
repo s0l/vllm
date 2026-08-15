@@ -335,6 +335,27 @@ def _dcp_causal_paged_custom_mask(
     return torch.cat(request_masks), local_seq_lens
 
 
+def _dcp_pseudo_block_table_capacity(
+    max_model_len: int,
+    max_num_batched_tokens: int,
+    page_size: int,
+    dcp_world_size: int,
+) -> int:
+    """Bound the worker's hybrid block-table width before graph capture."""
+    if min(max_model_len, max_num_batched_tokens, page_size, dcp_world_size) <= 0:
+        raise ValueError("pseudo-decode capacity inputs must be positive")
+    # History pages are DCP-local, but the scheduler tail is already expressed
+    # in kernel pages and must not be divided by DCP.  Keep one world-sized
+    # boundary/speculation guard, then mirror the worker's page alignment.
+    base_pages = cdiv(max_model_len, page_size * dcp_world_size)
+    scheduler_tail_pages = cdiv(max_num_batched_tokens, page_size)
+    capacity = base_pages + scheduler_tail_pages + dcp_world_size
+    if page_size <= 128:
+        alignment = 128 // page_size
+        capacity = cdiv(capacity, alignment) * alignment
+    return capacity
+
+
 @dataclass(frozen=True)
 class _AbsolutePrefillSegments:
     """CPU metadata for a scheduler-history-independent prompt segmentation."""
@@ -3394,13 +3415,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # The metadata builder receives only the kernel-sized spec, not
             # the original hybrid storage geometry, so include one complete
             # scheduler batch as a conservative pre-capture bound.
-            max_local_blocks = cdiv(
-                self.model_config.max_model_len + self.max_num_batched_tokens,
-                self.page_size * self.dcp_world_size,
+            max_local_blocks = _dcp_pseudo_block_table_capacity(
+                self.model_config.max_model_len,
+                self.max_num_batched_tokens,
+                self.page_size,
+                self.dcp_world_size,
             )
-            if self.page_size <= 128:
-                alignment = 128 // self.page_size
-                max_local_blocks = cdiv(max_local_blocks, alignment) * alignment
             self._dcp_pseudo_decode_block_tables = torch.empty(
                 (self._dcp_pseudo_decode_max_rows, max_local_blocks),
                 dtype=torch.int32,
