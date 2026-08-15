@@ -15,6 +15,12 @@ from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import is_torch_equal_or_newer
 
 
+@torch.compiler.assume_constant_result
+def _num_compute_units_for_compiled_matmul(device_id: int) -> int:
+    """Resolve immutable launch geometry once while Dynamo traces the call."""
+    return num_compute_units(device_id)
+
+
 def _matmul_launch_metadata(
     grid: Callable[..., Any], kernel: Any, args: dict[str, Any]
 ) -> dict[str, Any]:
@@ -138,7 +144,7 @@ def matmul_persistent(
     assert bias is None or bias.dim() == 1, (
         "Currently assuming bias is 1D, let Horace know if you run into this"
     )
-    NUM_SMS = num_compute_units(a.device.index)
+    NUM_SMS = _num_compute_units_for_compiled_matmul(a.device.index)
     M, K = a.shape
     K, N = b.shape
     dtype = a.dtype
