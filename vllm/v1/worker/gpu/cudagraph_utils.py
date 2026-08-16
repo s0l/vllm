@@ -147,6 +147,7 @@ class CudaGraphManager:
         decode_query_len: int,
         lora_capture_cases: list[int] | None = None,
         full_decode_query_lens: set[int] | None = None,
+        full_decode_cap_query_lens: set[int] | None = None,
         expand_dynamic_decode_query_lens: bool = True,
         max_uniform_decode_reqs: int | None = None,
     ):
@@ -165,6 +166,7 @@ class CudaGraphManager:
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
         self.full_decode_query_lens = full_decode_query_lens
+        self.full_decode_cap_query_lens = full_decode_cap_query_lens
         self.expand_dynamic_decode_query_lens = expand_dynamic_decode_query_lens
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
@@ -234,6 +236,7 @@ class CudaGraphManager:
 
         self._candidates: dict[tuple[int, int], list[BatchExecutionDescriptor]] = {}
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
+        self.max_capture_tokens = 0
 
         # Breakable CUDA graph (PW CUDA graph without torch.compile)
         self.use_breakable_cg = (
@@ -337,6 +340,14 @@ class CudaGraphManager:
         if separate_decode_routine and decode_mode:
             for decode_query_len in decode_query_lens:
                 query_capture_sizes = set(capture_sizes)
+                query_max_decode_tokens = (
+                    self.max_uniform_decode_reqs * decode_query_len
+                )
+                capture_cap_boundary = decode_query_len in (
+                    getattr(self, "full_decode_cap_query_lens", None) or set()
+                )
+                if capture_cap_boundary:
+                    query_capture_sizes.add(query_max_decode_tokens)
                 if self.max_uniform_decode_reqs < self.max_num_reqs:
                     if decode_query_len > 1:
                         query_capture_sizes.update(
@@ -358,7 +369,13 @@ class CudaGraphManager:
 
                     if (
                         rounded_num_tokens > max_decode_tokens
-                        or rounded_num_tokens > max_cg_capture_size
+                        or (
+                            rounded_num_tokens > max_cg_capture_size
+                            and not (
+                                capture_cap_boundary
+                                and rounded_num_tokens == query_max_decode_tokens
+                            )
+                        )
                         or rounded_num_reqs > self.max_uniform_decode_reqs
                     ):
                         continue
@@ -417,6 +434,11 @@ class CudaGraphManager:
         for mode, descs in descs_by_mode.items():
             descs.sort(key=lambda d: d.num_tokens, reverse=True)
             self._capture_descs[mode] = descs
+        self.max_capture_tokens = max(
+            desc.num_tokens
+            for descs in self._capture_descs.values()
+            for desc in descs
+        )
 
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
@@ -810,7 +832,9 @@ class ModelCudaGraphManager(CudaGraphManager):
         decode_query_len: int,
         lora_capture_cases: list[int] | None = None,
         full_decode_query_lens: set[int] | None = None,
+        full_decode_cap_query_lens: set[int] | None = None,
         tp3_sd_phase_reduce: bool = False,
+        tp3_owner_prequant: bool = False,
         max_uniform_decode_reqs: int | None = None,
     ):
         super().__init__(
@@ -820,6 +844,7 @@ class ModelCudaGraphManager(CudaGraphManager):
             decode_query_len,
             lora_capture_cases=lora_capture_cases,
             full_decode_query_lens=full_decode_query_lens,
+            full_decode_cap_query_lens=full_decode_cap_query_lens,
             max_uniform_decode_reqs=max_uniform_decode_reqs,
         )
         self.hidden_states: torch.Tensor | None = None
@@ -828,6 +853,10 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.use_aux_hidden_state_outputs = False
         self.intermediate_tensors: IntermediateTensors | None = None
         self.tp3_sd_phase_reduce = tp3_sd_phase_reduce
+        self.tp3_owner_prequant = tp3_owner_prequant
+        self._tp3_owner_replay_receipts: set[
+            tuple[int, int | None, int | None]
+        ] = set()
 
     def capture(
         self,
@@ -845,6 +874,7 @@ class ModelCudaGraphManager(CudaGraphManager):
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
+        owner_capture_descs: set[tuple[int, int | None, int | None]] = set()
         if self.use_breakable_cg:
             self.init_breakable_cg_runner(model)
 
@@ -917,6 +947,16 @@ class ModelCudaGraphManager(CudaGraphManager):
                     and desc.cg_mode == CUDAGraphMode.FULL
                     and desc.uniform_token_count == 1
                 )
+                tp3_owner_prequant_decode = (
+                    self.tp3_owner_prequant
+                    and desc.cg_mode == CUDAGraphMode.FULL
+                    and desc.uniform_token_count == self.decode_query_len
+                    and num_tokens >= envs.AG2_VLLM_TP3_OWNER_MIN_ROWS
+                )
+                if tp3_owner_prequant_decode:
+                    owner_capture_descs.add(
+                        (desc.num_tokens, desc.num_reqs, desc.uniform_token_count)
+                    )
                 batch_descriptor = None
                 if cg_mode == CUDAGraphMode.PIECEWISE:
                     batch_descriptor = BatchDescriptor(
@@ -935,6 +975,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                     batch_descriptor=batch_descriptor,
                     is_padding=input_buffers.is_padding[:num_tokens],
                     tp3_sd_phase_reduce=tp3_sd_phase_reduce,
+                    tp3_owner_prequant_decode=tp3_owner_prequant_decode,
                     marlin_request_layout_cpu=(
                         input_buffers.marlin_request_layout_cpu
                         if envs.AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL
@@ -961,11 +1002,24 @@ class ModelCudaGraphManager(CudaGraphManager):
                         hidden_states = model_output
                         aux_hidden_states = []
                     if self.hidden_states is None:
-                        self.hidden_states = torch.empty_like(hidden_states)
+                        self.hidden_states = torch.empty(
+                            (self.max_capture_tokens, *hidden_states.shape[1:]),
+                            dtype=hidden_states.dtype,
+                            device=hidden_states.device,
+                        )
                     self.hidden_states[:num_tokens] = hidden_states
                     if self.use_aux_hidden_state_outputs and not self.aux_hidden_states:
                         self.aux_hidden_states = [
-                            torch.empty_like(x) for x in aux_hidden_states
+                            (
+                                torch.empty(
+                                    (self.max_capture_tokens, *x.shape[1:]),
+                                    dtype=x.dtype,
+                                    device=x.device,
+                                )
+                                if x.ndim > 0 and x.shape[0] == num_tokens
+                                else torch.empty_like(x)
+                            )
+                            for x in aux_hidden_states
                         ]
                         self.aux_hidden_states_token_major = [
                             aux.ndim > 0 and aux.shape[0] == num_tokens
@@ -997,12 +1051,29 @@ class ModelCudaGraphManager(CudaGraphManager):
             return forward_fn
 
         super().capture(create_forward_fn, progress_bar_desc)
+        if self.tp3_owner_prequant:
+            logger.warning(
+                "TP3 owner prequant CUDA Graph capture completed: descriptors=%s",
+                sorted(owner_capture_descs),
+            )
 
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
         """Replay a captured FULL cudagraph and return hidden states."""
         super().run_fullgraph(desc)
+        receipt = (desc.num_tokens, desc.num_reqs, desc.uniform_token_count)
+        if (
+            self.tp3_owner_prequant
+            and desc.uniform_token_count == self.decode_query_len
+            and desc.num_tokens >= envs.AG2_VLLM_TP3_OWNER_MIN_ROWS
+            and receipt not in self._tp3_owner_replay_receipts
+        ):
+            self._tp3_owner_replay_receipts.add(receipt)
+            logger.warning(
+                "TP3 owner prequant CUDA Graph replay observed: descriptor=%s",
+                receipt,
+            )
         if not self.is_last_pp_rank:
             assert self.intermediate_tensors is not None
             return self.intermediate_tensors[: desc.num_tokens]

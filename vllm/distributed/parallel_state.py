@@ -187,26 +187,20 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
         is_forward_context_available,
     )
 
-    forward_context = (
-        get_forward_context() if is_forward_context_available() else None
-    )
+    forward_context = get_forward_context() if is_forward_context_available() else None
     cudagraph_mode = (
-        forward_context.cudagraph_runtime_mode
-        if forward_context is not None
-        else None
+        forward_context.cudagraph_runtime_mode if forward_context is not None else None
     )
-    if (
-        os.environ.get("AG2_VLLM_MTP_DEVICE_CE", "0") == "1"
-        and _should_use_tp3_mtp_device_ce(
-            explicit_mtp_lane=(
-                forward_context is not None
-                and forward_context.tp3_mtp_device_ce
-            ),
-            tensor_dim=tensor.dim(),
-            rows=tensor.shape[0] if tensor.dim() == 2 else 0,
-            hidden_size=tensor.shape[-1] if tensor.dim() else 0,
-            tp_world_size=group.world_size,
-        )
+    if os.environ.get(
+        "AG2_VLLM_MTP_DEVICE_CE", "0"
+    ) == "1" and _should_use_tp3_mtp_device_ce(
+        explicit_mtp_lane=(
+            forward_context is not None and forward_context.tp3_mtp_device_ce
+        ),
+        tensor_dim=tensor.dim(),
+        rows=tensor.shape[0] if tensor.dim() == 2 else 0,
+        hidden_size=tensor.shape[-1] if tensor.dim() else 0,
+        tp_world_size=group.world_size,
     ):
         if not _tp3_mtp_device_ce_logged:
             logger.warning(
@@ -214,32 +208,25 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
                 "shape=%s cudagraph_mode=%s packed_one_gather=%s",
                 tuple(tensor.shape),
                 cudagraph_mode,
-                os.environ.get(
-                    "AG2_VLLM_TP3_PIECEWISE_DEVICE_CE_PACKED", "0"
-                )
-                == "1",
+                os.environ.get("AG2_VLLM_TP3_PIECEWISE_DEVICE_CE_PACKED", "0") == "1",
             )
             _tp3_mtp_device_ce_logged = True
         return _tp3_device_ce_reduce(tensor, group)
-    if (
-        os.environ.get("AG2_VLLM_TP3_PIECEWISE_DEVICE_CE", "0") == "1"
-        and _should_use_tp3_piecewise_device_ce(
-            cudagraph_mode=cudagraph_mode,
-            tensor_dim=tensor.dim(),
-            rows=tensor.shape[0] if tensor.dim() == 2 else 0,
-            hidden_size=tensor.shape[-1] if tensor.dim() else 0,
-            tp_world_size=group.world_size,
-        )
+    if os.environ.get(
+        "AG2_VLLM_TP3_PIECEWISE_DEVICE_CE", "0"
+    ) == "1" and _should_use_tp3_piecewise_device_ce(
+        cudagraph_mode=cudagraph_mode,
+        tensor_dim=tensor.dim(),
+        rows=tensor.shape[0] if tensor.dim() == 2 else 0,
+        hidden_size=tensor.shape[-1] if tensor.dim() else 0,
+        tp_world_size=group.world_size,
     ):
         if not _tp3_piecewise_device_ce_logged:
             logger.warning(
                 "TP3 device-CE reduction active for PIECEWISE/intermediate "
                 "prefill all-reduces: shape=%s packed_one_gather=%s",
                 tuple(tensor.shape),
-                os.environ.get(
-                    "AG2_VLLM_TP3_PIECEWISE_DEVICE_CE_PACKED", "0"
-                )
-                == "1",
+                os.environ.get("AG2_VLLM_TP3_PIECEWISE_DEVICE_CE_PACKED", "0") == "1",
             )
             _tp3_piecewise_device_ce_logged = True
         return _tp3_device_ce_reduce(tensor, group)
@@ -283,9 +270,7 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
             forward_context.num_tokens_unpadded
             if forward_context is not None
             else None,
-            forward_context.tp3_ce_reduce
-            if forward_context is not None
-            else None,
+            forward_context.tp3_ce_reduce if forward_context is not None else None,
         )
         _tp3_ce_large_shapes_logged.add(large_shape_key)
     tp3_ce_enabled = _tp3_ce_runtime_enabled
@@ -307,9 +292,7 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
         _tp3_ce_first_context_logged = True
     if tp3_ce_enabled:
         logical_tokens = (
-            forward_context.num_tokens_unpadded
-            if forward_context is not None
-            else None
+            forward_context.num_tokens_unpadded if forward_context is not None else None
         )
         should_use_tp3_ce = (
             _should_use_tp3_ce(
@@ -362,11 +345,15 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
         )
 
         tp_group = _TP
-        if tp_group is not None and group is tp_group and should_use_tp3_ll(
-            tensor.dim(),
-            tensor.shape[0] if tensor.dim() == 2 else 0,
-            tensor.shape[-1],
-            group.world_size,
+        if (
+            tp_group is not None
+            and group is tp_group
+            and should_use_tp3_ll(
+                tensor.dim(),
+                tensor.shape[0] if tensor.dim() == 2 else 0,
+                tensor.shape[-1],
+                group.world_size,
+            )
         ):
             try:
                 return tp3_ll_all_reduce(tensor, group.rank_in_group)
@@ -384,15 +371,14 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
         )
     ):
         return _tp3_sd_deterministic_reduce(tensor, group)
-    if (
-        os.environ.get("VLLM_TP3_SD_DETERMINISTIC_REDUCE", "0") == "1"
-        and _should_use_tp3_sd_deterministic_reduce(
-            True,
-            tensor.dim(),
-            tensor.shape[0],
-            tensor.shape[-1],
-            group.world_size,
-        )
+    if os.environ.get(
+        "VLLM_TP3_SD_DETERMINISTIC_REDUCE", "0"
+    ) == "1" and _should_use_tp3_sd_deterministic_reduce(
+        True,
+        tensor.dim(),
+        tensor.shape[0],
+        tensor.shape[-1],
+        group.world_size,
     ):
         return _tp3_sd_deterministic_reduce(tensor, group)
     if os.environ.get("VLLM_TP3_SD_CANONICAL_REDUCE", "0") == "1":
@@ -428,9 +414,7 @@ def _should_use_tp3_piecewise_device_ce(
 ) -> bool:
     """Select one compressed reduction for graph and intermediate prefills."""
     mode = getattr(cudagraph_mode, "name", None)
-    selected_shape = mode == "PIECEWISE" or (
-        mode == "NONE" and 24 < rows < 4096
-    )
+    selected_shape = mode == "PIECEWISE" or (mode == "NONE" and 24 < rows < 4096)
     return (
         selected_shape
         and tensor_dim == 2
@@ -483,13 +467,9 @@ def _tp3_device_ce_reduce(
             payload_bytes, dtype=torch.uint8, device=tensor.device
         )
         q_local = payload_local[:q_bytes].view(rows, cols)
-        scale_local = payload_local[q_bytes:].view(torch.float32).view(
-            rows, num_blocks
-        )
+        scale_local = payload_local[q_bytes:].view(torch.float32).view(rows, num_blocks)
     else:
-        q_local = torch.empty(
-            (rows, cols), dtype=torch.uint8, device=tensor.device
-        )
+        q_local = torch.empty((rows, cols), dtype=torch.uint8, device=tensor.device)
         scale_local = torch.empty(
             (rows, num_blocks), dtype=torch.float32, device=tensor.device
         )
@@ -505,13 +485,10 @@ def _tp3_device_ce_reduce(
             3, payload_bytes
         )
         q_gathered = [
-            payload_gathered[rank, :q_bytes].view(rows, cols)
-            for rank in range(3)
+            payload_gathered[rank, :q_bytes].view(rows, cols) for rank in range(3)
         ]
         scale_gathered = [
-            payload_gathered[rank, q_bytes:].view(torch.float32).view(
-                rows, num_blocks
-            )
+            payload_gathered[rank, q_bytes:].view(torch.float32).view(rows, num_blocks)
             for rank in range(3)
         ]
     else:
@@ -552,9 +529,7 @@ def _tp3_unified_exact_backend(rows: int) -> str:
     }:
         raise ValueError(f"unknown TP3 unified exact backend: {backend}")
     if backend == "auto":
-        threshold = int(
-            os.environ.get("AG2_VLLM_TP3_EXACT_OWNER_MIN_ROWS", "24")
-        )
+        threshold = int(os.environ.get("AG2_VLLM_TP3_EXACT_OWNER_MIN_ROWS", "24"))
         if threshold < 1:
             raise ValueError("TP3 exact owner row threshold must be positive")
         return "weighted_owner_992" if rows >= threshold else "all_gather_fused"
@@ -608,6 +583,232 @@ def tp3_unified_exact_reduce(
     return exact_weighted_owner_992_reduce(tensor, group.device_group)
 
 
+def tp3_owner_residual_arc_prequant(
+    contribution: torch.Tensor,
+    residual_owner: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale_inv: torch.Tensor,
+    selected_all: torch.Tensor,
+    route0: torch.Tensor,
+    route1: torch.Tensor,
+    route2: torch.Tensor,
+    inverse_order: torch.Tensor,
+    route_counts: list[int],
+    group_name: str,
+    eps: float,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    from .device_communicators.tp3_owner_prequant import (
+        OFFSETS,
+        WIDTHS,
+        full_residual_arc_prequant,
+        owner_residual_arc_prequant,
+    )
+
+    if residual_owner.shape != contribution.shape:
+        raise ValueError("owner custom-op ABI requires a full residual carrier")
+    rank = torch.distributed.get_rank(group.device_group)
+    if _is_tp3_owner_prequant_decode():
+        start = OFFSETS[rank]
+        width = WIDTHS[rank]
+        q, sf, base_q, base_sf, next_owner = owner_residual_arc_prequant(
+            contribution,
+            residual_owner[:, start : start + width],
+            weight,
+            input_scale_inv,
+            selected_all,
+            route0,
+            route1,
+            route2,
+            inverse_order,
+            route_counts,
+            group.device_group,
+            eps,
+        )
+        carrier = torch.empty_like(contribution)
+        carrier[:, start : start + width].copy_(next_owner)
+        return q, sf, base_q, base_sf, carrier
+    return full_residual_arc_prequant(
+        contribution,
+        residual_owner,
+        weight,
+        input_scale_inv,
+        selected_all[rank],
+        group.device_group,
+        eps,
+    )
+
+
+def tp3_owner_residual_arc_prequant_fake(
+    contribution: torch.Tensor,
+    residual_owner: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale_inv: torch.Tensor,
+    selected_all: torch.Tensor,
+    route0: torch.Tensor,
+    route1: torch.Tensor,
+    route2: torch.Tensor,
+    inverse_order: torch.Tensor,
+    route_counts: list[int],
+    group_name: str,
+    eps: float,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    del weight, input_scale_inv, route0, route1, route2, inverse_order
+    del route_counts, group_name, eps
+    from vllm._custom_ops import create_fp4_output_tensors
+
+    rows = contribution.shape[0]
+    selected_count = selected_all.shape[1]
+    q, sf = create_fp4_output_tensors(
+        rows,
+        contribution.shape[1],
+        contribution.device,
+        True,
+        padded_n=contribution.shape[1] + selected_count,
+    )
+    canonical_q, canonical_sf = create_fp4_output_tensors(
+        rows,
+        contribution.shape[1],
+        contribution.device,
+        True,
+    )
+    return (
+        q,
+        sf.view(torch.float8_e4m3fn),
+        canonical_q,
+        canonical_sf.view(torch.float8_e4m3fn),
+        torch.empty_like(contribution),
+    )
+
+
+def tp3_owner_terminal_norm(
+    contribution: torch.Tensor,
+    residual_owner: torch.Tensor,
+    weight: torch.Tensor,
+    group_name: str,
+    eps: float,
+) -> torch.Tensor:
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    from .device_communicators.tp3_owner_prequant import (
+        OFFSETS,
+        WIDTHS,
+        full_terminal_norm,
+        owner_terminal_norm,
+    )
+
+    if residual_owner.shape != contribution.shape:
+        raise ValueError("terminal custom-op ABI requires a full residual carrier")
+    if _is_tp3_owner_prequant_decode():
+        rank = torch.distributed.get_rank(group.device_group)
+        start = OFFSETS[rank]
+        return owner_terminal_norm(
+            contribution,
+            residual_owner[:, start : start + WIDTHS[rank]],
+            weight,
+            group.device_group,
+            eps,
+        )
+    return full_terminal_norm(
+        contribution, residual_owner, weight, group.device_group, eps
+    )
+
+
+def tp3_owner_terminal_norm_fake(
+    contribution: torch.Tensor,
+    residual_owner: torch.Tensor,
+    weight: torch.Tensor,
+    group_name: str,
+    eps: float,
+) -> torch.Tensor:
+    del residual_owner, weight, group_name, eps
+    return torch.empty_like(contribution)
+
+
+def tp3_owner_materialize_aux(
+    contribution: torch.Tensor,
+    residual_owner: torch.Tensor,
+    group_name: str,
+) -> torch.Tensor:
+    """Return the full canonical layer boundary required by EAGLE/MTP.
+
+    Owner execution deliberately keeps the residual sharded between decoder
+    seams.  EAGLE auxiliary states are a separate public contract: they must
+    contain the same replicated ``reduced contribution + residual`` tensor as
+    the ordinary TP path, never the padded owner carrier.
+    """
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    if residual_owner.shape != contribution.shape:
+        raise ValueError("owner auxiliary ABI requires a full residual carrier")
+
+    reduced = tp3_unified_exact_reduce(contribution, group_name)
+    if _is_tp3_owner_prequant_decode():
+        from .device_communicators.tp3_owner_prequant import (
+            OFFSETS,
+            WIDTHS,
+            materialize_owner_tensor,
+        )
+
+        rank = torch.distributed.get_rank(group.device_group)
+        start = OFFSETS[rank]
+        residual = materialize_owner_tensor(
+            residual_owner[:, start : start + WIDTHS[rank]],
+            group.device_group,
+        )
+    else:
+        residual = residual_owner
+    return reduced + residual
+
+
+def tp3_owner_materialize_aux_fake(
+    contribution: torch.Tensor,
+    residual_owner: torch.Tensor,
+    group_name: str,
+) -> torch.Tensor:
+    del residual_owner, group_name
+    return torch.empty_like(contribution)
+
+
+def tp3_v1_block5_fused_add_rms_norm(
+    value: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from .device_communicators.tp3_owner_prequant import (
+        v1_full_block5_fused_add_rms_norm,
+    )
+
+    return v1_full_block5_fused_add_rms_norm(value, residual, weight, eps)
+
+
+def tp3_v1_block5_fused_add_rms_norm_fake(
+    value: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del residual, weight, eps
+    return torch.empty_like(value), torch.empty_like(value)
+
+
 def gdn_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     """Use a row-invariant compressed reduction for PIECEWISE GDN."""
     assert group_name in _groups, f"Group {group_name} is not found."
@@ -620,13 +821,9 @@ def gdn_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
         is_forward_context_available,
     )
 
-    forward_context = (
-        get_forward_context() if is_forward_context_available() else None
-    )
+    forward_context = get_forward_context() if is_forward_context_available() else None
     cudagraph_mode = (
-        forward_context.cudagraph_runtime_mode
-        if forward_context is not None
-        else None
+        forward_context.cudagraph_runtime_mode if forward_context is not None else None
     )
     if _should_use_tp3_piecewise_device_ce(
         cudagraph_mode=cudagraph_mode,
@@ -671,11 +868,7 @@ def embedding_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     force_exact_nccl = os.environ.get("AG2_VLLM_TP3_EMBEDDING_NCCL", "0") == "1"
-    if (
-        force_exact_nccl
-        and _tp3_ce_runtime_enabled
-        and not _tp3_embedding_nccl_logged
-    ):
+    if force_exact_nccl and _tp3_ce_runtime_enabled and not _tp3_embedding_nccl_logged:
         logger.warning(
             "TP3 vocabulary embedding diagnostic uses uniform exact NCCL; "
             "compressed all-reduce remains enabled for eligible non-embedding paths"
@@ -704,9 +897,19 @@ def _is_tp3_sd_phase_reduce() -> bool:
         is_forward_context_available,
     )
 
+    return is_forward_context_available() and get_forward_context().tp3_sd_phase_reduce
+
+
+def _is_tp3_owner_prequant_decode() -> bool:
+    """Read capture/runtime owner authority at the opaque custom-op boundary."""
+    from vllm.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+
     return (
         is_forward_context_available()
-        and get_forward_context().tp3_sd_phase_reduce
+        and get_forward_context().tp3_owner_prequant_decode
     )
 
 
@@ -1026,6 +1229,30 @@ direct_register_custom_op(
     op_name="tp3_unified_exact_reduce",
     op_func=tp3_unified_exact_reduce,
     fake_impl=all_reduce_fake,
+)
+
+direct_register_custom_op(
+    op_name="tp3_owner_residual_arc_prequant",
+    op_func=tp3_owner_residual_arc_prequant,
+    fake_impl=tp3_owner_residual_arc_prequant_fake,
+)
+
+direct_register_custom_op(
+    op_name="tp3_owner_terminal_norm",
+    op_func=tp3_owner_terminal_norm,
+    fake_impl=tp3_owner_terminal_norm_fake,
+)
+
+direct_register_custom_op(
+    op_name="tp3_owner_materialize_aux",
+    op_func=tp3_owner_materialize_aux,
+    fake_impl=tp3_owner_materialize_aux_fake,
+)
+
+direct_register_custom_op(
+    op_name="tp3_v1_block5_fused_add_rms_norm",
+    op_func=tp3_v1_block5_fused_add_rms_norm,
+    fake_impl=tp3_v1_block5_fused_add_rms_norm_fake,
 )
 
 direct_register_custom_op(

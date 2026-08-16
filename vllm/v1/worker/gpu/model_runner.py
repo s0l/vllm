@@ -294,6 +294,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if (
             envs.AG2_VLLM_NVFP4_MARLIN_GATE_UP_SCRATCH
             or envs.AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH
+            or envs.AG2_VLLM_TP3_OWNER_PREQUANT
         ):
             # Qwen3.5/3.6 TP3 gate+up physical width: 2 * 5824.  Allocate the
             # largest destination before model/KV profiling so its ownership
@@ -343,6 +344,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # workspace handoff to MTP.  DCP prefill needs that lifetime even
             # when the selected target linear backend is not Marlin.
             set_nvfp4_marlin_gate_up_scratch(self.marlin_gate_up_scratch)
+            if envs.AG2_VLLM_TP3_OWNER_PREQUANT:
+                from vllm.distributed.device_communicators.tp3_owner_prequant import (
+                    set_tp3_owner_prequant_workspace,
+                )
+
+                set_tp3_owner_prequant_workspace(self.marlin_gate_up_scratch)
             if envs.AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH:
                 from vllm.v1.attention.backends.flashinfer import (
                     set_ag2_dcp_prefill_query_scratch,
@@ -684,7 +691,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             decode_query_len=self.decode_query_len,
             lora_capture_cases=self.lora_capture_cases,
             full_decode_query_lens=full_decode_query_lens,
+            full_decode_cap_query_lens=(
+                {self.decode_query_len}
+                if envs.AG2_VLLM_TP3_OWNER_PREQUANT
+                else None
+            ),
             tp3_sd_phase_reduce=envs.VLLM_TP3_SD_PHASE_REDUCE,
+            tp3_owner_prequant=envs.AG2_VLLM_TP3_OWNER_PREQUANT,
             max_uniform_decode_reqs=(
                 self.kv_cache_config.effective_max_resident_seqs or self.max_num_reqs
             ),

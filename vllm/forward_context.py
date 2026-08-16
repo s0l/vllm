@@ -180,6 +180,11 @@ class ForwardContext:
     # captures and cannot alias an equal-shaped target-model graph.
     tp3_mtp_device_ce: bool = False
 
+    # Capture-time authority for the target-only compact owner residual. This
+    # is true only while building a bounded uniform K3 FULL graph; replay uses
+    # that already-specialized graph and never consults a request pointer.
+    tp3_owner_prequant_decode: bool = False
+
     ubatch_slices: UBatchSlices | None = None
 
     # Boolean mask over the token axis: True for padding rows that are not real
@@ -255,6 +260,7 @@ def create_forward_context(
     num_tokens_unpadded: int | None = None,
     tp3_sd_phase_reduce: bool = False,
     tp3_mtp_device_ce: bool = False,
+    tp3_owner_prequant_decode: bool = False,
     marlin_request_layout_cpu: torch.Tensor | None = None,
 ):
     if vllm_config.compilation_config.fast_moe_cold_start:
@@ -282,6 +288,7 @@ def create_forward_context(
         ),
         tp3_sd_phase_reduce=tp3_sd_phase_reduce,
         tp3_mtp_device_ce=tp3_mtp_device_ce,
+        tp3_owner_prequant_decode=tp3_owner_prequant_decode,
     )
 
 
@@ -315,6 +322,7 @@ def set_forward_context(
     num_tokens_unpadded: int | None = None,
     tp3_sd_phase_reduce: bool = False,
     tp3_mtp_device_ce: bool = False,
+    tp3_owner_prequant_decode: bool = False,
     marlin_request_layout_cpu: torch.Tensor | None = None,
 ):
     """A context manager that stores the current forward context,
@@ -388,6 +396,7 @@ def set_forward_context(
         num_tokens_unpadded=num_tokens_unpadded,
         tp3_sd_phase_reduce=tp3_sd_phase_reduce,
         tp3_mtp_device_ce=tp3_mtp_device_ce,
+        tp3_owner_prequant_decode=tp3_owner_prequant_decode,
         marlin_request_layout_cpu=marlin_request_layout_cpu,
     )
 

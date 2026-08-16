@@ -110,6 +110,52 @@ def test_dcp_pseudo_decode_rows_map_multiple_requests_without_aliasing_lengths()
     assert local_lens.tolist() == [14, 15, 15, 1184, 1184, 1185]
 
 
+def test_dcp_pseudo_decode_rows_preserve_padded_full_graph_carrier():
+    row_to_req, local_lens = _dcp_pseudo_decode_rows(
+        seq_lens_cpu=torch.tensor([44, 3553, 0], dtype=torch.int32),
+        qo_indptr_cpu=torch.tensor([0, 3, 6, 6], dtype=torch.int32),
+        dcp_world_size=3,
+        dcp_rank=0,
+        dcp_kv_cache_interleave_size=1,
+        padded_num_rows=9,
+    )
+
+    assert row_to_req.tolist() == [0, 0, 0, 1, 1, 1, 0, 0, 0]
+    assert local_lens.tolist() == [14, 15, 15, 1184, 1184, 1185, 14, 14, 14]
+
+
+def test_dcp_pseudo_decode_rows_reject_too_small_physical_carrier():
+    with pytest.raises(ValueError, match="smaller than its semantic rows"):
+        _dcp_pseudo_decode_rows(
+            seq_lens_cpu=torch.tensor([44], dtype=torch.int32),
+            qo_indptr_cpu=torch.tensor([0, 3], dtype=torch.int32),
+            dcp_world_size=3,
+            dcp_rank=0,
+            dcp_kv_cache_interleave_size=1,
+            padded_num_rows=2,
+        )
+
+
+def test_dcp_pseudo_decode_keeps_dispatch_family_on_full_graph_tail():
+    builder = FlashInferMetadataBuilder.__new__(FlashInferMetadataBuilder)
+    builder._dcp_special_decode_enabled = True
+    builder._dcp_pseudo_decode_query_len = 3
+    builder._dcp_pseudo_decode_max_rows = 9
+    builder.use_dcp = True
+    synthetic_tail = type(
+        "SyntheticTail",
+        (),
+        {
+            "query_start_loc_cpu": torch.tensor([0, 3, 6, 6], dtype=torch.int32),
+            "num_actual_tokens": 9,
+            "causal": True,
+            "is_prefilling": torch.tensor([False, False, False]),
+        },
+    )()
+
+    assert builder._can_use_dcp_pseudo_decode(0, synthetic_tail)
+
+
 def test_dcp_pseudo_decode_rejects_non_verification_autotune_shape():
     builder = FlashInferMetadataBuilder.__new__(FlashInferMetadataBuilder)
     builder._dcp_pseudo_decode_enabled = True

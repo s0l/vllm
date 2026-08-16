@@ -100,6 +100,8 @@ if TYPE_CHECKING:
     AG2_VLLM_MTP_BF16_GATE_UP_SCRATCH: bool = False
     AG2_VLLM_MTP_FC_BATCH_INVARIANT: bool = False
     AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH: bool = False
+    AG2_VLLM_TP3_OWNER_PREQUANT: bool = False
+    AG2_VLLM_TP3_OWNER_MIN_ROWS: int = 32
     AG2_VLLM_NVFP4_HUMMING_STABLE_K64: bool = False
     AG2_VLLM_NVFP4_HUMMING_NARROW_PAD64: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
@@ -650,6 +652,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH": lambda: bool(
         int(os.getenv("AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH", "0"))
+    ),
+    "AG2_VLLM_TP3_OWNER_PREQUANT": lambda: bool(
+        int(os.getenv("AG2_VLLM_TP3_OWNER_PREQUANT", "0"))
+    ),
+    "AG2_VLLM_TP3_OWNER_MIN_ROWS": lambda: int(
+        os.getenv("AG2_VLLM_TP3_OWNER_MIN_ROWS", "32")
     ),
     "AG2_VLLM_NVFP4_HUMMING_STABLE_K64": lambda: bool(
         int(os.getenv("AG2_VLLM_NVFP4_HUMMING_STABLE_K64", "0"))

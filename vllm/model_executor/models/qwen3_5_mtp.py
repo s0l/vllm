@@ -11,7 +11,10 @@ from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed.communication_op import tensor_model_parallel_all_gather
+from vllm.distributed.communication_op import (
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_v1_block5_fused_add_rms_norm,
+)
 from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -20,7 +23,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.nvfp4.marlin import (
     get_nvfp4_marlin_gate_up_scratch,
 )
-from vllm.model_executor.layers.batch_invariant import linear_batch_invariant
+from vllm.model_executor.layers.batch_invariant import (
+    linear_mtp_fc_batch_invariant,
+)
 from vllm.model_executor.layers.linear import PaddedMergedColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -69,9 +74,7 @@ def _mtp_fc_padded_output_size(
 ) -> int:
     """Pad the MTP projection so every TP rank owns an aligned output shard."""
     global_alignment = tp_size * local_alignment
-    return (
-        (hidden_size + global_alignment - 1) // global_alignment
-    ) * global_alignment
+    return ((hidden_size + global_alignment - 1) // global_alignment) * global_alignment
 
 
 @support_torch_compile(
@@ -167,6 +170,9 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             )
             for idx in range(self.num_mtp_layers)
         )
+        self._ag2_tp3_mtp_block5 = any(
+            getattr(layer, "_ag2_tp3_mtp_block5", False) for layer in self.layers
+        )
         if envs.AG2_VLLM_MTP_BF16_GATE_UP_SCRATCH:
             max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
             shared_scratch = get_nvfp4_marlin_gate_up_scratch()
@@ -236,7 +242,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
                 mtp_trace["feedback_norm"] = hidden_states
             hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
             if envs.AG2_VLLM_MTP_FC_BATCH_INVARIANT:
-                output_parallel = linear_batch_invariant(
+                output_parallel = linear_mtp_fc_batch_invariant(
                     hidden_states,
                     self.fc.weight,
                 )
@@ -283,7 +289,15 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         # two-output fused op here: its residual result is dead but otherwise
         # materializes a full BF16 [tokens, hidden] tensor in compiled prefill.
         assert residual is not None
-        output = self.norm.forward_native_output_only(hidden_states, residual)
+        if self._ag2_tp3_mtp_block5:
+            output, _ = tensor_model_parallel_v1_block5_fused_add_rms_norm(
+                hidden_states,
+                residual,
+                self.norm.weight.float() + 1.0,
+                self.norm.variance_epsilon,
+            )
+        else:
+            output = self.norm.forward_native_output_only(hidden_states, residual)
         if return_ag2_mtp_trace:
             mtp_trace["final_norm"] = output
             return output, output, mtp_trace
@@ -455,9 +469,7 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
         trace_pairs = getattr(
             self.logits_processor, "ag2_top_token_gathered_pairs", None
         )
-        trace_selected = getattr(
-            self.logits_processor, "ag2_top_token_selected", None
-        )
+        trace_selected = getattr(self.logits_processor, "ag2_top_token_selected", None)
         if trace_pairs is not None and trace_selected is not None:
             rows = hidden_states.shape[0]
             trace_pairs[:rows].copy_(gathered)

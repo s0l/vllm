@@ -23,8 +23,12 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_owner_residual_arc_prequant,
+    tensor_model_parallel_owner_materialize_aux,
+    tensor_model_parallel_owner_terminal_norm,
     tensor_model_parallel_reduce_scatter,
     tensor_model_parallel_unified_exact_all_reduce,
+    tensor_model_parallel_v1_block5_fused_add_rms_norm,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -33,6 +37,10 @@ from vllm.model_executor.layers.attention.head_partition import (
 )
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_qk_norm_rope import fused_qk_rmsnorm_rope_gate
+from vllm.model_executor.layers.fusion.quant_activation import (
+    GDNQuantizedActivations,
+    QuantizedActivation,
+)
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3NextRMSNorm,
 )
@@ -53,6 +61,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Dynamic
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -87,6 +96,91 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _ag2_tp3_owner_prequant_enabled(
+    vllm_config: VllmConfig,
+    prefix: str,
+    *,
+    is_moe_layer: bool,
+) -> bool:
+    """Resolve and fail-close the target-only owner-prequant experiment."""
+    if os.environ.get("AG2_VLLM_TP3_OWNER_PREQUANT", "0") != "1":
+        return False
+    # The current ARC sidecar describes target layers only. MTP deliberately
+    # stays on its accepted exact-reduce path until it has its own proof.
+    if ".mtp.layers." in f".{prefix}" or prefix.startswith("mtp.layers."):
+        return False
+    parallel = vllm_config.parallel_config
+    if (
+        parallel.tensor_parallel_size != 3
+        or parallel.pipeline_parallel_size != 1
+        or parallel.use_sequence_parallel_moe
+        or is_moe_layer
+    ):
+        raise RuntimeError(
+            "TP3 owner prequant requires dense TP=3, PP=1 without sequence parallelism"
+        )
+    if os.environ.get("VLLM_TP3_CE_REDUCE", "0") != "1":
+        raise RuntimeError(
+            "TP3 owner prequant requires CE (compressed all-reduce) enabled"
+        )
+    if not os.environ.get("AG2_VLLM_NVFP4_ARC_SIDECAR_DIR", "").strip():
+        raise RuntimeError("TP3 owner prequant requires the ARC sidecar")
+    boolean_trace_switches = (
+        "AG2_VLLM_AUX_HIDDEN_TRACE_ALL_INTERNAL_BOUNDARIES",
+        "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_ALL_BOUNDARIES",
+        "AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_ATTENTION_BOUNDARY",
+        "AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_GDN_BOUNDARIES",
+        "AG2_VLLM_AUX_HIDDEN_TRACE_FULL_ATTENTION_BOUNDARIES",
+        "AG2_VLLM_AUX_HIDDEN_TRACE_GDN_REPLAY_ONLY",
+    )
+    payload_trace_switches = (
+        "AG2_VLLM_AUX_HIDDEN_TRACE_OUTPUT",
+        "AG2_VLLM_AUX_HIDDEN_TRACE_LAYERS",
+        "AG2_VLLM_AUX_HIDDEN_TRACE_INTERNAL_BOUNDARY_LAYERS",
+        "AG2_VLLM_AUX_HIDDEN_TRACE_SEQUENCE_BOUNDARY_LAYERS",
+        "AG2_VLLM_LAYER0_TRACE_OUTPUT",
+    )
+    boundary_trace_switches = (
+        "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_BOUNDARY_LAYER",
+        "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_GDN_BOUNDARY_LAYER",
+    )
+    incompatible = sorted(
+        [name for name in boolean_trace_switches if os.environ.get(name, "0") == "1"]
+        + [name for name in payload_trace_switches if os.environ.get(name, "")]
+        + [
+            name
+            for name in boundary_trace_switches
+            if int(os.environ.get(name, "-1")) >= 0
+        ]
+    )
+    if incompatible:
+        raise RuntimeError(
+            "TP3 owner prequant is incompatible with diagnostic traces: "
+            + ", ".join(incompatible)
+        )
+    return True
+
+
+def _ag2_tp3_mtp_block5_enabled(
+    vllm_config: VllmConfig,
+    prefix: str,
+) -> bool:
+    if os.environ.get("AG2_VLLM_TP3_MTP_BLOCK5_RMS", "0") != "1":
+        return False
+    is_mtp = ".mtp.layers." in f".{prefix}" or prefix.startswith("mtp.layers.")
+    if not is_mtp:
+        return False
+    if os.environ.get("AG2_VLLM_TP3_OWNER_PREQUANT", "0") != "1":
+        raise RuntimeError("MTP block5 RMS requires target owner-prequant")
+    parallel = vllm_config.parallel_config
+    if parallel.tensor_parallel_size != 3 or parallel.pipeline_parallel_size != 1:
+        raise RuntimeError("MTP block5 RMS requires TP=3 and PP=1")
+    if os.environ.get("VLLM_TP3_CE_REDUCE", "0") != "1":
+        raise RuntimeError("MTP block5 RMS requires CE (compressed all-reduce)")
+    return True
+
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
@@ -141,13 +235,10 @@ def _ag2_compact_full_attention_stages() -> tuple[str, ...]:
     unknown = requested.difference(AG2_COMPACT_FULL_ATTENTION_STAGE_ORDER)
     if unknown:
         raise ValueError(
-            "Unknown compact full-attention trace stages: "
-            f"{sorted(unknown)}"
+            f"Unknown compact full-attention trace stages: {sorted(unknown)}"
         )
     return tuple(
-        stage
-        for stage in AG2_COMPACT_FULL_ATTENTION_STAGE_ORDER
-        if stage in requested
+        stage for stage in AG2_COMPACT_FULL_ATTENTION_STAGE_ORDER if stage in requested
     )
 
 
@@ -425,9 +516,7 @@ class Qwen3NextAttention(nn.Module):
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             bias=False,
-            reduce_results=(
-                reduce_results and not self._ag2_tp3_unified_exact_reduce
-            ),
+            reduce_results=(reduce_results and not self._ag2_tp3_unified_exact_reduce),
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
@@ -597,12 +686,9 @@ class Qwen3NextAttention(nn.Module):
                 "DCP causal observer history, pages and metadata must be "
                 "requested together"
             )
-        if (
-            self.attn._ag2_aux_dcp_kv_history_enabled
-            and (
-                self.attn._ag2_aux_dcp_kv_history_tokens < 1
-                or self.attn._ag2_aux_dcp_kv_history_rows < 1
-            )
+        if self.attn._ag2_aux_dcp_kv_history_enabled and (
+            self.attn._ag2_aux_dcp_kv_history_tokens < 1
+            or self.attn._ag2_aux_dcp_kv_history_rows < 1
         ):
             raise ValueError(
                 "DCP KV history trace requires positive row and token capacities"
@@ -708,9 +794,10 @@ class Qwen3NextAttention(nn.Module):
         stages = _ag2_compact_full_attention_stages()
         if not stages:
             raise ValueError("Compact full-attention trace requires stages")
-        if bool(
-            {"dcp_output_pack", "dcp_lse_pack"}.intersection(stages)
-        ) and not {"dcp_output_pack", "dcp_lse_pack"}.issubset(stages):
+        if bool({"dcp_output_pack", "dcp_lse_pack"}.intersection(stages)) and not {
+            "dcp_output_pack",
+            "dcp_lse_pack",
+        }.issubset(stages):
             raise ValueError(
                 "Compact DCP output and LSE packs must be requested together"
             )
@@ -718,9 +805,7 @@ class Qwen3NextAttention(nn.Module):
         # The ordinary full-boundary producer shares this forward path. Keep
         # its consumer registry atomic with the compact registry; `gate` is
         # compact-only and comes from the returned trace mapping.
-        self._ag2_aux_full_stages = tuple(
-            stage for stage in stages if stage != "gate"
-        )
+        self._ag2_aux_full_stages = tuple(stage for stage in stages if stage != "gate")
         self._ag2_aux_full_boundaries_enabled = True
         # return_ag2_mtp_trace publishes a shared attention mapping whose
         # output_parallel entry is constructed before the compact consumer
@@ -733,10 +818,7 @@ class Qwen3NextAttention(nn.Module):
         self.attn._ag2_aux_dcp_pack_rows = int(
             os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_DCP_REQUEST_TAIL_ROWS", "0")
         )
-        if (
-            self.attn._ag2_aux_dcp_pack_enabled
-            and self.attn._ag2_aux_dcp_pack_rows < 1
-        ):
+        if self.attn._ag2_aux_dcp_pack_enabled and self.attn._ag2_aux_dcp_pack_rows < 1:
             raise ValueError(
                 "Full internal attention trace requires positive "
                 "AG2_VLLM_AUX_HIDDEN_TRACE_DCP_REQUEST_TAIL_ROWS"
@@ -768,9 +850,7 @@ class Qwen3NextAttention(nn.Module):
             "output",
         )
         self._ag2_aux_full_stages = tuple(
-            stage
-            for stage in self._ag2_aux_compact_full_stages
-            if stage != "gate"
+            stage for stage in self._ag2_aux_compact_full_stages if stage != "gate"
         )
         self._ag2_aux_full_boundaries_enabled = True
         self.o_proj._ag2_aux_output_parallel_enabled = True
@@ -900,9 +980,7 @@ class Qwen3NextAttention(nn.Module):
                     )
                 )
             for name in dcp_trace_names:
-                mtp_trace[f"dcp_{name}"] = getattr(
-                    self.attn, f"_ag2_aux_dcp_{name}"
-                )
+                mtp_trace[f"dcp_{name}"] = getattr(self.attn, f"_ag2_aux_dcp_{name}")
         if self._ag2_aux_full_boundaries_enabled:
             if "dcp_output_pack" in self._ag2_aux_full_stages:
                 self._ag2_aux_dcp_output_pack = self.attn._ag2_aux_dcp_output_pack
@@ -921,9 +999,7 @@ class Qwen3NextAttention(nn.Module):
                     self.attn._ag2_aux_dcp_kv_page_indices_pack
                 )
             if "dcp_observer_meta" in self._ag2_aux_full_stages:
-                self._ag2_aux_dcp_observer_meta = (
-                    self.attn._ag2_aux_dcp_observer_meta
-                )
+                self._ag2_aux_dcp_observer_meta = self.attn._ag2_aux_dcp_observer_meta
             if "dcp_current_kv_pack" in self._ag2_aux_full_stages:
                 self._ag2_aux_dcp_current_kv_pack = (
                     self.attn._ag2_aux_dcp_current_kv_pack
@@ -957,6 +1033,8 @@ class Qwen3NextAttention(nn.Module):
             trace = attn_output[:3]
             self._ag2_trace_gated_output[: trace.shape[0]].copy_(trace)
         output, _ = self.o_proj(attn_output)
+        if self._ag2_tp3_unified_exact_reduce:
+            output = tensor_model_parallel_unified_exact_all_reduce(output)
         if return_ag2_mtp_trace:
             mtp_trace["output_parallel"] = self.o_proj._ag2_aux_output_parallel
             mtp_trace["output"] = output
@@ -1313,8 +1391,8 @@ class Qwen3NextDecoderLayer(nn.Module):
         self._ag2_aux_sequence_boundary_enabled = (
             self.layer_idx in sequence_boundary_layers
         )
-        self._ag2_aux_all_internal_boundaries = (
-            _ag2_internal_trace_layer_enabled(self.layer_idx)
+        self._ag2_aux_all_internal_boundaries = _ag2_internal_trace_layer_enabled(
+            self.layer_idx
         )
         self._ag2_aux_compact_gdn_stages = _ag2_selected_stages(
             "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_GDN_STAGES",
@@ -1337,21 +1415,16 @@ class Qwen3NextDecoderLayer(nn.Module):
                 )
             )
         )
-        self._ag2_aux_gdn_boundaries_enabled = (
-            layer_type == "linear_attention"
-            and (
-                self._ag2_aux_sequence_boundary_enabled
-                or (
+        self._ag2_aux_gdn_boundaries_enabled = layer_type == "linear_attention" and (
+            self._ag2_aux_sequence_boundary_enabled
+            or (
+                os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_GDN_BOUNDARIES", "0")
+                == "1"
+                and self.layer_idx
+                == int(
                     os.environ.get(
-                        "AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_GDN_BOUNDARIES", "0"
-                    )
-                    == "1"
-                    and self.layer_idx
-                    == int(
-                        os.environ.get(
-                            "AG2_VLLM_AUX_HIDDEN_TRACE_GDN_BOUNDARY_LAYER",
-                            "0",
-                        )
+                        "AG2_VLLM_AUX_HIDDEN_TRACE_GDN_BOUNDARY_LAYER",
+                        "0",
                     )
                 )
             )
@@ -1399,8 +1472,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         )
         self._ag2_aux_gdn_replay_enabled = (
             layer_type == "linear_attention"
-            and os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_GDN_REPLAY_ONLY", "0")
-            == "1"
+            and os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_GDN_REPLAY_ONLY", "0") == "1"
             and self.layer_idx
             == int(
                 os.environ.get(
@@ -1422,6 +1494,15 @@ class Qwen3NextDecoderLayer(nn.Module):
             and parallel_config.pipeline_parallel_size == 1
             and is_moe_layer
         )
+        self._ag2_tp3_owner_prequant = _ag2_tp3_owner_prequant_enabled(
+            vllm_config,
+            prefix,
+            is_moe_layer=is_moe_layer,
+        )
+        self._ag2_tp3_mtp_block5 = _ag2_tp3_mtp_block5_enabled(vllm_config, prefix)
+        reduce_results = not (
+            self.use_attn_reduce_scatter_for_moe or self._ag2_tp3_owner_prequant
+        )
 
         if self.layer_type == "linear_attention":
             self.linear_attn = QwenGatedDeltaNetAttention(
@@ -1429,7 +1510,7 @@ class Qwen3NextDecoderLayer(nn.Module):
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=True,
-                reduce_results=not self.use_attn_reduce_scatter_for_moe,
+                reduce_results=reduce_results,
             )
             if self._ag2_aux_all_internal_boundaries:
                 self.linear_attn.ag2_enable_compact_trace()
@@ -1439,7 +1520,7 @@ class Qwen3NextDecoderLayer(nn.Module):
                 model_config=model_config,
                 cache_config=cache_config,
                 quant_config=quant_config,
-                reduce_results=not self.use_attn_reduce_scatter_for_moe,
+                reduce_results=reduce_results,
                 prefix=f"{prefix}.self_attn",
             )
         else:
@@ -1456,6 +1537,7 @@ class Qwen3NextDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                reduce_results=not self._ag2_tp3_owner_prequant,
                 prefix=f"{prefix}.mlp",
             )
         if self._ag2_aux_all_internal_boundaries:
@@ -1484,9 +1566,7 @@ class Qwen3NextDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self._ag2_enable_projection_calibration_capture(
-            vllm_config.model_config.dtype
-        )
+        self._ag2_enable_projection_calibration_capture(vllm_config.model_config.dtype)
 
         self.layer_scale = getattr(config, "layer_scale", False)
         if self.layer_scale:
@@ -1505,26 +1585,22 @@ class Qwen3NextDecoderLayer(nn.Module):
                 ),
             )
 
-    def _ag2_enable_projection_calibration_capture(
-        self, dtype: torch.dtype
-    ) -> None:
+    def _ag2_enable_projection_calibration_capture(self, dtype: torch.dtype) -> None:
         output = os.environ.get("AG2_VLLM_PROJECTION_CALIBRATION_OUTPUT", "")
         self._ag2_projection_capture_enabled = bool(output)
         if not self._ag2_projection_capture_enabled:
             return
-        positions_raw = os.environ.get(
-            "AG2_VLLM_PROJECTION_CALIBRATION_POSITIONS", ""
-        )
+        positions_raw = os.environ.get("AG2_VLLM_PROJECTION_CALIBRATION_POSITIONS", "")
         positions = tuple(
             dict.fromkeys(int(value) for value in positions_raw.split(",") if value)
         )
-        capacity = int(
-            os.environ.get("AG2_VLLM_PROJECTION_CALIBRATION_CAPACITY", "4")
-        )
+        capacity = int(os.environ.get("AG2_VLLM_PROJECTION_CALIBRATION_CAPACITY", "4"))
         if not positions or any(position < 0 for position in positions):
             raise ValueError("projection calibration requires nonnegative positions")
         if capacity < len(positions):
-            raise ValueError("projection calibration capacity is smaller than positions")
+            raise ValueError(
+                "projection calibration capacity is smaller than positions"
+            )
         self._ag2_projection_capture_positions = positions
         self._ag2_projection_capture_capacity = capacity
         self.register_buffer(
@@ -1563,6 +1639,96 @@ class Qwen3NextDecoderLayer(nn.Module):
             )
         enable_mlp_capture(capacity, dtype)
 
+    def _ag2_owner_prequantize(
+        self,
+        contribution: torch.Tensor,
+        residual: torch.Tensor,
+        norm: Qwen3NextRMSNorm,
+        consumer: nn.Module,
+        *,
+        gdn_pair: bool = False,
+    ) -> tuple[
+        QuantizedActivation | GDNQuantizedActivations,
+        torch.Tensor,
+    ]:
+        if contribution.ndim != 2 or contribution.shape[1] != 5120:
+            raise RuntimeError(
+                "TP3 owner prequant requires a two-dimensional [M,5120] input"
+            )
+        if residual.shape != contribution.shape:
+            raise RuntimeError(
+                "TP3 owner prequant requires a full [M,5120] residual carrier"
+            )
+        required = (
+            "input_global_scale_inv",
+            "_ag2_nvfp4_arc_selected_all",
+            "_ag2_nvfp4_arc_route_to_0",
+            "_ag2_nvfp4_arc_route_to_1",
+            "_ag2_nvfp4_arc_route_to_2",
+            "_ag2_nvfp4_arc_inverse_order",
+            "_ag2_nvfp4_arc_route_counts",
+        )
+        missing = [name for name in required if not hasattr(consumer, name)]
+        if missing:
+            raise RuntimeError(
+                "TP3 owner prequant consumer is missing ARC ABI: " + ", ".join(missing)
+            )
+        arc_q, arc_sf, base_q, base_sf, residual = (
+            tensor_model_parallel_owner_residual_arc_prequant(
+                contribution,
+                residual,
+                norm.weight.float() + 1.0,
+                consumer.input_global_scale_inv,
+                consumer._ag2_nvfp4_arc_selected_all,
+                consumer._ag2_nvfp4_arc_route_to_0,
+                consumer._ag2_nvfp4_arc_route_to_1,
+                consumer._ag2_nvfp4_arc_route_to_2,
+                consumer._ag2_nvfp4_arc_inverse_order,
+                list(consumer._ag2_nvfp4_arc_route_counts),
+                norm.variance_epsilon,
+            )
+        )
+        arc = QuantizedActivation(
+            data=arc_q,
+            scale=arc_sf,
+            orig_dtype=contribution.dtype,
+            orig_shape=contribution.shape,
+            quant_key=kNvfp4Dynamic,
+        )
+        if not gdn_pair:
+            return arc, residual
+        canonical = QuantizedActivation(
+            data=base_q,
+            scale=base_sf,
+            orig_dtype=contribution.dtype,
+            orig_shape=contribution.shape,
+            quant_key=kNvfp4Dynamic,
+        )
+        return GDNQuantizedActivations(qkvz=arc, ba=canonical), residual
+
+    def _ag2_owner_attention_prequantize(
+        self,
+        contribution: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[
+        QuantizedActivation | GDNQuantizedActivations,
+        torch.Tensor,
+    ]:
+        if self.layer_type == "linear_attention":
+            return self._ag2_owner_prequantize(
+                contribution,
+                residual,
+                self.input_layernorm,
+                self.linear_attn.in_proj_qkvz,
+                gdn_pair=True,
+            )
+        return self._ag2_owner_prequantize(
+            contribution,
+            residual,
+            self.input_layernorm,
+            self.self_attn.qkv_proj,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1572,6 +1738,10 @@ class Qwen3NextDecoderLayer(nn.Module):
         **kwargs: object,
     ):
         mtp_trace: dict[str, torch.Tensor] = {}
+        if self._ag2_tp3_owner_prequant and return_ag2_mtp_trace:
+            raise RuntimeError(
+                "TP3 owner prequant does not expose full-BF16 diagnostic traces"
+            )
         full_num_tokens = positions.shape[-1]
         input_is_sequence_parallel = (
             self.use_attn_reduce_scatter_for_moe
@@ -1587,6 +1757,20 @@ class Qwen3NextDecoderLayer(nn.Module):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        elif self._ag2_tp3_owner_prequant:
+            hidden_states, residual = self._ag2_owner_attention_prequantize(
+                hidden_states,
+                residual,
+            )
+        elif self._ag2_tp3_mtp_block5:
+            hidden_states, residual = (
+                tensor_model_parallel_v1_block5_fused_add_rms_norm(
+                    hidden_states,
+                    residual,
+                    self.input_layernorm.weight.float() + 1.0,
+                    self.input_layernorm.variance_epsilon,
+                )
+            )
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         if return_ag2_mtp_trace:
@@ -1773,7 +1957,26 @@ class Qwen3NextDecoderLayer(nn.Module):
                 residual = sequence_parallel_chunk(residual)
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if self._ag2_tp3_owner_prequant:
+            hidden_states, residual = self._ag2_owner_prequantize(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm,
+                self.mlp.gate_up_proj,
+            )
+        elif self._ag2_tp3_mtp_block5:
+            hidden_states, residual = (
+                tensor_model_parallel_v1_block5_fused_add_rms_norm(
+                    hidden_states,
+                    residual,
+                    self.post_attention_layernorm.weight.float() + 1.0,
+                    self.post_attention_layernorm.variance_epsilon,
+                )
+            )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
         if self._ag2_projection_capture_enabled:
             self._ag2_projection_capture_mlp_input.copy_(
                 _ag2_compact_select(
@@ -1930,6 +2133,11 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
+        )
+        self._ag2_tp3_owner_prequant = any(
+            getattr(layer, "_ag2_tp3_owner_prequant", False)
+            for layer in self.layers
+            if not isinstance(layer, PPMissingLayer)
         )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
@@ -2194,13 +2402,11 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                             layer._ag2_aux_post_attention_residual,
                         )
                     )
-            if (
-                getattr(layer, "_ag2_aux_gdn_boundaries_enabled", False)
-                and not getattr(layer, "_ag2_aux_sequence_boundary_enabled", False)
+            if getattr(layer, "_ag2_aux_gdn_boundaries_enabled", False) and not getattr(
+                layer, "_ag2_aux_sequence_boundary_enabled", False
             ):
                 aux_hidden_states.extend(
-                    _ag2_trace_packet(value)
-                    for value in layer._ag2_aux_gdn_boundaries
+                    _ag2_trace_packet(value) for value in layer._ag2_aux_gdn_boundaries
                 )
             if getattr(layer, "_ag2_aux_gdn_replay_enabled", False):
                 aux_hidden_states.extend(
@@ -2210,10 +2416,9 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                         layer.linear_attn._ag2_aux_replay_meta,
                     )
                 )
-            if (
-                not getattr(layer, "_ag2_aux_all_internal_boundaries", False)
-                and getattr(layer, "_ag2_aux_compact_gdn_boundaries_enabled", False)
-            ):
+            if not getattr(
+                layer, "_ag2_aux_all_internal_boundaries", False
+            ) and getattr(layer, "_ag2_aux_compact_gdn_boundaries_enabled", False):
                 aux_hidden_states.extend(layer.linear_attn._ag2_aux_compact_boundaries)
             if (layer_idx + 1) in self.aux_hidden_state_layers and hidden_states.shape[
                 0
@@ -2224,13 +2429,28 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                     full_num_tokens,
                     self.config.hidden_size,
                 )
-            self._maybe_add_ag2_aux_hidden_state(
-                aux_hidden_states,
-                layer_idx + 1,
-                hidden_states,
-                residual,
-                positions,
-            )
+            if (
+                self._ag2_tp3_owner_prequant
+                and (layer_idx + 1) in self.aux_hidden_state_layers
+            ):
+                if residual is None:
+                    raise RuntimeError(
+                        "TP3 owner MTP boundary requires a residual carrier"
+                    )
+                aux_hidden_states.append(
+                    tensor_model_parallel_owner_materialize_aux(
+                        hidden_states,
+                        residual,
+                    )
+                )
+            else:
+                self._maybe_add_ag2_aux_hidden_state(
+                    aux_hidden_states,
+                    layer_idx + 1,
+                    hidden_states,
+                    residual,
+                    positions,
+                )
             _ag2_release_layer_trace_refs(layer)
 
         if not get_pp_group().is_last_rank:
@@ -2244,7 +2464,17 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                 full_num_tokens,
                 self.config.hidden_size,
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if self._ag2_tp3_owner_prequant:
+            if residual is None:
+                raise RuntimeError("TP3 owner terminal norm requires a residual")
+            hidden_states = tensor_model_parallel_owner_terminal_norm(
+                hidden_states,
+                residual,
+                self.norm.weight.float() + 1.0,
+                self.norm.variance_epsilon,
+            )
+        else:
+            hidden_states, _ = self.norm(hidden_states, residual)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -2258,6 +2488,42 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         )
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def _ag2_validate_tp3_owner_prequant_weights(self) -> None:
+        """Validate every consumer ABI once, after checkpoint loading."""
+        for layer in self.layers:
+            if not getattr(layer, "_ag2_tp3_owner_prequant", False):
+                continue
+            consumers = [layer.mlp.gate_up_proj]
+            if layer.layer_type == "linear_attention":
+                qkvz = layer.linear_attn.in_proj_qkvz
+                ba = layer.linear_attn.in_proj_ba
+                if not torch.equal(
+                    qkvz.input_global_scale_inv,
+                    ba.input_global_scale_inv,
+                ):
+                    raise RuntimeError(
+                        f"layer {layer.layer_idx} GDN qkvz/ba input scales differ"
+                    )
+                consumers.append(qkvz)
+            else:
+                consumers.append(layer.self_attn.qkv_proj)
+            for consumer in consumers:
+                if getattr(consumer, "input_quant_key", None) != kNvfp4Dynamic:
+                    raise RuntimeError(
+                        f"layer {layer.layer_idx} consumer cannot accept NVFP4 QA"
+                    )
+                if not hasattr(consumer, "_ag2_nvfp4_arc_selected_all"):
+                    raise RuntimeError(
+                        f"layer {layer.layer_idx} consumer is missing ARC owner metadata"
+                    )
+        logger.warning(
+            "Validated target-only TP3 owner residual + ARC prequant ABI for %d layers",
+            sum(
+                getattr(layer, "_ag2_tp3_owner_prequant", False)
+                for layer in self.layers
+            ),
+        )
 
 
 class QwenNextMixtureOfExperts(MixtureOfExperts):

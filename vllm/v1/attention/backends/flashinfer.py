@@ -202,9 +202,9 @@ def _flashinfer_seq_lens_and_blocks_for_paged_kv(
                 qo_indptr_prefill_cpu[1:] - qo_indptr_prefill_cpu[:-1]
             )
             standard_prefill_count = include_prefill_query_from - num_decodes
-            localized_seq_lens_cpu[
-                num_decodes:include_prefill_query_from
-            ] -= query_lens_prefill_cpu[:standard_prefill_count]
+            localized_seq_lens_cpu[num_decodes:include_prefill_query_from] -= (
+                query_lens_prefill_cpu[:standard_prefill_count]
+            )
 
         localized_seq_lens_cpu = get_dcp_local_seq_lens(
             localized_seq_lens_cpu,
@@ -224,6 +224,7 @@ def _dcp_pseudo_decode_rows(
     dcp_world_size: int,
     dcp_rank: int,
     dcp_kv_cache_interleave_size: int,
+    padded_num_rows: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Expand qlen>1 requests into causal qlen=1 DCP decode rows.
 
@@ -239,20 +240,27 @@ def _dcp_pseudo_decode_rows(
             "Pseudo-decode requires one query length per sequence length: "
             f"{query_lens.numel()=} versus {seq_lens_cpu.numel()=}."
         )
-    if bool(torch.any(query_lens <= 0)):
-        raise ValueError("Pseudo-decode does not support empty query rows.")
+    if bool(torch.any(query_lens < 0)):
+        raise ValueError("Pseudo-decode query indptr must be monotonic.")
+    active_requests = query_lens > 0
+    if not bool(torch.any(active_requests)):
+        raise ValueError("Pseudo-decode requires at least one active query row.")
+    active_request_ids = torch.arange(query_lens.numel(), dtype=torch.int64)[
+        active_requests
+    ]
+    active_query_lens = query_lens[active_requests]
 
     row_to_req = torch.repeat_interleave(
-        torch.arange(query_lens.numel(), dtype=torch.int64),
-        query_lens.to(torch.int64),
+        active_request_ids,
+        active_query_lens.to(torch.int64),
     )
     row_offsets = torch.cat(
         [
             torch.arange(1, int(query_len) + 1, dtype=seq_lens_cpu.dtype)
-            for query_len in query_lens
+            for query_len in active_query_lens
         ]
     )
-    query_lens_per_row = torch.repeat_interleave(query_lens, query_lens)
+    query_lens_per_row = torch.repeat_interleave(active_query_lens, active_query_lens)
     final_seq_lens_per_row = seq_lens_cpu[row_to_req]
     global_row_lens = final_seq_lens_per_row - query_lens_per_row + row_offsets
     local_row_lens = get_dcp_local_seq_lens(
@@ -261,6 +269,23 @@ def _dcp_pseudo_decode_rows(
         dcp_rank,
         dcp_kv_cache_interleave_size,
     )
+    if padded_num_rows is not None:
+        semantic_rows = row_to_req.numel()
+        if padded_num_rows < semantic_rows:
+            raise ValueError(
+                "Pseudo-decode physical row carrier is smaller than its "
+                f"semantic rows: {padded_num_rows=} {semantic_rows=}"
+            )
+        padding = padded_num_rows - semantic_rows
+        if padding:
+            # FULL CUDA graphs retain their physical carrier after a request
+            # finishes.  Route ignored padding queries through one valid KV
+            # row so capture/replay keeps the same pseudo-decode wrapper.
+            # Their outputs stay beyond qo_indptr's semantic tail.
+            row_to_req = torch.cat([row_to_req, row_to_req[:1].expand(padding)])
+            local_row_lens = torch.cat(
+                [local_row_lens, local_row_lens[:1].expand(padding)]
+            )
     return row_to_req, local_row_lens
 
 
@@ -293,9 +318,7 @@ def _dcp_causal_paged_custom_mask(
             f"{qo_indptr_cpu.numel()=} {seq_lens_cpu.numel()=}"
         )
     if dcp_world_size < 1 or not 0 <= dcp_rank < dcp_world_size:
-        raise ValueError(
-            f"Invalid DCP geometry: {dcp_world_size=} {dcp_rank=}"
-        )
+        raise ValueError(f"Invalid DCP geometry: {dcp_world_size=} {dcp_rank=}")
     if dcp_kv_cache_interleave_size < 1:
         raise ValueError("DCP KV cache interleave size must be positive")
 
@@ -332,9 +355,7 @@ def _dcp_causal_paged_custom_mask(
         )
         local_positions = torch.arange(local_seq_len, dtype=torch.int32)
         request_masks.append(
-            (local_positions.unsqueeze(0) < visible_local_lens.unsqueeze(1)).reshape(
-                -1
-            )
+            (local_positions.unsqueeze(0) < visible_local_lens.unsqueeze(1)).reshape(-1)
         )
     return torch.cat(request_masks), local_seq_lens
 
@@ -565,8 +586,10 @@ def _ag2_resolve_canonical_prefill_route(
             ).astype(np.bool_, copy=False)
             if bool(np.any(lifecycle)):
                 canonical_paged_start_req = int(np.argmax(lifecycle))
-                if not num_decodes <= canonical_paged_start_req < (
-                    num_decodes + num_prefills
+                if (
+                    not num_decodes
+                    <= canonical_paged_start_req
+                    < (num_decodes + num_prefills)
                 ):
                     raise RuntimeError(
                         "Actual prompt-prefill boundary is outside the resolved "
@@ -1675,9 +1698,7 @@ class BatchDCPPrefillWrapper:
             self._ag2_history_last_page_len_cpu = paged_kv_last_page_len_cpu.clone()
         if absolute_segmented:
             if self._use_cuda_graph:
-                raise RuntimeError(
-                    "Absolute-segment DCP prefill POC is PIECEWISE-only"
-                )
+                raise RuntimeError("Absolute-segment DCP prefill POC is PIECEWISE-only")
             if window_left != -1:
                 raise ValueError(
                     "Absolute-segment DCP prefill is not proven for sliding-window "
@@ -1685,8 +1706,7 @@ class BatchDCPPrefillWrapper:
                 )
             if global_seq_lens_cpu is None or num_prompt_tokens_cpu is None:
                 raise ValueError(
-                    "Absolute-segment DCP prefill requires sequence and prompt "
-                    "lengths"
+                    "Absolute-segment DCP prefill requires sequence and prompt lengths"
                 )
             if dcp_rank is None or dcp_kv_cache_interleave_size is None:
                 raise ValueError(
@@ -1732,12 +1752,9 @@ class BatchDCPPrefillWrapper:
                 segment_size=segment_size,
             )
 
-            canonical_page_offset = int(
-                paged_kv_indptr_cpu[canonical_paged_start_req]
-            )
+            canonical_page_offset = int(paged_kv_indptr_cpu[canonical_paged_start_req])
             canonical_request_page_indptr = (
-                paged_kv_indptr_cpu[canonical_paged_start_req:]
-                - canonical_page_offset
+                paged_kv_indptr_cpu[canonical_paged_start_req:] - canonical_page_offset
             )
             canonical_page_indices = paged_kv_indices[canonical_page_offset:]
             context_page_parts: list[torch.Tensor] = []
@@ -1756,12 +1773,8 @@ class BatchDCPPrefillWrapper:
                     )[0]
                 )
                 page_count = cdiv(local_len, page_size)
-                request_page_start = int(
-                    canonical_request_page_indptr[request_index]
-                )
-                request_page_end = int(
-                    canonical_request_page_indptr[request_index + 1]
-                )
+                request_page_start = int(canonical_request_page_indptr[request_index])
+                request_page_end = int(canonical_request_page_indptr[request_index + 1])
                 if page_count < 1 or request_page_start + page_count > request_page_end:
                     raise RuntimeError(
                         "Absolute-segment context exceeds the request page table: "
@@ -1865,9 +1878,7 @@ class BatchDCPPrefillWrapper:
                 return
 
             qo_indptr_cpu = qo_indptr_cpu[: canonical_paged_start_req + 1]
-            paged_kv_indptr_cpu = paged_kv_indptr_cpu[
-                : canonical_paged_start_req + 1
-            ]
+            paged_kv_indptr_cpu = paged_kv_indptr_cpu[: canonical_paged_start_req + 1]
             paged_kv_last_page_len_cpu = paged_kv_last_page_len_cpu[
                 :canonical_paged_start_req
             ]
@@ -1882,18 +1893,12 @@ class BatchDCPPrefillWrapper:
             self._ag2_request_tail_count = canonical_paged_start_req
             if self._ag2_history_qo_indptr_cpu is not None:
                 self._ag2_history_qo_indptr_cpu = qo_indptr_cpu.clone()
-                self._ag2_history_paged_kv_indptr_cpu = (
-                    paged_kv_indptr_cpu.clone()
-                )
-                self._ag2_history_last_page_len_cpu = (
-                    paged_kv_last_page_len_cpu.clone()
-                )
+                self._ag2_history_paged_kv_indptr_cpu = paged_kv_indptr_cpu.clone()
+                self._ag2_history_last_page_len_cpu = paged_kv_last_page_len_cpu.clone()
 
         if canonical_paged:
             if self._use_cuda_graph:
-                raise RuntimeError(
-                    "Canonical paged DCP prefill POC is PIECEWISE-only"
-                )
+                raise RuntimeError("Canonical paged DCP prefill POC is PIECEWISE-only")
             if global_seq_lens_cpu is None:
                 raise ValueError(
                     "Canonical paged DCP prefill requires global sequence lengths"
@@ -1922,8 +1927,7 @@ class BatchDCPPrefillWrapper:
                 paged_kv_indptr_cpu[canonical_paged_start_req].item()
             )
             canonical_paged_kv_indptr_cpu = (
-                paged_kv_indptr_cpu[canonical_paged_start_req:]
-                - canonical_page_offset
+                paged_kv_indptr_cpu[canonical_paged_start_req:] - canonical_page_offset
             )
             canonical_paged_kv_indices = paged_kv_indices[canonical_page_offset:]
             canonical_last_page_len_cpu = paged_kv_last_page_len_cpu[
@@ -1940,14 +1944,10 @@ class BatchDCPPrefillWrapper:
                 dcp_kv_cache_interleave_size,
             )
             expected_local_seq_lens = (
-                (
-                    canonical_paged_kv_indptr_cpu[1:]
-                    - canonical_paged_kv_indptr_cpu[:-1]
-                    - 1
-                )
-                * page_size
-                + canonical_last_page_len_cpu
-            )
+                canonical_paged_kv_indptr_cpu[1:]
+                - canonical_paged_kv_indptr_cpu[:-1]
+                - 1
+            ) * page_size + canonical_last_page_len_cpu
             if not torch.equal(
                 local_seq_lens.to(expected_local_seq_lens.dtype),
                 expected_local_seq_lens,
@@ -2004,9 +2004,7 @@ class BatchDCPPrefillWrapper:
                 qo_indptr=canonical_qo_indptr_cpu.to(metadata_device),
                 paged_kv_indptr=canonical_paged_kv_indptr_cpu.to(metadata_device),
                 paged_kv_indices=canonical_paged_kv_indices,
-                paged_kv_last_page_len=canonical_last_page_len_cpu.to(
-                    metadata_device
-                ),
+                paged_kv_last_page_len=canonical_last_page_len_cpu.to(metadata_device),
                 num_qo_heads=num_qo_heads * dcp_world_size,
                 num_kv_heads=num_kv_heads,
                 head_dim_qk=head_dim,
@@ -2034,9 +2032,7 @@ class BatchDCPPrefillWrapper:
             # query path. Rebind the local planning views so its metadata is
             # independent of the canonical suffix plan above.
             qo_indptr_cpu = qo_indptr_cpu[: canonical_paged_start_req + 1]
-            paged_kv_indptr_cpu = paged_kv_indptr_cpu[
-                : canonical_paged_start_req + 1
-            ]
+            paged_kv_indptr_cpu = paged_kv_indptr_cpu[: canonical_paged_start_req + 1]
             paged_kv_last_page_len_cpu = paged_kv_last_page_len_cpu[
                 :canonical_paged_start_req
             ]
@@ -2051,12 +2047,8 @@ class BatchDCPPrefillWrapper:
             self._ag2_request_tail_count = canonical_paged_start_req
             if self._ag2_history_qo_indptr_cpu is not None:
                 self._ag2_history_qo_indptr_cpu = qo_indptr_cpu.clone()
-                self._ag2_history_paged_kv_indptr_cpu = (
-                    paged_kv_indptr_cpu.clone()
-                )
-                self._ag2_history_last_page_len_cpu = (
-                    paged_kv_last_page_len_cpu.clone()
-                )
+                self._ag2_history_paged_kv_indptr_cpu = paged_kv_indptr_cpu.clone()
+                self._ag2_history_last_page_len_cpu = paged_kv_last_page_len_cpu.clone()
 
         self._context.plan(
             qo_indptr=qo_indptr_cpu,
@@ -2215,11 +2207,9 @@ class BatchDCPPrefillWrapper:
                     raise ValueError(
                         "DCP full-KV attention requires local KV head indices."
                     )
-                local_kv_head_indices_tensor = (
-                    self._get_local_kv_head_index_tensor(
-                        local_kv_head_indices,
-                        current_key.device,
-                    )
+                local_kv_head_indices_tensor = self._get_local_kv_head_index_tensor(
+                    local_kv_head_indices,
+                    current_key.device,
                 )
                 current_key = torch.index_select(
                     current_key,
@@ -2287,14 +2277,10 @@ class BatchDCPPrefillWrapper:
                 )
                 merged_output = torch.empty_like(context_output)
                 context_lse = context_lse.transpose(0, 1).contiguous()
-                selected_current_lse = (
-                    selected_current_lse.transpose(0, 1).contiguous()
-                )
+                selected_current_lse = selected_current_lse.transpose(0, 1).contiguous()
                 if self._convert_log2_lse_for_merge:
                     context_lse = context_lse * 0.6931471805599453
-                    selected_current_lse = (
-                        selected_current_lse * 0.6931471805599453
-                    )
+                    selected_current_lse = selected_current_lse * 0.6931471805599453
                 merge_attn_states(
                     merged_output,
                     context_output,
@@ -2518,6 +2504,13 @@ class BatchDCPPseudoPrefillWrapper:
         self,
         workspace_buffer: torch.Tensor | None = None,
         dcp_a2a: bool = False,
+        *,
+        use_cuda_graph: bool = False,
+        qo_indptr_buffer: torch.Tensor | None = None,
+        paged_kv_indptr_buffer: torch.Tensor | None = None,
+        paged_kv_indices_buffer: torch.Tensor | None = None,
+        paged_kv_last_page_len_buffer: torch.Tensor | None = None,
+        int_workspace_buffer: torch.Tensor | None = None,
     ):
         if dcp_a2a:
             self._dcp_combine = partial(dcp_a2a_lse_reduce, is_lse_base_on_e=False)
@@ -2526,6 +2519,26 @@ class BatchDCPPseudoPrefillWrapper:
         self._paged = BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer,
             get_kv_cache_layout(),
+            use_cuda_graph=use_cuda_graph,
+            qo_indptr_buf=qo_indptr_buffer,
+            paged_kv_indptr_buf=paged_kv_indptr_buffer,
+            paged_kv_indices_buf=paged_kv_indices_buffer,
+            paged_kv_last_page_len_buf=paged_kv_last_page_len_buffer,
+        )
+        if use_cuda_graph:
+            if int_workspace_buffer is None:
+                raise ValueError(
+                    "DCP pseudo-prefill CUDA graph mode requires a persistent "
+                    "integer workspace"
+                )
+            self._paged.reset_workspace_buffer(workspace_buffer, int_workspace_buffer)
+        self._use_cuda_graph = use_cuda_graph
+        self._disable_split_kv_for_cuda_graph = (
+            use_cuda_graph
+            and os.environ.get("AG2_VLLM_FLASHINFER_DCP_PREFILL_NO_SPLIT", "0") == "1"
+        )
+        self._graph_rows = (
+            int(qo_indptr_buffer.numel() - 1) if qo_indptr_buffer is not None else None
         )
         self._ag2_window_left = -1
         self._ag2_logits_soft_cap = 0.0
@@ -2551,6 +2564,12 @@ class BatchDCPPseudoPrefillWrapper:
         prefill_fixed_split_size: int,
         disable_split_kv: bool,
     ) -> None:
+        rows = int(qo_indptr_cpu.numel() - 1)
+        if self._graph_rows is not None and rows != self._graph_rows:
+            raise ValueError(
+                "DCP pseudo-prefill graph row count changed: "
+                f"captured={self._graph_rows} planned={rows}"
+            )
         self._ag2_plan_ready = False
         self._paged.plan(
             qo_indptr=qo_indptr_cpu,
@@ -2570,12 +2589,18 @@ class BatchDCPPseudoPrefillWrapper:
             q_data_type=q_data_type,
             kv_data_type=kv_cache_dtype,
             fixed_split_size=prefill_fixed_split_size,
-            disable_split_kv=disable_split_kv,
+            disable_split_kv=(
+                disable_split_kv or self._disable_split_kv_for_cuda_graph
+            ),
         )
         self._ag2_window_left = window_left
         self._ag2_logits_soft_cap = logits_soft_cap or 0.0
         self._ag2_sm_scale = sm_scale
         self._ag2_plan_ready = True
+
+    def graph_state_signature(self) -> tuple[object, ...]:
+        """Expose stable wrapper ownership for lifecycle controls."""
+        return (self._use_cuda_graph, self._graph_rows, id(self._paged))
 
     def assert_plan_contract(
         self,
@@ -3179,6 +3204,25 @@ class FlashInferMetadata:
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None
 
 
+def _semantic_attention_token_counts(
+    physical_tokens: int,
+    qo_indptr_cpu: torch.Tensor,
+    num_decodes: int,
+) -> tuple[int, int, int]:
+    """Resolve semantic query rows inside a padded physical graph carrier."""
+    if qo_indptr_cpu.ndim != 1 or qo_indptr_cpu.numel() < num_decodes + 1:
+        raise ValueError("attention query indptr cannot resolve decode boundary")
+    semantic_decode = int(qo_indptr_cpu[num_decodes])
+    semantic_total = int(qo_indptr_cpu[-1])
+    if not 0 <= semantic_decode <= semantic_total <= physical_tokens:
+        raise ValueError(
+            "attention query rows exceed the physical graph carrier: "
+            f"decode={semantic_decode} total={semantic_total} "
+            f"physical={physical_tokens}"
+        )
+    return semantic_total, semantic_decode, semantic_total - semantic_decode
+
+
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     kv_cache_spec: AttentionSpec
     reorder_batch_threshold: int = 1
@@ -3202,7 +3246,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             os.environ.get("AG2_VLLM_FLASHINFER_DCP_PREFILL_CUDAGRAPH", "0") == "1"
         )
         self._dcp_prefill_wrappers_cudagraph: dict[int, BatchDCPPrefillWrapper] = {}
-        self._dcp_prefill_captured_wrappers: dict[int, BatchDCPPrefillWrapper] = {}
+        self._dcp_pseudo_prefill_wrappers_cudagraph: dict[
+            int, BatchDCPPseudoPrefillWrapper
+        ] = {}
+        self._dcp_prefill_captured_wrappers: dict[
+            int, BatchDCPPrefillWrapper | BatchDCPPseudoPrefillWrapper
+        ] = {}
         self._dcp_prefill_qo_indptr_buffer: torch.Tensor | None = None
         self._dcp_prefill_context_int_workspace: torch.Tensor | None = None
         self._dcp_prefill_new_tokens_int_workspace: torch.Tensor | None = None
@@ -3347,19 +3396,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self._dcp_absolute_segment_prefill = (
             os.environ.get("AG2_VLLM_DCP_ABSOLUTE_SEGMENT_PREFILL", "0") == "1"
         )
-        if (
-            self._dcp_canonical_paged_prefill
-            and self._dcp_absolute_segment_prefill
-        ):
+        if self._dcp_canonical_paged_prefill and self._dcp_absolute_segment_prefill:
             raise ValueError(
                 "Dense canonical paged and absolute-segment DCP prefill POCs "
                 "are mutually exclusive"
             )
         if self._dcp_canonical_paged_prefill:
             if not self.use_dcp:
-                raise ValueError(
-                    "AG2_VLLM_DCP_CANONICAL_PAGED_PREFILL requires DCP"
-                )
+                raise ValueError("AG2_VLLM_DCP_CANONICAL_PAGED_PREFILL requires DCP")
             logger.warning_once(
                 "Research-only bounded canonical paged DCP prompt-prefill is "
                 "enabled. Actual causal prompt prefills with no cascade will "
@@ -3369,9 +3413,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             )
         if self._dcp_absolute_segment_prefill:
             if not self.use_dcp:
-                raise ValueError(
-                    "AG2_VLLM_DCP_ABSOLUTE_SEGMENT_PREFILL requires DCP"
-                )
+                raise ValueError("AG2_VLLM_DCP_ABSOLUTE_SEGMENT_PREFILL requires DCP")
             logger.warning_once(
                 "Research-only absolute-segment DCP prompt-prefill is enabled. "
                 "Actual prompt rows use stable paged-history + ragged-current "
@@ -3388,7 +3430,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     "CUDA graph mode."
                 )
             self._dcp_prefill_qo_indptr_buffer = torch.empty(
-                max_num_reqs + 1,
+                max(max_num_reqs, self.max_num_batched_tokens) + 1,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -3977,18 +4019,45 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             for_cudagraph_capture=True,
         )
 
-    def _get_dcp_pseudo_prefill_wrapper(self) -> BatchDCPPseudoPrefillWrapper:
-        if self._dcp_pseudo_prefill_wrapper is None:
-            self._dcp_pseudo_prefill_wrapper = BatchDCPPseudoPrefillWrapper(
+    def _get_dcp_pseudo_prefill_wrapper(
+        self,
+        cudagraph_batch_size: int | None = None,
+    ) -> BatchDCPPseudoPrefillWrapper:
+        if cudagraph_batch_size is None:
+            if self._dcp_pseudo_prefill_wrapper is None:
+                self._dcp_pseudo_prefill_wrapper = BatchDCPPseudoPrefillWrapper(
+                    workspace_buffer=self._get_workspace_buffer(),
+                    dcp_a2a=self.dcp_a2a,
+                )
+            return self._dcp_pseudo_prefill_wrapper
+
+        wrapper = self._dcp_pseudo_prefill_wrappers_cudagraph.get(cudagraph_batch_size)
+        if wrapper is None:
+            qo_indptr = self._dcp_prefill_qo_indptr_buffer
+            int_workspace = self._dcp_prefill_context_int_workspace
+            assert qo_indptr is not None
+            assert int_workspace is not None
+            wrapper = BatchDCPPseudoPrefillWrapper(
                 workspace_buffer=self._get_workspace_buffer(),
                 dcp_a2a=self.dcp_a2a,
+                use_cuda_graph=True,
+                qo_indptr_buffer=qo_indptr[: cudagraph_batch_size + 1],
+                paged_kv_indptr_buffer=self.paged_kv_indptr.gpu[
+                    : cudagraph_batch_size + 1
+                ],
+                paged_kv_indices_buffer=self.paged_kv_indices.gpu,
+                paged_kv_last_page_len_buffer=self.paged_kv_last_page_len.gpu[
+                    :cudagraph_batch_size
+                ],
+                int_workspace_buffer=int_workspace,
             )
-        return self._dcp_pseudo_prefill_wrapper
+            self._dcp_pseudo_prefill_wrappers_cudagraph[cudagraph_batch_size] = wrapper
+        return wrapper
 
     def _verify_dcp_prefill_cudagraph_wrapper_identity(
         self,
         batch_size: int,
-        wrapper: BatchDCPPrefillWrapper,
+        wrapper: BatchDCPPrefillWrapper | BatchDCPPseudoPrefillWrapper,
         *,
         for_cudagraph_capture: bool,
     ) -> None:
@@ -4015,6 +4084,19 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 "DCP prefill CUDA graph capture/replay wrapper mismatch for "
                 f"batch_size={batch_size}"
             )
+
+    def _select_captured_dcp_prefill_cudagraph_batch_size(
+        self,
+        batch_size: int | None,
+        *,
+        for_cudagraph_capture: bool,
+    ) -> int | None:
+        """Use graph storage only for a shape captured by this builder."""
+        if batch_size is None or for_cudagraph_capture:
+            return batch_size
+        if batch_size not in self._dcp_prefill_captured_wrappers:
+            return None
+        return batch_size
 
     def _get_dcp_batched_decode_wrapper(
         self,
@@ -4111,20 +4193,31 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             common_attn_metadata.query_start_loc_cpu[1:]
             - common_attn_metadata.query_start_loc_cpu[:-1]
         )
-        if query_lens.numel() == 0 or bool(
-            torch.any(query_lens != self._dcp_pseudo_decode_query_len)
+        if query_lens.numel() == 0 or bool(torch.any(query_lens < 0)):
+            return False
+        active_rows = query_lens != 0
+        if not bool(torch.any(active_rows)) or bool(
+            torch.any(query_lens[active_rows] != self._dcp_pseudo_decode_query_len)
         ):
             return False
-        if int(query_lens.sum()) != common_attn_metadata.num_actual_tokens:
+        # An unpadded call has one fixed-width span per request.  A FULL graph
+        # tail keeps that same physical carrier while one or more spans become
+        # zero; both must retain the captured pseudo-decode dispatch family.
+        if (
+            common_attn_metadata.num_actual_tokens
+            != query_lens.numel() * self._dcp_pseudo_decode_query_len
+        ):
             return False
 
         is_prefilling = common_attn_metadata.is_prefilling
         if is_prefilling is None:
             return False
         if isinstance(is_prefilling, torch.Tensor):
-            if bool(torch.any(is_prefilling[: query_lens.numel()]).item()):
+            if bool(torch.any(is_prefilling[: query_lens.numel()][active_rows]).item()):
                 return False
-        elif bool(np.any(np.asarray(is_prefilling)[: query_lens.numel()])):
+        elif bool(
+            np.any(np.asarray(is_prefilling)[: query_lens.numel()][active_rows.numpy()])
+        ):
             return False
 
         return True
@@ -4172,6 +4265,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         seq_lens_cpu: torch.Tensor,
         qo_indptr_cpu: torch.Tensor,
         block_table_tensor: torch.Tensor,
+        *,
+        padded_num_rows: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         row_to_req_cpu, local_row_lens_cpu = _dcp_pseudo_decode_rows(
             seq_lens_cpu,
@@ -4179,6 +4274,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.dcp_world_size,
             self.dcp_rank,
             self.dcp_kv_cache_interleave_size,
+            padded_num_rows,
         )
         if self._dcp_sequential_decode_enabled:
             num_rows = row_to_req_cpu.numel()
@@ -4375,6 +4471,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 original_seq_lens_cpu,
                 qo_indptr_cpu,
                 block_table_tensor,
+                padded_num_rows=num_actual_tokens,
             )
             qo_indptr_cpu = torch.arange(
                 num_actual_tokens + 1,
@@ -4382,14 +4479,45 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 device="cpu",
             )
 
+        # A captured DCP qlen>1 prefill graph can retain its physical carrier
+        # after one or more requests finish.  Only that dispatch consumes the
+        # ragged qo_indptr as the authoritative query-row count.  Native decode
+        # deliberately keeps its padded physical token count (for example,
+        # eleven live qlen1 requests replaying an M12 graph), so applying this
+        # conversion globally corrupts its request/token split.
+        semantic_prefill_graph = (
+            self._dcp_prefill_cudagraph_batch_size(
+                common_attn_metadata,
+                num_decodes,
+                num_prefills,
+                for_cudagraph_capture=for_cudagraph_capture,
+            )
+            is not None
+        )
+        if semantic_prefill_graph:
+            (
+                attention_num_actual_tokens,
+                attention_num_decode_tokens,
+                attention_num_prefill_tokens,
+            ) = _semantic_attention_token_counts(
+                num_actual_tokens,
+                qo_indptr_cpu,
+                num_decodes,
+            )
+            num_decode_tokens = attention_num_decode_tokens
+            num_prefill_tokens = attention_num_prefill_tokens
+        else:
+            attention_num_actual_tokens = num_actual_tokens
+
         # Step 1: Decide which dispatch modes to use:
         # - Cascade attention (distinct mode)
         # - Prefill (FI native or TRTLLM)
         # - Decode (FI native, XQA, or trtllm-gen)
         if (
-            self._dcp_canonical_paged_prefill
-            or self._dcp_absolute_segment_prefill
-        ) and causal and self.use_dcp:
+            (self._dcp_canonical_paged_prefill or self._dcp_absolute_segment_prefill)
+            and causal
+            and self.use_dcp
+        ):
             is_prefilling = common_attn_metadata.is_prefilling
             has_actual_prefill = False
             if is_prefilling is not None:
@@ -4484,7 +4612,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # Leave prefill/decode/cascade_wrapper empty, to be populated
         # case by case depending on the batch contents and backend selection.
         attn_metadata = FlashInferMetadata(
-            num_actual_tokens=num_actual_tokens,
+            num_actual_tokens=attention_num_actual_tokens,
             slot_mapping=common_attn_metadata.slot_mapping,
             q_data_type_prefill=self.q_data_type_prefill,
             q_data_type_decode=self.q_data_type_decode,
@@ -4668,6 +4796,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         for_cudagraph_capture=for_cudagraph_capture,
                     )
                 )
+                dcp_prefill_cudagraph_batch_size = (
+                    self._select_captured_dcp_prefill_cudagraph_batch_size(
+                        dcp_prefill_cudagraph_batch_size,
+                        for_cudagraph_capture=for_cudagraph_capture,
+                    )
+                )
                 prefill_wrapper = (
                     (
                         self._get_dcp_batched_decode_wrapper()
@@ -4675,7 +4809,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         else (
                             self._get_dcp_sequential_decode_wrapper()
                             if self._dcp_sequential_decode_enabled
-                            else self._get_dcp_pseudo_prefill_wrapper()
+                            else self._get_dcp_pseudo_prefill_wrapper(
+                                dcp_prefill_cudagraph_batch_size
+                            )
                         )
                     )
                     if use_dcp_pseudo_decode
@@ -4685,7 +4821,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     )
                 )
                 if dcp_prefill_cudagraph_batch_size is not None:
-                    assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
+                    assert isinstance(
+                        prefill_wrapper,
+                        BatchDCPPrefillWrapper | BatchDCPPseudoPrefillWrapper,
+                    )
                     self._verify_dcp_prefill_cudagraph_wrapper_identity(
                         dcp_prefill_cudagraph_batch_size,
                         prefill_wrapper,
@@ -4727,9 +4866,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         disable_split_kv=self.prefill_disable_split_kv,
                         **(
                             {
-                                "canonical_paged": (
-                                    self._dcp_canonical_paged_prefill
-                                ),
+                                "canonical_paged": (self._dcp_canonical_paged_prefill),
                                 "absolute_segmented": (
                                     self._dcp_absolute_segment_prefill
                                 ),

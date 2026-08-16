@@ -7,6 +7,7 @@ from typing import Literal
 
 import torch
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
@@ -22,6 +23,25 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
+
+
+def _gdn_decode_cudagraph_capacity(
+    max_num_seqs: int,
+    num_spec: int,
+    max_capture_size: int | None,
+    owner_full_query_len: bool,
+) -> int:
+    """Return token capacity for the admitted FULL decode family.
+
+    The generic capture ceiling is token-shaped.  The owner path declares one
+    additional FULL boundary at ``max_num_seqs * (num_spec + 1)``; accepting
+    that descriptor requires the GDN metadata buffers to use the same bound.
+    This only grows capacity and does not create any additional graph shape.
+    """
+    full_decode_tokens = max_num_seqs * (num_spec + 1)
+    if owner_full_query_len or max_capture_size is None:
+        return full_decode_tokens
+    return min(full_decode_tokens, max_capture_size)
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -130,14 +150,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         )
 
-        self.decode_cudagraph_max_bs: int = (
-            self.vllm_config.scheduler_config.max_num_seqs * (self.num_spec + 1)
+        self.decode_cudagraph_max_bs = _gdn_decode_cudagraph_capacity(
+            self.vllm_config.scheduler_config.max_num_seqs,
+            self.num_spec,
+            self.compilation_config.max_cudagraph_capture_size,
+            envs.AG2_VLLM_TP3_OWNER_PREQUANT,
         )
-        if self.compilation_config.max_cudagraph_capture_size is not None:
-            self.decode_cudagraph_max_bs = min(
-                self.decode_cudagraph_max_bs,
-                self.compilation_config.max_cudagraph_capture_size,
-            )
 
         self.spec_state_indices_tensor: torch.Tensor = torch.empty(
             (self.decode_cudagraph_max_bs, self.num_spec + 1),

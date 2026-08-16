@@ -89,6 +89,8 @@ from .qwen3_next import (
     QwenNextMixtureOfExperts,
     _ag2_internal_trace_layer_enabled,
     _ag2_selected_stages,
+    _ag2_tp3_owner_prequant_enabled,
+    _ag2_tp3_mtp_block5_enabled,
     _is_shared_expert_fse_compatible,
 )
 from .qwen3_vl import (
@@ -182,8 +184,8 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         self._ag2_aux_sequence_boundary_enabled = (
             self.layer_idx in sequence_boundary_layers
         )
-        self._ag2_aux_all_internal_boundaries = (
-            _ag2_internal_trace_layer_enabled(self.layer_idx)
+        self._ag2_aux_all_internal_boundaries = _ag2_internal_trace_layer_enabled(
+            self.layer_idx
         )
         self._ag2_aux_compact_gdn_stages = _ag2_selected_stages(
             "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_GDN_STAGES",
@@ -242,6 +244,15 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             and parallel_config.pipeline_parallel_size == 1
             and is_moe_layer
         )
+        self._ag2_tp3_owner_prequant = _ag2_tp3_owner_prequant_enabled(
+            vllm_config,
+            prefix,
+            is_moe_layer=is_moe_layer,
+        )
+        self._ag2_tp3_mtp_block5 = _ag2_tp3_mtp_block5_enabled(vllm_config, prefix)
+        reduce_results = not (
+            self.use_attn_reduce_scatter_for_moe or self._ag2_tp3_owner_prequant
+        )
 
         if self.layer_type == "linear_attention":
             self.linear_attn = QwenGatedDeltaNetAttention(
@@ -249,7 +260,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
-                reduce_results=not self.use_attn_reduce_scatter_for_moe,
+                reduce_results=reduce_results,
             )
             if self._ag2_aux_all_internal_boundaries:
                 self.linear_attn.ag2_enable_compact_trace()
@@ -260,7 +271,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
-                reduce_results=not self.use_attn_reduce_scatter_for_moe,
+                reduce_results=reduce_results,
             )
         else:
             raise ValueError(f"Invalid layer_type {self.layer_type}")
@@ -278,6 +289,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                reduce_results=not self._ag2_tp3_owner_prequant,
                 prefix=f"{prefix}.mlp",
             )
         else:
@@ -330,15 +342,10 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             bool(os.environ.get("AG2_VLLM_LAYER0_TRACE_OUTPUT"))
             and self.layer_idx == trace_layer
         )
-        self._ag2_aux_attention_boundary_enabled = (
-            os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_ATTENTION_BOUNDARY", "0")
-            == "1"
-            and self.layer_idx
-            == int(
-                os.environ.get(
-                    "AG2_VLLM_AUX_HIDDEN_TRACE_ATTENTION_BOUNDARY_LAYER", "0"
-                )
-            )
+        self._ag2_aux_attention_boundary_enabled = os.environ.get(
+            "AG2_VLLM_AUX_HIDDEN_TRACE_FIRST_ATTENTION_BOUNDARY", "0"
+        ) == "1" and self.layer_idx == int(
+            os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_ATTENTION_BOUNDARY_LAYER", "0")
         )
         self._ag2_aux_gdn_boundaries_enabled = (
             self.layer_type == "linear_attention"
@@ -360,8 +367,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             )
         )
         self._ag2_aux_gdn_replay_enabled = (
-            os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_GDN_REPLAY_ONLY", "0")
-            == "1"
+            os.environ.get("AG2_VLLM_AUX_HIDDEN_TRACE_GDN_REPLAY_ONLY", "0") == "1"
             and self.layer_idx
             == int(
                 os.environ.get(
@@ -447,6 +453,11 @@ class Qwen3_5Model(Qwen3NextModel):
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
+        )
+        self._ag2_tp3_owner_prequant = any(
+            getattr(layer, "_ag2_tp3_owner_prequant", False)
+            for layer in self.layers
+            if not isinstance(layer, PPMissingLayer)
         )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
@@ -545,6 +556,10 @@ class Qwen3_5ForCausalLMBase(
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def process_weights_after_loading(self) -> None:
+        if self.model._ag2_tp3_owner_prequant:
+            self.model._ag2_validate_tp3_owner_prequant_weights()
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = layers
@@ -672,6 +687,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, int]:
         return self.language_model.compute_local_logits(hidden_states)
+
+    def process_weights_after_loading(self) -> None:
+        self.language_model.process_weights_after_loading()
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
         # protocols have not __init__ method, so we need to use nn.Module.__init__
@@ -885,9 +903,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             stages: dict[str, torch.Tensor] = {}
             layer_types: dict[str, str] = {}
             for layer_index, layer in enumerate(layers):
-                if not torch.equal(
-                    layer._ag2_projection_capture_rows, reference_rows
-                ):
+                if not torch.equal(layer._ag2_projection_capture_rows, reference_rows):
                     raise RuntimeError(
                         f"projection calibration row identity split at layer {layer_index}"
                     )

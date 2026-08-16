@@ -8,11 +8,15 @@ from typing import Any
 import torch
 
 import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.mem_utils import get_max_shared_memory_bytes
 from vllm.utils.platform_utils import num_compute_units
-from vllm.utils.torch_utils import is_torch_equal_or_newer
+from vllm.utils.torch_utils import direct_register_custom_op, is_torch_equal_or_newer
+
+logger = init_logger(__name__)
+_mtp_fc_schedule_markers: set[tuple[int, int]] = set()
 
 
 @torch.compiler.assume_constant_result
@@ -136,7 +140,11 @@ def matmul_kernel_persistent(
 
 
 def matmul_persistent(
-    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    mtp_fc_small_m: bool = False,
 ):
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
@@ -187,6 +195,35 @@ def matmul_persistent(
             "num_warps": 8,
         },
     }
+    config = configs[dtype]
+    if mtp_fc_small_m and dtype == torch.bfloat16 and M <= 128:
+        # MTP FC is a very wide 10240x1728 BF16 projection.  Its default
+        # 128x128 tile exposes only fourteen programs at small M on a 36-SM
+        # GPU.  Smaller M tiles and 64-wide N tiles preserve the identical K
+        # reduction tree while filling the device.  Keep the generic kernel
+        # and large-M path unchanged.
+        if M <= 4:
+            block_m = 16
+        elif M <= 32:
+            block_m = 32
+        elif M <= 64:
+            block_m = 64
+        else:
+            block_m = 128
+        config = {
+            **config,
+            "BLOCK_SIZE_M": block_m,
+            "BLOCK_SIZE_N": 64,
+        }
+        marker = (block_m, 64)
+        if marker not in _mtp_fc_schedule_markers:
+            _mtp_fc_schedule_markers.add(marker)
+            logger.warning(
+                "MTP FC concrete-shape schedule active: M=%d BM=%d BN=64",
+                M,
+                block_m,
+            )
+
     matmul_kernel_persistent[grid](
         a,
         b,
@@ -206,7 +243,7 @@ def matmul_persistent(
         B_LARGE=b.numel() > 2**31,
         C_LARGE=c.numel() > 2**31,
         HAS_BIAS=bias is not None,
-        **configs[dtype],
+        **config,
     )
     return c
 
@@ -898,6 +935,47 @@ def linear_batch_invariant(input, weight, bias=None):
     if bias is not None:
         output = output + bias
     return output
+
+
+def _linear_mtp_fc_batch_invariant_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Execute after Dynamo so concrete M selects the CUDA Graph schedule."""
+    if input.ndim != 2 or weight.ndim != 2:
+        raise ValueError("MTP FC batch-invariant linear requires 2D tensors")
+    output = matmul_persistent(input, weight.t(), mtp_fc_small_m=True)
+    if bias is not None:
+        output = output + bias
+    return output
+
+
+def _linear_mtp_fc_batch_invariant_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    del bias
+    return torch.empty(
+        (input.shape[0], weight.shape[0]), dtype=input.dtype, device=input.device
+    )
+
+
+direct_register_custom_op(
+    "mtp_fc_batch_invariant",
+    _linear_mtp_fc_batch_invariant_impl,
+    fake_impl=_linear_mtp_fc_batch_invariant_fake,
+)
+
+
+def linear_mtp_fc_batch_invariant(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Row-invariant MTP FC with concrete-shape CUDA Graph dispatch."""
+    return torch.ops.vllm.mtp_fc_batch_invariant(input, weight, bias)
 
 
 _batch_invariant_MODE = False

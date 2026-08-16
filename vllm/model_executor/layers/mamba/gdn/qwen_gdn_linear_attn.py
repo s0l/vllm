@@ -22,6 +22,9 @@ from vllm.distributed import (
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
+from vllm.model_executor.layers.fusion.quant_activation import (
+    GDNQuantizedActivations,
+)
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -1343,7 +1346,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | GDNQuantizedActivations,
     ) -> torch.Tensor:
         return self._forward_method(hidden_states)
 
@@ -1447,7 +1450,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
     def forward_cuda(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | GDNQuantizedActivations,
     ) -> torch.Tensor:
         """
         Forward pass with three parts:
@@ -1455,12 +1458,27 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         2. Core attention (custom op)
         3. Output projection
         """
-        num_tokens = hidden_states.size(0)
+        if isinstance(hidden_states, GDNQuantizedActivations):
+            qkvz_input = hidden_states.qkvz
+            ba_input = hidden_states.ba
+            if len(qkvz_input.orig_shape) != 2 or (
+                ba_input.orig_shape != qkvz_input.orig_shape
+            ):
+                raise RuntimeError("owner-prequant GDN requires matching 2D inputs")
+            num_tokens = qkvz_input.orig_shape[0]
+            input_dtype = qkvz_input.orig_dtype
+            input_device = qkvz_input.data.device
+        else:
+            qkvz_input = hidden_states
+            ba_input = hidden_states
+            num_tokens = hidden_states.size(0)
+            input_dtype = hidden_states.dtype
+            input_device = hidden_states.device
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        ba, _ = self.in_proj_ba(hidden_states)
+        mixed_qkvz, _ = self.in_proj_qkvz(qkvz_input)
+        ba, _ = self.in_proj_ba(ba_input)
         if self._ag2_aux_boundaries_enabled:
             self._ag2_aux_qkvz = mixed_qkvz
             self._ag2_aux_ba = ba
@@ -1502,8 +1520,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # see discussions in https://github.com/vllm-project/vllm/pull/28182
         core_attn_out = torch.zeros(
             (num_tokens, self.local_num_v_heads, self.head_v_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+            dtype=input_dtype,
+            device=input_device,
         )
         replay_float_out = None
         replay_state_out = None

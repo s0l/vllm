@@ -10,7 +10,10 @@ from vllm.platforms import current_platform
 if not current_platform.is_cuda():
     pytest.skip("FlashInfer backend requires CUDA.", allow_module_level=True)
 
-from vllm.v1.attention.backends.flashinfer import FlashInferMetadataBuilder
+from vllm.v1.attention.backends.flashinfer import (
+    FlashInferMetadataBuilder,
+    _semantic_attention_token_counts,
+)
 
 
 def _builder(*, enabled: bool = True) -> FlashInferMetadataBuilder:
@@ -131,6 +134,30 @@ def test_dcp_prefill_cudagraph_capture_and_runtime_wrapper_identity():
         )
 
 
+def test_dcp_prefill_cudagraph_uses_only_captured_runtime_shapes():
+    builder = _builder()
+    builder._dcp_prefill_captured_wrappers = {64: object()}
+
+    assert (
+        builder._select_captured_dcp_prefill_cudagraph_batch_size(
+            64, for_cudagraph_capture=False
+        )
+        == 64
+    )
+    assert (
+        builder._select_captured_dcp_prefill_cudagraph_batch_size(
+            92, for_cudagraph_capture=False
+        )
+        is None
+    )
+    assert (
+        builder._select_captured_dcp_prefill_cudagraph_batch_size(
+            92, for_cudagraph_capture=True
+        )
+        == 92
+    )
+
+
 @pytest.mark.parametrize(
     ("metadata", "num_decodes"),
     [
@@ -190,6 +217,51 @@ def test_dcp_prefill_cudagraph_is_default_off():
             metadata,
             num_decodes=0,
             num_prefills=1,
+        )
+        is None
+    )
+
+
+def test_padded_full_graph_uses_semantic_attention_rows():
+    assert _semantic_attention_token_counts(
+        92,
+        torch.tensor([*range(0, 89, 4), 88], dtype=torch.int32),
+        0,
+    ) == (88, 0, 88)
+
+
+def test_mixed_padded_graph_preserves_decode_prefill_boundary():
+    assert _semantic_attention_token_counts(
+        16,
+        torch.tensor([0, 1, 2, 6, 10], dtype=torch.int32),
+        2,
+    ) == (10, 2, 8)
+
+
+def test_semantic_attention_rows_cannot_exceed_physical_carrier():
+    with pytest.raises(ValueError, match="exceed the physical graph carrier"):
+        _semantic_attention_token_counts(
+            8,
+            torch.tensor([0, 4, 12], dtype=torch.int32),
+            0,
+        )
+
+
+def test_native_decode_tail_is_not_a_semantic_prefill_graph():
+    metadata = _metadata(
+        list(range(12)),
+        is_prefilling=[False] * 11,
+        draft_counts=[0] * 11,
+    )
+
+    # Eleven live qlen1 rows may be carried by an M12 outer graph.  The
+    # FlashInfer native-decode dispatch must preserve the physical M12 token
+    # count; the semantic-row conversion belongs only to the DCP prefill lane.
+    assert (
+        _builder()._dcp_prefill_cudagraph_batch_size(
+            metadata,
+            num_decodes=12,
+            num_prefills=0,
         )
         is None
     )
