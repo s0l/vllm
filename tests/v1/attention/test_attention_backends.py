@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for v1 attention backends without GPUModelRunner dependency."""
 
+import ast
 from functools import partial
+import inspect
 
 import pytest
 import torch
@@ -74,6 +76,37 @@ def _convert_dtype_to_torch(dtype):
         return dtype
     else:
         raise ValueError(f"Unknown dtype: {dtype}")
+
+
+def test_flashinfer_dcp_paged_metadata_uses_local_context_lengths():
+    from vllm.v1.attention.backends.flashinfer import (
+        _flashinfer_seq_lens_and_blocks_for_paged_kv,
+    )
+
+    # Long chunked prefill shape from the TP3/DCP experiment:
+    # 96K cached context plus a 16K scheduled chunk. FlashInfer's paged
+    # context run must see only the DCP-local portion of the cached context;
+    # the scheduled query chunk is handled by the ragged new-token run.
+    seq_lens_cpu = torch.tensor([96_672 + 16_112], dtype=torch.int32)
+    qo_indptr_cpu = torch.tensor([0, 16_112], dtype=torch.int32)
+
+    local_seq_lens, seq_lens_np, num_blocks_np = (
+        _flashinfer_seq_lens_and_blocks_for_paged_kv(
+            seq_lens_cpu,
+            qo_indptr_cpu,
+            num_decodes=0,
+            num_prefills=1,
+            page_size=16,
+            use_dcp=True,
+            dcp_world_size=3,
+            dcp_rank=2,
+            dcp_kv_cache_interleave_size=1,
+        )
+    )
+
+    assert local_seq_lens.tolist() == [32_224]
+    assert seq_lens_np.tolist() == [32_224]
+    assert num_blocks_np.tolist() == [2_014]
 
 
 # Define common batch configurations
@@ -721,7 +754,30 @@ def test_causal_backend_correctness(
     AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
     reason="FlashInfer is not available.",
 )
-def test_flashinfer_xqa_bmm1_scale_matches_decode_q_dtype():
+@pytest.mark.parametrize(
+    ("query_dtype", "expected"),
+    [
+        (torch.bfloat16, None),
+        (torch.float16, None),
+        (torch.float32, None),
+        (current_platform.fp8_dtype(), 2.0),
+        (torch.float8_e5m2, 2.0),
+    ],
+)
+def test_flashinfer_query_scale_matches_query_dtype(query_dtype, expected):
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    assert (
+        flashinfer_backend.get_query_scale_for_flashinfer(2.0, query_dtype)
+        == expected
+    )
+
+
+@pytest.mark.skipif(
+    AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
+    reason="FlashInfer is not available.",
+)
+def test_flashinfer_xqa_bmm1_scale_matches_query_dtype():
     """XQA decode should only apply q_scale when decode Q is FP8."""
     from vllm.v1.attention.backends import flashinfer as flashinfer_backend
 
@@ -734,7 +790,39 @@ def test_flashinfer_xqa_bmm1_scale_matches_decode_q_dtype():
     impl.kv_cache_dtype = "fp8"
 
     assert impl.get_xqa_bmm1_scale(MockLayer, torch.bfloat16) == 1.5
-    assert impl.get_xqa_bmm1_scale(MockLayer, torch.float8_e4m3fn) == 3.0
+    assert impl.get_xqa_bmm1_scale(MockLayer, current_platform.fp8_dtype()) == 3.0
+
+
+@pytest.mark.skipif(
+    AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
+    reason="FlashInfer is not available.",
+)
+def test_flashinfer_scaled_wrapper_calls_use_dtype_aware_query_scale():
+    """Every wrapper call carrying KV scales must gate its query scale."""
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    tree = ast.parse(inspect.getsource(flashinfer_backend))
+    query_scaled_calls = []
+    kv_scaled_calls = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        keyword_names = {keyword.arg for keyword in node.keywords}
+        if "q_scale" not in keyword_names:
+            continue
+        query_scaled_calls.append(node)
+        if {"k_scale", "v_scale"}.issubset(keyword_names):
+            kv_scaled_calls.append(node)
+        q_scale = next(
+            (keyword.value for keyword in node.keywords if keyword.arg == "q_scale"),
+            None,
+        )
+        assert isinstance(q_scale, ast.Call)
+        assert isinstance(q_scale.func, ast.Name)
+        assert q_scale.func.id == "get_query_scale_for_flashinfer"
+
+    assert len(query_scaled_calls) == 11
+    assert len(kv_scaled_calls) == 9
 
 
 @pytest.mark.skipif(

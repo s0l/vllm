@@ -300,6 +300,7 @@ class StructuredOutputManager:
 
                 state_advancements = 0
                 post_reasoning_end_in_window = False
+                post_reasoning_draft_prefix_valid = True
                 req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
                 for i, token in enumerate(req_tokens):
                     self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
@@ -321,15 +322,25 @@ class StructuredOutputManager:
                             # Reasoning ended mid-window. Constrain the rest
                             # of the window via bitmask. Skip grammar advance
                             # through the marker (it is reasoning content);
-                            # try to advance through subsequent drafts so the
-                            # next bitmask row reflects the post-advance state,
-                            # but tolerate rejection since those drafts predate
-                            # the bitmask and are not guaranteed valid.
+                            # Validate subsequent drafts before mutating the
+                            # grammar: those drafts predate the bitmask and are
+                            # not guaranteed valid. Once one is invalid, the
+                            # dependent suffix cannot advance the simulated
+                            # grammar either.
                             apply_bitmask = True
                             advance_grammar = False
                             post_reasoning_end_in_window = True
                     if advance_grammar and not grammar.is_terminated():
-                        accepted = grammar.accept_tokens(req_id, [token])
+                        accepted = True
+                        if post_reasoning_end_in_window:
+                            accepted = (
+                                post_reasoning_draft_prefix_valid
+                                and grammar.validate_tokens([token]) == [token]
+                            )
+                            if not accepted:
+                                post_reasoning_draft_prefix_valid = False
+                        if accepted:
+                            accepted = grammar.accept_tokens(req_id, [token])
                         if accepted:
                             state_advancements += 1
                         elif not post_reasoning_end_in_window:

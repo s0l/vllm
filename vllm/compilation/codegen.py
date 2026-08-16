@@ -93,8 +93,7 @@ def generate_execution_code_with_name(
             if node.target is operator.getitem:
                 source = ref(node.args[0])
                 index = node.args[1]
-                assert isinstance(index, int)
-                lines.append(f"    {node.name} = {source}[{index}]")
+                lines.append(f"    {node.name} = {source}[{ref(index)}]")
             else:
                 args_str = ", ".join(ref(a) for a in node.args)
                 kwargs_str = ", ".join(f"{k}={ref(v)}" for k, v in node.kwargs.items())
@@ -222,6 +221,12 @@ def _node_ref(arg: Any, consts: list[Any], const_index: dict[int, int]) -> str:
                 for k, v in arg.items()
             )
             + "}"
+        )
+    if isinstance(arg, slice):
+        return (
+            f"slice({_node_ref(arg.start, consts, const_index)}, "
+            f"{_node_ref(arg.stop, consts, const_index)}, "
+            f"{_node_ref(arg.step, consts, const_index)})"
         )
     if isinstance(arg, (int, float, bool, str, bytes, type(None))):
         return repr(arg)

@@ -8,6 +8,7 @@ import pytest
 
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker import startup_plan
+from vllm.v1.worker.gpu_worker import _post_warmup_elastic_kv_budget
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
@@ -59,6 +60,23 @@ def test_startup_plan_fingerprint_sensitivity(plan_env):
         assert base != fp(_plan_worker().vllm_config, 0, 1)
 
 
+def test_startup_plan_fingerprint_ignores_superseded_bootstrap_reserve(plan_env):
+    class Config:
+        def __init__(self, reserve: int, backend: str = "flashinfer") -> None:
+            self.additional_config = {"elastic_runtime_reserve_mb": reserve}
+            self.backend = backend
+            self.not_copyable = object()
+
+        def compute_hash(self) -> str:
+            return f"{self.backend}:{self.additional_config}"
+
+    fp = startup_plan.compute_plan_fingerprint
+    first = Config(1024)
+    assert fp(first, 0, 1) == fp(Config(2048), 0, 1)
+    assert first.additional_config == {"elastic_runtime_reserve_mb": 1024}
+    assert fp(Config(1024), 0, 1) != fp(Config(1024, "other"), 0, 1)
+
+
 def test_startup_plan_apply_gate(plan_env):
     """Only a fingerprint-matching, memory-safe plan is ever applied."""
     maybe_save_startup_plan(_plan_worker(), 50 * GiB_bytes)
@@ -66,6 +84,7 @@ def test_startup_plan_apply_gate(plan_env):
     applied = _plan_worker()
     maybe_apply_startup_plan(applied)
     assert applied.cache_config.kv_cache_memory_bytes == 50 * GiB_bytes
+    assert not applied._startup_plan_includes_runtime_headroom
 
     less_memory = _plan_worker(free_memory=60 * GiB_bytes)
     other_config = _plan_worker(config_hash="zzz999")
@@ -77,3 +96,42 @@ def test_startup_plan_apply_gate(plan_env):
     explicit = _plan_worker(kv_bytes=7 * GiB_bytes)
     maybe_apply_startup_plan(explicit)
     assert explicit.cache_config.kv_cache_memory_bytes == 7 * GiB_bytes
+    assert explicit._startup_plan_includes_runtime_headroom
+
+
+def test_startup_plan_save_uses_pre_planning_identity(plan_env):
+    worker = _plan_worker(config_hash="before")
+    maybe_apply_startup_plan(worker)
+    assert worker._startup_plan_fingerprint
+
+    worker.vllm_config = SimpleNamespace(compute_hash=lambda: "after")
+    maybe_save_startup_plan(worker, 50 * GiB_bytes)
+
+    replay = _plan_worker(config_hash="before")
+    maybe_apply_startup_plan(replay)
+    assert replay.cache_config.kv_cache_memory_bytes == 50 * GiB_bytes
+
+
+def test_startup_plan_promotes_headroom_only_after_full_warmup(plan_env):
+    worker = _plan_worker()
+    maybe_apply_startup_plan(worker)
+    maybe_save_startup_plan(
+        worker,
+        45 * GiB_bytes,
+        post_warmup_complete=True,
+    )
+    replay = _plan_worker()
+    maybe_apply_startup_plan(replay)
+    assert replay.cache_config.kv_cache_memory_bytes == 45 * GiB_bytes
+    assert replay._startup_plan_includes_runtime_headroom
+
+
+def test_post_warmup_elastic_budget_accounts_for_full_runtime_headroom():
+    mib = 1 << 20
+    assert _post_warmup_elastic_kv_budget(
+        physical_budget=4000 * mib,
+        current_free=1200 * mib,
+        initial_free=15000 * mib,
+        requested_memory=14500 * mib,
+        mapping_quantum=2 * mib,
+    ) == 4550 * mib

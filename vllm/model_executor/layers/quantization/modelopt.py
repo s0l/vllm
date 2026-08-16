@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any, cast
 
@@ -11,6 +12,7 @@ import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
+    PerTensorTorchFP8ScaledMMLinearKernel,
     init_fp8_linear_kernel,
     init_mxfp8_linear_kernel,
     init_nvfp4_linear_kernel,
@@ -55,6 +57,10 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+from vllm.model_executor.layers.quantization.utils.ag2_nvfp4_arc import (
+    ensure_ag2_nvfp4_base_owner_metadata,
+    maybe_apply_ag2_nvfp4_arc_sidecar,
+)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     process_fp8_input_tensor_strategy_moe,
     process_fp8_weight_channel_strategy,
@@ -508,6 +514,11 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             input_dtype=self.input_dtype,
             out_dtype=self.out_dtype,
             module_name=self.__class__.__name__,
+            force_kernel=(
+                PerTensorTorchFP8ScaledMMLinearKernel
+                if os.environ.get("AG2_VLLM_FP8_FORCE_TORCH_SCALED_MM", "0") == "1"
+                else None
+            ),
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -1038,6 +1049,62 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
         return [torch.bfloat16, torch.half, torch.float8_e4m3fn]
 
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> "QuantizeMethodBase | None":
+        selective_a16 = tuple(
+            pattern.strip()
+            for pattern in os.environ.get(
+                "AG2_VLLM_NVFP4_A16_PREFIXES", ""
+            ).split(",")
+            if pattern.strip()
+        )
+        selective_a4 = tuple(
+            pattern.strip()
+            for pattern in os.environ.get(
+                "AG2_VLLM_NVFP4_A4_PREFIXES", ""
+            ).split(",")
+            if pattern.strip()
+        )
+        if selective_a16 and selective_a4:
+            raise ValueError(
+                "AG2 selective NVFP4 dispatch cannot combine A16 and A4 "
+                "prefix selectors in one runtime"
+            )
+        if selective_a4 and self.quant_method != "W4A16_NVFP4":
+            raise ValueError(
+                "AG2_VLLM_NVFP4_A4_PREFIXES requires a W4A16 base; for a "
+                "ModelOpt NVFP4 checkpoint set AG2_VLLM_NVFP4_FORCE_W4A16=1"
+            )
+        if (
+            self.quant_method == "NVFP4"
+            and isinstance(layer, (LinearBase, ParallelLMHead))
+            and any(fnmatch(prefix, pattern) for pattern in selective_a16)
+        ):
+            logger.warning(
+                "AG2 selective NVFP4 dispatch: %s uses W4A16 while other "
+                "NVFP4 layers retain W4A4",
+                prefix,
+            )
+            return ModelOptNvFp4W4A16LinearMethod(self)
+        if (
+            self.quant_method == "W4A16_NVFP4"
+            and isinstance(layer, (LinearBase, ParallelLMHead))
+            and any(fnmatch(prefix, pattern) for pattern in selective_a4)
+        ):
+            logger.warning(
+                "AG2 selective NVFP4 dispatch: %s uses W4A4 while other "
+                "W4A16 layers retain W4A16",
+                prefix,
+            )
+            method = ModelOptNvFp4LinearMethod(self)
+            method.layer_prefix = prefix
+            return method
+        quant_method = super().get_quant_method(layer, prefix)
+        if isinstance(quant_method, ModelOptNvFp4LinearMethod):
+            quant_method.layer_prefix = prefix
+        return quant_method
+
     @classmethod
     def get_min_capability(cls) -> int:
         return 75
@@ -1062,6 +1129,18 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
         group_size: int | None,
         **kwargs: Any,
     ) -> "ModelOptNvFp4Config":
+        if (
+            quant_method == "NVFP4"
+            and os.environ.get("AG2_VLLM_NVFP4_FORCE_W4A16", "0") == "1"
+        ):
+            logger.warning(
+                "AG2_VLLM_NVFP4_FORCE_W4A16=1: loading an NVFP4 W4A4 "
+                "checkpoint through the W4A16 Marlin path. Packed weights "
+                "and weight scales are preserved; checkpoint input_scale is "
+                "loaded only for compatibility and is not used."
+            )
+            quant_method = "W4A16_NVFP4"
+
         is_checkpoint_nvfp4_serialized = "NVFP4" in quant_method
 
         if group_size is None:
@@ -1105,6 +1184,7 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         self.quant_config = quant_config
         self.marlin_input_dtype = None
         self.kernel = init_nvfp4_linear_kernel()
+        self.layer_prefix: str | None = None
 
     def create_weights(
         self,
@@ -1211,6 +1291,9 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         layer.input_global_scale_inv = Parameter(
             (1.0 / layer.input_global_scale).to(torch.float32), requires_grad=False
         )
+
+        maybe_apply_ag2_nvfp4_arc_sidecar(layer, self.layer_prefix)
+        ensure_ag2_nvfp4_base_owner_metadata(layer)
 
         # Convert layer to NVFP4 linear kernel format
         self.kernel.process_weights_after_loading(layer)

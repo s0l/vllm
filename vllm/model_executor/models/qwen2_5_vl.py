@@ -57,6 +57,8 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
+    PaddedMergedColumnParallelLinear,
+    PaddedRowParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
@@ -109,6 +111,7 @@ from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
     cast_overflow_tensors,
+    ceil_to_multiple,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -365,28 +368,44 @@ class Qwen2_5_VisionAttention(nn.Module):
         self.hidden_size_per_attention_head = dist_utils.divide(
             projection_size, num_heads
         )
-        self.num_attention_heads_per_partition = dist_utils.divide(
-            num_heads, self.tp_size
-        )
+        padded_num_heads = ceil_to_multiple(num_heads, self.tp_size)
+        self.num_attention_heads_per_partition = padded_num_heads // self.tp_size
+        padded_projection_size = padded_num_heads * self.hidden_size_per_attention_head
 
-        self.qkv = QKVParallelLinear(
-            hidden_size=embed_dim,
-            head_size=self.hidden_size_per_attention_head,
-            total_num_heads=num_heads,
-            total_num_kv_heads=num_heads,
-            bias=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv",
-            disable_tp=use_data_parallel,
-        )
-
-        self.proj = RowParallelLinear(
-            input_size=projection_size,
-            output_size=embed_dim,
-            quant_config=quant_config,
-            prefix=f"{prefix}.proj",
-            disable_tp=use_data_parallel,
-        )
+        if padded_num_heads == num_heads:
+            self.qkv = QKVParallelLinear(
+                hidden_size=embed_dim,
+                head_size=self.hidden_size_per_attention_head,
+                total_num_heads=num_heads,
+                total_num_kv_heads=num_heads,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv",
+                disable_tp=use_data_parallel,
+            )
+            self.proj = RowParallelLinear(
+                input_size=projection_size,
+                output_size=embed_dim,
+                quant_config=quant_config,
+                prefix=f"{prefix}.proj",
+                disable_tp=use_data_parallel,
+            )
+        else:
+            self.qkv = PaddedMergedColumnParallelLinear(
+                input_size=embed_dim,
+                output_sizes=[projection_size] * 3,
+                padded_output_sizes=[padded_projection_size] * 3,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv",
+            )
+            self.proj = PaddedRowParallelLinear(
+                input_size=projection_size,
+                padded_input_size=padded_projection_size,
+                output_size=embed_dim,
+                quant_config=quant_config,
+                prefix=f"{prefix}.proj",
+            )
 
         self.attn = MMEncoderAttention(
             num_heads=self.num_attention_heads_per_partition,

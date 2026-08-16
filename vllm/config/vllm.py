@@ -2476,6 +2476,9 @@ class VllmConfig:
         finalised block_size.
         """
         block_size = self.cache_config.block_size
+        logger.info_once(
+            "Validated scheduler/cache block size: %d tokens.", block_size
+        )
 
         # DCP interleave-size compatibility
         if self.parallel_config.decode_context_parallel_size > 1:

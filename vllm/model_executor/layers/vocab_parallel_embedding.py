@@ -3,6 +3,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from math import lcm
 
 import torch
 import torch.nn.functional as F
@@ -13,7 +14,7 @@ from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_embedding_all_reduce,
 )
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.batch_invariant import (
@@ -263,11 +264,13 @@ class VocabParallelEmbedding(PluggableLayer):
         self.padding_size = padding_size
         self.org_vocab_size = org_num_embeddings or num_embeddings
         num_added_embeddings = num_embeddings - self.org_vocab_size
+        tp_aligned_padding_size = lcm(self.padding_size, self.tp_size)
         self.org_vocab_size_padded = pad_vocab_size(
-            self.org_vocab_size, self.padding_size
+            self.org_vocab_size, tp_aligned_padding_size
         )
         self.num_embeddings_padded = pad_vocab_size(
-            self.org_vocab_size_padded + num_added_embeddings, self.padding_size
+            self.org_vocab_size_padded + num_added_embeddings,
+            tp_aligned_padding_size,
         )
         assert self.org_vocab_size_padded <= self.num_embeddings_padded
 
@@ -503,7 +506,7 @@ class VocabParallelEmbedding(PluggableLayer):
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
             # Reduce across all the model parallel GPUs.
-            return tensor_model_parallel_all_reduce(output_parallel)
+            return tensor_model_parallel_embedding_all_reduce(output_parallel)
         return output_parallel
 
     def extra_repr(self) -> str:

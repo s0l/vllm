@@ -25,6 +25,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    KVCacheTensor,
     KVQuantMode,
     MambaSpec,
     UniformTypeKVCacheSpecs,
@@ -198,18 +199,49 @@ def get_query_lens_mismatch_unsupported_backend(
 
 
 def _allocate_kv_cache(
-    kv_cache_config: KVCacheConfig, shared_layers: dict[str, str], device: torch.device
+    kv_cache_config: KVCacheConfig,
+    shared_layers: dict[str, str],
+    device: torch.device,
+    elastic_backings: dict[str, Any] | None = None,
+    elastic_geometry: dict[str, int] | None = None,
 ):
     kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
-    packed_backing: torch.Tensor | None = None
+    packed_backings: dict[str, torch.Tensor] = {}
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-        if kv_cache_tensor.block_stride > 0:
-            # Allocate once; all packed tensors alias the same backing.
-            if packed_backing is None:
-                packed_backing = torch.zeros(
+        if kv_cache_tensor.mapping_quantum:
+            from vllm.device_allocator.elastic_cumem import allocate_elastic_backing
+
+            backing_id = kv_cache_tensor.backing_id
+            if backing_id not in packed_backings:
+                owner = (
+                    elastic_backings.get(backing_id)
+                    if elastic_backings is not None
+                    else None
+                )
+                if owner is None:
+                    owner = allocate_elastic_backing(
+                        reserved_bytes=kv_cache_tensor.size,
+                        committed_bytes=kv_cache_tensor.committed_size,
+                        quantum_bytes=kv_cache_tensor.mapping_quantum,
+                        device=device,
+                    )
+                    if elastic_backings is not None:
+                        elastic_backings[backing_id] = owner
+                        assert elastic_geometry is not None
+                        elastic_geometry[backing_id] = (
+                            kv_cache_tensor.logical_block_size
+                        )
+                packed_backings[backing_id] = owner.tensor.view(torch.int8)
+            tensor = packed_backings[backing_id]
+        elif kv_cache_tensor.block_stride > 0:
+            # Allocate once per backing id; attention and GDN elastic arenas
+            # must have independent stable virtual-address ranges.
+            backing_id = kv_cache_tensor.backing_id or "packed"
+            if backing_id not in packed_backings:
+                packed_backings[backing_id] = torch.zeros(
                     kv_cache_tensor.size, dtype=torch.int8, device=device
                 )
-            tensor = packed_backing
+            tensor = packed_backings[backing_id]
         else:
             tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
         for layer_name in kv_cache_tensor.shared_by:
@@ -274,7 +306,7 @@ def _reshape_attention_kv_cache(
     kv_cache_shape: tuple[int, ...],
     kv_cache_stride_order: tuple[int, ...],
     num_blocks: int,
-    packing: tuple[int, int] | None,
+    packing: tuple[int, int, int] | None,
     page_aligned_blocks: bool = False,
 ) -> torch.Tensor:
     permuted_kv_cache_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
@@ -284,11 +316,22 @@ def _reshape_attention_kv_cache(
     dtype = kv_cache_spec.dtype
 
     if packing is not None:
-        offset, block_stride = packing
+        offset, block_stride, logical_num_blocks = packing
         assert inv_order[0] == 0
         page_bytes = prod(kv_cache_shape[1:]) * get_dtype_size(dtype)
+        if logical_num_blocks:
+            total_shape_bytes = prod(permuted_kv_cache_shape) * get_dtype_size(dtype)
+            if total_shape_bytes % logical_num_blocks:
+                raise ValueError("packed KV shape does not divide into logical blocks")
+            page_bytes = total_shape_bytes // logical_num_blocks
+        packed_bytes = (
+            logical_num_blocks * block_stride
+            if logical_num_blocks
+            else kv_raw_tensor.numel()
+        )
         kv_cache = (
-            kv_raw_tensor.view(-1, block_stride)[:, offset : offset + page_bytes]
+            kv_raw_tensor[:packed_bytes]
+            .view(-1, block_stride)[:, offset : offset + page_bytes]
             .view(dtype)
             .view(permuted_kv_cache_shape)
         )
@@ -354,12 +397,19 @@ def _reshape_kv_cache(
     kv_caches: dict[str, Any] = {}
     has_attn = False
 
-    layer_packing: dict[str, tuple[int, int]] = {}
+    layer_packing: dict[str, tuple[int, int, int]] = {}
+    layer_tensor_config: dict[str, KVCacheTensor] = {}
     if kv_cache_config is not None:
         for kv_tensor in kv_cache_config.kv_cache_tensors:
+            for ln in kv_tensor.shared_by:
+                layer_tensor_config[ln] = kv_tensor
             if kv_tensor.block_stride > 0:
                 for ln in kv_tensor.shared_by:
-                    layer_packing[ln] = (kv_tensor.offset, kv_tensor.block_stride)
+                    layer_packing[ln] = (
+                        kv_tensor.offset,
+                        kv_tensor.block_stride,
+                        kv_tensor.num_blocks,
+                    )
 
     page_aligned_layers = _kv_first_layers_sharing_pool_with_mamba(
         attn_groups, kernel_block_sizes, cache_dtype, kv_cache_config
@@ -384,15 +434,25 @@ def _reshape_kv_cache(
 
             kv_raw_tensor = kv_cache_raw_tensors[layer_name]
             packing = layer_packing.get(layer_name)
+            tensor_config = layer_tensor_config.get(layer_name)
             if packing is not None:
-                _, blk_stride = packing
-                num_blocks = kv_raw_tensor.numel() // blk_stride
+                _, blk_stride, configured_num_blocks = packing
+                num_blocks = (
+                    configured_num_blocks or kv_raw_tensor.numel() // blk_stride
+                )
             else:
-                assert kv_raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-                num_blocks = kv_raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                num_blocks = (
+                    tensor_config.num_blocks
+                    if tensor_config is not None and tensor_config.num_blocks
+                    else kv_raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                )
 
             if isinstance(kv_cache_spec, AttentionSpec):
                 has_attn = True
+                if tensor_config is not None and tensor_config.logical_block_size:
+                    kv_raw_tensor = kv_raw_tensor[
+                        : num_blocks * tensor_config.logical_block_size
+                    ]
                 # Use storage_block_size: it equals block_size for uncompressed
                 # specs but is smaller for compressed ones (DeepSeek V4), which
                 # store block_size tokens in block_size // compress_ratio slots.
@@ -440,9 +500,18 @@ def _reshape_kv_cache(
                 # each block's bytes into its conv/ssm state views. Keeping
                 # one tensor per layer lets the KV connector register it
                 # without special-casing Mamba.
-                kv_caches[layer_name] = kv_raw_tensor[
-                    : num_blocks * page_size_bytes
-                ].view(num_blocks, 1, 1, page_size_bytes)
+                if packing is not None:
+                    offset, block_stride, _ = packing
+                    kv_caches[layer_name] = torch.as_strided(
+                        kv_raw_tensor,
+                        size=(num_blocks, 1, 1, page_size_bytes),
+                        stride=(block_stride, page_size_bytes, page_size_bytes, 1),
+                        storage_offset=offset,
+                    )
+                else:
+                    kv_caches[layer_name] = kv_raw_tensor[
+                        : num_blocks * page_size_bytes
+                    ].view(num_blocks, 1, 1, page_size_bytes)
             else:
                 raise NotImplementedError(
                     f"Unsupported KV cache spec type: {type(kv_cache_spec)}"
@@ -551,10 +620,16 @@ def init_kv_cache(
     cache_dtype: str,
     kernel_block_sizes: list[int],
     vllm_config: VllmConfig,
+    elastic_backings: dict[str, Any] | None = None,
+    elastic_geometry: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     shared_kv_cache_layers = get_shared_kv_cache_layers(vllm_config)
     kv_cache_raw_tensors = _allocate_kv_cache(
-        kv_cache_config, shared_kv_cache_layers, device
+        kv_cache_config,
+        shared_kv_cache_layers,
+        device,
+        elastic_backings,
+        elastic_geometry,
     )
     flattened_attn_groups = list(group for groups in attn_groups for group in groups)
     kv_caches = _reshape_kv_cache(
@@ -604,6 +679,10 @@ def build_attn_metadata(
     dcp_local_seq_lens: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
     is_prefilling: torch.Tensor | None = None,
+    request_ids: tuple[str | None, ...] | None = None,
+    num_scheduled_tokens_cpu: torch.Tensor | None = None,
+    num_computed_tokens_provenance_cpu: torch.Tensor | None = None,
+    num_prompt_tokens_cpu: torch.Tensor | None = None,
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None,
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
@@ -651,6 +730,10 @@ def build_attn_metadata(
             dcp_local_seq_lens=dcp_local_seq_lens,
             positions=positions,
             is_prefilling=group_is_prefilling,
+            request_ids=request_ids,
+            num_scheduled_tokens_cpu=num_scheduled_tokens_cpu,
+            num_computed_tokens_provenance_cpu=num_computed_tokens_provenance_cpu,
+            num_prompt_tokens_cpu=num_prompt_tokens_cpu,
             mm_req_doc_ranges=mm_req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
             **common_attn_metadata_extra_kwargs,

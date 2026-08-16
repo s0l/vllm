@@ -236,6 +236,32 @@ class EngineCore:
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
+        # Bounded research observer for attributing the host-side gap between
+        # otherwise identical saturated decode iterations. It is inert unless
+        # an output path is explicitly configured, keeps records in memory,
+        # and performs one atomic write only after the requested steady window.
+        self._ag2_step_trace_path = os.environ.get("AG2_VLLM_ENGINE_STEP_TRACE", "")
+        self._ag2_step_trace_min_running = int(
+            os.environ.get("AG2_VLLM_ENGINE_STEP_TRACE_MIN_RUNNING", "0")
+        )
+        self._ag2_step_trace_limit = int(
+            os.environ.get("AG2_VLLM_ENGINE_STEP_TRACE_STEPS", "64")
+        )
+        self._ag2_step_trace_records: list[dict[str, int | float]] = []
+        self._ag2_step_trace_previous_start_ns: int | None = None
+        self._ag2_step_trace_complete = False
+        if self._ag2_step_trace_path:
+            if self._ag2_step_trace_min_running < 1:
+                raise ValueError("engine step trace requires MIN_RUNNING >= 1")
+            if self._ag2_step_trace_limit < 1:
+                raise ValueError("engine step trace requires STEPS >= 1")
+            logger.info(
+                "AG2 engine-step trace initialized: path=%s min_running=%d steps=%d",
+                self._ag2_step_trace_path,
+                self._ag2_step_trace_min_running,
+                self._ag2_step_trace_limit,
+            )
+
         self.aborts_queue = queue.Queue[list[str]]()
 
         self._idle_state_callbacks: list[Callable] = []
@@ -290,14 +316,23 @@ class EngineCore:
                 available_gpu_memory = [self.available_gpu_memory_for_kv_cache] * len(
                     kv_cache_specs
                 )
+                available_memory_includes_runtime_headroom = [False] * len(
+                    kv_cache_specs
+                )
             else:
                 # Profiles the peak memory usage of the model to determine how
                 # much memory can be allocated for kv cache.
                 available_gpu_memory = self.model_executor.determine_available_memory()
+                available_memory_includes_runtime_headroom = (
+                    self.model_executor.collective_rpc(
+                        "kv_cache_memory_includes_runtime_headroom"
+                    )
+                )
                 self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
         else:
             # Attention free models don't need memory for kv cache
             available_gpu_memory = [0] * len(kv_cache_specs)
+            available_memory_includes_runtime_headroom = [False] * len(kv_cache_specs)
 
         assert len(kv_cache_specs) == len(available_gpu_memory)
 
@@ -305,7 +340,10 @@ class EngineCore:
         max_model_len_before = vllm_config.model_config.max_model_len
 
         kv_cache_configs = get_kv_cache_configs(
-            vllm_config, kv_cache_specs, available_gpu_memory
+            vllm_config,
+            kv_cache_specs,
+            available_gpu_memory,
+            available_memory_includes_runtime_headroom,
         )
 
         # If auto-fit reduced max_model_len, sync the new value to workers.
@@ -315,7 +353,13 @@ class EngineCore:
         if max_model_len_after != max_model_len_before:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
 
-        scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+        scheduler_kv_cache_config = generate_scheduler_kv_cache_config(
+            kv_cache_configs,
+            configured_max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
+            enable_auto_resident_cap=(
+                os.environ.get("AG2_VLLM_ELASTIC_AUTO_RESIDENT_CAP", "0") == "1"
+            ),
+        )
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
         if kv_cache_groups:
@@ -591,8 +635,14 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        trace_enabled = bool(
+            self._ag2_step_trace_path and not self._ag2_step_trace_complete
+        )
+        step_start_ns = time.perf_counter_ns() if trace_enabled else 0
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        schedule_end_ns = time.perf_counter_ns() if trace_enabled else 0
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        submit_end_ns = time.perf_counter_ns() if trace_enabled else 0
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
@@ -601,14 +651,57 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+        future_end_ns = time.perf_counter_ns() if trace_enabled else 0
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        abort_end_ns = time.perf_counter_ns() if trace_enabled else 0
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        update_end_ns = time.perf_counter_ns() if trace_enabled else 0
         self._attach_iteration_details(engine_core_outputs, iteration_details)
+
+        if trace_enabled:
+            details = compute_iteration_details(scheduler_output)
+            if (
+                details.num_ctx_tokens == 0
+                and details.num_generation_requests
+                >= self._ag2_step_trace_min_running
+            ):
+                previous_start_ns = self._ag2_step_trace_previous_start_ns
+                self._ag2_step_trace_records.append({
+                    "generation_requests": details.num_generation_requests,
+                    "generation_tokens": details.num_generation_tokens,
+                    "step_start_ns": step_start_ns,
+                    "start_spacing_ms": (
+                        (step_start_ns - previous_start_ns) / 1e6
+                        if previous_start_ns is not None
+                        else -1.0
+                    ),
+                    "schedule_ms": (schedule_end_ns - step_start_ns) / 1e6,
+                    "execute_submit_ms": (submit_end_ns - schedule_end_ns) / 1e6,
+                    "future_wait_ms": (future_end_ns - submit_end_ns) / 1e6,
+                    "abort_ms": (abort_end_ns - future_end_ns) / 1e6,
+                    "update_ms": (update_end_ns - abort_end_ns) / 1e6,
+                    "step_total_ms": (update_end_ns - step_start_ns) / 1e6,
+                })
+                self._ag2_step_trace_previous_start_ns = step_start_ns
+                if len(self._ag2_step_trace_records) >= self._ag2_step_trace_limit:
+                    payload = {
+                        "schema": "ag2-engine-step-trace-v1",
+                        "min_running": self._ag2_step_trace_min_running,
+                        "records": self._ag2_step_trace_records,
+                    }
+                    path = self._ag2_step_trace_path
+                    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                    temporary = f"{path}.tmp.{os.getpid()}"
+                    with open(temporary, "wb") as stream:
+                        stream.write(msgspec.json.encode(payload))
+                    os.replace(temporary, path)
+                    self._ag2_step_trace_complete = True
+                    logger.info("AG2 engine-step trace complete: %s", path)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -641,6 +734,13 @@ class EngineCore:
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
+        trace_enabled = bool(
+            self._ag2_step_trace_path and not self._ag2_step_trace_complete
+        )
+        step_start_ns = time.perf_counter_ns() if trace_enabled else 0
+        schedule_end_ns = step_start_ns
+        submit_end_ns = step_start_ns
+
         # Try to schedule a new batch if the batch queue is not full, but
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
@@ -650,6 +750,7 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            schedule_end_ns = time.perf_counter_ns() if trace_enabled else 0
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -674,6 +775,7 @@ class EngineCore:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
+            submit_end_ns = time.perf_counter_ns() if trace_enabled else 0
 
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
@@ -693,6 +795,7 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
+        wait_start_ns = time.perf_counter_ns() if trace_enabled else 0
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
@@ -703,13 +806,16 @@ class EngineCore:
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+        future_end_ns = time.perf_counter_ns() if trace_enabled else 0
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        abort_end_ns = time.perf_counter_ns() if trace_enabled else 0
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        update_end_ns = time.perf_counter_ns() if trace_enabled else 0
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
@@ -734,6 +840,53 @@ class EngineCore:
             )
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
+
+        deferred_end_ns = time.perf_counter_ns() if trace_enabled else 0
+        if trace_enabled:
+            details = compute_iteration_details(scheduler_output)
+            if (
+                details.num_ctx_tokens == 0
+                and details.num_generation_requests
+                >= self._ag2_step_trace_min_running
+            ):
+                previous_start_ns = self._ag2_step_trace_previous_start_ns
+                self._ag2_step_trace_records.append({
+                    "generation_requests": details.num_generation_requests,
+                    "generation_tokens": details.num_generation_tokens,
+                    "step_start_ns": step_start_ns,
+                    "start_spacing_ms": (
+                        (step_start_ns - previous_start_ns) / 1e6
+                        if previous_start_ns is not None
+                        else -1.0
+                    ),
+                    "schedule_ms": (schedule_end_ns - step_start_ns) / 1e6,
+                    "execute_and_sample_submit_ms": (
+                        submit_end_ns - schedule_end_ns
+                    ) / 1e6,
+                    "queue_pre_wait_ms": (wait_start_ns - submit_end_ns) / 1e6,
+                    "future_wait_ms": (future_end_ns - wait_start_ns) / 1e6,
+                    "abort_ms": (abort_end_ns - future_end_ns) / 1e6,
+                    "update_ms": (update_end_ns - abort_end_ns) / 1e6,
+                    "deferred_sample_ms": (
+                        deferred_end_ns - update_end_ns
+                    ) / 1e6,
+                    "step_total_ms": (deferred_end_ns - step_start_ns) / 1e6,
+                })
+                self._ag2_step_trace_previous_start_ns = step_start_ns
+                if len(self._ag2_step_trace_records) >= self._ag2_step_trace_limit:
+                    payload = {
+                        "schema": "ag2-engine-step-trace-v1",
+                        "min_running": self._ag2_step_trace_min_running,
+                        "records": self._ag2_step_trace_records,
+                    }
+                    path = self._ag2_step_trace_path
+                    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                    temporary = f"{path}.tmp.{os.getpid()}"
+                    with open(temporary, "wb") as stream:
+                        stream.write(msgspec.json.encode(payload))
+                    os.replace(temporary, path)
+                    self._ag2_step_trace_complete = True
+                    logger.info("AG2 engine-step trace complete: %s", path)
 
         return engine_core_outputs, model_executed
 

@@ -69,6 +69,8 @@ from vllm.model_executor.layers.attention.mm_encoder_attention import (
 from vllm.model_executor.layers.conv import Conv3dLayer
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    PaddedMergedColumnParallelLinear,
+    PaddedRowParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -150,6 +152,7 @@ from .utils import (
     StageMissingLayer,
     WeightsMapper,
     _merge_multimodal_embeddings,
+    ceil_to_multiple,
     maybe_prefix,
 )
 from .vision import (
@@ -409,24 +412,50 @@ class Qwen3_VisionMLP(nn.Module):
     ):
         super().__init__()
         use_data_parallel = is_vit_use_data_parallel()
-        self.linear_fc1 = ColumnParallelLinear(
-            in_features,
-            hidden_features,
-            bias=bias,
-            quant_config=quant_config,
-            return_bias=False,
-            prefix=f"{prefix}.linear_fc1",
-            disable_tp=use_data_parallel,
+        tp_size = (
+            1
+            if use_data_parallel
+            else parallel_state.get_tensor_model_parallel_world_size()
         )
-        self.linear_fc2 = RowParallelLinear(
-            hidden_features,
-            in_features,
-            bias=bias,
-            quant_config=quant_config,
-            return_bias=False,
-            prefix=f"{prefix}.linear_fc2",
-            disable_tp=use_data_parallel,
-        )
+        padded_hidden_features = ceil_to_multiple(hidden_features, tp_size)
+        if padded_hidden_features == hidden_features:
+            self.linear_fc1 = ColumnParallelLinear(
+                in_features,
+                hidden_features,
+                bias=bias,
+                quant_config=quant_config,
+                return_bias=False,
+                prefix=f"{prefix}.linear_fc1",
+                disable_tp=use_data_parallel,
+            )
+            self.linear_fc2 = RowParallelLinear(
+                hidden_features,
+                in_features,
+                bias=bias,
+                quant_config=quant_config,
+                return_bias=False,
+                prefix=f"{prefix}.linear_fc2",
+                disable_tp=use_data_parallel,
+            )
+        else:
+            self.linear_fc1 = PaddedMergedColumnParallelLinear(
+                input_size=in_features,
+                output_sizes=[hidden_features],
+                padded_output_sizes=[padded_hidden_features],
+                bias=bias,
+                quant_config=quant_config,
+                return_bias=False,
+                prefix=f"{prefix}.linear_fc1",
+            )
+            self.linear_fc2 = PaddedRowParallelLinear(
+                input_size=hidden_features,
+                padded_input_size=padded_hidden_features,
+                output_size=in_features,
+                bias=bias,
+                quant_config=quant_config,
+                return_bias=False,
+                prefix=f"{prefix}.linear_fc2",
+            )
         self.act_fn = act_fn
 
     def forward(self, x: torch.Tensor):

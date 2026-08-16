@@ -25,6 +25,7 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
+import os
 import pickle
 import weakref
 from collections import namedtuple
@@ -121,10 +122,30 @@ def _get_unique_name(name: str) -> str:
 
 
 _groups: dict[str, Callable[[], "GroupCoordinator | None"]] = {}
+_tp3_ce_runtime_enabled = False
+_tp3_ce_first_context_logged = False
+_tp3_ce_large_shapes_logged: set[tuple[int, bool]] = set()
+_tp3_ce_first_known_dispatch_logged = False
+_tp3_ce_first_active_dispatch_logged = False
+_tp3_piecewise_device_ce_logged = False
+_tp3_mtp_device_ce_logged = False
+_tp3_prefill_canonical_logged = False
+_tp3_embedding_nccl_logged = False
+_tp3_unified_exact_logged: set[str] = set()
 
 
 def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
+
+
+def set_tp3_ce_runtime_enabled(enabled: bool) -> None:
+    """Enable CE only after model profiling, compilation and graph capture."""
+    global _tp3_ce_runtime_enabled
+    _tp3_ce_runtime_enabled = enabled
+    logger.info(
+        "TP3 compressed all-reduce runtime gate is %s after warmup",
+        "enabled" if enabled else "disabled",
+    )
 
 
 def _apply_to_device_comms(
@@ -150,11 +171,854 @@ def _apply_to_device_comms(
 
 
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    global _tp3_ce_first_active_dispatch_logged
+    global _tp3_ce_first_context_logged
+    global _tp3_ce_first_known_dispatch_logged
+    global _tp3_piecewise_device_ce_logged
+    global _tp3_mtp_device_ce_logged
+    global _tp3_prefill_canonical_logged
+
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
+    from vllm.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+
+    forward_context = get_forward_context() if is_forward_context_available() else None
+    cudagraph_mode = (
+        forward_context.cudagraph_runtime_mode if forward_context is not None else None
+    )
+    if os.environ.get(
+        "AG2_VLLM_MTP_DEVICE_CE", "0"
+    ) == "1" and _should_use_tp3_mtp_device_ce(
+        explicit_mtp_lane=(
+            forward_context is not None and forward_context.tp3_mtp_device_ce
+        ),
+        tensor_dim=tensor.dim(),
+        rows=tensor.shape[0] if tensor.dim() == 2 else 0,
+        hidden_size=tensor.shape[-1] if tensor.dim() else 0,
+        tp_world_size=group.world_size,
+    ):
+        if not _tp3_mtp_device_ce_logged:
+            logger.warning(
+                "MTP-owned TP3 device compressed all-reduce active: "
+                "shape=%s cudagraph_mode=%s packed_one_gather=%s",
+                tuple(tensor.shape),
+                cudagraph_mode,
+                os.environ.get("AG2_VLLM_TP3_PIECEWISE_DEVICE_CE_PACKED", "0") == "1",
+            )
+            _tp3_mtp_device_ce_logged = True
+        return _tp3_device_ce_reduce(tensor, group)
+    if os.environ.get(
+        "AG2_VLLM_TP3_PIECEWISE_DEVICE_CE", "0"
+    ) == "1" and _should_use_tp3_piecewise_device_ce(
+        cudagraph_mode=cudagraph_mode,
+        tensor_dim=tensor.dim(),
+        rows=tensor.shape[0] if tensor.dim() == 2 else 0,
+        hidden_size=tensor.shape[-1] if tensor.dim() else 0,
+        tp_world_size=group.world_size,
+    ):
+        if not _tp3_piecewise_device_ce_logged:
+            logger.warning(
+                "TP3 device-CE reduction active for PIECEWISE/intermediate "
+                "prefill all-reduces: shape=%s packed_one_gather=%s",
+                tuple(tensor.shape),
+                os.environ.get("AG2_VLLM_TP3_PIECEWISE_DEVICE_CE_PACKED", "0") == "1",
+            )
+            _tp3_piecewise_device_ce_logged = True
+        return _tp3_device_ce_reduce(tensor, group)
+    if (
+        os.environ.get("AG2_VLLM_TP3_PREFILL_CANONICAL_REDUCE", "0") == "1"
+        and tensor.dim() == 2
+        and tensor.shape == (2976, 5120)
+        and group.world_size == 3
+    ):
+        if not _tp3_prefill_canonical_logged:
+            logger.warning(
+                "TP3 all-layer prefill canonical reduction control active: "
+                "shape=%s proof_rows=64",
+                tuple(tensor.shape),
+            )
+            _tp3_prefill_canonical_logged = True
+        output = group._all_reduce_out_place(tensor)
+        proof_rows = 64
+        output[:proof_rows].copy_(
+            _tp3_sd_deterministic_reduce(tensor[:proof_rows], group)
+        )
+        return output
+    large_shape_key = (
+        int(tensor.shape[0]),
+        forward_context is not None,
+    )
+    if (
+        tensor.dim() == 2
+        and tensor.shape[-1] == 5120
+        and tensor.shape[0] >= 1000
+        and large_shape_key not in _tp3_ce_large_shapes_logged
+        and len(_tp3_ce_large_shapes_logged) < 16
+    ):
+        logger.info(
+            "TP3 all-reduce first large physical shape: shape=%s group=%s tp=%s "
+            "context_available=%s logical_tokens=%s config_enabled=%s",
+            tuple(tensor.shape),
+            group_name,
+            group.world_size,
+            forward_context is not None,
+            forward_context.num_tokens_unpadded
+            if forward_context is not None
+            else None,
+            forward_context.tp3_ce_reduce if forward_context is not None else None,
+        )
+        _tp3_ce_large_shapes_logged.add(large_shape_key)
+    tp3_ce_enabled = _tp3_ce_runtime_enabled
+    if (
+        forward_context is not None
+        and forward_context.num_tokens_unpadded is not None
+        and not _tp3_ce_first_context_logged
+    ):
+        logger.info(
+            "TP3 all-reduce first runtime context: env_enabled=%s "
+            "config_enabled=%s logical_tokens=%s shape=%s group=%s tp=%s",
+            os.environ.get("VLLM_TP3_CE_REDUCE", "0") == "1",
+            forward_context.tp3_ce_reduce,
+            forward_context.num_tokens_unpadded,
+            tuple(tensor.shape),
+            group_name,
+            group.world_size,
+        )
+        _tp3_ce_first_context_logged = True
+    if tp3_ce_enabled:
+        logical_tokens = (
+            forward_context.num_tokens_unpadded if forward_context is not None else None
+        )
+        should_use_tp3_ce = (
+            _should_use_tp3_ce(
+                logical_tokens,
+                get_dcp_group().world_size,
+                tensor.dim(),
+                tensor.shape[-1],
+                group.world_size,
+            )
+            if logical_tokens is not None
+            else _should_use_tp3_ce_physical(
+                True,
+                tensor.shape[0] if tensor.dim() == 2 else 0,
+                tensor.dim(),
+                tensor.shape[-1],
+                group.world_size,
+            )
+        )
+        if logical_tokens is not None and not _tp3_ce_first_known_dispatch_logged:
+            logger.info(
+                "TP3 compressed all-reduce first known dispatch: "
+                "logical_tokens=%s dcp=%s shape=%s tp=%s selected=%s",
+                logical_tokens,
+                get_dcp_group().world_size,
+                tuple(tensor.shape),
+                group.world_size,
+                should_use_tp3_ce,
+            )
+            _tp3_ce_first_known_dispatch_logged = True
+        if should_use_tp3_ce:
+            if not _tp3_ce_first_active_dispatch_logged:
+                logger.info(
+                    "TP3 compressed all-reduce data path active: "
+                    "logical_tokens=%s dcp=%s shape=%s tp=%s",
+                    logical_tokens,
+                    get_dcp_group().world_size,
+                    tuple(tensor.shape),
+                    group.world_size,
+                )
+                _tp3_ce_first_active_dispatch_logged = True
+            from .device_communicators.tp3_ce_all_reduce import (
+                tp3_ce_all_reduce as run,
+            )
+
+            return run(tensor, group.device_group)
+    if os.environ.get("VLLM_TP3_LL_REDUCE", "0") == "1":
+        from .device_communicators.tp3_ll_all_reduce import (
+            should_use_tp3_ll,
+            tp3_ll_all_reduce,
+        )
+
+        tp_group = _TP
+        if (
+            tp_group is not None
+            and group is tp_group
+            and should_use_tp3_ll(
+                tensor.dim(),
+                tensor.shape[0] if tensor.dim() == 2 else 0,
+                tensor.shape[-1],
+                group.world_size,
+            )
+        ):
+            try:
+                return tp3_ll_all_reduce(tensor, group.rank_in_group)
+            except Exception:
+                pass
+    if (
+        os.environ.get("VLLM_TP3_SD_PHASE_REDUCE", "0") == "1"
+        and _is_tp3_sd_phase_reduce()
+        and _should_use_tp3_sd_deterministic_reduce(
+            True,
+            tensor.dim(),
+            tensor.shape[0],
+            tensor.shape[-1],
+            group.world_size,
+        )
+    ):
+        return _tp3_sd_deterministic_reduce(tensor, group)
+    if os.environ.get(
+        "VLLM_TP3_SD_DETERMINISTIC_REDUCE", "0"
+    ) == "1" and _should_use_tp3_sd_deterministic_reduce(
+        True,
+        tensor.dim(),
+        tensor.shape[0],
+        tensor.shape[-1],
+        group.world_size,
+    ):
+        return _tp3_sd_deterministic_reduce(tensor, group)
+    if os.environ.get("VLLM_TP3_SD_CANONICAL_REDUCE", "0") == "1":
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        cudagraph_mode = (
+            get_forward_context().cudagraph_runtime_mode
+            if is_forward_context_available()
+            else None
+        )
+        if _should_use_tp3_sd_canonical_reduce(
+            True,
+            cudagraph_mode,
+            tensor.dim(),
+            tensor.shape[0],
+            tensor.shape[-1],
+            group.world_size,
+        ):
+            return _tp3_sd_canonical_reduce(tensor, group._all_reduce_out_place)
     return group._all_reduce_out_place(tensor)
+
+
+def _should_use_tp3_piecewise_device_ce(
+    *,
+    cudagraph_mode: object | None,
+    tensor_dim: int,
+    rows: int,
+    hidden_size: int,
+    tp_world_size: int,
+) -> bool:
+    """Select one compressed reduction for graph and intermediate prefills."""
+    mode = getattr(cudagraph_mode, "name", None)
+    selected_shape = mode == "PIECEWISE" or (mode == "NONE" and 24 < rows < 4096)
+    return (
+        selected_shape
+        and tensor_dim == 2
+        and rows > 0
+        and hidden_size == 5120
+        and tp_world_size == 3
+    )
+
+
+def _should_use_tp3_mtp_device_ce(
+    *,
+    explicit_mtp_lane: bool,
+    tensor_dim: int,
+    rows: int,
+    hidden_size: int,
+    tp_world_size: int,
+) -> bool:
+    """Select per-row device CE only for an explicitly owned MTP forward."""
+    return (
+        explicit_mtp_lane
+        and tensor_dim == 2
+        and rows > 0
+        and hidden_size == 5120
+        and tp_world_size == 3
+    )
+
+
+def _tp3_device_ce_reduce(
+    tensor: torch.Tensor,
+    group: "GroupCoordinator",
+) -> torch.Tensor:
+    """Compress per row, all-gather exact payloads, then sum in fixed order."""
+    from .device_communicators.tp3_ce_all_reduce import (
+        _dequant_sum_i8_block,
+        _quantize_i8_block,
+    )
+
+    rows, cols = tensor.shape
+    quant_block = 8192
+    num_blocks = (cols + quant_block - 1) // quant_block
+    use_packed_gather = (
+        os.environ.get("AG2_VLLM_TP3_PIECEWISE_DEVICE_CE_PACKED", "0") == "1"
+        and rows >= 4
+    )
+    if use_packed_gather:
+        q_bytes = rows * cols
+        scale_bytes = rows * num_blocks * 4
+        payload_bytes = q_bytes + scale_bytes
+        payload_local = torch.empty(
+            payload_bytes, dtype=torch.uint8, device=tensor.device
+        )
+        q_local = payload_local[:q_bytes].view(rows, cols)
+        scale_local = payload_local[q_bytes:].view(torch.float32).view(rows, num_blocks)
+    else:
+        q_local = torch.empty((rows, cols), dtype=torch.uint8, device=tensor.device)
+        scale_local = torch.empty(
+            (rows, num_blocks), dtype=torch.float32, device=tensor.device
+        )
+    _quantize_i8_block[(rows, num_blocks)](
+        tensor,
+        q_local,
+        scale_local,
+        cols,
+        quant_block,
+    )
+    if use_packed_gather:
+        payload_gathered = group._all_gather_out_place(payload_local, 0).view(
+            3, payload_bytes
+        )
+        q_gathered = [
+            payload_gathered[rank, :q_bytes].view(rows, cols) for rank in range(3)
+        ]
+        scale_gathered = [
+            payload_gathered[rank, q_bytes:].view(torch.float32).view(rows, num_blocks)
+            for rank in range(3)
+        ]
+    else:
+        q_gathered = group._all_gather_out_place(q_local, 0).view(
+            3,
+            rows,
+            cols,
+        )
+        scale_gathered = group._all_gather_out_place(scale_local, 0).view(
+            3,
+            rows,
+            num_blocks,
+        )
+    output = torch.empty_like(tensor)
+    _dequant_sum_i8_block[(rows, num_blocks)](
+        q_gathered[0],
+        q_gathered[1],
+        q_gathered[2],
+        scale_gathered[0],
+        scale_gathered[1],
+        scale_gathered[2],
+        output,
+        cols,
+        quant_block,
+    )
+    return output
+
+
+def _tp3_unified_exact_backend(rows: int) -> str:
+    backend = os.environ.get("AG2_VLLM_TP3_UNIFIED_EXACT_BACKEND", "auto")
+    if backend not in {
+        "auto",
+        "all_gather",
+        "all_gather_fused",
+        "fast_pair_owner",
+        "direct_pair_owner",
+        "weighted_owner_992",
+    }:
+        raise ValueError(f"unknown TP3 unified exact backend: {backend}")
+    if backend == "auto":
+        threshold = int(os.environ.get("AG2_VLLM_TP3_EXACT_OWNER_MIN_ROWS", "24"))
+        if threshold < 1:
+            raise ValueError("TP3 exact owner row threshold must be positive")
+        return "weighted_owner_992" if rows >= threshold else "all_gather_fused"
+    return backend
+
+
+def tp3_unified_exact_reduce(
+    tensor: torch.Tensor,
+    group_name: str,
+) -> torch.Tensor:
+    """Apply one exact arithmetic contract to target, prefill and MTP rows."""
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    if (
+        tensor.ndim != 2
+        or tensor.shape[1] != 5120
+        or group.world_size != 3
+        or tensor.dtype != torch.bfloat16
+    ):
+        raise ValueError(
+            "TP3 unified exact reduction requires BF16 [rows,5120], TP=3; "
+            f"got shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+            f"tp={group.world_size}"
+        )
+    backend = _tp3_unified_exact_backend(tensor.shape[0])
+    if backend not in _tp3_unified_exact_logged:
+        logger.warning(
+            "Unified exact TP3 reduction active: backend=%s shape=%s",
+            backend,
+            tuple(tensor.shape),
+        )
+        _tp3_unified_exact_logged.add(backend)
+    from .device_communicators.tp3_exact_reduce import (
+        exact_all_gather_reduce,
+        exact_all_gather_fused_reduce,
+        exact_direct_pair_owner_reduce,
+        exact_fast_pair_owner_reduce,
+        exact_weighted_owner_992_reduce,
+    )
+
+    if backend == "all_gather":
+        return exact_all_gather_reduce(tensor, group.device_group)
+    if backend == "all_gather_fused":
+        return exact_all_gather_fused_reduce(tensor, group.device_group)
+    if backend == "fast_pair_owner":
+        return exact_fast_pair_owner_reduce(tensor, group.device_group)
+    if backend == "direct_pair_owner":
+        return exact_direct_pair_owner_reduce(tensor, group.device_group)
+    return exact_weighted_owner_992_reduce(tensor, group.device_group)
+
+
+def tp3_owner_residual_arc_prequant(
+    contribution: torch.Tensor,
+    residual_owner: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale_inv: torch.Tensor,
+    selected_all: torch.Tensor,
+    route0: torch.Tensor,
+    route1: torch.Tensor,
+    route2: torch.Tensor,
+    inverse_order: torch.Tensor,
+    route_counts: list[int],
+    group_name: str,
+    eps: float,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    from .device_communicators.tp3_owner_prequant import (
+        full_residual_arc_prequant,
+        owner_geometry,
+        owner_residual_arc_prequant,
+    )
+
+    if residual_owner.shape != contribution.shape:
+        raise ValueError("owner custom-op ABI requires a full residual carrier")
+    rank = torch.distributed.get_rank(group.device_group)
+    if _is_tp3_owner_prequant_decode():
+        widths, offsets = owner_geometry()
+        start = offsets[rank]
+        width = widths[rank]
+        q, sf, base_q, base_sf, next_owner = owner_residual_arc_prequant(
+            contribution,
+            residual_owner[:, start : start + width],
+            weight,
+            input_scale_inv,
+            selected_all,
+            route0,
+            route1,
+            route2,
+            inverse_order,
+            route_counts,
+            group.device_group,
+            eps,
+        )
+        carrier = torch.empty_like(contribution)
+        carrier[:, start : start + width].copy_(next_owner)
+        return q, sf, base_q, base_sf, carrier
+    return full_residual_arc_prequant(
+        contribution,
+        residual_owner,
+        weight,
+        input_scale_inv,
+        selected_all[rank],
+        group.device_group,
+        eps,
+    )
+
+
+def tp3_owner_residual_arc_prequant_fake(
+    contribution: torch.Tensor,
+    residual_owner: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale_inv: torch.Tensor,
+    selected_all: torch.Tensor,
+    route0: torch.Tensor,
+    route1: torch.Tensor,
+    route2: torch.Tensor,
+    inverse_order: torch.Tensor,
+    route_counts: list[int],
+    group_name: str,
+    eps: float,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    del weight, input_scale_inv, route0, route1, route2, inverse_order
+    del route_counts, group_name, eps
+    from vllm._custom_ops import create_fp4_output_tensors
+
+    rows = contribution.shape[0]
+    selected_count = selected_all.shape[1]
+    q, sf = create_fp4_output_tensors(
+        rows,
+        contribution.shape[1],
+        contribution.device,
+        True,
+        padded_n=contribution.shape[1] + selected_count,
+    )
+    canonical_q, canonical_sf = create_fp4_output_tensors(
+        rows,
+        contribution.shape[1],
+        contribution.device,
+        True,
+    )
+    return (
+        q,
+        sf.view(torch.float8_e4m3fn),
+        canonical_q,
+        canonical_sf.view(torch.float8_e4m3fn),
+        torch.empty_like(contribution),
+    )
+
+
+def tp3_owner_terminal_norm(
+    contribution: torch.Tensor,
+    residual_owner: torch.Tensor,
+    weight: torch.Tensor,
+    group_name: str,
+    eps: float,
+) -> torch.Tensor:
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    from .device_communicators.tp3_owner_prequant import (
+        full_terminal_norm,
+        owner_geometry,
+        owner_terminal_norm,
+    )
+
+    if residual_owner.shape != contribution.shape:
+        raise ValueError("terminal custom-op ABI requires a full residual carrier")
+    if _is_tp3_owner_prequant_decode():
+        rank = torch.distributed.get_rank(group.device_group)
+        widths, offsets = owner_geometry()
+        start = offsets[rank]
+        return owner_terminal_norm(
+            contribution,
+            residual_owner[:, start : start + widths[rank]],
+            weight,
+            group.device_group,
+            eps,
+        )
+    return full_terminal_norm(
+        contribution, residual_owner, weight, group.device_group, eps
+    )
+
+
+def tp3_owner_terminal_norm_fake(
+    contribution: torch.Tensor,
+    residual_owner: torch.Tensor,
+    weight: torch.Tensor,
+    group_name: str,
+    eps: float,
+) -> torch.Tensor:
+    del residual_owner, weight, group_name, eps
+    return torch.empty_like(contribution)
+
+
+def tp3_owner_materialize_aux(
+    contribution: torch.Tensor,
+    residual_owner: torch.Tensor,
+    group_name: str,
+) -> torch.Tensor:
+    """Return the full canonical layer boundary required by EAGLE/MTP.
+
+    Owner execution deliberately keeps the residual sharded between decoder
+    seams.  EAGLE auxiliary states are a separate public contract: they must
+    contain the same replicated ``reduced contribution + residual`` tensor as
+    the ordinary TP path, never the padded owner carrier.
+    """
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    if residual_owner.shape != contribution.shape:
+        raise ValueError("owner auxiliary ABI requires a full residual carrier")
+
+    reduced = tp3_unified_exact_reduce(contribution, group_name)
+    if _is_tp3_owner_prequant_decode():
+        from .device_communicators.tp3_owner_prequant import (
+            materialize_owner_tensor,
+            owner_geometry,
+        )
+
+        rank = torch.distributed.get_rank(group.device_group)
+        widths, offsets = owner_geometry()
+        start = offsets[rank]
+        residual = materialize_owner_tensor(
+            residual_owner[:, start : start + widths[rank]],
+            group.device_group,
+        )
+    else:
+        residual = residual_owner
+    return reduced + residual
+
+
+def tp3_owner_materialize_aux_fake(
+    contribution: torch.Tensor,
+    residual_owner: torch.Tensor,
+    group_name: str,
+) -> torch.Tensor:
+    del residual_owner, group_name
+    return torch.empty_like(contribution)
+
+
+def tp3_v1_block5_fused_add_rms_norm(
+    value: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from .device_communicators.tp3_owner_prequant import (
+        v1_full_block5_fused_add_rms_norm,
+    )
+
+    return v1_full_block5_fused_add_rms_norm(value, residual, weight, eps)
+
+
+def tp3_v1_block5_fused_add_rms_norm_fake(
+    value: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del residual, weight, eps
+    return torch.empty_like(value), torch.empty_like(value)
+
+
+def gdn_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    """Use a row-invariant compressed reduction for PIECEWISE GDN."""
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+
+    from vllm.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+
+    forward_context = get_forward_context() if is_forward_context_available() else None
+    cudagraph_mode = (
+        forward_context.cudagraph_runtime_mode if forward_context is not None else None
+    )
+    if _should_use_tp3_piecewise_device_ce(
+        cudagraph_mode=cudagraph_mode,
+        tensor_dim=tensor.dim(),
+        rows=tensor.shape[0] if tensor.dim() == 2 else 0,
+        hidden_size=tensor.shape[-1] if tensor.dim() else 0,
+        tp_world_size=group.world_size,
+    ):
+        return _tp3_device_ce_reduce(tensor, group)
+    return all_reduce(tensor, group_name)
+
+
+def _should_use_tp3_embedding_ce(
+    runtime_enabled: bool,
+    rows: int,
+    tensor_dim: int,
+    hidden_size: int,
+    tp_world_size: int,
+    force_exact_nccl: bool = False,
+) -> bool:
+    """Keep every prefill embedding on one reduction contract.
+
+    Decode and MTP verification use at most three physical rows. Prefill uses
+    more than three. Unlike the generic CE fallback, this must not depend on
+    the arbitrary 4096-row physical threshold.
+    """
+    return (
+        runtime_enabled
+        and not force_exact_nccl
+        and rows > 3
+        and tensor_dim == 2
+        and hidden_size == 5120
+        and tp_world_size == 3
+    )
+
+
+def embedding_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    """Apply a phase-stable TP3 reduction to vocabulary embeddings."""
+    global _tp3_embedding_nccl_logged
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    force_exact_nccl = os.environ.get("AG2_VLLM_TP3_EMBEDDING_NCCL", "0") == "1"
+    if force_exact_nccl and _tp3_ce_runtime_enabled and not _tp3_embedding_nccl_logged:
+        logger.warning(
+            "TP3 vocabulary embedding diagnostic uses uniform exact NCCL; "
+            "compressed all-reduce remains enabled for eligible non-embedding paths"
+        )
+        _tp3_embedding_nccl_logged = True
+    if _should_use_tp3_embedding_ce(
+        runtime_enabled=_tp3_ce_runtime_enabled,
+        rows=tensor.shape[0] if tensor.dim() == 2 else 0,
+        tensor_dim=tensor.dim(),
+        hidden_size=tensor.shape[-1] if tensor.dim() else 0,
+        tp_world_size=group.world_size,
+        force_exact_nccl=force_exact_nccl,
+    ):
+        from .device_communicators.tp3_ce_all_reduce import (
+            tp3_ce_all_reduce,
+        )
+
+        return tp3_ce_all_reduce(tensor, group.device_group)
+    return group._all_reduce_out_place(tensor)
+
+
+def _is_tp3_sd_phase_reduce() -> bool:
+    """Read the explicit target pure-decode lane from forward context."""
+    from vllm.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+
+    return is_forward_context_available() and get_forward_context().tp3_sd_phase_reduce
+
+
+def _is_tp3_owner_prequant_decode() -> bool:
+    """Read capture/runtime owner authority at the opaque custom-op boundary."""
+    from vllm.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+
+    return (
+        is_forward_context_available()
+        and get_forward_context().tp3_owner_prequant_decode
+    )
+
+
+def _should_use_tp3_ce(
+    logical_tokens: int | None,
+    dcp_world_size: int,
+    tensor_dim: int,
+    hidden_size: int,
+    tp_world_size: int,
+) -> bool:
+    """Return true only for known large TP3 prefill reductions."""
+    return (
+        logical_tokens is not None
+        and logical_tokens * dcp_world_size >= 4096
+        and tensor_dim == 2
+        and hidden_size == 5120
+        and tp_world_size == 3
+    )
+
+
+def _should_use_tp3_ce_physical(
+    runtime_enabled: bool,
+    rows: int,
+    tensor_dim: int,
+    hidden_size: int,
+    tp_world_size: int,
+) -> bool:
+    """Conservative fallback when compiled fallback loses forward context.
+
+    The 4096-row boundary intentionally does not reconstruct a DCP-global
+    token count. It admits the measured 6528/7056 large-prefill shapes while
+    excluding startup (runtime gate off), decode and short-prefill graphs.
+    """
+    return (
+        runtime_enabled
+        and rows >= 4096
+        and tensor_dim == 2
+        and hidden_size == 5120
+        and tp_world_size == 3
+    )
+
+
+def _should_use_tp3_sd_canonical_reduce(
+    enabled: bool,
+    cudagraph_mode: object | None,
+    tensor_dim: int,
+    rows: int,
+    hidden_size: int,
+    tp_world_size: int,
+) -> bool:
+    """Canonicalize only the K0 FULL decode lanes paired with K=2 MTP."""
+    return (
+        enabled
+        and getattr(cudagraph_mode, "name", None) == "FULL"
+        and tensor_dim == 2
+        and 1 <= rows <= 8
+        and hidden_size == 5120
+        and tp_world_size == 3
+    )
+
+
+def _should_use_tp3_sd_deterministic_reduce(
+    enabled: bool,
+    tensor_dim: int,
+    rows: int,
+    hidden_size: int,
+    tp_world_size: int,
+) -> bool:
+    """Select only bounded TP3 decode and MTP verification reductions."""
+    max_rows = int(os.environ.get("VLLM_TP3_SD_DETERMINISTIC_MAX_ROWS", "24"))
+    return (
+        enabled
+        and tensor_dim == 2
+        and 1 <= rows <= max_rows
+        and hidden_size == 5120
+        and tp_world_size == 3
+    )
+
+
+def _tp3_sd_deterministic_sum(gathered: torch.Tensor) -> torch.Tensor:
+    """Accumulate exact TP3 inputs in a defined order and round once."""
+    if gathered.shape[0] != 3:
+        raise ValueError(f"expected three TP ranks, got shape={gathered.shape}")
+    output = gathered[0].float() + gathered[1].float()
+    output.add_(gathered[2].float())
+    return output.to(gathered.dtype)
+
+
+def _tp3_sd_deterministic_reduce(
+    tensor: torch.Tensor,
+    group: "GroupCoordinator",
+) -> torch.Tensor:
+    """All-gather exact local values, then perform a fixed FP32 TP3 sum."""
+    communicator = group.device_communicator
+    if communicator is None:
+        raise ValueError("No device communicator found")
+    gathered = communicator.all_gather(tensor, dim=0)
+    gathered = gathered.view(3, *tensor.shape)
+    return _tp3_sd_deterministic_sum(gathered)
+
+
+def _tp3_sd_canonical_reduce(
+    tensor: torch.Tensor,
+    reduce_fn: Callable[[torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """Reduce K0 as physical M=3N, then return its N logical rows."""
+    rows = tensor.shape[0]
+    padded = torch.nn.functional.pad(tensor, (0, 0, 0, rows * 2))
+    return reduce_fn(padded)[:rows]
 
 
 def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
@@ -352,6 +1216,48 @@ def patched_fused_scaled_matmul_reduce_scatter(
 direct_register_custom_op(
     op_name="all_reduce",
     op_func=all_reduce,
+    fake_impl=all_reduce_fake,
+)
+
+direct_register_custom_op(
+    op_name="gdn_all_reduce",
+    op_func=gdn_all_reduce,
+    fake_impl=all_reduce_fake,
+)
+
+direct_register_custom_op(
+    op_name="tp3_unified_exact_reduce",
+    op_func=tp3_unified_exact_reduce,
+    fake_impl=all_reduce_fake,
+)
+
+direct_register_custom_op(
+    op_name="tp3_owner_residual_arc_prequant",
+    op_func=tp3_owner_residual_arc_prequant,
+    fake_impl=tp3_owner_residual_arc_prequant_fake,
+)
+
+direct_register_custom_op(
+    op_name="tp3_owner_terminal_norm",
+    op_func=tp3_owner_terminal_norm,
+    fake_impl=tp3_owner_terminal_norm_fake,
+)
+
+direct_register_custom_op(
+    op_name="tp3_owner_materialize_aux",
+    op_func=tp3_owner_materialize_aux,
+    fake_impl=tp3_owner_materialize_aux_fake,
+)
+
+direct_register_custom_op(
+    op_name="tp3_v1_block5_fused_add_rms_norm",
+    op_func=tp3_v1_block5_fused_add_rms_norm,
+    fake_impl=tp3_v1_block5_fused_add_rms_norm_fake,
+)
+
+direct_register_custom_op(
+    op_name="embedding_all_reduce",
+    op_func=embedding_all_reduce,
     fake_impl=all_reduce_fake,
 )
 
@@ -709,6 +1615,23 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_gather(input_, dim)
 
+    def all_gather_into(
+        self,
+        input_: torch.Tensor,
+        raw_output: torch.Tensor,
+        final_output: torch.Tensor,
+        dim: int = -1,
+    ) -> torch.Tensor:
+        """Gather into caller-owned buffers without an allocating custom op."""
+        if self.world_size == 1:
+            final_output.copy_(input_)
+            return final_output
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.all_gather_into(
+            input_, raw_output, final_output, dim
+        )
+
     def all_gatherv(
         self,
         input_: torch.Tensor | list[torch.Tensor],
@@ -734,6 +1657,16 @@ class GroupCoordinator:
             )
         else:
             return self._reduce_scatter_out_place(input_, dim)
+
+    def reduce_scatter_chunked(
+        self, input_: torch.Tensor, dim: int = -1
+    ) -> torch.Tensor:
+        """Memory-bounded reduce-scatter for non-leading dimensions."""
+        if self.world_size == 1:
+            return input_
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.reduce_scatter_chunked(input_, dim)
 
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None

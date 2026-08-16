@@ -672,6 +672,9 @@ class MambaSpec(KVCacheSpec):
     mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
     mamba_cache_mode: str = "none"
     num_speculative_blocks: int = 0
+    separate_pool: bool = False
+    separate_pool_num_blocks: int = 0
+    state_update_chunk_alignment: int = 1
 
     @property
     def page_size_bytes(self) -> int:
@@ -691,6 +694,8 @@ class MambaSpec(KVCacheSpec):
                 cdiv(max_model_len, self.block_size) + self.num_speculative_blocks
             ) * self.page_size_bytes
         elif vllm_config.cache_config.mamba_cache_mode == "align":
+            if self.separate_pool:
+                return self.page_size_bytes
             return self.page_size_bytes * (2 + self.num_speculative_blocks)
         else:
             return self.page_size_bytes * (1 + self.num_speculative_blocks)
@@ -699,6 +704,8 @@ class MambaSpec(KVCacheSpec):
         # Mamba state is replicated across DCP/PCP ranks, never sharded, so
         # no CP scaling applies.
         if vllm_config.cache_config.mamba_cache_mode == "align":
+            if self.separate_pool:
+                return 1
             # Block table rows are position-indexed over the full sequence
             # even though only 2 + num_speculative_blocks state blocks are
             # resident at a time (earlier states are nulled out by
@@ -713,6 +720,8 @@ class MambaSpec(KVCacheSpec):
         return all(
             isinstance(spec, MambaSpec)
             and spec.num_speculative_blocks == self.num_speculative_blocks
+            and spec.state_update_chunk_alignment
+            == self.state_update_chunk_alignment
             for spec in kv_cache_specs.values()
         )
 
@@ -935,6 +944,11 @@ class KVCacheTensor:
     shared_by: list[str]  # layer names that share the same KV cache tensor
     offset: int = 0  # byte offset of this layer within a contiguous block
     block_stride: int = 0  # total bytes per block in a packed layout (0 = not packed)
+    backing_id: str = ""  # tensors with the same id alias one backing allocation
+    committed_size: int = 0  # initially mapped bytes (0 = fully committed)
+    mapping_quantum: int = 0  # CUDA-VMM resize quantum in bytes
+    num_blocks: int = 0  # logical blocks when reserved size includes tail padding
+    logical_block_size: int = 0  # mapped bytes contributed by one logical block
 
 
 @dataclass
@@ -970,6 +984,15 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    elastic_attention_stride: int = 0
+    elastic_gdn_stride: int = 0
+    elastic_mapping_quantum: int = 0
+    elastic_gdn_initial_blocks: int = 0
+    elastic_gdn_blocks_per_request: int = 0
+    elastic_budget_bytes: int = 0
+    elastic_attention_capacity_by_gdn_blocks: tuple[int, ...] = ()
+    effective_max_resident_seqs: int = 0
+    """Post-profile hard residency cap for elastic KV; 0 leaves it disabled."""
 
     @property
     def has_mamba_layers(self) -> bool:

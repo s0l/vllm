@@ -4,6 +4,46 @@
 DynamicSDSchedule = list[tuple[int, int, int]]
 
 
+def parse_force_non_speculative_xarg(
+    extra_args: dict | None,
+    *,
+    enabled: bool,
+) -> bool:
+    """Parse the bounded diagnostic request override.
+
+    This can only reduce a request to K=0. It deliberately cannot select or
+    increase a speculative K.
+    """
+    value = (extra_args or {}).get("ag2_force_non_speculative")
+    if value is None:
+        return False
+    if value not in (True, 1, "1"):
+        raise ValueError("ag2_force_non_speculative must be exactly 1")
+    if not enabled:
+        raise ValueError(
+            "ag2_force_non_speculative requires "
+            "AG2_VLLM_ALLOW_FORCE_NON_SPECULATIVE=1"
+        )
+    return True
+
+
+def apply_force_non_speculative_override(
+    default_num_spec_tokens: int,
+    scheduled_force_flags: list[bool],
+) -> int:
+    """Conservatively disable speculation for the whole scheduled batch.
+
+    The scheduler selects one speculative-token count for the complete step,
+    not independently per request.  A forced request therefore makes the
+    whole co-batched step non-speculative.  This preserves the diagnostic
+    request's K=0 contract without turning a valid mixed batch into a fatal
+    EngineCore exception.
+    """
+    if not any(scheduled_force_flags):
+        return default_num_spec_tokens
+    return 0
+
+
 def validate_and_normalize_dynamic_sd_schedule(
     num_speculative_tokens_per_batch_size: object,
 ) -> DynamicSDSchedule:

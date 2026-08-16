@@ -388,6 +388,61 @@ class CudaCommunicator(DeviceCommunicatorBase):
             + input_size[dim + 1 :]
         )
 
+    def all_gather_into(
+        self,
+        input_: torch.Tensor,
+        raw_output: torch.Tensor,
+        final_output: torch.Tensor,
+        dim: int = -1,
+    ) -> torch.Tensor:
+        """Gather and reorder into caller-owned contiguous CUDA buffers."""
+        if dim < 0:
+            dim += input_.dim()
+        if not 0 <= dim < input_.dim():
+            raise ValueError(f"Invalid dim {dim} for shape {tuple(input_.shape)}")
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or pynccl_comm.disabled:
+            raise RuntimeError("all_gather_into requires an enabled PyNCCL communicator")
+        if not input_.is_contiguous():
+            raise ValueError("all_gather_into input must be contiguous")
+        expected_raw_shape = (input_.shape[0] * self.world_size, *input_.shape[1:])
+        expected_final_shape = (
+            input_.shape[:dim]
+            + (self.world_size * input_.shape[dim],)
+            + input_.shape[dim + 1 :]
+        )
+        for name, tensor, shape in (
+            ("raw_output", raw_output, expected_raw_shape),
+            ("final_output", final_output, expected_final_shape),
+        ):
+            if tensor.dtype != input_.dtype or tensor.device != input_.device:
+                raise ValueError(
+                    f"{name} dtype/device must match input: "
+                    f"{tensor.dtype}/{tensor.device} != {input_.dtype}/{input_.device}"
+                )
+            if not tensor.is_contiguous() or tuple(tensor.shape) != tuple(shape):
+                raise ValueError(
+                    f"{name} must be contiguous with shape {tuple(shape)}, got "
+                    f"shape={tuple(tensor.shape)} contiguous={tensor.is_contiguous()}"
+                )
+        if raw_output.untyped_storage().data_ptr() == final_output.untyped_storage().data_ptr():
+            raw_end = raw_output.storage_offset() + raw_output.numel()
+            final_start = final_output.storage_offset()
+            final_end = final_start + final_output.numel()
+            if not (raw_end <= final_start or final_end <= raw_output.storage_offset()):
+                raise ValueError("raw_output and final_output must not overlap")
+
+        pynccl_comm.all_gather(raw_output, input_)
+        split_shape = (
+            input_.shape[:dim]
+            + (self.world_size, input_.shape[dim])
+            + input_.shape[dim + 1 :]
+        )
+        final_output.view(split_shape).copy_(
+            raw_output.view((self.world_size,) + input_.shape).movedim(0, dim)
+        )
+        return final_output
+
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
@@ -414,6 +469,36 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         # Reshape before returning
         return output.movedim(0, dim).contiguous()
+
+    def reduce_scatter_chunked(
+        self, input_: torch.Tensor, dim: int = -1
+    ) -> torch.Tensor:
+        """Reduce dim-1 chunks without a full transposed input allocation."""
+        if dim < 0:
+            dim += input_.dim()
+        pynccl_comm = self.pynccl_comm
+        if (
+            current_platform.is_rocm()
+            or pynccl_comm is None
+            or dim != 1
+            or input_.dim() != 3
+        ):
+            return self.reduce_scatter(input_, dim)
+
+        world_size = self.world_size
+        assert input_.shape[1] % world_size == 0
+        local_heads = input_.shape[1] // world_size
+        output = torch.empty(
+            (input_.shape[0], local_heads, input_.shape[2]),
+            dtype=input_.dtype,
+            device=input_.device,
+        )
+        scratch = torch.empty_like(output)
+        for root in range(world_size):
+            start = root * local_heads
+            scratch.copy_(input_[:, start : start + local_heads, :])
+            pynccl_comm.reduce(output, scratch, root)
+        return output
 
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None

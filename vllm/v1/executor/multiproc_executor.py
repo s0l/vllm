@@ -1031,6 +1031,32 @@ class WorkerProc:
                 indefinite=True
             )
             try:
+                memory_snapshot_dir = os.environ.get(
+                    "AG2_VLLM_MEMORY_SNAPSHOT_DIR", ""
+                )
+                if (
+                    memory_snapshot_dir
+                    and method == "execute_model"
+                    and not getattr(self, "_ag2_memory_history_started", False)
+                ):
+                    # Start immediately before the first real model execution,
+                    # not during model load/graph capture.  The bounded ring
+                    # then retains the allocation lifetime nearest a live OOM
+                    # without paying for an entire startup history.
+                    torch.cuda.memory._record_memory_history(
+                        enabled="all",
+                        context="all",
+                        stacks="all",
+                        max_entries=20_000,
+                        clear_history=True,
+                    )
+                    self._ag2_memory_history_started = True
+                    logger.warning(
+                        "Bounded CUDA allocator history armed for rank %d; "
+                        "snapshots will be written under %s on first OOM.",
+                        self.rank,
+                        memory_snapshot_dir,
+                    )
                 if isinstance(method, str):
                     func = getattr(self.worker, method)
                 elif isinstance(method, bytes):
@@ -1041,6 +1067,25 @@ class WorkerProc:
                 if output_rank is None or self.rank == output_rank:
                     self.handle_output(output)
             except Exception as e:
+                if (
+                    isinstance(e, torch.OutOfMemoryError)
+                    and getattr(self, "_ag2_memory_history_started", False)
+                    and not getattr(self, "_ag2_memory_snapshot_dumped", False)
+                ):
+                    try:
+                        os.makedirs(memory_snapshot_dir, exist_ok=True)
+                        snapshot_path = os.path.join(
+                            memory_snapshot_dir,
+                            f"cuda-oom-rank{self.rank}-{time.time_ns()}.pickle",
+                        )
+                        torch.cuda.memory._dump_snapshot(snapshot_path)
+                        self._ag2_memory_snapshot_dumped = True
+                        logger.error(
+                            "CUDA allocator OOM snapshot written: %s",
+                            snapshot_path,
+                        )
+                    except Exception:
+                        logger.exception("Failed to write CUDA allocator snapshot")
                 # Notes have been introduced in python 3.11
                 if hasattr(e, "add_note"):
                     e.add_note(traceback.format_exc())
