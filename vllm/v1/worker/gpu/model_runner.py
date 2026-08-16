@@ -296,11 +296,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             or envs.AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH
             or envs.AG2_VLLM_TP3_OWNER_PREQUANT
         ):
-            # Qwen3.5/3.6 TP3 gate+up physical width: 2 * 5824.  Allocate the
-            # largest destination before model/KV profiling so its ownership
-            # and HBM cost are explicit instead of depending on runtime
-            # allocator contiguity after smaller outputs split the segment.
-            gate_up_elements = self.max_num_tokens * 11648
+            # Derive the rank-local padded gate+up destination from the actual
+            # model and TP geometry.  Dense Qwen padding is TP*32 so every
+            # rank-local projection remains 32-wide aligned.
+            text_config = self.model_config.hf_text_config
+            intermediate_size = getattr(text_config, "intermediate_size", None)
+            tp_size = self.parallel_config.tensor_parallel_size
+            if not isinstance(intermediate_size, int) or intermediate_size <= 0:
+                raise RuntimeError(
+                    "shared gate/up scratch requires a positive runtime "
+                    "intermediate_size"
+                )
+            padded_multiple = tp_size * 32
+            padded_intermediate = (
+                (intermediate_size + padded_multiple - 1) // padded_multiple
+            ) * padded_multiple
+            gate_up_cols = 2 * (padded_intermediate // tp_size)
+            gate_up_elements = self.max_num_tokens * gate_up_cols
             workspace_elements = gate_up_elements
             if envs.AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH:
                 if not envs.AG2_VLLM_MTP_BF16_GATE_UP_SCRATCH:
@@ -330,9 +342,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     * head_dim
                 )
                 workspace_elements = max(workspace_elements, dcp_elements)
-            workspace_rows = cdiv(workspace_elements, 11648)
+            workspace_rows = cdiv(workspace_elements, gate_up_cols)
             self.marlin_gate_up_scratch = torch.empty(
-                (workspace_rows, 11648),
+                (workspace_rows, gate_up_cols),
                 dtype=self.dtype,
                 device=self.device,
             )

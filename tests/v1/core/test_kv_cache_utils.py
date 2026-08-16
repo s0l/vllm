@@ -1887,6 +1887,55 @@ def test_physical_pool_capacity_planner_matches_legacy_formula():
         assert planner.max_primary_blocks(secondary_blocks, upper_bound=60) == legacy
 
 
+def test_elastic_committed_budget_counts_unique_backings_after_shrink():
+    config = KVCacheConfig(
+        num_blocks=5,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=40,
+                committed_size=40,
+                mapping_quantum=4,
+                backing_id="elastic-attention-0",
+                num_blocks=5,
+                logical_block_size=8,
+                shared_by=["attention"],
+            ),
+            KVCacheTensor(
+                size=32,
+                committed_size=12,
+                mapping_quantum=4,
+                backing_id="elastic-gdn",
+                num_blocks=8,
+                logical_block_size=3,
+                shared_by=["gdn-0"],
+            ),
+            KVCacheTensor(
+                size=32,
+                committed_size=12,
+                mapping_quantum=4,
+                backing_id="elastic-gdn",
+                num_blocks=8,
+                logical_block_size=3,
+                shared_by=["gdn-1"],
+            ),
+        ],
+        kv_cache_groups=[],
+        elastic_mapping_quantum=4,
+    )
+    kv_cache_utils._shrink_kv_cache_tensor_blocks(
+        config.kv_cache_tensors[0], 5, 4
+    )
+    assert kv_cache_utils._elastic_committed_budget(config) == 44
+
+
+def test_elastic_runtime_reserve_respects_memory_provenance():
+    config = SimpleNamespace(
+        additional_config={"elastic_runtime_reserve_mb": 1344}
+    )
+    assert kv_cache_utils._elastic_runtime_reserve_bytes(config, False) == 1344 << 20
+    assert kv_cache_utils._elastic_runtime_reserve_bytes(config, True) == 0
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [

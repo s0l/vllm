@@ -46,6 +46,23 @@ _v4_column_index_cache: dict[tuple[int, str], torch.Tensor] = {}
 _v8_column_index_cache: dict[tuple[int, str], torch.Tensor] = {}
 
 
+def owner_geometry() -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """Return the installed runtime geometry after kernel capability check."""
+    from .ag2_runtime_plan import get_runtime_plan
+
+    plan = get_runtime_plan(required=False)
+    if plan is None:
+        # Standalone POCs load this module without a model runtime receipt.
+        return WIDTHS, OFFSETS
+    if plan.owner_widths != WIDTHS or plan.owner_offsets != OFFSETS:
+        raise RuntimeError(
+            "installed owner geometry exceeds the exact kernel capability: "
+            f"plan={plan.owner_widths}/{plan.owner_offsets} "
+            f"kernel={WIDTHS}/{OFFSETS}"
+        )
+    return plan.owner_widths, plan.owner_offsets
+
+
 def v4_owner_column_indices(rank: int, device: torch.device) -> torch.Tensor:
     """Canonical hidden columns owned by one 6/5/5 FP4 block-class shard."""
     key = (rank, str(device))
@@ -1735,6 +1752,8 @@ def _owner_residual_arc_prequant_direct(
         )
     base_q = torch.cat(q_parts, dim=1)
     base_sf = swizzle_blockscale(torch.cat(sf_parts, dim=1).contiguous())
+    if selected_count == 0:
+        return base_q, base_sf, base_q, base_sf, residual_out
     selected_values = (
         torch.cat(selected_parts, dim=1).index_select(1, inverse_order).contiguous()
     )
@@ -2072,13 +2091,15 @@ def full_residual_arc_prequant(
     normalized, residual_out = _full_reduce_and_norm(
         contribution, residual, weight, group, eps
     )
-    arc_q, arc_sf = ag2_nvfp4_arc_quantize(normalized, input_scale_inv, selected)
     base_q, base_sf = scaled_fp4_quant(
         normalized,
         input_scale_inv,
         is_sf_swizzled_layout=True,
         backend="b12x",
     )
+    if selected.numel() == 0:
+        return base_q, base_sf, base_q, base_sf, residual_out
+    arc_q, arc_sf = ag2_nvfp4_arc_quantize(normalized, input_scale_inv, selected)
     return arc_q, arc_sf, base_q, base_sf, residual_out
 
 

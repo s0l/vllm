@@ -28,15 +28,22 @@ class ElasticKVController:
         self._physical_budget_bytes: int | None = None
 
     def configure_physical_budget(self, budget_bytes: int, quantum: int) -> None:
-        """Pin the largest representable planner budget across transitions."""
+        """Pin the already-committed physical budget across transitions.
+
+        The planner budget is a ceiling.  It must be normalized to the exact
+        sum of the backing prefixes before reaching this controller; treating
+        uncommitted rounding slack as physical memory turns a later rebalance
+        into an allocation and makes its success depend on unrelated graph
+        allocations.
+        """
         if budget_bytes <= 0 or quantum <= 0:
             raise ValueError("elastic physical budget and quantum must be positive")
         physical_budget = budget_bytes // quantum * quantum
         committed = sum(owner.info.committed for owner in self.backings.values())
         reserved = sum(owner.info.reserved for owner in self.backings.values())
-        if not committed <= physical_budget <= reserved:
+        if physical_budget != committed or physical_budget > reserved:
             raise ValueError(
-                "elastic physical budget is outside backing bounds: "
+                "elastic physical budget must equal committed backing bytes: "
                 f"committed={committed}, budget={physical_budget}, "
                 f"reserved={reserved}"
             )
@@ -218,6 +225,10 @@ class ElasticKVController:
             self.backings[key].info.committed // self.geometry[key]
             for key in attention_ids
         )
+
+    def physical_budget_bytes(self) -> int | None:
+        """Return the exact committed-byte budget pinned for transitions."""
+        return self._physical_budget_bytes
 
 
 def validate_elastic_attention_block_tables(

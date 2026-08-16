@@ -313,14 +313,23 @@ class EngineCore:
                 available_gpu_memory = [self.available_gpu_memory_for_kv_cache] * len(
                     kv_cache_specs
                 )
+                available_memory_includes_runtime_headroom = [False] * len(
+                    kv_cache_specs
+                )
             else:
                 # Profiles the peak memory usage of the model to determine how
                 # much memory can be allocated for kv cache.
                 available_gpu_memory = self.model_executor.determine_available_memory()
+                available_memory_includes_runtime_headroom = (
+                    self.model_executor.collective_rpc(
+                        "kv_cache_memory_includes_runtime_headroom"
+                    )
+                )
                 self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
         else:
             # Attention free models don't need memory for kv cache
             available_gpu_memory = [0] * len(kv_cache_specs)
+            available_memory_includes_runtime_headroom = [False] * len(kv_cache_specs)
 
         assert len(kv_cache_specs) == len(available_gpu_memory)
 
@@ -328,7 +337,10 @@ class EngineCore:
         max_model_len_before = vllm_config.model_config.max_model_len
 
         kv_cache_configs = get_kv_cache_configs(
-            vllm_config, kv_cache_specs, available_gpu_memory
+            vllm_config,
+            kv_cache_specs,
+            available_gpu_memory,
+            available_memory_includes_runtime_headroom,
         )
 
         # If auto-fit reduced max_model_len, sync the new value to workers.

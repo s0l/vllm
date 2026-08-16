@@ -607,9 +607,8 @@ def tp3_owner_residual_arc_prequant(
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     from .device_communicators.tp3_owner_prequant import (
-        OFFSETS,
-        WIDTHS,
         full_residual_arc_prequant,
+        owner_geometry,
         owner_residual_arc_prequant,
     )
 
@@ -617,8 +616,9 @@ def tp3_owner_residual_arc_prequant(
         raise ValueError("owner custom-op ABI requires a full residual carrier")
     rank = torch.distributed.get_rank(group.device_group)
     if _is_tp3_owner_prequant_decode():
-        start = OFFSETS[rank]
-        width = WIDTHS[rank]
+        widths, offsets = owner_geometry()
+        start = offsets[rank]
+        width = widths[rank]
         q, sf, base_q, base_sf, next_owner = owner_residual_arc_prequant(
             contribution,
             residual_owner[:, start : start + width],
@@ -706,9 +706,8 @@ def tp3_owner_terminal_norm(
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     from .device_communicators.tp3_owner_prequant import (
-        OFFSETS,
-        WIDTHS,
         full_terminal_norm,
+        owner_geometry,
         owner_terminal_norm,
     )
 
@@ -716,10 +715,11 @@ def tp3_owner_terminal_norm(
         raise ValueError("terminal custom-op ABI requires a full residual carrier")
     if _is_tp3_owner_prequant_decode():
         rank = torch.distributed.get_rank(group.device_group)
-        start = OFFSETS[rank]
+        widths, offsets = owner_geometry()
+        start = offsets[rank]
         return owner_terminal_norm(
             contribution,
-            residual_owner[:, start : start + WIDTHS[rank]],
+            residual_owner[:, start : start + widths[rank]],
             weight,
             group.device_group,
             eps,
@@ -761,15 +761,15 @@ def tp3_owner_materialize_aux(
     reduced = tp3_unified_exact_reduce(contribution, group_name)
     if _is_tp3_owner_prequant_decode():
         from .device_communicators.tp3_owner_prequant import (
-            OFFSETS,
-            WIDTHS,
             materialize_owner_tensor,
+            owner_geometry,
         )
 
         rank = torch.distributed.get_rank(group.device_group)
-        start = OFFSETS[rank]
+        widths, offsets = owner_geometry()
+        start = offsets[rank]
         residual = materialize_owner_tensor(
-            residual_owner[:, start : start + WIDTHS[rank]],
+            residual_owner[:, start : start + widths[rank]],
             group.device_group,
         )
     else:

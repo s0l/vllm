@@ -87,6 +87,7 @@ from .qwen3_next import (
     Qwen3NextModel,
     Qwen3NextSparseMoeBlock,
     QwenNextMixtureOfExperts,
+    _ag2_install_runtime_plan,
     _ag2_internal_trace_layer_enabled,
     _ag2_selected_stages,
     _ag2_tp3_owner_prequant_enabled,
@@ -522,6 +523,7 @@ class Qwen3_5ForCausalLMBase(
         cache_config = vllm_config.cache_config
 
         scheduler_config = vllm_config.scheduler_config
+        _ag2_install_runtime_plan(vllm_config)
         if cache_config.mamba_cache_mode == "all":
             raise NotImplementedError(
                 "Qwen3.5 currently does not support 'all' prefix caching, "

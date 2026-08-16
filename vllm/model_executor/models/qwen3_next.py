@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next model."""
 
+import json
 import os
 from collections.abc import Iterable
 from itertools import islice
@@ -23,8 +24,8 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
-    tensor_model_parallel_owner_residual_arc_prequant,
     tensor_model_parallel_owner_materialize_aux,
+    tensor_model_parallel_owner_residual_arc_prequant,
     tensor_model_parallel_owner_terminal_norm,
     tensor_model_parallel_reduce_scatter,
     tensor_model_parallel_unified_exact_all_reduce,
@@ -98,6 +99,111 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _ag2_install_runtime_plan(vllm_config: VllmConfig) -> None:
+    """Compile model + physical-topology facts before any layer is built."""
+    if os.environ.get("AG2_VLLM_TP3_OWNER_PREQUANT", "0") != "1":
+        return
+    from vllm.distributed.device_communicators.ag2_runtime_plan import (
+        BackendCapabilities,
+        ModelGeometry,
+        PhysicalTopology,
+        canonical_identity,
+        compile_runtime_plan,
+        install_runtime_plan,
+    )
+
+    bootstrap_text = os.environ.get("AG2_TOPOLOGY_BOOTSTRAP", "")
+    if not bootstrap_text:
+        raise RuntimeError("TP3 owner runtime requires a topology bootstrap receipt")
+    bootstrap = json.loads(bootstrap_text)
+    if bootstrap.get("schema") != "ag2-topology-bootstrap-v1":
+        raise RuntimeError("invalid AG2 topology bootstrap schema")
+    receipt_sha = bootstrap.get("receipt_sha256")
+    unsigned_bootstrap = {
+        key: value for key, value in bootstrap.items() if key != "receipt_sha256"
+    }
+    if receipt_sha != canonical_identity(unsigned_bootstrap):
+        raise RuntimeError("AG2 topology bootstrap receipt SHA mismatch")
+    topology = PhysicalTopology.from_dict(bootstrap["topology"])
+
+    model_config = vllm_config.model_config
+    config = model_config.hf_text_config
+    full_config = model_config.hf_config.to_dict()
+    quantization = full_config.get("quantization_config", {})
+    groups = quantization.get("config_groups", {})
+    group_sizes = {
+        int(group["input_activations"]["group_size"])
+        for group in groups.values()
+        if group.get("input_activations", {}).get("group_size") is not None
+    }
+    if len(group_sizes) != 1:
+        raise RuntimeError(
+            f"owner runtime requires one activation quant group size: {group_sizes}"
+        )
+    speculative = vllm_config.speculative_config
+    speculative_tokens = (
+        speculative.num_speculative_tokens if speculative is not None else 0
+    )
+    geometry = ModelGeometry(
+        model_identity=canonical_identity(full_config),
+        hidden_size=config.hidden_size,
+        quant_group_size=group_sizes.pop(),
+        # This is a backend arithmetic capability, not a model-name constant:
+        # the accepted exact kernel preserves 1024-wide RMS subtrees.
+        rms_root_size=1024,
+        num_hidden_layers=config.num_hidden_layers,
+        num_attention_heads=config.num_attention_heads,
+        num_key_value_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        speculative_tokens=speculative_tokens,
+        tensor_parallel_size=vllm_config.parallel_config.tensor_parallel_size,
+    )
+    backend = BackendCapabilities(
+        backend_identity=canonical_identity(
+            {
+                "schema": "ag2-tp3-owner-root-local-v1",
+                "rms_root_size": geometry.rms_root_size,
+                "owner_alignment": 256,
+                "exact_sum_order": ((0, 1), 2),
+            }
+        ),
+        owner_alignment=256,
+        preserves_root_local_math=True,
+    )
+    plan = compile_runtime_plan(
+        model=geometry,
+        backend=backend,
+        topology=topology,
+        rows=max(1, vllm_config.scheduler_config.max_num_seqs),
+    )
+    from vllm.distributed.device_communicators.tp3_owner_prequant import (
+        OFFSETS,
+        WIDTHS,
+    )
+
+    # The compiler is already generic; the currently proven CUDA seam is not.
+    # Treat its fixed geometry as a capability check, never as model policy.
+    if plan.owner_widths != WIDTHS or plan.owner_offsets != OFFSETS:
+        raise RuntimeError(
+            "runtime owner plan is not supported by the installed exact kernel: "
+            f"plan={plan.owner_widths}/{plan.owner_offsets} "
+            f"kernel={WIDTHS}/{OFFSETS}"
+        )
+    install_runtime_plan(plan)
+    logger.warning(
+        "Installed AG2 runtime plan sha=%s model=%s topology=%s rows=%d "
+        "widths=%s mapping=%s sum=%s source=%s",
+        plan.plan_sha256,
+        plan.model_identity,
+        plan.topology_identity,
+        plan.rows,
+        plan.owner_widths,
+        plan.logical_to_physical,
+        plan.exact_sum_order,
+        plan.source,
+    )
+
+
 def _ag2_tp3_owner_prequant_enabled(
     vllm_config: VllmConfig,
     prefix: str,
@@ -105,7 +211,11 @@ def _ag2_tp3_owner_prequant_enabled(
     is_moe_layer: bool,
 ) -> bool:
     """Resolve and fail-close the target-only owner-prequant experiment."""
-    if os.environ.get("AG2_VLLM_TP3_OWNER_PREQUANT", "0") != "1":
+    from vllm.distributed.device_communicators.ag2_runtime_plan import (
+        get_runtime_plan,
+    )
+
+    if get_runtime_plan(required=False) is None:
         return False
     # The current ARC sidecar describes target layers only. MTP deliberately
     # stays on its accepted exact-reduce path until it has its own proof.
@@ -125,8 +235,6 @@ def _ag2_tp3_owner_prequant_enabled(
         raise RuntimeError(
             "TP3 owner prequant requires CE (compressed all-reduce) enabled"
         )
-    if not os.environ.get("AG2_VLLM_NVFP4_ARC_SIDECAR_DIR", "").strip():
-        raise RuntimeError("TP3 owner prequant requires the ARC sidecar")
     boolean_trace_switches = (
         "AG2_VLLM_AUX_HIDDEN_TRACE_ALL_INTERNAL_BOUNDARIES",
         "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_ALL_BOUNDARIES",
@@ -167,12 +275,14 @@ def _ag2_tp3_mtp_block5_enabled(
     vllm_config: VllmConfig,
     prefix: str,
 ) -> bool:
-    if os.environ.get("AG2_VLLM_TP3_MTP_BLOCK5_RMS", "0") != "1":
-        return False
     is_mtp = ".mtp.layers." in f".{prefix}" or prefix.startswith("mtp.layers.")
     if not is_mtp:
         return False
-    if os.environ.get("AG2_VLLM_TP3_OWNER_PREQUANT", "0") != "1":
+    from vllm.distributed.device_communicators.ag2_runtime_plan import (
+        get_runtime_plan,
+    )
+
+    if get_runtime_plan(required=False) is None:
         raise RuntimeError("MTP block5 RMS requires target owner-prequant")
     parallel = vllm_config.parallel_config
     if parallel.tensor_parallel_size != 3 or parallel.pipeline_parallel_size != 1:
@@ -1651,13 +1761,17 @@ class Qwen3NextDecoderLayer(nn.Module):
         QuantizedActivation | GDNQuantizedActivations,
         torch.Tensor,
     ]:
-        if contribution.ndim != 2 or contribution.shape[1] != 5120:
+        hidden_size = norm.weight.shape[0]
+        if contribution.ndim != 2 or contribution.shape[1] != hidden_size:
             raise RuntimeError(
-                "TP3 owner prequant requires a two-dimensional [M,5120] input"
+                "TP3 owner prequant input does not match the runtime norm geometry: "
+                f"input={tuple(contribution.shape)} hidden_size={hidden_size}"
             )
         if residual.shape != contribution.shape:
             raise RuntimeError(
-                "TP3 owner prequant requires a full [M,5120] residual carrier"
+                "TP3 owner prequant requires a full residual carrier matching "
+                f"the runtime input: residual={tuple(residual.shape)} "
+                f"input={tuple(contribution.shape)}"
             )
         required = (
             "input_global_scale_inv",
@@ -2515,10 +2629,17 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                     )
                 if not hasattr(consumer, "_ag2_nvfp4_arc_selected_all"):
                     raise RuntimeError(
-                        f"layer {layer.layer_idx} consumer is missing ARC owner metadata"
+                        f"layer {layer.layer_idx} consumer is missing owner metadata"
+                    )
+                mode = getattr(consumer, "_ag2_nvfp4_owner_metadata_mode", None)
+                if mode not in ("native-base-only", "model-bound-arc"):
+                    raise RuntimeError(
+                        f"layer {layer.layer_idx} owner metadata mode is "
+                        f"invalid: {mode}"
                     )
         logger.warning(
-            "Validated target-only TP3 owner residual + ARC prequant ABI for %d layers",
+            "Validated target-only TP3 owner residual/RMS/prequant ABI for %d "
+            "layers (ARC is capability-bound, not required)",
             sum(
                 getattr(layer, "_ag2_tp3_owner_prequant", False)
                 for layer in self.layers
@@ -2595,6 +2716,7 @@ class Qwen3NextForCausalLM(
         cache_config = vllm_config.cache_config
 
         scheduler_config = vllm_config.scheduler_config
+        _ag2_install_runtime_plan(vllm_config)
         if cache_config.mamba_cache_mode == "all":
             raise NotImplementedError(
                 "Qwen3Next currently does not support 'all' prefix caching, "

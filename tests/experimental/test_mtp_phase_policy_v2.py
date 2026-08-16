@@ -835,7 +835,7 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
         self.assertEqual(attention.resizes, [])
         self.assertEqual(gdn.resizes, [])
 
-    def test_v2_elastic_uses_configured_planner_budget(self):
+    def test_v2_elastic_rejects_uncommitted_planner_slack(self):
         controller = ElasticKVController(torch.device("cpu"))
         attention = _Owner(16)
         gdn = _Owner(8)
@@ -847,18 +847,13 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
             "elastic-attention-0": 4,
             "elastic-gdn": 4,
         }
-        controller.configure_physical_budget(30, 4)
-
-        with (
-            patch.object(torch.cuda, "Event", return_value=_Event()),
-            patch.object(torch.cuda, "current_stream", return_value=object()),
-            patch.object(torch.distributed, "is_initialized", return_value=False),
+        with self.assertRaisesRegex(
+            ValueError, "must equal committed backing bytes"
         ):
-            controller.apply((2, 3))
-            controller.apply((3, 4))
+            controller.configure_physical_budget(30, 4)
 
-        self.assertEqual(attention.committed + gdn.committed, 28)
-        self.assertEqual(controller._physical_budget_bytes, 28)
+        controller.configure_physical_budget(24, 4)
+        self.assertEqual(controller._physical_budget_bytes, 24)
 
 
 if __name__ == "__main__":

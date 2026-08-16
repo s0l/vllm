@@ -35,7 +35,36 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-PLAN_SCHEMA_VERSION = 1
+PLAN_SCHEMA_VERSION = 3
+
+
+def _memory_plan_config_hash(vllm_config: VllmConfig) -> str:
+    """Hash runtime identity without one-shot elastic bootstrap headroom.
+
+    Once an actual graph capture has produced an exact KV byte budget, the
+    provisional reserve is superseded by that measurement.  Excluding only
+    this bootstrap input lets the measured plan remain valid when the reserve
+    is removed; model, scheduler, graph, topology and backend changes still
+    invalidate the plan through ``VllmConfig.compute_hash``.
+    """
+    additional = getattr(vllm_config, "additional_config", None)
+    if (
+        not isinstance(additional, dict)
+        or "elastic_runtime_reserve_mb" not in additional
+    ):
+        return vllm_config.compute_hash()
+
+    # VllmConfig may already contain loaded custom torch Parameters here and
+    # is intentionally not deepcopy-safe.  Replace only the small plain dict
+    # for the synchronous hash call, and restore object identity even if a
+    # downstream config hash raises.
+    normalized_additional = dict(additional)
+    normalized_additional.pop("elastic_runtime_reserve_mb")
+    vllm_config.additional_config = normalized_additional
+    try:
+        return vllm_config.compute_hash()
+    finally:
+        vllm_config.additional_config = additional
 
 
 def compute_plan_fingerprint(
@@ -61,7 +90,7 @@ def compute_plan_fingerprint(
     factors = {
         "schema": PLAN_SCHEMA_VERSION,
         "vllm": vllm_version,
-        "vllm_config": vllm_config.compute_hash(),
+        "vllm_config": _memory_plan_config_hash(vllm_config),
         "device_name": current_platform.get_device_name(),
         "device_total_memory": current_platform.get_device_total_memory(),
         "device_capability": str(capability) if capability else "",
@@ -135,16 +164,26 @@ def maybe_apply_startup_plan(worker: "Worker") -> None:
     """If enabled and ``--kv-cache-memory`` was not set explicitly, apply a
     persisted plan by setting ``worker.cache_config.kv_cache_memory_bytes``.
     No-op unless ``VLLM_ENABLE_STARTUP_PLAN=1``."""
-    if (
-        not envs.VLLM_ENABLE_STARTUP_PLAN
-        or worker.cache_config.kv_cache_memory_bytes is not None
-    ):
+    if worker.cache_config.kv_cache_memory_bytes is not None:
+        worker._startup_plan_includes_runtime_headroom = True
+        return
+    worker._startup_plan_includes_runtime_headroom = False
+    if not envs.VLLM_ENABLE_STARTUP_PLAN:
         return
     fingerprint = compute_plan_fingerprint(
         worker.vllm_config, worker.rank, worker.parallel_config.world_size
     )
+    # Pin lookup identity before memory planning mutates derived runtime config.
+    # Saving under a recomputed post-capture identity creates a cache entry that
+    # can never be found at the next pre-planning lookup.
+    worker._startup_plan_fingerprint = fingerprint
     plan = _load_plan(fingerprint)
     if plan is None:
+        logger.info(
+            "Startup plan miss (fingerprint %s, path %s); profiling runtime memory",
+            fingerprint,
+            _plan_path(fingerprint),
+        )
         return
     current_free_memory = worker.init_snapshot.free_memory
     kv_bytes = _applicable_kv_cache_memory_bytes(plan, current_free_memory)
@@ -162,17 +201,39 @@ def maybe_apply_startup_plan(worker: "Worker") -> None:
         current_free_memory / (1 << 30),
     )
     worker.cache_config.kv_cache_memory_bytes = kv_bytes
+    worker._startup_plan_includes_runtime_headroom = bool(
+        plan.get("post_warmup_complete", False)
+    )
 
 
-def maybe_save_startup_plan(worker: "Worker", kv_cache_memory_bytes: int) -> None:
+def maybe_save_startup_plan(
+    worker: "Worker",
+    kv_cache_memory_bytes: int,
+    *,
+    post_warmup_complete: bool = False,
+) -> None:
     """Atomically persist this boot's profiling result for future boots.
     No-op unless ``VLLM_ENABLE_STARTUP_PLAN=1``; failures are logged,
     never raised."""
     if not envs.VLLM_ENABLE_STARTUP_PLAN:
         return
-    fingerprint = compute_plan_fingerprint(
+    fingerprint = getattr(worker, "_startup_plan_fingerprint", None)
+    if fingerprint is None:
+        # Defensive compatibility for callers that save without first calling
+        # maybe_apply_startup_plan; normal Worker lifecycle always pins it.
+        fingerprint = compute_plan_fingerprint(
+            worker.vllm_config, worker.rank, worker.parallel_config.world_size
+        )
+    post_runtime_fingerprint = compute_plan_fingerprint(
         worker.vllm_config, worker.rank, worker.parallel_config.world_size
     )
+    if post_runtime_fingerprint != fingerprint:
+        logger.info(
+            "Startup plan runtime config drift: lookup=%s post_runtime=%s; "
+            "saving under lookup identity",
+            fingerprint,
+            post_runtime_fingerprint,
+        )
     path = _plan_path(fingerprint)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -181,6 +242,8 @@ def maybe_save_startup_plan(worker: "Worker", kv_cache_memory_bytes: int) -> Non
             "fingerprint": fingerprint,
             "kv_cache_memory_bytes": int(kv_cache_memory_bytes),
             "free_memory_baseline": int(worker.init_snapshot.free_memory),
+            "post_runtime_fingerprint": post_runtime_fingerprint,
+            "post_warmup_complete": post_warmup_complete,
         }
         tmp = f"{path}.tmp.{os.getpid()}"
         with open(tmp, "w") as f:

@@ -17,7 +17,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
-from vllm.utils.mem_utils import format_gib
+from vllm.utils.mem_utils import format_gib, format_mib
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.kv_cache_capacity import PhysicalPoolCapacityPlanner
 from vllm.v1.kv_cache_interface import (
@@ -184,6 +184,36 @@ def _shrink_kv_cache_tensor_blocks(
 
     assert tensor.size % old_num_blocks == 0
     tensor.size = tensor.size // old_num_blocks * new_num_blocks
+
+
+def _elastic_committed_budget(config: KVCacheConfig) -> int:
+    """Return exact physical bytes represented by unique elastic backings."""
+    committed_by_backing: dict[str, int] = {}
+    for tensor in config.kv_cache_tensors:
+        if not tensor.mapping_quantum:
+            continue
+        committed = tensor.committed_size
+        prior = committed_by_backing.setdefault(tensor.backing_id, committed)
+        if prior != committed:
+            raise ValueError(
+                "elastic backing has inconsistent committed sizes: "
+                f"backing={tensor.backing_id} first={prior} current={committed}"
+            )
+    if not committed_by_backing:
+        raise ValueError("elastic KV config has no committed backing")
+    return sum(committed_by_backing.values())
+
+
+def _elastic_runtime_reserve_bytes(
+    vllm_config: VllmConfig,
+    available_memory_includes_runtime_headroom: bool,
+) -> int:
+    if available_memory_includes_runtime_headroom:
+        return 0
+    return (
+        int(vllm_config.additional_config.get("elastic_runtime_reserve_mb", 0))
+        * 1024**2
+    )
 
 
 # The hash seed for the first block of any prefix block sequence.
@@ -1463,6 +1493,8 @@ def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
+    *,
+    available_memory_includes_runtime_headroom: bool = False,
 ) -> KVCacheConfig:
     """
     Generate the KV cache configuration from the KV cache groups and spec
@@ -1520,13 +1552,13 @@ def get_kv_cache_config_from_groups(
                     )
                     * 1024**2
                 )
-                runtime_reserve = (
-                    int(
-                        vllm_config.additional_config.get(
-                            "elastic_runtime_reserve_mb", 0
-                        )
-                    )
-                    * 1024**2
+                # An explicit/persisted KV byte budget is already derived from
+                # actual graph capture and includes all non-KV headroom.  The
+                # reserve is only a first-boot containment for runtimes whose
+                # graph profiler cannot run before KV initialization.
+                runtime_reserve = _elastic_runtime_reserve_bytes(
+                    vllm_config,
+                    available_memory_includes_runtime_headroom,
                 )
                 min_seqs = int(
                     vllm_config.additional_config.get("elastic_gdn_min_seqs", 1)
@@ -1574,6 +1606,14 @@ def get_kv_cache_config_from_groups(
                     )
 
                 attention_reserved = planner.primary_mapped_bytes(num_blocks)
+                # ``elastic_budget`` is the planning ceiling, not necessarily
+                # physically committed memory: independent attention backings
+                # and the packed GDN backing are quantum-rounded separately.
+                # Publish the exact committed total to both the scheduler and
+                # the runtime controller. Otherwise the first transition tries
+                # to materialize the uncommitted planning slack after CUDA
+                # graphs have consumed the runtime reserve.
+                committed_budget = attention_reserved + mamba_committed
                 mamba_reserved = planner.secondary_mapped_bytes(mamba_num_blocks)
                 attention_tensors: list[KVCacheTensor] = []
                 backing_index = 0
@@ -1617,6 +1657,7 @@ def get_kv_cache_config_from_groups(
                     "gdn_virtual_blocks=%d, gdn_initial_blocks=%d, "
                     "attention_mapped=%s GiB, gdn_mapped=%s GiB, "
                     "runtime_reserve=%s GiB, profiled_available=%s GiB, "
+                    "committed_budget=%s GiB, planning_slack=%s MiB, "
                     "quantum=%d MiB",
                     num_blocks,
                     mamba_num_blocks,
@@ -1625,6 +1666,8 @@ def get_kv_cache_config_from_groups(
                     format_gib(mamba_committed),
                     format_gib(runtime_reserve),
                     format_gib(available_memory),
+                    format_gib(committed_budget),
+                    format_mib(elastic_budget - committed_budget),
                     quantum // 1024**2,
                 )
                 return KVCacheConfig(
@@ -1636,7 +1679,7 @@ def get_kv_cache_config_from_groups(
                     elastic_mapping_quantum=quantum,
                     elastic_gdn_initial_blocks=initial_mamba_blocks,
                     elastic_gdn_blocks_per_request=blocks_per_seq,
-                    elastic_budget_bytes=elastic_budget,
+                    elastic_budget_bytes=committed_budget,
                 )
 
             mamba_tensors: list[KVCacheTensor] = []
@@ -2588,6 +2631,7 @@ def get_kv_cache_configs(
     vllm_config: VllmConfig,
     kv_cache_specs: list[dict[str, KVCacheSpec]],
     available_memory: list[int],
+    available_memory_includes_runtime_headroom: list[bool] | None = None,
 ) -> list[KVCacheConfig]:
     """
     Generates the KV cache configurations for a model.
@@ -2618,6 +2662,11 @@ def get_kv_cache_configs(
     Returns:
         The generated KVCacheConfigs for each worker.
     """
+
+    if available_memory_includes_runtime_headroom is None:
+        available_memory_includes_runtime_headroom = [False] * len(available_memory)
+    if len(available_memory_includes_runtime_headroom) != len(available_memory):
+        raise ValueError("KV memory provenance must match worker count")
 
     # Merge the KV cache specs of all workers. Different PP stages may have
     # different layer names, and different TP ranks of the same PP stage should
@@ -2688,15 +2737,26 @@ def get_kv_cache_configs(
         )
 
     kv_cache_configs: list[KVCacheConfig] = []
-    for projected_groups, kv_cache_spec_one_worker, available_memory_one_worker in zip(
-        projected_groups_per_worker, kv_cache_specs, available_memory
+    for (
+        projected_groups,
+        kv_cache_spec_one_worker,
+        available_memory_one_worker,
+        includes_runtime_headroom,
+    ) in zip(
+        projected_groups_per_worker,
+        kv_cache_specs,
+        available_memory,
+        available_memory_includes_runtime_headroom,
     ):
         assert sum(len(group.layer_names) for group in projected_groups) == len(
             kv_cache_spec_one_worker
         ), "Some layers are not assigned to any group."
         kv_cache_configs.append(
             get_kv_cache_config_from_groups(
-                vllm_config, projected_groups, available_memory_one_worker
+                vllm_config,
+                projected_groups,
+                available_memory_one_worker,
+                available_memory_includes_runtime_headroom=includes_runtime_headroom,
             )
         )
 
@@ -2724,6 +2784,15 @@ def get_kv_cache_configs(
                 ):
                     continue
                 _shrink_kv_cache_tensor_blocks(tensor, num_blocks_old, min_num_blocks)
+
+        if kv_cache_config.elastic_mapping_quantum:
+            # Rank-safe shrinking changes the actually committed attention
+            # prefixes. Keep the worker/controller byte contract synchronized
+            # with the tensors that will be allocated, rather than retaining
+            # the pre-merge local planning budget.
+            kv_cache_config.elastic_budget_bytes = _elastic_committed_budget(
+                kv_cache_config
+            )
 
     return kv_cache_configs
 

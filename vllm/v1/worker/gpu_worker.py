@@ -89,6 +89,34 @@ logger = init_logger(__name__)
 
 _KV_REDUNDANCY_BUFFER_BYTES = 150 * (1 << 20)
 
+
+def _post_warmup_elastic_kv_budget(
+    *,
+    physical_budget: int,
+    current_free: int,
+    initial_free: int,
+    requested_memory: int,
+    mapping_quantum: int,
+) -> int:
+    """Derive a replay budget after graphs and sampler have materialized."""
+    if physical_budget <= 0 or mapping_quantum <= 0:
+        raise ValueError("post-warmup elastic geometry must be positive")
+    unrequested = max(initial_free - requested_memory, 0)
+    candidate = (
+        physical_budget
+        + current_free
+        - unrequested
+        - _KV_REDUNDANCY_BUFFER_BYTES
+    )
+    budget = candidate // mapping_quantum * mapping_quantum
+    if budget <= 0:
+        raise RuntimeError(
+            "post-warmup runtime leaves no safe elastic KV budget: "
+            f"physical={physical_budget} free={current_free} "
+            f"unrequested={unrequested}"
+        )
+    return budget
+
 if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -627,6 +655,12 @@ class Worker(WorkerBase):
             getattr(self.parallel_config, "_api_process_count", 1),
         )
 
+    def kv_cache_memory_includes_runtime_headroom(self) -> bool:
+        """Whether the returned KV bytes already include runtime headroom."""
+        return bool(
+            getattr(self, "_startup_plan_includes_runtime_headroom", False)
+        )
+
     def get_kv_connector_handshake_metadata(
         self,
     ) -> dict[tuple[int, int], KVConnectorHandshakeMetadata] | None:
@@ -831,6 +865,39 @@ class Worker(WorkerBase):
                 self.model_runner._dummy_pooler_run(hidden_states)
             else:
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
+
+        elastic_controller = getattr(
+            self.model_runner, "elastic_kv_controller", None
+        )
+        physical_budget = (
+            elastic_controller.physical_budget_bytes()
+            if elastic_controller is not None
+            else None
+        )
+        if physical_budget is not None:
+            torch.accelerator.synchronize()
+            current_free = torch.accelerator.get_memory_info()[0]
+            mapping_quantum = self.model_runner.kv_cache_config.elastic_mapping_quantum
+            replay_budget = _post_warmup_elastic_kv_budget(
+                physical_budget=physical_budget,
+                current_free=current_free,
+                initial_free=self.init_snapshot.free_memory,
+                requested_memory=int(self.requested_memory),
+                mapping_quantum=mapping_quantum,
+            )
+            logger.info(
+                "Post-warmup elastic KV plan: current_physical=%s GiB, "
+                "current_free=%s GiB, replay_budget=%s GiB, margin=%s MiB",
+                format_gib(physical_budget),
+                format_gib(current_free),
+                format_gib(replay_budget),
+                _KV_REDUNDANCY_BUFFER_BYTES // (1 << 20),
+            )
+            maybe_save_startup_plan(
+                self,
+                replay_budget,
+                post_warmup_complete=True,
+            )
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
