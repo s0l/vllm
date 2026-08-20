@@ -152,6 +152,7 @@ from vllm.v1.worker.utils import (
 logger = init_logger(__name__)
 
 _AG2_GRAPH_MODE_RECEIPT = os.environ.get("AG2_VLLM_GRAPH_MODE_RECEIPT") == "1"
+_AG2_GRAPH_MODE_LOGGED_RECEIPTS: set[tuple[str, int, int, int]] = set()
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -1627,6 +1628,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         graph_receipt = None
         if _AG2_GRAPH_MODE_RECEIPT and not dummy_run:
+            graph_receipt_key = (
+                batch_desc.cg_mode.name,
+                num_toks,
+                batch_desc.num_tokens,
+                num_reqs,
+            )
+            if graph_receipt_key not in _AG2_GRAPH_MODE_LOGGED_RECEIPTS:
+                _AG2_GRAPH_MODE_LOGGED_RECEIPTS.add(graph_receipt_key)
+                logger.info(
+                    "AG2 CUDA Graph execution receipt: mode=%s "
+                    "tokens_unpadded=%d tokens_padded=%d requests=%d "
+                    "descriptor=%r",
+                    batch_desc.cg_mode.name,
+                    num_toks,
+                    batch_desc.num_tokens,
+                    num_reqs,
+                    batch_desc,
+                )
             graph_receipt = (
                 "ag2.graph_receipt"
                 f"|mode={batch_desc.cg_mode.name}"
