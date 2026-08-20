@@ -680,7 +680,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             use_v2_model_runner=True,
             tensor_parallel_size=self.parallel_config.tensor_parallel_size,
             kv_cache_config=self.kv_cache_config,
-            max_num_reqs=self.max_num_reqs,
+            max_num_reqs=(
+                self.kv_cache_config.effective_max_resident_seqs
+                or self.max_num_reqs
+            ),
         )
         self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,
