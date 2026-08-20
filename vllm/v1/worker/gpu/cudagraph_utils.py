@@ -778,6 +778,11 @@ class CudaGraphManager:
         if graph is not None:
             graph.reset()
             evicted += 1
+        # Drop the manager's last private-pool handle before the caller runs
+        # gc/empty_cache and measures physical reclamation. Keeping this handle
+        # on the entry makes the reclaim oracle retain part of the pool it is
+        # trying to prove was released.
+        entry.graph_pool = None
         return evicted
 
     def _evict_dynamic_entry(self, entry: DynamicGraphEntry) -> None:
@@ -819,7 +824,6 @@ class CudaGraphManager:
         entry.charged_bytes = 0
         entry.local_charged_bytes = 0
         entry.graph_segments = 0
-        entry.graph_pool = None
         entry.state = DynamicGraphResidency.WARM
         entry.hits = 0
         logger.info(
@@ -868,7 +872,6 @@ class CudaGraphManager:
                 f"descriptor={entry.descriptor} local_charge={local_charge} "
                 f"local_reclaimed={local_reclaimed}"
             )
-        entry.graph_pool = None
         logger.info(
             "Unpublished dynamic CUDA graph reclaimed: owner=%s descriptor=%s "
             "local_charge=%d local_reclaimed=%d",
