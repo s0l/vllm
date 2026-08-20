@@ -111,6 +111,11 @@ def _is_compatible(
 ) -> bool:
     # desc.uniform_token_count=None (PIECEWISE) can handle any uniform_token_count
     # desc.num_reqs=None means no request padding needed (PIECEWISE)
+    exact_multitoken_full_requests = not (
+        desc.cg_mode == CUDAGraphMode.FULL
+        and desc.uniform_token_count is not None
+        and desc.uniform_token_count > 1
+    ) or (desc.num_reqs == num_reqs and desc.num_tokens == num_tokens)
     return (
         (
             desc.uniform_token_count is None
@@ -119,6 +124,7 @@ def _is_compatible(
         and (desc.num_reqs is None or desc.num_reqs >= num_reqs)
         and desc.num_tokens >= num_tokens
         and desc.num_active_loras == num_active_loras
+        and exact_multitoken_full_requests
     )
 
 

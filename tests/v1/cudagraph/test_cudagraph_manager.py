@@ -109,3 +109,39 @@ def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
         manager.capture(create_forward_fn)
 
     mock_cuda_graph.assert_called_once()
+
+
+def test_full_multitoken_compatibility_requires_exact_request_shape():
+    check = gpu_cudagraph_utils._is_compatible
+
+    exact = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL,
+        num_tokens=12,
+        num_reqs=3,
+        uniform_token_count=4,
+    )
+    assert check(exact, 3, 12, 4, 0)
+
+    padded_multitoken = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL,
+        num_tokens=16,
+        num_reqs=4,
+        uniform_token_count=4,
+    )
+    assert not check(padded_multitoken, 3, 12, 4, 0)
+
+    padded_qlen1 = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL,
+        num_tokens=4,
+        num_reqs=4,
+        uniform_token_count=1,
+    )
+    assert check(padded_qlen1, 3, 3, 1, 0)
+
+    padded_piecewise = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.PIECEWISE,
+        num_tokens=16,
+        num_reqs=None,
+        uniform_token_count=None,
+    )
+    assert check(padded_piecewise, 3, 12, 4, 0)
