@@ -538,6 +538,26 @@ class Worker(WorkerBase):
             if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
             else 0
         )
+        additional_config = self.vllm_config.additional_config
+        dynamic_graph_budget_mb = (
+            additional_config.get("dynamic_cudagraph_budget_mb", 0)
+            if isinstance(additional_config, dict)
+            else 0
+        )
+        if (
+            isinstance(dynamic_graph_budget_mb, bool)
+            or not isinstance(dynamic_graph_budget_mb, int)
+            or dynamic_graph_budget_mb < 0
+        ):
+            raise ValueError("dynamic_cudagraph_budget_mb must be an integer >= 0")
+        dynamic_graph_reserve_bytes = dynamic_graph_budget_mb * 1024 * 1024
+        cudagraph_memory_estimate_applied += dynamic_graph_reserve_bytes
+        if dynamic_graph_reserve_bytes:
+            logger.info_once(
+                "Reserved %.2f GiB for dynamic CUDA Graph residency before "
+                "KV cache sizing",
+                dynamic_graph_reserve_bytes / (1 << 30),
+            )
 
         self.total_consumed = profile_result.total_consumed
         self.peak_activation_memory = (

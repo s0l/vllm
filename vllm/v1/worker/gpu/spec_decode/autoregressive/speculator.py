@@ -188,6 +188,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             max_uniform_decode_reqs=(
                 self.kv_cache_config.effective_max_resident_seqs or self.max_num_reqs
             ),
+            owner="mtp_prefill",
         )
 
         # PIECEWISE cudagraphs are not supported for draft decodes.
@@ -206,6 +207,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             max_uniform_decode_reqs=(
                 self.kv_cache_config.effective_max_resident_seqs or self.max_num_reqs
             ),
+            owner="mtp_decode",
         )
         if self._ag2_mtp_layer_capture is not None:
             self.decode_cudagraph_manager.require_capture_output(

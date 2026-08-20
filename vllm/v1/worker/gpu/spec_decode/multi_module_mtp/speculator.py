@@ -111,6 +111,7 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             self.num_speculative_steps + 1,
+            owner="mtp_multi",
         )
 
     def capture(self) -> None:

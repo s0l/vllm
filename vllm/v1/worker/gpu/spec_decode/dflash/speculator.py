@@ -131,6 +131,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             decode_query_len=self.num_query_per_req,
+            owner="dflash_query",
         )
 
     def capture(self) -> None:

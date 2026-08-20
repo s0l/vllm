@@ -152,7 +152,7 @@ from vllm.v1.worker.utils import (
 logger = init_logger(__name__)
 
 _AG2_GRAPH_MODE_RECEIPT = os.environ.get("AG2_VLLM_GRAPH_MODE_RECEIPT") == "1"
-_AG2_GRAPH_MODE_LOGGED_RECEIPTS: set[tuple[str, int, int, int]] = set()
+_AG2_GRAPH_MODE_LOGGED_RECEIPTS: set[tuple[str, str, int, int, int]] = set()
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -704,6 +704,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_uniform_decode_reqs=(
                 self.kv_cache_config.effective_max_resident_seqs or self.max_num_reqs
             ),
+            owner="target",
         )
         check_attention_cp_compatibility(self.vllm_config)
         if isinstance(self.speculator, DraftModelSpeculator):
@@ -1629,6 +1630,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         graph_receipt = None
         if _AG2_GRAPH_MODE_RECEIPT and not dummy_run:
             graph_receipt_key = (
+                self.cudagraph_manager.dynamic_graph_owner,
                 batch_desc.cg_mode.name,
                 num_toks,
                 batch_desc.num_tokens,
@@ -1637,9 +1639,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if graph_receipt_key not in _AG2_GRAPH_MODE_LOGGED_RECEIPTS:
                 _AG2_GRAPH_MODE_LOGGED_RECEIPTS.add(graph_receipt_key)
                 logger.info(
-                    "AG2 CUDA Graph execution receipt: mode=%s "
+                    "AG2 CUDA Graph execution receipt: owner=%s mode=%s "
                     "tokens_unpadded=%d tokens_padded=%d requests=%d "
                     "descriptor=%r",
+                    self.cudagraph_manager.dynamic_graph_owner,
                     batch_desc.cg_mode.name,
                     num_toks,
                     batch_desc.num_tokens,

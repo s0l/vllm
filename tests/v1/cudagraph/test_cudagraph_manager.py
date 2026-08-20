@@ -192,3 +192,51 @@ def test_dynamic_piecewise_descriptor_queues_before_hot_dispatch(monkeypatch):
     manager._dynamic_pending = None
     hot = manager.dispatch(2, 8, None, 0)
     assert hot.cg_mode == CUDAGraphMode.PIECEWISE
+
+
+def test_dynamic_full_uses_piecewise_safety_until_hot(monkeypatch):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform,
+        "get_global_graph_pool",
+        lambda: object(),
+    )
+    config = _create_vllm_config(
+        additional_config={
+            "dynamic_cudagraph_full_capture_sizes": [3],
+            "dynamic_cudagraph_budget_mb": 64,
+            "dynamic_cudagraph_min_hits": 2,
+        },
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+    )
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        decode_query_len=1,
+        owner="target",
+    )
+    manager._graphs_captured = True
+
+    first = manager.dispatch(3, 3, 1, 0)
+    second = manager.dispatch(3, 3, 1, 0)
+    assert first.cg_mode == CUDAGraphMode.FULL
+    assert first.num_tokens == 4
+    assert second.cg_mode == CUDAGraphMode.FULL
+    assert second.num_tokens == 4
+    assert manager._dynamic_pending is not None
+
+    entry = manager._dynamic_graph_entries[manager._dynamic_pending]
+    entry.state = gpu_cudagraph_utils.DynamicGraphResidency.HOT
+    manager._dynamic_pending = None
+    hot = manager.dispatch(3, 3, 1, 0)
+    assert hot == BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL,
+        num_tokens=3,
+        num_reqs=3,
+        uniform_token_count=1,
+    )

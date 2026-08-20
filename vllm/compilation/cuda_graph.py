@@ -129,6 +129,7 @@ class CUDAGraphEntry:
     batch_descriptor: BatchDescriptor
     cudagraph: torch.cuda.CUDAGraph | None = None
     output: Any | None = None
+    graph_pool: Any | None = None
 
     # for cudagraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
@@ -176,25 +177,35 @@ class CUDAGraphWrapper:
             instance.clear_graphs()
 
     @classmethod
-    def count_batch_descriptor(cls, batch_descriptor: BatchDescriptor) -> int:
+    def count_batch_descriptor(
+        cls, batch_descriptor: BatchDescriptor, graph_pool: Any | None = None
+    ) -> int:
         """Count compiled graph segments resident for one descriptor."""
         return sum(
-            batch_descriptor in instance.concrete_cudagraph_entries
+            (entry := instance.concrete_cudagraph_entries.get(batch_descriptor))
+            is not None
+            and (graph_pool is None or entry.graph_pool == graph_pool)
             for instance in list(cls._all_instances)
         )
 
     @classmethod
-    def evict_batch_descriptor(cls, batch_descriptor: BatchDescriptor) -> int:
+    def evict_batch_descriptor(
+        cls, batch_descriptor: BatchDescriptor, graph_pool: Any | None = None
+    ) -> int:
         """Destroy every compiled graph segment owned by one descriptor."""
         evicted = 0
         for instance in list(cls._all_instances):
-            entry = instance.concrete_cudagraph_entries.pop(batch_descriptor, None)
-            if entry is None:
+            entry = instance.concrete_cudagraph_entries.get(batch_descriptor)
+            if entry is None or (
+                graph_pool is not None and entry.graph_pool != graph_pool
+            ):
                 continue
+            del instance.concrete_cudagraph_entries[batch_descriptor]
             if entry.cudagraph is not None:
                 entry.cudagraph.reset()
             entry.cudagraph = None
             entry.output = None
+            entry.graph_pool = None
             evicted += 1
         return evicted
 
@@ -358,6 +369,7 @@ class CUDAGraphWrapper:
             # to save memory
             entry.output = weak_ref_tensors(output)
             entry.cudagraph = cudagraph
+            entry.graph_pool = self.graph_pool
 
             compilation_counter.num_cudagraph_captured += 1
 
