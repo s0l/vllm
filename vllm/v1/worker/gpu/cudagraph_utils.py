@@ -785,6 +785,16 @@ class CudaGraphManager:
         entry.graph_pool = None
         return evicted
 
+    @staticmethod
+    def _dynamic_graph_pool_bytes(graph_pool: object | None) -> int:
+        if graph_pool is None:
+            return 0
+        return sum(
+            int(segment["total_size"])
+            for segment in torch.cuda.memory_snapshot()
+            if segment.get("segment_pool_id") == graph_pool
+        )
+
     def _evict_dynamic_entry(self, entry: DynamicGraphEntry) -> None:
         if entry.state == DynamicGraphResidency.HOT:
             torch.cuda.synchronize(self.device)
@@ -1735,7 +1745,13 @@ class ModelCudaGraphManager(CudaGraphManager):
         graph_segments = CUDAGraphWrapper.count_batch_descriptor(
             runtime_desc, entry.graph_pool
         ) + int(desc in self.graphs)
-        local_charge = max(0, start_free - torch.accelerator.get_memory_info()[0])
+        end_free = torch.accelerator.get_memory_info()[0]
+        local_capture_delta = max(0, start_free - end_free)
+        # Charge only the evictable private CUDA Graph pool. A first capture can
+        # also materialize persistent default-pool allocations; charging those
+        # to this entry makes a complete private-pool reset look like a leak.
+        local_charge = self._dynamic_graph_pool_bytes(entry.graph_pool)
+        local_non_pool_delta = max(0, local_capture_delta - local_charge)
         charge = torch.tensor(local_charge, dtype=torch.int64, device=self.device)
         segment_count = torch.tensor(
             graph_segments, dtype=torch.int32, device=self.device
@@ -1786,12 +1802,14 @@ class ModelCudaGraphManager(CudaGraphManager):
         self._dynamic_pending = None
         logger.info(
             "Dynamic CUDA graph HOT: owner=%s descriptor=%s segments=%d "
-            "charged_bytes=%d "
+            "charged_bytes=%d capture_delta_bytes=%d non_pool_delta_bytes=%d "
             "resident_bytes=%d budget_bytes=%d",
             self.dynamic_graph_owner,
             desc,
             graph_segments,
             charged_bytes,
+            local_capture_delta,
+            local_non_pool_delta,
             self._dynamic_resident_bytes,
             self.dynamic_graph_budget_bytes,
         )
