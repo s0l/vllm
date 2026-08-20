@@ -175,6 +175,29 @@ class CUDAGraphWrapper:
         for instance in list(cls._all_instances):
             instance.clear_graphs()
 
+    @classmethod
+    def count_batch_descriptor(cls, batch_descriptor: BatchDescriptor) -> int:
+        """Count compiled graph segments resident for one descriptor."""
+        return sum(
+            batch_descriptor in instance.concrete_cudagraph_entries
+            for instance in list(cls._all_instances)
+        )
+
+    @classmethod
+    def evict_batch_descriptor(cls, batch_descriptor: BatchDescriptor) -> int:
+        """Destroy every compiled graph segment owned by one descriptor."""
+        evicted = 0
+        for instance in list(cls._all_instances):
+            entry = instance.concrete_cudagraph_entries.pop(batch_descriptor, None)
+            if entry is None:
+                continue
+            if entry.cudagraph is not None:
+                entry.cudagraph.reset()
+            entry.cudagraph = None
+            entry.output = None
+            evicted += 1
+        return evicted
+
     def __init__(
         self,
         runnable: Callable[..., Any],

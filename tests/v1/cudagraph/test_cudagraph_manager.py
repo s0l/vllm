@@ -29,9 +29,12 @@ def _reset_graph_pool_id():
     pynccl_allocator._graph_pool_id = None
 
 
-def _create_vllm_config() -> MagicMock:
+def _create_vllm_config(
+    additional_config: dict | None = None,
+    cudagraph_mode: CUDAGraphMode = CUDAGraphMode.FULL,
+) -> MagicMock:
     compilation_config = CompilationConfig(
-        cudagraph_mode="FULL",
+        cudagraph_mode=cudagraph_mode,
         cudagraph_capture_sizes=[4],
     )
     compilation_config.max_cudagraph_capture_size = 4
@@ -43,6 +46,7 @@ def _create_vllm_config() -> MagicMock:
     vllm_config.parallel_config = ParallelConfig()
     vllm_config.speculative_config = None
     vllm_config.num_speculative_tokens = 0
+    vllm_config.additional_config = additional_config
     return vllm_config
 
 
@@ -145,3 +149,46 @@ def test_full_multitoken_compatibility_requires_exact_request_shape():
         uniform_token_count=None,
     )
     assert check(padded_piecewise, 3, 12, 4, 0)
+
+
+def test_dynamic_piecewise_descriptor_queues_before_hot_dispatch(monkeypatch):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform,
+        "get_global_graph_pool",
+        lambda: object(),
+    )
+    config = _create_vllm_config(
+        additional_config={
+            "dynamic_cudagraph_capture_sizes": [8],
+            "dynamic_cudagraph_budget_mb": 64,
+            "dynamic_cudagraph_min_hits": 2,
+        },
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+    )
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        decode_query_len=1,
+    )
+    manager._graphs_captured = True
+
+    first = manager.dispatch(2, 8, None, 0)
+    second = manager.dispatch(2, 8, None, 0)
+
+    assert first.cg_mode == CUDAGraphMode.NONE
+    assert second.cg_mode == CUDAGraphMode.NONE
+    assert manager.has_pending_dynamic_capture()
+    assert manager._dynamic_pending is not None
+    entry = manager._dynamic_graph_entries[manager._dynamic_pending]
+    assert entry.state == gpu_cudagraph_utils.DynamicGraphResidency.QUEUED
+
+    entry.state = gpu_cudagraph_utils.DynamicGraphResidency.HOT
+    manager._dynamic_pending = None
+    hot = manager.dispatch(2, 8, None, 0)
+    assert hot.cg_mode == CUDAGraphMode.PIECEWISE

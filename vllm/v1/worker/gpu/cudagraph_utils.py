@@ -6,6 +6,7 @@ import re
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 from itertools import product
 from typing import Any, NamedTuple, Protocol
 
@@ -24,6 +25,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
 from vllm.distributed.parallel_state import (
     get_pp_group,
+    get_tp_group,
     graph_capture,
     is_global_first_rank,
 )
@@ -88,6 +90,25 @@ class BatchExecutionDescriptor:
     num_reqs: int | None  # None means no request padding is needed (PIECEWISE graphs)
     uniform_token_count: int | None = None
     num_active_loras: int = 0
+
+
+class DynamicGraphResidency(str, Enum):
+    WARM = "warm"
+    QUEUED = "queued"
+    HOT = "hot"
+    COOLDOWN = "cooldown"
+
+
+@dataclass
+class DynamicGraphEntry:
+    descriptor: BatchExecutionDescriptor
+    pinned: bool = False
+    state: DynamicGraphResidency = DynamicGraphResidency.WARM
+    hits: int = 0
+    last_used_epoch: int = 0
+    cooldown_until_epoch: int = 0
+    charged_bytes: int = 0
+    graph_segments: int = 0
 
 
 class CreateForwardFn(Protocol):
@@ -231,6 +252,100 @@ class CudaGraphManager:
             BatchExecutionDescriptor,
             tuple[Any, list[tuple[int, Any]], int],
         ] = {}
+        dynamic_sizes = (
+            additional_config.get("dynamic_cudagraph_capture_sizes", [])
+            if isinstance(additional_config, dict)
+            else []
+        )
+        if not isinstance(dynamic_sizes, list) or any(
+            isinstance(size, bool) or not isinstance(size, int) or size <= 0
+            for size in dynamic_sizes
+        ):
+            raise ValueError(
+                "dynamic_cudagraph_capture_sizes must be a list of positive integers"
+            )
+        startup_sizes = set(self.compilation_config.cudagraph_capture_sizes or [])
+        self.dynamic_capture_sizes = tuple(
+            sorted(set(dynamic_sizes).difference(startup_sizes))
+        )
+        dynamic_budget_mb = (
+            additional_config.get("dynamic_cudagraph_budget_mb", 0)
+            if isinstance(additional_config, dict)
+            else 0
+        )
+        if isinstance(dynamic_budget_mb, bool) or not isinstance(
+            dynamic_budget_mb, int
+        ):
+            raise ValueError("dynamic_cudagraph_budget_mb must be an integer")
+        if bool(self.dynamic_capture_sizes) != (dynamic_budget_mb > 0):
+            raise ValueError(
+                "dynamic CUDA graphs require both capture sizes and a positive "
+                "dynamic_cudagraph_budget_mb"
+            )
+        self.dynamic_graph_budget_bytes = dynamic_budget_mb * 1024 * 1024
+        max_entry_mb = (
+            additional_config.get(
+                "dynamic_cudagraph_max_entry_mb", dynamic_budget_mb
+            )
+            if isinstance(additional_config, dict)
+            else 0
+        )
+        guard_mb = (
+            additional_config.get("dynamic_cudagraph_guard_mb", 150)
+            if isinstance(additional_config, dict)
+            else 150
+        )
+        self.dynamic_graph_min_hits = (
+            additional_config.get("dynamic_cudagraph_min_hits", 2)
+            if isinstance(additional_config, dict)
+            else 2
+        )
+        self.dynamic_graph_cooldown_steps = (
+            additional_config.get("dynamic_cudagraph_cooldown_steps", 128)
+            if isinstance(additional_config, dict)
+            else 128
+        )
+        for name, value, minimum in (
+            ("dynamic_cudagraph_max_entry_mb", max_entry_mb, 1),
+            ("dynamic_cudagraph_guard_mb", guard_mb, 0),
+            ("dynamic_cudagraph_min_hits", self.dynamic_graph_min_hits, 1),
+            (
+                "dynamic_cudagraph_cooldown_steps",
+                self.dynamic_graph_cooldown_steps,
+                1,
+            ),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or (self.dynamic_capture_sizes and value < minimum)
+            ):
+                raise ValueError(f"{name} must be an integer >= {minimum}")
+        self.dynamic_graph_max_entry_bytes = max_entry_mb * 1024 * 1024
+        self.dynamic_graph_guard_bytes = guard_mb * 1024 * 1024
+        pinned_sizes = (
+            additional_config.get("dynamic_cudagraph_pinned_sizes", [])
+            if isinstance(additional_config, dict)
+            else []
+        )
+        if not isinstance(pinned_sizes, list) or any(
+            isinstance(size, bool) or not isinstance(size, int) or size <= 0
+            for size in pinned_sizes
+        ):
+            raise ValueError(
+                "dynamic_cudagraph_pinned_sizes must be a list of positive integers"
+            )
+        if not set(pinned_sizes).issubset(self.dynamic_capture_sizes):
+            raise ValueError(
+                "dynamic_cudagraph_pinned_sizes must be dynamic capture sizes"
+            )
+        self.dynamic_graph_pinned_sizes = frozenset(pinned_sizes)
+        self._dynamic_graph_entries: dict[
+            BatchExecutionDescriptor, DynamicGraphEntry
+        ] = {}
+        self._dynamic_pending: BatchExecutionDescriptor | None = None
+        self._dynamic_epoch = 0
+        self._dynamic_resident_bytes = 0
         # Precompute actual num_active_loras -> captured case mapping so that
         # dispatch() is a plain dict lookup instead of a per-call bisect.
         self._lora_dispatch_map, self._max_lora_case = self._build_lora_dispatch_map()
@@ -249,6 +364,10 @@ class CudaGraphManager:
             is_breakable_cudagraph_enabled()
             and self.cudagraph_mode.has_piecewise_cudagraphs()
         )
+        if self.dynamic_capture_sizes and self.use_breakable_cg:
+            raise ValueError(
+                "dynamic CUDA graph residency does not yet support breakable graphs"
+            )
         self.breakable_cg_runner: BreakableCUDAGraphWrapper | None = None
 
         self._init_candidates()
@@ -286,6 +405,9 @@ class CudaGraphManager:
             return
 
         capture_sizes = sorted(capture_sizes)
+        registered_mixed_sizes = sorted(
+            set(capture_sizes).union(self.dynamic_capture_sizes)
+        )
         decode_mode = self.cudagraph_mode.decode_mode()
         mixed_mode = self.cudagraph_mode.mixed_mode()
         separate_decode_routine = self.cudagraph_mode.separate_routine()
@@ -402,7 +524,7 @@ class CudaGraphManager:
                         ].append(desc)
 
         for num_tokens, num_active_loras in product(
-            capture_sizes, self.lora_capture_cases
+            registered_mixed_sizes, self.lora_capture_cases
         ):
             if mixed_mode:
                 # for PIECEWISE graphs there is no limit on requests when replaying
@@ -421,6 +543,11 @@ class CudaGraphManager:
                 )
                 descs_by_mode[mixed_mode].append(desc)
                 descs_by_token_lora[(num_tokens, num_active_loras)].append(desc)
+                if num_tokens in self.dynamic_capture_sizes:
+                    self._dynamic_graph_entries[desc] = DynamicGraphEntry(
+                        descriptor=desc,
+                        pinned=num_tokens in self.dynamic_graph_pinned_sizes,
+                    )
 
         if not descs_by_token_lora:
             return
@@ -439,21 +566,149 @@ class CudaGraphManager:
 
         for mode, descs in descs_by_mode.items():
             descs.sort(key=lambda d: d.num_tokens, reverse=True)
-            self._capture_descs[mode] = descs
+            startup_descs = [
+                desc for desc in descs if desc not in self._dynamic_graph_entries
+            ]
+            if startup_descs:
+                self._capture_descs[mode] = startup_descs
         self.max_capture_tokens = max(
-            desc.num_tokens
-            for descs in self._capture_descs.values()
-            for desc in descs
+            (
+                desc.num_tokens
+                for descs in self._capture_descs.values()
+                for desc in descs
+            ),
+            default=0,
         )
 
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
+
+    def has_pending_dynamic_capture(self) -> bool:
+        return self._dynamic_pending is not None
+
+    def _observe_dynamic_descriptor(self, desc: BatchExecutionDescriptor) -> bool:
+        entry = self._dynamic_graph_entries[desc]
+        self._dynamic_epoch += 1
+        entry.last_used_epoch = self._dynamic_epoch
+        if entry.state == DynamicGraphResidency.COOLDOWN:
+            if self._dynamic_epoch < entry.cooldown_until_epoch:
+                return False
+            entry.state = DynamicGraphResidency.WARM
+            entry.hits = 0
+        if entry.state == DynamicGraphResidency.HOT:
+            return True
+        entry.hits += 1
+        if (
+            entry.state == DynamicGraphResidency.WARM
+            and entry.hits >= self.dynamic_graph_min_hits
+            and self._dynamic_pending is None
+        ):
+            entry.state = DynamicGraphResidency.QUEUED
+            self._dynamic_pending = desc
+            logger.info(
+                "Dynamic CUDA graph queued: descriptor=%s hits=%d epoch=%d",
+                desc,
+                entry.hits,
+                self._dynamic_epoch,
+            )
+        return False
+
+    @staticmethod
+    def _runtime_batch_descriptor(desc: BatchExecutionDescriptor) -> BatchDescriptor:
+        return BatchDescriptor(
+            num_tokens=desc.num_tokens,
+            has_lora=desc.num_active_loras > 0,
+            num_active_loras=desc.num_active_loras,
+        )
+
+    def _cooldown_dynamic_entry(self, entry: DynamicGraphEntry) -> None:
+        entry.state = DynamicGraphResidency.COOLDOWN
+        entry.hits = 0
+        entry.cooldown_until_epoch = (
+            self._dynamic_epoch + self.dynamic_graph_cooldown_steps
+        )
+
+    def _evict_dynamic_entry(self, entry: DynamicGraphEntry) -> None:
+        from vllm.compilation.cuda_graph import CUDAGraphWrapper
+
+        if entry.state == DynamicGraphResidency.HOT:
+            torch.cuda.synchronize(self.device)
+        evicted = CUDAGraphWrapper.evict_batch_descriptor(
+            self._runtime_batch_descriptor(entry.descriptor)
+        )
+        if entry.graph_segments and evicted != entry.graph_segments:
+            raise RuntimeError(
+                "Dynamic CUDA graph eviction was incomplete: "
+                f"descriptor={entry.descriptor}, expected={entry.graph_segments}, "
+                f"evicted={evicted}"
+            )
+        self._dynamic_resident_bytes -= entry.charged_bytes
+        entry.charged_bytes = 0
+        entry.graph_segments = 0
+        entry.state = DynamicGraphResidency.WARM
+        entry.hits = 0
+        logger.info("Dynamic CUDA graph evicted: descriptor=%s", entry.descriptor)
+
+    def _reserve_dynamic_capture(self, candidate: DynamicGraphEntry) -> bool:
+        required = self.dynamic_graph_max_entry_bytes
+        while self._dynamic_resident_bytes + required > self.dynamic_graph_budget_bytes:
+            victims = sorted(
+                (
+                    entry
+                    for entry in self._dynamic_graph_entries.values()
+                    if entry.state == DynamicGraphResidency.HOT
+                    and not entry.pinned
+                    and entry is not candidate
+                ),
+                key=lambda entry: entry.last_used_epoch,
+            )
+            if not victims:
+                return False
+            self._evict_dynamic_entry(victims[0])
+        local_free = torch.accelerator.get_memory_info()[0]
+        free_tensor = torch.tensor(local_free, dtype=torch.int64, device=self.device)
+        if self.tp_size > 1:
+            torch.distributed.all_reduce(
+                free_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_tp_group().device_group,
+            )
+        return int(free_tensor.item()) >= required + self.dynamic_graph_guard_bytes
+
+    def _consensus_dynamic_candidate(
+        self, desc: BatchExecutionDescriptor
+    ) -> bool:
+        group = get_tp_group()
+        identity = (
+            int(desc.cg_mode),
+            desc.num_tokens,
+            desc.num_reqs,
+            desc.uniform_token_count,
+            desc.num_active_loras,
+        )
+        expected = group.broadcast_object(
+            identity if group.is_first_rank else None,
+            src=0,
+        )
+        matches = torch.tensor(
+            int(identity == expected), dtype=torch.int32, device=self.device
+        )
+        if self.tp_size > 1:
+            torch.distributed.all_reduce(
+                matches,
+                op=torch.distributed.ReduceOp.MIN,
+                group=group.device_group,
+            )
+        return bool(matches.item())
 
     @torch.inference_mode()
     def capture(
         self,
         create_forward_fn: CreateForwardFn,
         progress_bar_desc: str = "Capturing CUDA graphs",
+        capture_descs: dict[
+            CUDAGraphMode, list[BatchExecutionDescriptor]
+        ] | None = None,
     ) -> None:
         """Capture CUDA graphs.
 
@@ -468,11 +723,12 @@ class CudaGraphManager:
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
             # buffers in the graph pool.
+            selected_descs = self._capture_descs if capture_descs is None else capture_descs
             for mode in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]:
-                if mode not in self._capture_descs:
+                if mode not in selected_descs:
                     continue
 
-                descs = self._capture_descs[mode]
+                descs = selected_descs[mode]
                 if is_global_first_rank():
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
                 for desc in descs:
@@ -727,6 +983,9 @@ class CudaGraphManager:
                     uniform_token_count,
                     effective_loras,
                 ):
+                    if desc in self._dynamic_graph_entries:
+                        if not self._observe_dynamic_descriptor(desc):
+                            continue
                     return desc
         return BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,
@@ -877,6 +1136,9 @@ class ModelCudaGraphManager(CudaGraphManager):
         use_aux_hidden_state_outputs: bool = False,
         lora_capture_hook: Callable[[int, int, int], None] | None = None,
         progress_bar_desc: str = "Capturing CUDA graphs",
+        capture_descs: dict[
+            CUDAGraphMode, list[BatchExecutionDescriptor]
+        ] | None = None,
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
@@ -1056,12 +1318,132 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             return forward_fn
 
-        super().capture(create_forward_fn, progress_bar_desc)
+        super().capture(create_forward_fn, progress_bar_desc, capture_descs)
         if self.tp3_owner_prequant:
             logger.warning(
                 "TP3 owner prequant CUDA Graph capture completed: descriptors=%s",
                 sorted(owner_capture_descs),
             )
+
+    def capture_next_dynamic(
+        self,
+        model: nn.Module,
+        model_state: ModelState,
+        input_buffers: InputBuffers,
+        intermediate_tensors: IntermediateTensors | None,
+        block_tables: BlockTables,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+        has_lora: bool = False,
+        use_aux_hidden_state_outputs: bool = False,
+        lora_capture_hook: Callable[[int, int, int], None] | None = None,
+    ) -> bool:
+        desc = self._dynamic_pending
+        if desc is None:
+            return False
+        entry = self._dynamic_graph_entries[desc]
+        if not self._consensus_dynamic_candidate(desc):
+            self._dynamic_pending = None
+            self._cooldown_dynamic_entry(entry)
+            logger.error(
+                "Dynamic CUDA graph rank descriptor mismatch: descriptor=%s", desc
+            )
+            return False
+        if not self._reserve_dynamic_capture(entry):
+            self._dynamic_pending = None
+            self._cooldown_dynamic_entry(entry)
+            logger.warning(
+                "Dynamic CUDA graph budget or guard refused capture: "
+                "descriptor=%s resident_bytes=%d budget_bytes=%d",
+                desc,
+                self._dynamic_resident_bytes,
+                self.dynamic_graph_budget_bytes,
+            )
+            return False
+
+        from vllm.compilation.cuda_graph import CUDAGraphWrapper
+
+        runtime_desc = self._runtime_batch_descriptor(desc)
+        start_free = torch.accelerator.get_memory_info()[0]
+        try:
+            self.capture(
+                model,
+                model_state,
+                input_buffers,
+                intermediate_tensors,
+                block_tables,
+                attn_groups,
+                kv_cache_config,
+                has_lora=has_lora,
+                use_aux_hidden_state_outputs=use_aux_hidden_state_outputs,
+                lora_capture_hook=lora_capture_hook,
+                progress_bar_desc="Promoting dynamic CUDA graph",
+                capture_descs={CUDAGraphMode.PIECEWISE: [desc]},
+            )
+            torch.cuda.synchronize(self.device)
+        except Exception:
+            CUDAGraphWrapper.evict_batch_descriptor(runtime_desc)
+            self._dynamic_pending = None
+            self._cooldown_dynamic_entry(entry)
+            logger.exception(
+                "Dynamic CUDA graph capture failed: descriptor=%s", desc
+            )
+            raise
+
+        graph_segments = CUDAGraphWrapper.count_batch_descriptor(runtime_desc)
+        local_charge = max(0, start_free - torch.accelerator.get_memory_info()[0])
+        charge = torch.tensor(local_charge, dtype=torch.int64, device=self.device)
+        segment_count = torch.tensor(
+            graph_segments, dtype=torch.int32, device=self.device
+        )
+        if self.tp_size > 1:
+            torch.distributed.all_reduce(
+                charge,
+                op=torch.distributed.ReduceOp.MAX,
+                group=get_tp_group().device_group,
+            )
+            torch.distributed.all_reduce(
+                segment_count,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_tp_group().device_group,
+            )
+        charged_bytes = int(charge.item())
+        graph_segments = int(segment_count.item())
+        if (
+            graph_segments <= 0
+            or charged_bytes > self.dynamic_graph_max_entry_bytes
+            or self._dynamic_resident_bytes + charged_bytes
+            > self.dynamic_graph_budget_bytes
+        ):
+            CUDAGraphWrapper.evict_batch_descriptor(runtime_desc)
+            self._dynamic_pending = None
+            self._cooldown_dynamic_entry(entry)
+            logger.error(
+                "Dynamic CUDA graph publication rejected: descriptor=%s "
+                "segments=%d charged_bytes=%d resident_bytes=%d budget_bytes=%d",
+                desc,
+                graph_segments,
+                charged_bytes,
+                self._dynamic_resident_bytes,
+                self.dynamic_graph_budget_bytes,
+            )
+            return False
+        get_tp_group().barrier()
+        entry.state = DynamicGraphResidency.HOT
+        entry.charged_bytes = charged_bytes
+        entry.graph_segments = graph_segments
+        self._dynamic_resident_bytes += charged_bytes
+        self._dynamic_pending = None
+        logger.info(
+            "Dynamic CUDA graph HOT: descriptor=%s segments=%d charged_bytes=%d "
+            "resident_bytes=%d budget_bytes=%d",
+            desc,
+            graph_segments,
+            charged_bytes,
+            self._dynamic_resident_bytes,
+            self.dynamic_graph_budget_bytes,
+        )
+        return True
 
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor

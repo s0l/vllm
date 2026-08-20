@@ -1522,6 +1522,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        if (
+            not dummy_run
+            and not is_profile
+            and self.cudagraph_manager is not None
+            and self.cudagraph_manager.has_pending_dynamic_capture()
+        ):
+            with self.maybe_setup_dummy_loras(self.lora_config):
+                self.cudagraph_manager.capture_next_dynamic(
+                    self.model,
+                    self.model_state,
+                    self.input_buffers,
+                    self.intermediate_tensors,
+                    self.block_tables,
+                    self.attn_groups,
+                    self.kv_cache_config,
+                    has_lora=self.lora_config is not None,
+                    use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
+                    lora_capture_hook=create_lora_capture_hook(
+                        self.lora_config, self
+                    ),
+                )
         if not dummy_run:
             with record_function_or_nullcontext("ag2.elastic_kv_transition"):
                 self.elastic_kv_controller.apply(
