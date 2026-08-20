@@ -1526,23 +1526,49 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             not dummy_run
             and not is_profile
             and self.cudagraph_manager is not None
-            and self.cudagraph_manager.has_pending_dynamic_capture()
         ):
-            with self.maybe_setup_dummy_loras(self.lora_config):
-                self.cudagraph_manager.capture_next_dynamic(
-                    self.model,
-                    self.model_state,
-                    self.input_buffers,
-                    self.intermediate_tensors,
-                    self.block_tables,
-                    self.attn_groups,
-                    self.kv_cache_config,
-                    has_lora=self.lora_config is not None,
-                    use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
-                    lora_capture_hook=create_lora_capture_hook(
-                        self.lora_config, self
-                    ),
+            safety_required = False
+            if (
+                self.lora_config is None
+                and scheduler_output.total_num_scheduled_tokens > 0
+            ):
+                early_num_reqs = len(scheduler_output.num_scheduled_tokens)
+                early_num_toks = scheduler_output.total_num_scheduled_tokens
+                early_max_query_len = max(
+                    scheduler_output.num_scheduled_tokens.values()
                 )
+                early_uniform_tok_count = get_uniform_token_count(
+                    early_num_reqs,
+                    early_num_toks,
+                    early_max_query_len,
+                )
+                safety_required = (
+                    self.cudagraph_manager.ensure_piecewise_safety_for_first_use(
+                        early_num_toks,
+                        early_uniform_tok_count,
+                        0,
+                    )
+                )
+            if self.cudagraph_manager.has_pending_dynamic_capture():
+                with self.maybe_setup_dummy_loras(self.lora_config):
+                    captured = self.cudagraph_manager.capture_next_dynamic(
+                        self.model,
+                        self.model_state,
+                        self.input_buffers,
+                        self.intermediate_tensors,
+                        self.block_tables,
+                        self.attn_groups,
+                        self.kv_cache_config,
+                        has_lora=self.lora_config is not None,
+                        use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
+                        lora_capture_hook=create_lora_capture_hook(
+                            self.lora_config, self
+                        ),
+                    )
+                if safety_required and not captured:
+                    raise RuntimeError(
+                        "Required PIECEWISE safety graph could not be captured"
+                    )
         if not dummy_run:
             with record_function_or_nullcontext("ag2.elastic_kv_transition"):
                 self.elastic_kv_controller.apply(

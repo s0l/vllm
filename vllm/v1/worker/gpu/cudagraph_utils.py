@@ -104,6 +104,7 @@ class DynamicGraphResidency(str, Enum):
 class DynamicGraphEntry:
     descriptor: BatchExecutionDescriptor
     pinned: bool = False
+    min_hits: int = 1
     state: DynamicGraphResidency = DynamicGraphResidency.WARM
     hits: int = 0
     last_used_epoch: int = 0
@@ -279,6 +280,11 @@ class CudaGraphManager:
             if isinstance(additional_config, dict)
             else []
         )
+        safety_sizes = (
+            additional_config.get("dynamic_cudagraph_piecewise_safety_sizes", [])
+            if isinstance(additional_config, dict)
+            else []
+        )
         piecewise_range = (
             additional_config.get("dynamic_cudagraph_piecewise_capture_range", [])
             if isinstance(additional_config, dict)
@@ -287,6 +293,7 @@ class CudaGraphManager:
         for name, sizes in (
             ("dynamic_cudagraph_full_capture_sizes", dynamic_full_sizes),
             ("dynamic_cudagraph_piecewise_coverage_sizes", coverage_sizes),
+            ("dynamic_cudagraph_piecewise_safety_sizes", safety_sizes),
         ):
             if not isinstance(sizes, list) or any(
                 isinstance(size, bool) or not isinstance(size, int) or size <= 0
@@ -316,18 +323,23 @@ class CudaGraphManager:
         self.dynamic_piecewise_coverage_sizes = tuple(
             sorted(set(coverage_sizes).difference(startup_sizes))
         )
+        self.dynamic_piecewise_safety_sizes = tuple(
+            sorted(set(safety_sizes).difference(startup_sizes))
+        )
         self.dynamic_piecewise_capture_range = (
             (piecewise_range[0], piecewise_range[1])
             if piecewise_range
             else None
         )
         self.dynamic_piecewise_static_sizes = frozenset(
-            startup_sizes.union(coverage_sizes)
+            startup_sizes.union(coverage_sizes).union(safety_sizes)
         )
         self.dynamic_capture_sizes = tuple(
             sorted(
                 set(self.dynamic_piecewise_capture_sizes).union(
                     self.dynamic_full_capture_sizes
+                ).union(
+                    self.dynamic_piecewise_safety_sizes
                 )
             )
         )
@@ -366,6 +378,27 @@ class CudaGraphManager:
             if isinstance(additional_config, dict)
             else 2
         )
+        self.dynamic_graph_full_min_hits = (
+            additional_config.get(
+                "dynamic_cudagraph_full_min_hits", self.dynamic_graph_min_hits
+            )
+            if isinstance(additional_config, dict)
+            else self.dynamic_graph_min_hits
+        )
+        self.dynamic_graph_piecewise_min_hits = (
+            additional_config.get(
+                "dynamic_cudagraph_piecewise_min_hits", self.dynamic_graph_min_hits
+            )
+            if isinstance(additional_config, dict)
+            else self.dynamic_graph_min_hits
+        )
+        self.dynamic_graph_piecewise_min_padding_pct = (
+            additional_config.get(
+                "dynamic_cudagraph_piecewise_min_padding_pct", 25
+            )
+            if isinstance(additional_config, dict)
+            else 25
+        )
         self.dynamic_graph_cooldown_steps = (
             additional_config.get("dynamic_cudagraph_cooldown_steps", 128)
             if isinstance(additional_config, dict)
@@ -375,6 +408,21 @@ class CudaGraphManager:
             ("dynamic_cudagraph_max_entry_mb", max_entry_mb, 1),
             ("dynamic_cudagraph_guard_mb", guard_mb, 0),
             ("dynamic_cudagraph_min_hits", self.dynamic_graph_min_hits, 1),
+            (
+                "dynamic_cudagraph_full_min_hits",
+                self.dynamic_graph_full_min_hits,
+                1,
+            ),
+            (
+                "dynamic_cudagraph_piecewise_min_hits",
+                self.dynamic_graph_piecewise_min_hits,
+                1,
+            ),
+            (
+                "dynamic_cudagraph_piecewise_min_padding_pct",
+                self.dynamic_graph_piecewise_min_padding_pct,
+                0,
+            ),
             (
                 "dynamic_cudagraph_cooldown_steps",
                 self.dynamic_graph_cooldown_steps,
@@ -475,6 +523,7 @@ class CudaGraphManager:
             set(capture_sizes)
             .union(self.dynamic_piecewise_coverage_sizes)
             .union(self.dynamic_piecewise_capture_sizes)
+            .union(self.dynamic_piecewise_safety_sizes)
         )
         decode_mode = self.cudagraph_mode.decode_mode()
         mixed_mode = self.cudagraph_mode.mixed_mode()
@@ -601,6 +650,7 @@ class CudaGraphManager:
                                     rounded_num_tokens
                                     in self.dynamic_graph_pinned_sizes
                                 ),
+                                min_hits=self.dynamic_graph_full_min_hits,
                             )
 
         for num_tokens, num_active_loras in product(
@@ -623,10 +673,17 @@ class CudaGraphManager:
                 )
                 descs_by_mode[mixed_mode].append(desc)
                 descs_by_token_lora[(num_tokens, num_active_loras)].append(desc)
-                if num_tokens in self.dynamic_piecewise_capture_sizes:
+                if num_tokens in self.dynamic_piecewise_capture_sizes or (
+                    num_tokens in self.dynamic_piecewise_safety_sizes
+                ):
                     self._dynamic_graph_entries[desc] = DynamicGraphEntry(
                         descriptor=desc,
                         pinned=num_tokens in self.dynamic_graph_pinned_sizes,
+                        min_hits=(
+                            1
+                            if num_tokens in self.dynamic_piecewise_safety_sizes
+                            else self.dynamic_graph_piecewise_min_hits
+                        ),
                     )
 
         if not descs_by_token_lora:
@@ -683,7 +740,7 @@ class CudaGraphManager:
         entry.hits += 1
         if (
             entry.state == DynamicGraphResidency.WARM
-            and entry.hits >= self.dynamic_graph_min_hits
+            and entry.hits >= entry.min_hits
             and self._dynamic_pending is None
         ):
             entry.state = DynamicGraphResidency.QUEUED
@@ -773,8 +830,66 @@ class CudaGraphManager:
             local_reclaimed,
         )
 
+    def _reclaim_unpublished_capture(
+        self,
+        entry: DynamicGraphEntry,
+        graph_segments: int,
+        local_charge: int,
+    ) -> None:
+        free_before = torch.accelerator.get_memory_info()[0]
+        evicted = self._destroy_dynamic_graphs(entry)
+        if graph_segments and evicted != graph_segments:
+            raise RuntimeError(
+                "Unpublished dynamic CUDA graph cleanup was incomplete: "
+                f"descriptor={entry.descriptor}, expected={graph_segments}, "
+                f"evicted={evicted}"
+            )
+        gc.collect()
+        torch.accelerator.empty_cache()
+        torch.cuda.synchronize(self.device)
+        local_reclaimed = max(
+            0, torch.accelerator.get_memory_info()[0] - free_before
+        )
+        reclaimed = torch.tensor(
+            int(local_reclaimed + (1 << 20) >= local_charge),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        if self.tp_size > 1:
+            torch.distributed.all_reduce(
+                reclaimed,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_tp_group().device_group,
+            )
+        if not bool(reclaimed.item()):
+            raise RuntimeError(
+                "Unpublished dynamic CUDA graph did not physically reclaim "
+                f"its pool: owner={self.dynamic_graph_owner} "
+                f"descriptor={entry.descriptor} local_charge={local_charge} "
+                f"local_reclaimed={local_reclaimed}"
+            )
+        entry.graph_pool = None
+        logger.info(
+            "Unpublished dynamic CUDA graph reclaimed: owner=%s descriptor=%s "
+            "local_charge=%d local_reclaimed=%d",
+            self.dynamic_graph_owner,
+            entry.descriptor,
+            local_charge,
+            local_reclaimed,
+        )
+
+    def _dynamic_capture_reservation_bytes(
+        self, entry: DynamicGraphEntry
+    ) -> int:
+        if entry.descriptor.cg_mode == CUDAGraphMode.PIECEWISE:
+            estimate = max(32 << 20, entry.descriptor.num_tokens * (128 << 10))
+            estimate = round_up(estimate, 2 << 20)
+        else:
+            estimate = 64 << 20
+        return min(estimate, self.dynamic_graph_max_entry_bytes)
+
     def _reserve_dynamic_capture(self, candidate: DynamicGraphEntry) -> bool:
-        required = self.dynamic_graph_max_entry_bytes
+        required = self._dynamic_capture_reservation_bytes(candidate)
         while self._dynamic_resident_bytes + required > self.dynamic_graph_budget_bytes:
             victims = sorted(
                 (
@@ -798,6 +913,59 @@ class CudaGraphManager:
                 group=get_tp_group().device_group,
             )
         return int(free_tensor.item()) >= required + self.dynamic_graph_guard_bytes
+
+    def _piecewise_safety_size(self, num_tokens: int) -> int | None:
+        return next(
+            (
+                size
+                for size in self.dynamic_piecewise_safety_sizes
+                if size >= num_tokens
+            ),
+            None,
+        )
+
+    def ensure_piecewise_safety_for_first_use(
+        self,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        num_active_loras: int,
+    ) -> bool:
+        if (
+            not self._graphs_captured
+            or uniform_token_count is not None
+            or not self.dynamic_piecewise_safety_sizes
+        ):
+            return False
+        safety_size = self._piecewise_safety_size(num_tokens)
+        if safety_size is None:
+            return False
+        desc = BatchExecutionDescriptor(
+            cg_mode=CUDAGraphMode.PIECEWISE,
+            num_tokens=safety_size,
+            num_reqs=None,
+            num_active_loras=self._resolve_effective_loras(num_active_loras),
+        )
+        entry = self._dynamic_graph_entries[desc]
+        if entry.state == DynamicGraphResidency.HOT:
+            return False
+        if entry.state == DynamicGraphResidency.COOLDOWN:
+            raise RuntimeError(
+                "Required PIECEWISE safety graph is cooling down: "
+                f"descriptor={desc}"
+            )
+        if self._dynamic_pending is not None and self._dynamic_pending != desc:
+            displaced = self._dynamic_graph_entries[self._dynamic_pending]
+            displaced.state = DynamicGraphResidency.WARM
+            displaced.hits = 0
+        entry.state = DynamicGraphResidency.QUEUED
+        entry.hits = max(entry.hits, 1)
+        self._dynamic_pending = desc
+        logger.info(
+            "Dynamic PIECEWISE safety graph queued before first use: "
+            "descriptor=%s",
+            desc,
+        )
+        return True
 
     def _consensus_dynamic_candidate(
         self, desc: BatchExecutionDescriptor
@@ -1098,6 +1266,7 @@ class CudaGraphManager:
         """Find matching cudagraph descriptor from priority-ordered candidates."""
 
         effective_loras = self._resolve_effective_loras(num_active_loras)
+        safety_size = self._piecewise_safety_size(num_tokens)
         if (
             self._graphs_captured
             and uniform_token_count is None
@@ -1106,6 +1275,9 @@ class CudaGraphManager:
             <= num_tokens
             <= self.dynamic_piecewise_capture_range[1]
             and num_tokens not in self.dynamic_piecewise_static_sizes
+            and safety_size is not None
+            and (safety_size - num_tokens) * 100
+            >= num_tokens * self.dynamic_graph_piecewise_min_padding_pct
         ):
             dynamic_desc = BatchExecutionDescriptor(
                 cg_mode=CUDAGraphMode.PIECEWISE,
@@ -1115,7 +1287,10 @@ class CudaGraphManager:
             )
             self._dynamic_graph_entries.setdefault(
                 dynamic_desc,
-                DynamicGraphEntry(descriptor=dynamic_desc),
+                DynamicGraphEntry(
+                    descriptor=dynamic_desc,
+                    min_hits=self.dynamic_graph_piecewise_min_hits,
+                ),
             )
             if self._observe_dynamic_descriptor(dynamic_desc):
                 return dynamic_desc
@@ -1521,6 +1696,9 @@ class ModelCudaGraphManager(CudaGraphManager):
         for wrapper in wrappers:
             wrapper.graph_pool = entry.graph_pool
         self.pool = entry.graph_pool
+        gc.collect()
+        torch.accelerator.empty_cache()
+        torch.cuda.synchronize(self.device)
         start_free = torch.accelerator.get_memory_info()[0]
         try:
             self.capture(
@@ -1579,7 +1757,11 @@ class ModelCudaGraphManager(CudaGraphManager):
             or self._dynamic_resident_bytes + charged_bytes
             > self.dynamic_graph_budget_bytes
         ):
-            self._destroy_dynamic_graphs(entry)
+            self._reclaim_unpublished_capture(
+                entry,
+                graph_segments,
+                local_charge,
+            )
             self._dynamic_pending = None
             self._cooldown_dynamic_entry(entry)
             logger.error(

@@ -208,7 +208,7 @@ def test_dynamic_piecewise_range_uses_sparse_safety_until_hot(monkeypatch):
     config = _create_vllm_config(
         additional_config={
             "dynamic_cudagraph_piecewise_capture_range": [65, 4096],
-            "dynamic_cudagraph_piecewise_coverage_sizes": [
+            "dynamic_cudagraph_piecewise_safety_sizes": [
                 128,
                 256,
                 512,
@@ -229,6 +229,10 @@ def test_dynamic_piecewise_range_uses_sparse_safety_until_hot(monkeypatch):
     )
     manager._graphs_captured = True
 
+    assert manager.ensure_piecewise_safety_for_first_use(65, None, 0)
+    safety_entry = manager._dynamic_graph_entries[manager._dynamic_pending]
+    safety_entry.state = gpu_cudagraph_utils.DynamicGraphResidency.HOT
+    manager._dynamic_pending = None
     first = manager.dispatch(8, 65, None, 0)
     second = manager.dispatch(8, 65, None, 0)
     assert first.cg_mode == CUDAGraphMode.PIECEWISE
@@ -246,6 +250,12 @@ def test_dynamic_piecewise_range_uses_sparse_safety_until_hot(monkeypatch):
         num_tokens=65,
         num_reqs=None,
         uniform_token_count=None,
+    )
+    near_bucket = manager.dispatch(8, 127, None, 0)
+    assert near_bucket.num_tokens == 128
+    assert all(
+        entry.descriptor.num_tokens != 127
+        for entry in manager._dynamic_graph_entries.values()
     )
 
 
