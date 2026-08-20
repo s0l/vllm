@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -548,7 +549,11 @@ class CommonAttentionMetadata:
     )
     def seq_lens_cpu(self) -> torch.Tensor:
         if self._seq_lens_cpu is None:
-            self._seq_lens_cpu = self.seq_lens.to("cpu")
+            if os.getenv("AG2_VLLM_GRAPH_MODE_RECEIPT") == "1":
+                with torch.profiler.record_function("ag2.seq_lens_cpu_join"):
+                    self._seq_lens_cpu = self.seq_lens.to("cpu")
+            else:
+                self._seq_lens_cpu = self.seq_lens.to("cpu")
         return self._seq_lens_cpu
 
     @property

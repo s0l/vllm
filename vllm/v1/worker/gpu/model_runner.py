@@ -151,6 +151,8 @@ from vllm.v1.worker.utils import (
 
 logger = init_logger(__name__)
 
+_AG2_GRAPH_MODE_RECEIPT = os.environ.get("AG2_VLLM_GRAPH_MODE_RECEIPT") == "1"
+
 
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -1602,6 +1604,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return empty_output
 
+        graph_receipt = None
+        if _AG2_GRAPH_MODE_RECEIPT and not dummy_run:
+            graph_receipt = (
+                "ag2.graph_receipt"
+                f"|mode={batch_desc.cg_mode.name}"
+                f"|tokens_unpadded={num_toks}"
+                f"|tokens_padded={batch_desc.num_tokens}"
+                f"|requests={num_reqs}"
+                f"|descriptor={batch_desc!r}"
+            )
+
         if not dummy_run:
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
@@ -1773,7 +1786,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     scheduler_output.has_structured_output_requests,
                     scheduler_output.pending_structured_output_tokens,
                 )
-            with record_function_or_nullcontext("ag2.target_forward.full"):
+            forward_scope = (
+                torch.profiler.record_function(graph_receipt)
+                if graph_receipt is not None
+                else record_function_or_nullcontext("ag2.target_forward.full")
+            )
+            with forward_scope:
                 model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
@@ -1811,17 +1829,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # cudagraph, chosen inside run_pw_graph). cg_mode is only
                     # PIECEWISE after the cudagraph manager exists.
                     assert self.cudagraph_manager is not None
-                    with record_function_or_nullcontext(
-                        "ag2.target_forward.piecewise"
-                    ):
+                    forward_scope = (
+                        torch.profiler.record_function(graph_receipt)
+                        if graph_receipt is not None
+                        else record_function_or_nullcontext(
+                            "ag2.target_forward.piecewise"
+                        )
+                    )
+                    with forward_scope:
                         model_output = self.cudagraph_manager.run_pw_graph(
                             self.model, model_inputs
                         )
                 else:
                     # Eager (NONE): call the raw model directly.
-                    with record_function_or_nullcontext(
-                        "ag2.target_forward.eager"
-                    ):
+                    forward_scope = (
+                        torch.profiler.record_function(graph_receipt)
+                        if graph_receipt is not None
+                        else record_function_or_nullcontext(
+                            "ag2.target_forward.eager"
+                        )
+                    )
+                    with forward_scope:
                         model_output = self.model(**model_inputs)
 
         if not dummy_run:

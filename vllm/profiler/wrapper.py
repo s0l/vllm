@@ -16,6 +16,18 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _should_create_profiler_schedule(profiler_config: ProfilerConfig) -> bool:
+    """Return whether any iteration-bounded torch schedule was requested."""
+    return any(
+        iterations > 0
+        for iterations in (
+            profiler_config.wait_iterations,
+            profiler_config.warmup_iterations,
+            profiler_config.active_iterations,
+        )
+    )
+
+
 class WorkerProfiler(ABC):
     def __init__(self, profiler_config: ProfilerConfig) -> None:
         self._delay_iters = profiler_config.delay_iterations
@@ -199,7 +211,7 @@ class TorchProfilerWrapper(WorkerProfiler):
 
         # Create profiler schedule if warmup or wait iterations are configured
         profiler_schedule = None
-        if profiler_config.warmup_iterations > 0 or profiler_config.wait_iterations > 0:
+        if _should_create_profiler_schedule(profiler_config):
             profiler_schedule = torch.profiler.schedule(
                 skip_first=0,
                 wait=profiler_config.wait_iterations,

@@ -375,21 +375,39 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         self._prepare_eplb_forward(input_batch.num_tokens)
 
-        if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
-            # Replay the full graph for draft prefill.
-            assert self.prefill_cudagraph_manager is not None
-            with record_function_or_nullcontext("ag2.mtp_prefill.full"):
-                self.prefill_cudagraph_manager.run_fullgraph(prefill_batch_desc)
-        else:
-            # The target model's attention metadata and slot mappings
-            # can directly be used for draft prefill, because of the
-            # identical batch shape and KV cache layout.
-            scope = (
+        prefill_receipt_name = (
+            "ag2.mtp_prefill_graph_receipt"
+            f"|mode={prefill_batch_desc.cg_mode.name}"
+            f"|tokens_unpadded={input_batch.num_tokens}"
+            f"|tokens_padded={prefill_batch_desc.num_tokens}"
+            f"|requests={num_reqs}"
+            f"|uniform_token_count={uniform_token_count}"
+            f"|descriptor={prefill_batch_desc}"
+        )
+        prefill_default_scope = (
+            "ag2.mtp_prefill.full"
+            if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL
+            else (
                 "ag2.mtp_prefill.piecewise"
                 if prefill_batch_desc.cg_mode == CUDAGraphMode.PIECEWISE
                 else "ag2.mtp_prefill.eager"
             )
-            with record_function_or_nullcontext(scope):
+        )
+        prefill_scope = (
+            torch.profiler.record_function(prefill_receipt_name)
+            if os.getenv("AG2_VLLM_GRAPH_MODE_RECEIPT") == "1" and not dummy_run
+            else record_function_or_nullcontext(prefill_default_scope)
+        )
+
+        with prefill_scope:
+            if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
+                # Replay the full graph for draft prefill.
+                assert self.prefill_cudagraph_manager is not None
+                self.prefill_cudagraph_manager.run_fullgraph(prefill_batch_desc)
+            else:
+                # The target model's attention metadata and slot mappings
+                # can directly be used for draft prefill, because of the
+                # identical batch shape and KV cache layout.
                 self._prefill(
                     num_reqs,
                     prefill_batch_desc.num_tokens,
@@ -436,12 +454,26 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
         # Generate the remaining num_speculative_steps - 1 draft tokens.
-        scope = (
+        decode_receipt_name = (
+            "ag2.mtp_decode_graph_receipt"
+            f"|mode={decode_batch_desc.cg_mode.name}"
+            f"|tokens_unpadded={num_reqs}"
+            f"|tokens_padded={decode_batch_desc.num_tokens}"
+            f"|requests={num_reqs}"
+            "|uniform_token_count=1"
+            f"|descriptor={decode_batch_desc}"
+        )
+        decode_default_scope = (
             "ag2.mtp_decode.full"
             if decode_batch_desc.cg_mode == CUDAGraphMode.FULL
             else "ag2.mtp_decode.eager"
         )
-        with record_function_or_nullcontext(scope):
+        decode_scope = (
+            torch.profiler.record_function(decode_receipt_name)
+            if os.getenv("AG2_VLLM_GRAPH_MODE_RECEIPT") == "1" and not dummy_run
+            else record_function_or_nullcontext(decode_default_scope)
+        )
+        with decode_scope:
             self._multi_step_decode(
                 num_reqs,
                 dummy_run and skip_attn_for_dummy_run,
