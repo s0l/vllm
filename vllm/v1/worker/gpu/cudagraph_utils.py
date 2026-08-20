@@ -680,7 +680,7 @@ class CudaGraphManager:
     ) -> bool:
         group = get_tp_group()
         identity = (
-            int(desc.cg_mode),
+            int(desc.cg_mode.value),
             desc.num_tokens,
             desc.num_reqs,
             desc.uniform_token_count,
