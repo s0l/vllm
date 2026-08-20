@@ -306,11 +306,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             gate_up_elements = self.max_num_tokens * 11648
             workspace_elements = gate_up_elements
             if envs.AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH:
-                if not envs.AG2_VLLM_MTP_BF16_GATE_UP_SCRATCH:
-                    raise RuntimeError(
-                        "DCP prefill query scratch requires shared target/MTP "
-                        "gate/up scratch ownership"
-                    )
                 if self.dtype != torch.bfloat16:
                     raise RuntimeError(
                         f"DCP prefill query scratch requires BF16, got {self.dtype}"
