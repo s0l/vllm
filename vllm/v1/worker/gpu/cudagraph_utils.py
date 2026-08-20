@@ -945,13 +945,18 @@ class CudaGraphManager:
     ) -> bool:
         if (
             not self._graphs_captured
-            or uniform_token_count is not None
             or not self.dynamic_piecewise_safety_sizes
+            or self.dynamic_piecewise_capture_range is None
+            or num_tokens < self.dynamic_piecewise_capture_range[0]
         ):
             return False
         safety_size = self._piecewise_safety_size(num_tokens)
         if safety_size is None:
-            return False
+            raise RuntimeError(
+                "PIECEWISE execution shape exceeds the dynamic safety boundary: "
+                f"num_tokens={num_tokens} max_safety_size="
+                f"{self.dynamic_piecewise_safety_sizes[-1]}"
+            )
         desc = BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.PIECEWISE,
             num_tokens=safety_size,
