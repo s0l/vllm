@@ -279,6 +279,11 @@ class CudaGraphManager:
             if isinstance(additional_config, dict)
             else []
         )
+        piecewise_range = (
+            additional_config.get("dynamic_cudagraph_piecewise_capture_range", [])
+            if isinstance(additional_config, dict)
+            else []
+        )
         for name, sizes in (
             ("dynamic_cudagraph_full_capture_sizes", dynamic_full_sizes),
             ("dynamic_cudagraph_piecewise_coverage_sizes", coverage_sizes),
@@ -288,6 +293,19 @@ class CudaGraphManager:
                 for size in sizes
             ):
                 raise ValueError(f"{name} must be a list of positive integers")
+        if (
+            not isinstance(piecewise_range, list)
+            or len(piecewise_range) not in (0, 2)
+            or any(
+                isinstance(size, bool) or not isinstance(size, int) or size <= 0
+                for size in piecewise_range
+            )
+            or (piecewise_range and piecewise_range[0] > piecewise_range[1])
+        ):
+            raise ValueError(
+                "dynamic_cudagraph_piecewise_capture_range must be an empty "
+                "list or [min_tokens, max_tokens]"
+            )
         startup_sizes = set(self.compilation_config.cudagraph_capture_sizes or [])
         self.dynamic_piecewise_capture_sizes = tuple(
             sorted(set(dynamic_sizes).difference(startup_sizes))
@@ -298,12 +316,23 @@ class CudaGraphManager:
         self.dynamic_piecewise_coverage_sizes = tuple(
             sorted(set(coverage_sizes).difference(startup_sizes))
         )
+        self.dynamic_piecewise_capture_range = (
+            (piecewise_range[0], piecewise_range[1])
+            if piecewise_range
+            else None
+        )
+        self.dynamic_piecewise_static_sizes = frozenset(
+            startup_sizes.union(coverage_sizes)
+        )
         self.dynamic_capture_sizes = tuple(
             sorted(
                 set(self.dynamic_piecewise_capture_sizes).union(
                     self.dynamic_full_capture_sizes
                 )
             )
+        )
+        self.has_dynamic_capture_candidates = bool(
+            self.dynamic_capture_sizes or self.dynamic_piecewise_capture_range
         )
         dynamic_budget_mb = (
             additional_config.get("dynamic_cudagraph_budget_mb", 0)
@@ -314,7 +343,7 @@ class CudaGraphManager:
             dynamic_budget_mb, int
         ):
             raise ValueError("dynamic_cudagraph_budget_mb must be an integer")
-        if bool(self.dynamic_capture_sizes) != (dynamic_budget_mb > 0):
+        if self.has_dynamic_capture_candidates != (dynamic_budget_mb > 0):
             raise ValueError(
                 "dynamic CUDA graphs require both capture sizes and a positive "
                 "dynamic_cudagraph_budget_mb"
@@ -401,7 +430,7 @@ class CudaGraphManager:
             is_breakable_cudagraph_enabled()
             and self.cudagraph_mode.has_piecewise_cudagraphs()
         )
-        if self.dynamic_capture_sizes and self.use_breakable_cg:
+        if self.has_dynamic_capture_candidates and self.use_breakable_cg:
             raise ValueError(
                 "dynamic CUDA graph residency does not yet support breakable graphs"
             )
@@ -1069,6 +1098,27 @@ class CudaGraphManager:
         """Find matching cudagraph descriptor from priority-ordered candidates."""
 
         effective_loras = self._resolve_effective_loras(num_active_loras)
+        if (
+            self._graphs_captured
+            and uniform_token_count is None
+            and self.dynamic_piecewise_capture_range is not None
+            and self.dynamic_piecewise_capture_range[0]
+            <= num_tokens
+            <= self.dynamic_piecewise_capture_range[1]
+            and num_tokens not in self.dynamic_piecewise_static_sizes
+        ):
+            dynamic_desc = BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.PIECEWISE,
+                num_tokens=num_tokens,
+                num_reqs=None,
+                num_active_loras=effective_loras,
+            )
+            self._dynamic_graph_entries.setdefault(
+                dynamic_desc,
+                DynamicGraphEntry(descriptor=dynamic_desc),
+            )
+            if self._observe_dynamic_descriptor(dynamic_desc):
+                return dynamic_desc
         key = (num_tokens, effective_loras)
         if self._graphs_captured and num_tokens > 0 and key in self._candidates:
             for desc in self._candidates[key]:

@@ -194,6 +194,61 @@ def test_dynamic_piecewise_descriptor_queues_before_hot_dispatch(monkeypatch):
     assert hot.cg_mode == CUDAGraphMode.PIECEWISE
 
 
+def test_dynamic_piecewise_range_uses_sparse_safety_until_hot(monkeypatch):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform,
+        "get_global_graph_pool",
+        lambda: object(),
+    )
+    config = _create_vllm_config(
+        additional_config={
+            "dynamic_cudagraph_piecewise_capture_range": [65, 4096],
+            "dynamic_cudagraph_piecewise_coverage_sizes": [
+                128,
+                256,
+                512,
+                1024,
+                2048,
+                4096,
+            ],
+            "dynamic_cudagraph_budget_mb": 64,
+            "dynamic_cudagraph_min_hits": 2,
+        },
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+    )
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        decode_query_len=1,
+    )
+    manager._graphs_captured = True
+
+    first = manager.dispatch(8, 65, None, 0)
+    second = manager.dispatch(8, 65, None, 0)
+    assert first.cg_mode == CUDAGraphMode.PIECEWISE
+    assert first.num_tokens == 128
+    assert second.cg_mode == CUDAGraphMode.PIECEWISE
+    assert second.num_tokens == 128
+    assert manager._dynamic_pending is not None
+
+    entry = manager._dynamic_graph_entries[manager._dynamic_pending]
+    entry.state = gpu_cudagraph_utils.DynamicGraphResidency.HOT
+    manager._dynamic_pending = None
+    hot = manager.dispatch(8, 65, None, 0)
+    assert hot == BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.PIECEWISE,
+        num_tokens=65,
+        num_reqs=None,
+        uniform_token_count=None,
+    )
+
+
 def test_dynamic_full_uses_piecewise_safety_until_hot(monkeypatch):
     monkeypatch.setattr(
         gpu_cudagraph_utils,
