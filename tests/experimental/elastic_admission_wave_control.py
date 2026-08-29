@@ -73,7 +73,7 @@ def main() -> None:
     attention.free_blocks(reversed(history))
     assert attention.get_num_free_blocks() == 65
 
-    assert coordinator.reserve_elastic_admission_wave((1,) * 16) == 16
+    assert coordinator.apply_elastic_admission_wave((1,) * 16) == 16
     assert (attention.active_num_gpu_blocks, gdn.active_num_gpu_blocks) == (34, 145)
 
     request_attention = []
@@ -91,9 +91,7 @@ def main() -> None:
 
     # Keep one request and release the other fifteen. The arena must reclaim
     # the GDN wave and make the whole attention capacity available again.
-    for a_blocks, g_blocks in zip(
-        request_attention[1:], request_gdn[1:], strict=True
-    ):
+    for a_blocks, g_blocks in zip(request_attention[1:], request_gdn[1:], strict=True):
         attention.free_blocks(reversed(a_blocks))
         gdn.free_blocks(reversed(g_blocks))
     coordinator.rebalance_elastic_capacity()
@@ -111,19 +109,16 @@ def main() -> None:
     # If no offered request is admitted, the speculative scheduler-side
     # reservation collapses before publication and emits no worker transition.
     unused = make_manager().coordinator
-    assert unused.reserve_elastic_admission_wave((1,) * 16) == 16
+    assert unused.apply_elastic_admission_wave((1,) * 16) == 16
     unused.rebalance_elastic_capacity()
     assert unused.take_elastic_transition() is None
 
     # A long request at the head must reduce the wave, not be starved by a
     # layout sized as if every candidate needed only one primary block.
     long_first = make_manager().coordinator
-    admitted = long_first.reserve_elastic_admission_wave((40,) + (1,) * 15)
+    admitted = long_first.apply_elastic_admission_wave((40,) + (1,) * 15)
     assert 0 < admitted < 16
-    assert (
-        long_first.block_pool.get_num_free_blocks()
-        >= 40 + max(admitted - 1, 0)
-    )
+    assert long_first.block_pool.get_num_free_blocks() >= 40 + max(admitted - 1, 0)
     estimated = make_manager().estimate_uncached_full_sequence_requirements(
         SimpleNamespace(
             request_id="long",
@@ -143,12 +138,12 @@ def main() -> None:
     assert staged_gdn is not None
     staged_history = staged_attention.get_new_blocks(52)
     staged_attention.free_blocks(reversed(staged_history))
-    assert staged.reserve_elastic_admission_wave((1,) * 14) == 14
+    assert staged.apply_elastic_admission_wave((1,) * 14) == 14
     first_wave_attention = staged_attention.get_new_blocks(14)
     first_wave_gdn = staged_gdn.get_new_blocks(14 * 9)
     first_wave_ids = [block.block_id for block in first_wave_attention]
     assert first_wave_ids == list(range(1, 15)), first_wave_ids
-    assert staged.reserve_elastic_admission_wave((1, 1)) == 2
+    assert staged.apply_elastic_admission_wave((1, 1)) == 2
     second_wave_attention = staged_attention.get_new_blocks(2)
     second_wave_gdn = staged_gdn.get_new_blocks(2 * 9)
     assert [block.block_id for block in second_wave_attention] == [15, 16]
@@ -169,12 +164,12 @@ def main() -> None:
     no_lookahead_attention = no_lookahead.block_pool
     no_lookahead_gdn = no_lookahead.mamba_block_pool
     assert no_lookahead_gdn is not None
-    assert no_lookahead.reserve_elastic_admission_wave((1,) * 9) == 9
+    assert no_lookahead.apply_elastic_admission_wave((1,) * 9) == 9
     assert no_lookahead_attention.active_num_gpu_blocks == 49
     no_lookahead_gdn_leases = no_lookahead_gdn.get_new_blocks(9 * 9)
     pinned_shared_prefix = no_lookahead_attention.blocks[46]
     no_lookahead_attention.touch((pinned_shared_prefix,))
-    assert no_lookahead.reserve_elastic_admission_wave((1,)) == 0
+    assert no_lookahead.apply_elastic_admission_wave((1,)) == 0
     assert no_lookahead.last_elastic_rejection is None
     assert not no_lookahead.ensure_elastic_capacity(
         KVCacheBlockPoolRequirements(primary=1, mamba=9)
@@ -185,7 +180,7 @@ def main() -> None:
     no_lookahead_gdn.free_blocks(reversed(no_lookahead_gdn_leases))
 
     with_lookahead = make_manager().coordinator
-    assert with_lookahead.reserve_elastic_admission_wave((1,) * 10) == 10
+    assert with_lookahead.apply_elastic_admission_wave((1,) * 10) == 10
     assert with_lookahead.block_pool.active_num_gpu_blocks == 46
 
     # Scheduler integration: ready, already-promoted and still-compiling
@@ -240,16 +235,16 @@ def main() -> None:
     scheduler.kv_cache_manager = SimpleNamespace(
         kv_cache_config=SimpleNamespace(elastic_mapping_quantum=1),
         watermark_blocks=0,
-        estimate_uncached_full_sequence_requirements=lambda request: (
-            SimpleNamespace(primary=1)
+        estimate_uncached_full_sequence_requirements=lambda request: SimpleNamespace(
+            primary=1
         ),
         coordinator=SimpleNamespace(
-            reserve_elastic_admission_wave=lambda requirements: (
+            apply_elastic_admission_wave=lambda requirements: (
                 reserved_candidates.append(requirements) or len(requirements)
             )
-        )
+        ),
     )
-    assert scheduler._reserve_elastic_waiting_wave(token_budget=8) == 6
+    assert scheduler._apply_elastic_waiting_wave(token_budget=8) == 6
     assert reserved_candidates == [(1, 1, 1, 1, 1, 1)]
     assert ready.status == RequestStatus.WAITING
     assert pending.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
@@ -265,10 +260,10 @@ def main() -> None:
     reserved_candidates.clear()
     scheduler.running = [SimpleNamespace()]
     scheduler.max_num_running_reqs = 2
-    assert scheduler._reserve_elastic_incremental_headroom() == 1
+    assert scheduler._apply_elastic_incremental_headroom() == 1
     assert reserved_candidates == [(1,)]
     scheduler.running.append(SimpleNamespace())
-    assert scheduler._reserve_elastic_incremental_headroom() == 0
+    assert scheduler._apply_elastic_incremental_headroom() == 0
 
     def worker_config(blocks_per_request: int) -> KVCacheConfig:
         return KVCacheConfig(
@@ -309,14 +304,38 @@ def main() -> None:
     else:
         raise AssertionError("rank-local GDN topology mismatch was accepted")
 
+    # Dynamic CUDA Graph memory is a step-scoped loan from the attention tail,
+    # not a startup reserve. A pinned tail rejects the loan atomically; after
+    # release, the same bytes reduce MaxX and returning them restores baseline.
+    external = make_manager().coordinator
+    baseline_attention = external.block_pool.active_num_gpu_blocks
+    pinned_tail = external.block_pool.blocks[baseline_attention - 1]
+    external.block_pool.touch((pinned_tail,))
+    graph_bytes = 256 * 1024 * 1024
+    assert not external.set_elastic_external_memory(graph_bytes)
+    assert external.elastic_external_memory_bytes == 0
+    assert external.block_pool.active_num_gpu_blocks == baseline_attention
+    external.block_pool.free_blocks((pinned_tail,))
+
+    assert external.set_elastic_external_memory(graph_bytes)
+    borrowed_attention = external.block_pool.active_num_gpu_blocks
+    assert borrowed_attention < baseline_attention
+    graph_maxx = external.plan_elastic_admission_wave((1,) * 16)
+    assert graph_maxx is not None
+    assert graph_maxx.max_requests <= 16
+    assert external.set_elastic_external_memory(0)
+    assert external.block_pool.active_num_gpu_blocks == baseline_attention
+    assert external.elastic_external_memory_bytes == 0
+
     print(
         "PASS: high-tail x16 admitted; attention IDs remained in-range; "
-        "single-request capacity reclaimed; unused reservation unpublished; "
+        "single-request capacity reclaimed; unused plan unpublished; "
         "long-head request reduced rather than deadlocked the wave; "
         "scheduler covered pending grammars, excluded unbounded waits, and "
         "obeyed token budget; "
         "rank topology mismatch failed closed; incremental high-tail arrival "
-        "remained shrink-safe"
+        "remained shrink-safe; graph bytes borrowed a free KV tail, changed "
+        "MaxX, and returned the X1 baseline"
     )
 
 

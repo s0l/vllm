@@ -26,8 +26,22 @@ class ElasticKVController:
         self.backings: dict[str, ElasticCuMemBacking] = {}
         self.geometry: dict[str, int] = {}
         self._physical_budget_bytes: int | None = None
+        self._mapping_quantum: int | None = None
+        self._logical_transition: tuple[int, int] | None = None
+        self._external_memory_bytes = 0
+        self._last_logged_external_floor_bytes = 0
 
-    def configure_physical_budget(self, budget_bytes: int, quantum: int) -> None:
+    @property
+    def external_memory_bytes(self) -> int:
+        """Return the worker-applied, mapping-quantized external loan."""
+        return self._external_memory_bytes
+
+    def configure_physical_budget(
+        self,
+        budget_bytes: int,
+        quantum: int,
+        initial_transition: tuple[int, int],
+    ) -> None:
         """Pin the largest representable planner budget across transitions."""
         if budget_bytes <= 0 or quantum <= 0:
             raise ValueError("elastic physical budget and quantum must be positive")
@@ -41,17 +55,31 @@ class ElasticKVController:
                 f"reserved={reserved}"
             )
         self._physical_budget_bytes = physical_budget
+        self._mapping_quantum = quantum
+        self._logical_transition = initial_transition
 
-    def _preserve_physical_budget(self, targets: dict[str, int]) -> dict[str, int]:
+    def _preserve_physical_budget(
+        self,
+        targets: dict[str, int],
+        external_memory_bytes: int,
+    ) -> dict[str, int]:
         if self._physical_budget_bytes is None:
             self._physical_budget_bytes = sum(
                 owner.info.committed for owner in self.backings.values()
             )
+        if external_memory_bytes < 0:
+            raise ValueError("elastic external memory cannot be negative")
+        quantum = self._mapping_quantum
+        if quantum is None:
+            quantum = next(iter(self.backings.values())).info.quantum
+        external_mapped = (external_memory_bytes + quantum - 1) // quantum * quantum
+        retained_budget = self._physical_budget_bytes - external_mapped
         normalized = dict(targets)
-        slack = self._physical_budget_bytes - sum(normalized.values())
+        slack = retained_budget - sum(normalized.values())
         if slack < 0:
             raise RuntimeError(
-                f"elastic KV targets exceed the fixed physical budget by {-slack} bytes"
+                "elastic KV and external targets exceed the physical budget by "
+                f"{-slack} bytes"
             )
         for key in sorted(normalized):
             if slack == 0:
@@ -99,8 +127,13 @@ class ElasticKVController:
             if missing:
                 self.backings[key].resize(targets[key], fence)
 
-    def apply(self, transition: tuple[int, int] | None) -> None:
-        if transition is None:
+    def apply(
+        self,
+        transition: tuple[int, int] | None,
+        external_memory_bytes: int = 0,
+    ) -> None:
+        target_transition = transition or self._logical_transition
+        if target_transition is None:
             return
         if not self.backings:
             raise RuntimeError("elastic KV transition without elastic backings")
@@ -109,7 +142,7 @@ class ElasticKVController:
             key for key in self.backings if key.startswith("elastic-attention-")
         )
         old_sizes = {key: owner.info.committed for key, owner in self.backings.items()}
-        attention_blocks, gdn_blocks = transition
+        attention_blocks, gdn_blocks = target_transition
         targets: dict[str, int] = {}
         preflight_error: Exception | None = None
         try:
@@ -121,7 +154,7 @@ class ElasticKVController:
                     // owner.info.quantum
                     * owner.info.quantum
                 )
-            targets = self._preserve_physical_budget(targets)
+            targets = self._preserve_physical_budget(targets, external_memory_bytes)
         except Exception as exc:
             preflight_error = exc
 
@@ -153,6 +186,8 @@ class ElasticKVController:
                 group=get_tp_group().device_group,
             )
         if not bool(any_change.item()):
+            self._logical_transition = target_transition
+            self._external_memory_bytes = external_memory_bytes
             return
 
         fence = torch.cuda.Event()
@@ -201,11 +236,94 @@ class ElasticKVController:
                 "elastic KV transition aborted on at least one rank"
             ) from apply_error
 
-        logger.info(
-            "Elastic KV transition committed: attention=%.3f GiB GDN=%.3f GiB",
+        logger.debug(
+            "Elastic KV transition committed: attention=%.3f GiB GDN=%.3f GiB "
+            "external=%.3f GiB",
             sum(self.backings[key].info.committed for key in attention_ids) / 1024**3,
             self.backings["elastic-gdn"].info.committed / 1024**3,
+            external_memory_bytes / 1024**3,
         )
+        self._logical_transition = target_transition
+        self._external_memory_bytes = external_memory_bytes
+
+    def reconcile_external_memory(self, external_memory_bytes: int) -> int:
+        """Return as much external memory as can be mapped back into KV.
+
+        CUDA may keep graph-pool or allocator mappings alive after the graph
+        ledger has released them.  Query rank-safe driver-free physical memory
+        before changing any VMM mapping and return only whole quanta that are
+        already available.  This is a retryable observed floor, not a reserve
+        and not the old mutate/fail/rollback binary search.
+        """
+        if not self.backings:
+            self.apply(None, external_memory_bytes)
+            return external_memory_bytes
+
+        quantum = self._mapping_quantum
+        if quantum is None:
+            quantum = next(iter(self.backings.values())).info.quantum
+
+        requested = (
+            (external_memory_bytes + quantum - 1) // quantum * quantum
+        )
+        current = (
+            (self._external_memory_bytes + quantum - 1) // quantum * quantum
+        )
+
+        # Taking memory from KV remains fail-closed and needs no new physical
+        # allocation. Returning memory to KV may grow a VMM backing, so bound
+        # that one commit by the worst-rank free-memory oracle first.
+        if requested >= current:
+            self.apply(None, requested)
+            return requested
+
+        local_free = torch.cuda.mem_get_info(self.device)[0]
+        free = torch.tensor(local_free, dtype=torch.int64, device=self.device)
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(
+                free,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_tp_group().device_group,
+            )
+        returnable = min(current - requested, int(free.item()) // quantum * quantum)
+        effective = current - returnable
+        if effective < current:
+            self.apply(None, effective)
+
+        retained = effective - requested
+        if retained != getattr(self, "_last_logged_external_floor_bytes", 0):
+            logger.warning(
+                "Elastic KV measured a temporary physical external-memory floor: "
+                "requested=%.3f GiB effective=%.3f GiB retained=%.3f GiB "
+                "rank_safe_driver_free=%.3f GiB; "
+                "future steps will retry the return",
+                requested / 1024**3,
+                effective / 1024**3,
+                retained / 1024**3,
+                int(free.item()) / 1024**3,
+            )
+            self._last_logged_external_floor_bytes = retained
+        elif retained == 0:
+            self._last_logged_external_floor_bytes = 0
+        return effective
+
+    def apply_scheduler_step(
+        self,
+        transition: tuple[int, int] | None,
+        external_memory_bytes: int,
+    ) -> int:
+        """Apply a worker step without mistaking a physical floor for OOM.
+
+        A missing transition means attention/GDN geometry is unchanged and
+        only the step-scoped external loan is moving. That return must use the
+        measured floor path: allocator or CUDA Graph teardown may make a small
+        part temporarily unavailable to KV even though the scheduler's logical
+        request is correct. Real geometry changes remain exact and fail closed.
+        """
+        if transition is None:
+            return self.reconcile_external_memory(external_memory_bytes)
+        self.apply(transition, external_memory_bytes)
+        return external_memory_bytes
 
     def mapped_attention_block_capacity(self) -> int | None:
         """Return the fully mapped logical attention-block prefix."""
@@ -248,9 +366,7 @@ def validate_elastic_attention_block_tables(
             # .item() on the GPU mirror here inserts a rank-local device
             # synchronization immediately before CUDA Graph replay, which can
             # turn a distributed warmup into a diagnostic-induced hang.
-            block_ids = block_tables.host_block_tables[group_id][
-                req_index, :count
-            ]
+            block_ids = block_tables.host_block_tables[group_id][req_index, :count]
             invalid = (block_ids < 0) | (block_ids >= mapped_kernel_blocks)
             if bool(invalid.any()):
                 invalid_ids = block_ids[invalid].tolist()

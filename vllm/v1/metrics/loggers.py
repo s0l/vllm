@@ -5,6 +5,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from typing import Any
 
 from prometheus_client import Counter, Gauge, Histogram
 
@@ -568,6 +569,53 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_kv_cache_usage, per_engine_labelvalues
         )
 
+        elastic_graph_stat_names = (
+            "hot_hits",
+            "cold_misses",
+            "promotions",
+            "evictions",
+            "evicted_bytes",
+            "deferrals",
+            "pinned_bytes",
+            "evictable_bytes",
+            "external_bytes",
+            "external_floor_bytes",
+            "maintenance_wall_ms_total",
+            "maintenance_transactions_total",
+            "useful_wall_ms_total",
+            "useful_transactions_total",
+            "rate_limited_logs_total",
+        )
+        gauge_elastic_graph_stat = self._gauge_cls(
+            name="vllm:elastic_graph_stat",
+            documentation=(
+                "Current cumulative counters and resident-byte ledgers for "
+                "the elastic CUDA Graph/KV authority."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames + ["stat"],
+        )
+        self.gauge_elastic_graph_stats: dict[str, dict[int, Gauge]] = {}
+        for stat_name in elastic_graph_stat_names:
+            per_engine_labelvalues_with_stat = {
+                idx: labelvalues + [stat_name]
+                for idx, labelvalues in per_engine_labelvalues.items()
+            }
+            self.gauge_elastic_graph_stats[stat_name] = create_metric_per_engine(
+                gauge_elastic_graph_stat, per_engine_labelvalues_with_stat
+            )
+        self.gauge_elastic_graph_key_total = self._gauge_cls(
+            name="vllm:elastic_graph_key_total",
+            documentation=(
+                "Cumulative elastic CUDA Graph outcomes by bounded physical "
+                "owner class."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames
+            + ["owner", "mode", "token_bucket", "outcome"],
+        )
+        self._elastic_graph_base_labelvalues = per_engine_labelvalues
+
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             counter_corrupted_requests = self._counter_cls(
                 name="vllm:corrupted_requests",
@@ -1125,6 +1173,30 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             metrics_info["engine"] = str(engine_index)
             info_gauge.labels(**metrics_info).set(1)
 
+    def _record_elastic_graph_stats(
+        self, elastic_graph_stats: dict[str, Any] | None, engine_idx: int
+    ) -> None:
+        if not elastic_graph_stats:
+            return
+        for stat_name, gauges in self.gauge_elastic_graph_stats.items():
+            value = elastic_graph_stats.get(stat_name)
+            if isinstance(value, int | float):
+                gauges[engine_idx].set(value)
+        key_totals = elastic_graph_stats.get("key_totals", {})
+        if not isinstance(key_totals, dict):
+            return
+        base_labels = self._elastic_graph_base_labelvalues[engine_idx]
+        for encoded_key, value in key_totals.items():
+            if not isinstance(encoded_key, str) or not isinstance(value, int | float):
+                continue
+            parts = encoded_key.split("|")
+            if len(parts) != 4:
+                continue
+            owner, mode, token_bucket, outcome = parts
+            self.gauge_elastic_graph_key_total.labels(
+                *(base_labels + [owner, mode, token_bucket, outcome])
+            ).set(value)
+
     def record(
         self,
         scheduler_stats: SchedulerStats | None,
@@ -1149,6 +1221,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+            self._record_elastic_graph_stats(
+                scheduler_stats.elastic_graph_stats, engine_idx
+            )
             self.counter_num_kv_tail_deferrals[engine_idx].inc(
                 scheduler_stats.num_kv_tail_deferrals
             )

@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 
 import vllm.envs as envs
+from vllm.exceptions import VLLMValidationError
 from vllm.envs import (
     disable_envs_cache,
     enable_envs_cache,
@@ -15,7 +16,22 @@ from vllm.envs import (
     env_with_choices,
     environment_variables,
 )
-from vllm.exceptions import VLLMValidationError
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "expected"),
+    [
+        ("VLLM_TP3_CE_MAX_ROWS", "12288", 12288),
+        ("VLLM_TP3_LL_REDUCE", "1", True),
+        ("VLLM_TP3_LL_MAX_ROWS", "16", 16),
+        ("VLLM_TP3_SD_DETERMINISTIC_MAX_ROWS", "24", 24),
+    ],
+)
+def test_tp3_runtime_envs_are_registered(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str, expected: object
+) -> None:
+    monkeypatch.setenv(name, value)
+    assert environment_variables[name]() == expected
 
 
 def test_getattr_without_cache(monkeypatch: pytest.MonkeyPatch):

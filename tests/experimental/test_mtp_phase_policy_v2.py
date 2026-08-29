@@ -14,8 +14,10 @@ from vllm.config import (
     SchedulerConfig,
     VllmConfig,
 )
-from vllm.distributed.parallel_state import _is_tp3_sd_phase_reduce
-from vllm.distributed.parallel_state import _should_use_tp3_mtp_device_ce
+from vllm.distributed.parallel_state import (
+    _is_tp3_sd_phase_reduce,
+    _should_use_tp3_mtp_device_ce,
+)
 from vllm.forward_context import BatchDescriptor, override_forward_context
 from vllm.model_executor.models.qwen3_5 import (
     _ag2_layer0_trace_match_row,
@@ -40,6 +42,7 @@ from vllm.v1.worker.gpu.elastic_gdn import (
     V2GDNCheckpointManager,
 )
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
+    AutoRegressiveSpeculator,
     _resolve_prefill_cudagraph_mode,
 )
 from vllm.v1.worker.gpu.warmup import (
@@ -75,6 +78,17 @@ class _Owner:
         self.committed -= bytes_
         destination.committed += bytes_
         self.transfers.append((destination, bytes_))
+
+
+class _CapacityOwner(_Owner):
+    def __init__(self, committed: int, max_committed: int):
+        super().__init__(committed)
+        self.max_committed = max_committed
+
+    def resize(self, committed: int, event) -> None:
+        if committed > self.max_committed:
+            raise RuntimeError("out of memory")
+        super().resize(committed, event)
 
 
 class _Event:
@@ -229,13 +243,9 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
         default.assert_called_once_with(tensor)
 
     def test_phase_reduce_requires_explicit_forward_lane(self):
-        with override_forward_context(
-            SimpleNamespace(tp3_sd_phase_reduce=True)
-        ):
+        with override_forward_context(SimpleNamespace(tp3_sd_phase_reduce=True)):
             self.assertTrue(_is_tp3_sd_phase_reduce())
-        with override_forward_context(
-            SimpleNamespace(tp3_sd_phase_reduce=False)
-        ):
+        with override_forward_context(SimpleNamespace(tp3_sd_phase_reduce=False)):
             self.assertFalse(_is_tp3_sd_phase_reduce())
         with override_forward_context(None):
             self.assertFalse(_is_tp3_sd_phase_reduce())
@@ -380,11 +390,51 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
             CUDAGraphMode.FULL_AND_PIECEWISE,
         )
 
+    def test_elastic_on_demand_defers_but_preserves_draft_graph_modes(self):
+        config = SimpleNamespace(
+            additional_config={"elastic_gdn_backing": True},
+            compilation_config=SimpleNamespace(cudagraph_capture_sizes=[1, 4]),
+        )
+        speculator = SimpleNamespace(
+            vllm_config=config,
+            num_speculative_steps=3,
+            attn_cg_support=SimpleNamespace(
+                min_cg_support=AttentionCGSupport.UNIFORM_BATCH,
+                min_cg_attn_backend="flashinfer",
+            ),
+            device=torch.device("cpu"),
+            kv_cache_config=SimpleNamespace(effective_max_resident_seqs=8),
+            max_num_reqs=32,
+            _ag2_mtp_layer_capture=None,
+        )
+        manager = MagicMock()
+        with patch(
+            "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator."
+            "SpeculatorCudaGraphManager",
+            return_value=manager,
+        ) as constructor:
+            AutoRegressiveSpeculator.init_cudagraph_manager(
+                speculator, CUDAGraphMode.FULL_AND_PIECEWISE
+            )
+
+        assert constructor.call_count == 2
+        assert (
+            constructor.call_args_list[0].args[2]
+            == CUDAGraphMode.FULL_AND_PIECEWISE
+        )
+        assert (
+            constructor.call_args_list[1].args[2]
+            == CUDAGraphMode.FULL_DECODE_ONLY
+        )
+
     def test_dcp_prefill_reuses_stable_head_index_tensor_during_capture(self):
         wrapper = object.__new__(BatchDCPPrefillWrapper)
         wrapper._local_kv_head_index_tensors = {}
         device = torch.device("cpu")
-        first = wrapper._get_local_kv_head_index_tensor([0, 2], device)
+        with patch.object(
+            torch.cuda, "is_current_stream_capturing", return_value=False
+        ):
+            first = wrapper._get_local_kv_head_index_tensor([0, 2], device)
         with (
             patch.object(torch.cuda, "is_current_stream_capturing", return_value=True),
             patch.object(torch, "tensor", side_effect=AssertionError("reallocated")),
@@ -442,19 +492,26 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
         spec.num_speculative_tokens_per_batch_size = [(1, 8, 2), (9, 64, 0)]
         config.speculative_config = spec
 
-        with patch.object(
-            cudagraph_utils,
-            "get_pp_group",
-            return_value=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+        with (
+            patch.object(
+                cudagraph_utils,
+                "get_pp_group",
+                return_value=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+            ),
+            patch.object(
+                cudagraph_utils.current_platform,
+                "get_global_graph_pool",
+                return_value=object(),
+            ),
         ):
             manager = cudagraph_utils.ModelCudaGraphManager(
                 vllm_config=config,
                 device=torch.device("cpu"),
                 cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
                 decode_query_len=3,
-            full_decode_query_lens={1},
-            tp3_sd_phase_reduce=True,
-        )
+                full_decode_query_lens={1},
+                tp3_sd_phase_reduce=True,
+            )
         manager._graphs_captured = True
         self.assertTrue(manager.tp3_sd_phase_reduce)
 
@@ -503,10 +560,17 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
         spec.num_speculative_tokens_per_batch_size = [(1, 64, 2)]
         config.speculative_config = spec
 
-        with patch.object(
-            cudagraph_utils,
-            "get_pp_group",
-            return_value=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+        with (
+            patch.object(
+                cudagraph_utils,
+                "get_pp_group",
+                return_value=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+            ),
+            patch.object(
+                cudagraph_utils.current_platform,
+                "get_global_graph_pool",
+                return_value=object(),
+            ),
         ):
             manager = cudagraph_utils.ModelCudaGraphManager(
                 vllm_config=config,
@@ -550,10 +614,17 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
         spec.num_speculative_tokens_per_batch_size = [(1, 8, 2), (9, 64, 0)]
         config.speculative_config = spec
 
-        with patch.object(
-            cudagraph_utils,
-            "get_pp_group",
-            return_value=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+        with (
+            patch.object(
+                cudagraph_utils,
+                "get_pp_group",
+                return_value=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+            ),
+            patch.object(
+                cudagraph_utils.current_platform,
+                "get_global_graph_pool",
+                return_value=object(),
+            ),
         ):
             manager = cudagraph_utils.CudaGraphManager(
                 vllm_config=config,
@@ -572,6 +643,120 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
                 and 0 < desc.num_reqs <= desc.num_tokens
                 for desc in descs
             )
+        )
+
+    def test_dynamic_graph_working_set_retains_hot_entries_when_x_drops(self):
+        compilation_config = CompilationConfig(
+            cudagraph_mode="FULL_AND_PIECEWISE",
+            cudagraph_capture_sizes=[4],
+        )
+        compilation_config.max_cudagraph_capture_size = 4
+        compilation_config.post_init_cudagraph_sizes()
+        config = MagicMock(spec=VllmConfig)
+        config.compilation_config = compilation_config
+        config.scheduler_config = SchedulerConfig.default_factory(max_num_seqs=8)
+        config.parallel_config = ParallelConfig()
+        config.speculative_config = None
+        config.num_speculative_tokens = 0
+        config.additional_config = {
+            "dynamic_cudagraph_full_capture_sizes": [3, 5],
+            "dynamic_cudagraph_budget_mb": 64,
+            "dynamic_cudagraph_guard_mb": 0,
+            "dynamic_cudagraph_min_hits": 1,
+        }
+
+        with (
+            patch.object(
+                cudagraph_utils,
+                "get_pp_group",
+                return_value=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+            ),
+            patch.object(
+                cudagraph_utils.current_platform,
+                "get_global_graph_pool",
+                return_value=object(),
+            ),
+        ):
+            manager = cudagraph_utils.ModelCudaGraphManager(
+                vllm_config=config,
+                device=torch.device("cpu"),
+                cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+                decode_query_len=1,
+                owner="target",
+            )
+        manager._graphs_captured = True
+        entries = {
+            entry.descriptor.num_tokens: entry
+            for entry in manager._dynamic_graph_entries.values()
+            if entry.descriptor.cg_mode == CUDAGraphMode.FULL
+        }
+        old_entry = entries[3]
+        next_entry = entries[5]
+        old_entry.state = cudagraph_utils.DynamicGraphResidency.HOT
+        old_entry.charged_bytes = 16
+        manager._dynamic_resident_bytes = 16
+        next_entry.state = cudagraph_utils.DynamicGraphResidency.QUEUED
+        next_entry.estimated_bytes = 32
+        manager._dynamic_pending = next_entry.descriptor
+
+        with patch.object(manager, "_evict_dynamic_entry") as evict:
+            self.assertFalse(manager.prepare_pending_dynamic_capture(31))
+            self.assertEqual(manager._dynamic_pending, next_entry.descriptor)
+            self.assertTrue(manager.prepare_pending_dynamic_capture(32))
+            self.assertEqual(manager.dynamic_resident_bytes, 16)
+            evict.assert_not_called()
+
+            next_entry.state = cudagraph_utils.DynamicGraphResidency.HOT
+            next_entry.charged_bytes = 20
+            manager._dynamic_resident_bytes = 36
+            manager._dynamic_pending = None
+            manager.begin_dynamic_step()
+            self.assertEqual(manager.dispatch(5, 5, 1, 0), next_entry.descriptor)
+            self.assertEqual(manager.finish_dynamic_step(), 36)
+
+            manager.begin_dynamic_step()
+            manager.release_unused_dynamic_residency(1, 1, 1, 0)
+            self.assertEqual(manager.dynamic_resident_bytes, 36)
+            evict.assert_not_called()
+
+        next_entry.state = cudagraph_utils.DynamicGraphResidency.QUEUED
+        manager._dynamic_pending = next_entry.descriptor
+        with (
+            patch.object(manager, "_consensus_dynamic_candidate", return_value=True),
+            patch.object(manager, "_admit_dynamic_capture", return_value=True),
+            patch.object(
+                manager, "capture", side_effect=RuntimeError("capture failed")
+            ),
+            patch.object(manager, "_destroy_dynamic_graphs", return_value=0) as destroy,
+            patch.object(
+                cudagraph_utils.current_platform,
+                "graph_pool_handle",
+                return_value=object(),
+            ),
+            patch.object(cudagraph_utils.gc, "collect"),
+            patch.object(torch.accelerator, "empty_cache") as empty_cache,
+            patch.object(torch.accelerator, "get_memory_info", return_value=(64, 128)),
+            patch.object(torch.cuda, "synchronize"),
+            patch(
+                "vllm.compilation.cuda_graph.CUDAGraphWrapper._all_instances",
+                [],
+            ),
+            self.assertRaisesRegex(RuntimeError, "capture failed"),
+        ):
+            manager.capture_next_dynamic(
+                MagicMock(),
+                MagicMock(),
+                MagicMock(),
+                None,
+                MagicMock(),
+                [],
+                MagicMock(),
+            )
+        destroy.assert_called_once_with(next_entry)
+        empty_cache.assert_called()
+        self.assertIsNone(manager._dynamic_pending)
+        self.assertEqual(
+            next_entry.state, cudagraph_utils.DynamicGraphResidency.COOLDOWN
         )
 
     def test_warmup_uses_separate_pool_ids_and_elastic_transitions(self):
@@ -600,10 +785,20 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
         output = SchedulerOutput.make_empty()
         _set_elastic_warmup_transition(output, runner, next_ids)
         self.assertEqual(output.elastic_kv_transition, (8, 3))
+        self.assertTrue(output.is_synthetic_warmup)
 
         cleanup = SchedulerOutput.make_empty()
         _set_elastic_warmup_transition(cleanup, runner, next_ids, restore_initial=True)
         self.assertEqual(cleanup.elastic_kv_transition, (8, 2))
+        self.assertTrue(cleanup.is_synthetic_warmup)
+
+        no_elastic = SchedulerOutput.make_empty()
+        no_elastic_runner = SimpleNamespace(
+            kv_cache_config=SimpleNamespace(elastic_mapping_quantum=0)
+        )
+        _set_elastic_warmup_transition(no_elastic, no_elastic_runner, next_ids)
+        self.assertTrue(no_elastic.is_synthetic_warmup)
+        self.assertIsNone(no_elastic.elastic_kv_transition)
 
     def test_separate_pool_mtp_exposes_scratch_but_checkpoints_only_base(self):
         spec = MambaSpec(
@@ -740,6 +935,7 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
 
         self.assertEqual(controller.backings["elastic-attention-0"].committed, 16)
         self.assertEqual(controller.backings["elastic-gdn"].committed, 8)
+        self.assertIsNone(controller._logical_transition)
         self.assertEqual(calls, 4)
 
     def test_v2_elastic_preflight_rejects_before_any_rank_mutates(self):
@@ -754,7 +950,7 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
             "elastic-attention-0": 4,
             "elastic-gdn": 4,
         }
-        controller.configure_physical_budget(24, 4)
+        controller.configure_physical_budget(24, 4, (4, 2))
         tp_group = object()
 
         def reject_preflight(vote, *, op, group):
@@ -799,6 +995,7 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
         with (
             patch.object(torch.cuda, "Event", return_value=_Event()),
             patch.object(torch.cuda, "current_stream", return_value=object()),
+            patch.object(torch.cuda, "mem_get_info", return_value=(24, 24)),
             patch.object(torch.distributed, "is_initialized", return_value=False),
         ):
             controller.apply((2, 4))
@@ -847,7 +1044,7 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
             "elastic-attention-0": 4,
             "elastic-gdn": 4,
         }
-        controller.configure_physical_budget(30, 4)
+        controller.configure_physical_budget(30, 4, (4, 2))
 
         with (
             patch.object(torch.cuda, "Event", return_value=_Event()),
@@ -859,6 +1056,88 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
 
         self.assertEqual(attention.committed + gdn.committed, 28)
         self.assertEqual(controller._physical_budget_bytes, 28)
+
+    def test_v2_elastic_external_owner_returns_pages_to_current_kv_layout(self):
+        controller = ElasticKVController(torch.device("cpu"))
+        attention = _Owner(16)
+        gdn = _Owner(8)
+        controller.backings = {
+            "elastic-attention-0": attention,
+            "elastic-gdn": gdn,
+        }
+        controller.geometry = {
+            "elastic-attention-0": 4,
+            "elastic-gdn": 4,
+        }
+        controller.configure_physical_budget(24, 4, (4, 2))
+
+        with (
+            patch.object(torch.cuda, "Event", return_value=_Event()),
+            patch.object(torch.cuda, "current_stream", return_value=object()),
+            patch.object(torch.cuda, "mem_get_info", return_value=(24, 24)),
+            patch.object(torch.distributed, "is_initialized", return_value=False),
+        ):
+            controller.apply((2, 2), external_memory_bytes=8)
+            self.assertEqual(attention.committed + gdn.committed, 16)
+            self.assertEqual(controller.reconcile_external_memory(0), 0)
+
+        self.assertEqual(attention.committed + gdn.committed, 24)
+        self.assertEqual(controller._external_memory_bytes, 0)
+
+    def test_v2_elastic_external_return_preflights_and_retries_physical_floor(self):
+        controller = ElasticKVController(torch.device("cpu"))
+        attention = _CapacityOwner(12, max_committed=12)
+        gdn = _Owner(4)
+        controller.backings = {
+            "elastic-attention-0": attention,
+            "elastic-gdn": gdn,
+        }
+        controller.geometry = {
+            "elastic-attention-0": 4,
+            "elastic-gdn": 4,
+        }
+        controller.configure_physical_budget(24, 4, (3, 1))
+
+        with (
+            patch.object(torch.cuda, "Event", return_value=_Event()),
+            patch.object(torch.cuda, "current_stream", return_value=object()),
+            patch.object(
+                torch.cuda,
+                "mem_get_info",
+                side_effect=((4, 24), (8, 24)),
+            ),
+            patch.object(torch.distributed, "is_initialized", return_value=False),
+        ):
+            controller.apply((2, 2), external_memory_bytes=8)
+            self.assertEqual(controller.reconcile_external_memory(0), 4)
+            self.assertEqual(attention.committed + gdn.committed, 20)
+            self.assertEqual(controller._external_memory_bytes, 4)
+
+            # The floor is observational, not a permanent reserve.  Once the
+            # lower layer can map the pages, the next step returns all of it.
+            attention.max_committed = 16
+            self.assertEqual(controller.reconcile_external_memory(0), 0)
+
+        self.assertEqual(attention.committed + gdn.committed, 24)
+        self.assertEqual(controller._external_memory_bytes, 0)
+
+    def test_v2_scheduler_step_reconciles_only_external_loan(self):
+        controller = object.__new__(ElasticKVController)
+        with (
+            patch.object(
+                controller,
+                "reconcile_external_memory",
+                return_value=12,
+            ) as reconcile,
+            patch.object(controller, "apply") as apply,
+        ):
+            self.assertEqual(controller.apply_scheduler_step(None, 8), 12)
+            reconcile.assert_called_once_with(8)
+            apply.assert_not_called()
+
+            self.assertEqual(controller.apply_scheduler_step((7, 5), 16), 16)
+            apply.assert_called_once_with((7, 5), 16)
+            self.assertEqual(reconcile.call_count, 1)
 
 
 if __name__ == "__main__":

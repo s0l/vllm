@@ -23,8 +23,8 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
-    tensor_model_parallel_owner_residual_arc_prequant,
     tensor_model_parallel_owner_materialize_aux,
+    tensor_model_parallel_owner_residual_arc_prequant,
     tensor_model_parallel_owner_terminal_norm,
     tensor_model_parallel_reduce_scatter,
     tensor_model_parallel_unified_exact_all_reduce,
@@ -60,6 +60,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.model_executor.layers.projection_capture import projection_capture_copy
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Dynamic
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -141,6 +142,7 @@ def _ag2_tp3_owner_prequant_enabled(
         "AG2_VLLM_AUX_HIDDEN_TRACE_INTERNAL_BOUNDARY_LAYERS",
         "AG2_VLLM_AUX_HIDDEN_TRACE_SEQUENCE_BOUNDARY_LAYERS",
         "AG2_VLLM_LAYER0_TRACE_OUTPUT",
+        "AG2_VLLM_PROJECTION_CALIBRATION_OUTPUT",
     )
     boundary_trace_switches = (
         "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_BOUNDARY_LAYER",
@@ -1021,7 +1023,10 @@ class Qwen3NextAttention(nn.Module):
                 attn_output,
                 self._ag2_projection_capture_row_indices,
             )
-            self._ag2_projection_capture_gated.copy_(selected)
+            projection_capture_copy(
+                selected,
+                self._ag2_projection_capture_gated,
+            )
         if return_ag2_mtp_trace:
             mtp_trace["gated"] = attn_output
         if (
@@ -1626,6 +1631,25 @@ class Qwen3NextDecoderLayer(nn.Module):
             ),
             persistent=False,
         )
+        if self._ag2_tp3_owner_prequant:
+            self.register_buffer(
+                "_ag2_projection_capture_attention_residual",
+                torch.full(
+                    (capacity, self.input_layernorm.weight.shape[0]),
+                    torch.nan,
+                    dtype=dtype,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_ag2_projection_capture_mlp_residual",
+                torch.full(
+                    (capacity, self.post_attention_layernorm.weight.shape[0]),
+                    torch.nan,
+                    dtype=dtype,
+                ),
+                persistent=False,
+            )
         if self.layer_type == "full_attention":
             self.self_attn.ag2_enable_projection_calibration_capture(capacity, dtype)
         else:
@@ -1754,6 +1778,28 @@ class Qwen3NextDecoderLayer(nn.Module):
             self._ag2_trace_input[: trace.shape[0]].copy_(trace)
         if return_ag2_mtp_trace:
             mtp_trace["layer_input"] = hidden_states
+        if self._ag2_projection_capture_enabled:
+            capture_rows = _ag2_compact_row_indices(
+                positions,
+                self._ag2_projection_capture_positions,
+                self._ag2_projection_capture_capacity,
+            )
+            projection_capture_copy(
+                capture_rows,
+                self._ag2_projection_capture_rows,
+            )
+            if self._ag2_tp3_owner_prequant:
+                projection_capture_copy(
+                    _ag2_compact_select(hidden_states, capture_rows),
+                    self._ag2_projection_capture_attention_input,
+                )
+                projection_capture_copy(
+                    _ag2_compact_select(
+                        hidden_states if residual is None else residual,
+                        capture_rows,
+                    ),
+                    self._ag2_projection_capture_attention_residual,
+                )
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -1776,15 +1822,11 @@ class Qwen3NextDecoderLayer(nn.Module):
         if return_ag2_mtp_trace:
             mtp_trace["input_norm"] = hidden_states
         if self._ag2_projection_capture_enabled:
-            capture_rows = _ag2_compact_row_indices(
-                positions,
-                self._ag2_projection_capture_positions,
-                self._ag2_projection_capture_capacity,
-            )
-            self._ag2_projection_capture_rows.copy_(capture_rows)
-            self._ag2_projection_capture_attention_input.copy_(
-                _ag2_compact_select(hidden_states, capture_rows)
-            )
+            if not self._ag2_tp3_owner_prequant:
+                projection_capture_copy(
+                    _ag2_compact_select(hidden_states, capture_rows),
+                    self._ag2_projection_capture_attention_input,
+                )
             self.mlp._ag2_projection_capture_row_indices = capture_rows
             if self.layer_type == "full_attention":
                 self.self_attn._ag2_projection_capture_row_indices = capture_rows
@@ -1957,6 +1999,21 @@ class Qwen3NextDecoderLayer(nn.Module):
                 residual = sequence_parallel_chunk(residual)
 
         # Fully Connected
+        if self._ag2_projection_capture_enabled and self._ag2_tp3_owner_prequant:
+            projection_capture_copy(
+                _ag2_compact_select(
+                    hidden_states,
+                    self._ag2_projection_capture_rows,
+                ),
+                self._ag2_projection_capture_mlp_input,
+            )
+            projection_capture_copy(
+                _ag2_compact_select(
+                    residual,
+                    self._ag2_projection_capture_rows,
+                ),
+                self._ag2_projection_capture_mlp_residual,
+            )
         if self._ag2_tp3_owner_prequant:
             hidden_states, residual = self._ag2_owner_prequantize(
                 hidden_states,
@@ -1977,12 +2034,13 @@ class Qwen3NextDecoderLayer(nn.Module):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
-        if self._ag2_projection_capture_enabled:
-            self._ag2_projection_capture_mlp_input.copy_(
+        if self._ag2_projection_capture_enabled and not self._ag2_tp3_owner_prequant:
+            projection_capture_copy(
                 _ag2_compact_select(
                     hidden_states,
                     self._ag2_projection_capture_rows,
-                )
+                ),
+                self._ag2_projection_capture_mlp_input,
             )
         if return_ag2_mtp_trace:
             mtp_trace["post_attention_norm"] = hidden_states

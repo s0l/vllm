@@ -2,7 +2,25 @@
 
 import pytest
 
-from vllm.v1.attention.backends.flashinfer import _resolve_decode_split_plan
+from vllm.v1.attention.backends.flashinfer import (
+    _resolve_decode_split_plan,
+    _use_decode_cudagraph_wrapper,
+)
+
+
+def test_decode_graph_wrapper_is_full_only() -> None:
+    common = {
+        "backend_enabled": True,
+        "pure_decode": True,
+        "num_decode_tokens": 18,
+        "max_cudagraph_tokens": 256,
+        "force_non_graph_wrapper": False,
+    }
+    assert _use_decode_cudagraph_wrapper(full_cudagraph=True, **common)
+    assert not _use_decode_cudagraph_wrapper(full_cudagraph=False, **common)
+
+    common["force_non_graph_wrapper"] = True
+    assert not _use_decode_cudagraph_wrapper(full_cudagraph=True, **common)
 
 
 def test_spec_target_policy_preserves_single_token_full_graph() -> None:

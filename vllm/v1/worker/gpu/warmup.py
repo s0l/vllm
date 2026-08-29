@@ -12,13 +12,13 @@ from vllm import PoolingParams, SamplingParams
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.kv_cache_capacity import PhysicalPoolCapacityPlanner
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
     NewRequestData,
     SchedulerOutput,
 )
-from vllm.v1.core.kv_cache_capacity import PhysicalPoolCapacityPlanner
 from vllm.v1.kv_cache_interface import CrossAttentionSpec, MambaSpec
 from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -53,6 +53,7 @@ def _set_elastic_warmup_transition(
     restore_initial: bool = False,
 ) -> None:
     """Map enough elastic capacity for a scheduler-bypassing warmup batch."""
+    scheduler_output.is_synthetic_warmup = True
     config = model_runner.kv_cache_config
     if not config.elastic_mapping_quantum:
         return
@@ -393,14 +394,12 @@ def warmup_kernels(
                     for spec, held in zip(kv_cache_specs, req_blocks[i])
                 ]
                 cached_req_data.new_block_ids.append(
-                    (
-                        tuple(
-                            alloc_blocks(n, spec)
-                            for n, spec in zip(deltas, kv_cache_specs)
-                        )
-                        if any(deltas)
-                        else None
+                    tuple(
+                        alloc_blocks(n, spec)
+                        for n, spec in zip(deltas, kv_cache_specs)
                     )
+                    if any(deltas)
+                    else None
                 )
                 req_blocks[i] = [
                     held + delta for held, delta in zip(req_blocks[i], deltas)

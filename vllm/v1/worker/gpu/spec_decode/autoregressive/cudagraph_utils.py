@@ -56,6 +56,13 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
             raise ValueError("required CUDA Graph output fields cannot be empty")
         self._ag2_required_capture_output_fields = fields
 
+    def _release_dynamic_capture_state(
+        self, desc: BatchExecutionDescriptor
+    ) -> None:
+        outputs = getattr(self, "_ag2_capture_outputs", None)
+        if outputs is not None:
+            outputs.pop(desc, None)
+
     def capture(
         self,
         forward_fn: Callable,
@@ -65,13 +72,20 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         progress_bar_desc: str = "Capturing CUDA graphs",
+        capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]]
+        | None = None,
+        capture_begin_hook: Callable[[BatchExecutionDescriptor], None] | None = None,
+        capture_complete_hook: Callable[
+            [BatchExecutionDescriptor, Callable[[CUDAGraphMode], None]], None
+        ]
+        | None = None,
     ) -> None:
         def create_forward_fn(
             desc: BatchExecutionDescriptor,
             warmup: bool,
         ) -> Callable[[CUDAGraphMode], None]:
             num_tokens = desc.num_tokens
-            num_reqs = desc.num_reqs or min(num_tokens, self.max_num_reqs)
+            num_reqs = self._capture_num_reqs(desc)
             num_tokens_across_dp = (
                 torch.full((self.dp_size,), num_tokens, dtype=torch.int32, device="cpu")
                 if self.dp_size > 1
@@ -101,6 +115,8 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
                     slot_mappings,
                     num_tokens_across_dp,
                     cg_mode,
+                    physical_num_reqs=desc.physical_num_reqs,
+                    runtime_generation=desc.runtime_generation,
                 )
                 if not warmup:
                     self._store_capture_output(desc, output)
@@ -108,7 +124,13 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
 
             return captured_forward
 
-        super().capture(create_forward_fn, progress_bar_desc)
+        super().capture(
+            create_forward_fn,
+            progress_bar_desc,
+            capture_descs,
+            capture_begin_hook=capture_begin_hook,
+            capture_complete_hook=capture_complete_hook,
+        )
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> Any:
         super().run_fullgraph(desc)

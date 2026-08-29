@@ -21,7 +21,7 @@ import functools
 import gc
 import os
 import time
-from copy import deepcopy
+from copy import copy, deepcopy
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -35,6 +35,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
+    get_tp_group,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -63,6 +64,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.v1.core.elastic_graph import ElasticPlanKind, ElasticStepPlan
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import (
@@ -71,8 +73,8 @@ from vllm.v1.outputs import (
     RoutedExpertsTensors,
     make_empty_encoder_model_runner_output,
 )
-from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
@@ -91,6 +93,7 @@ from vllm.v1.worker.gpu.buffer_utils import (
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
+    DynamicGraphWorkingSet,
     ModelCudaGraphManager,
     get_uniform_token_count,
 )
@@ -153,6 +156,20 @@ logger = init_logger(__name__)
 
 _AG2_GRAPH_MODE_RECEIPT = os.environ.get("AG2_VLLM_GRAPH_MODE_RECEIPT") == "1"
 _AG2_GRAPH_MODE_LOGGED_RECEIPTS: set[tuple[str, str, int, int, int]] = set()
+
+
+def _release_idle_graph_cache(scheduler_output: SchedulerOutput) -> bool:
+    """Return whether a zero-token step is a real idle/reclaim boundary.
+
+    Request-free MAINTENANCE is executable work: it publishes the exact graph
+    owner set for the deferred user step. Treating it as X0 destroys that set
+    before the scheduler can consume it and makes worker/scheduler residency
+    diverge. Ordinary request-free steps, including RECLAIM, remain X0.
+    """
+    if scheduler_output.elastic_abort_staged_hotset:
+        return False
+    plan = scheduler_output.elastic_step_plan
+    return not (plan is not None and plan.kind == ElasticPlanKind.MAINTENANCE)
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -321,11 +338,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
                 head_dim = self.model_config.get_head_size()
                 dcp_elements = (
-                    2
-                    * self.max_num_tokens
-                    * dcp_world_size
-                    * local_q_heads
-                    * head_dim
+                    2 * self.max_num_tokens * dcp_world_size * local_q_heads * head_dim
                 )
                 workspace_elements = max(workspace_elements, dcp_elements)
             workspace_rows = cdiv(workspace_elements, 11648)
@@ -660,10 +673,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     attn_cg_support.min_cg_attn_backend,
                 )
             elif (
-                os.environ.get(
-                    "AG2_VLLM_FLASHINFER_DCP_PREFILL_CUDAGRAPH", "0"
-                )
-                == "1"
+                os.environ.get("AG2_VLLM_FLASHINFER_DCP_PREFILL_CUDAGRAPH", "0") == "1"
             ):
                 full_decode_query_lens = {1, *scheduled_query_lens}
                 cg_validation_query_len = max(full_decode_query_lens)
@@ -681,8 +691,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             tensor_parallel_size=self.parallel_config.tensor_parallel_size,
             kv_cache_config=self.kv_cache_config,
             max_num_reqs=(
-                self.kv_cache_config.effective_max_resident_seqs
-                or self.max_num_reqs
+                self.kv_cache_config.effective_max_resident_seqs or self.max_num_reqs
             ),
         )
         self.cudagraph_manager = ModelCudaGraphManager(
@@ -693,9 +702,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             lora_capture_cases=self.lora_capture_cases,
             full_decode_query_lens=full_decode_query_lens,
             full_decode_cap_query_lens=(
-                {self.decode_query_len}
-                if envs.AG2_VLLM_TP3_OWNER_PREQUANT
-                else None
+                {self.decode_query_len} if envs.AG2_VLLM_TP3_OWNER_PREQUANT else None
             ),
             tp3_sd_phase_reduce=envs.VLLM_TP3_SD_PHASE_REDUCE,
             tp3_owner_prequant=envs.AG2_VLLM_TP3_OWNER_PREQUANT,
@@ -747,6 +754,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.elastic_kv_controller.configure_physical_budget(
                 self.kv_cache_config.elastic_budget_bytes,
                 self.kv_cache_config.elastic_mapping_quantum,
+                (
+                    self.kv_cache_config.num_blocks,
+                    self.kv_cache_config.elastic_gdn_initial_blocks,
+                ),
             )
         if any(
             isinstance(group.kv_cache_spec, MambaSpec)
@@ -983,10 +994,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         assert self.cudagraph_manager is not None
         if not self.cudagraph_manager.needs_capture():
-            logger.warning(
-                "Skipping CUDA graph capture. To turn on CUDA graph capture, "
-                "ensure `cudagraph_mode` was not manually set to `NONE`"
-            )
+            if self.cudagraph_manager.defer_startup_graphs:
+                logger.info(
+                    "Startup CUDA Graph capture is deferred; exact runtime "
+                    "descriptors will capture under same-step KV loans"
+                )
+            else:
+                logger.warning(
+                    "Skipping CUDA graph capture. To turn on CUDA graph capture, "
+                    "ensure `cudagraph_mode` was not manually set to `NONE`"
+                )
             return 0
 
         compilation_counter.num_gpu_runner_capture_triggers += 1
@@ -1166,10 +1183,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_tokens = scheduler_output.total_num_scheduled_tokens
         num_tokens_after_padding = batch_desc.num_tokens
         assert num_tokens > 0
-        if envs.VLLM_MOE_SKIP_PADDING:
-            # Mark trailing cudagraph-padding rows so kernels can skip work for
-            # them when supported.
-            self.input_buffers.is_padding[:num_tokens].fill_(False)
+        # Padding is part of the consumed correctness contract, not only a MoE
+        # optimization hint. Every captured consumer sees the same live/tail
+        # mask; kernels that support skip-padding may additionally avoid work.
+        self.input_buffers.is_padding[:num_tokens].fill_(False)
+        if num_tokens_after_padding > num_tokens:
             self.input_buffers.is_padding[num_tokens:num_tokens_after_padding].fill_(
                 True
             )
@@ -1239,7 +1257,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Get query_start_loc.
         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
-        num_reqs_padded = batch_desc.num_reqs or num_reqs
+        # PIECEWISE descriptors omit logical num_reqs, but elastic decode
+        # executables capture metadata at a physical request bucket. Repeating
+        # the terminal query offset creates zero-token dummy request slots.
+        bounded_short_decode = bool(
+            scheduler_output.is_pure_decode_step
+            and scheduler_output.num_spec_tokens_to_schedule > 0
+            and num_tokens == num_reqs * self.decode_query_len
+        )
+        num_reqs_padded = (
+            batch_desc.num_reqs
+            or (batch_desc.physical_num_reqs if bounded_short_decode else None)
+            or num_reqs
+        )
         query_start_loc_np = np.empty(self.max_num_reqs + 1, dtype=np.int32)
         query_start_loc_np[0] = 0
         np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1 : num_reqs + 1])
@@ -1318,6 +1348,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits,
             total_num_logits,
             self.model_state.num_new_sampled_tokens_per_step,
+            self.input_buffers.logits_indices,
         )
 
         # CPU upper bound on seq_lens; padded entries left at zero.
@@ -1514,6 +1545,557 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     @torch.inference_mode()
+    def _dynamic_graph_working_set(self) -> DynamicGraphWorkingSet:
+        assert self.cudagraph_manager is not None
+        managers = [self.cudagraph_manager]
+        dynamic_managers = getattr(self.speculator, "dynamic_cudagraph_managers", None)
+        if dynamic_managers is not None:
+            managers.extend(dynamic_managers())
+        manager_tuple = tuple(managers)
+        working_set = getattr(self, "_elastic_dynamic_graph_working_set", None)
+        if working_set is None:
+            # The working set owns transaction state in addition to aggregating
+            # managers.  In particular, staged hotset victims are armed before
+            # model execution and retired only after sampling has consumed the
+            # preceding executables.  Reconstructing this object at settlement
+            # silently drops that pending retirement and lets worker residency
+            # diverge from scheduler ownership.
+            working_set = DynamicGraphWorkingSet(manager_tuple)
+            self._elastic_dynamic_graph_working_set = working_set
+        elif working_set.managers != manager_tuple:
+            raise RuntimeError(
+                "dynamic CUDA Graph manager set changed after working-set "
+                "lifecycle initialization"
+            )
+        return working_set
+
+    def _trim_dynamic_attention_cudagraph_state(
+        self, working_set: DynamicGraphWorkingSet
+    ) -> tuple[int, int]:
+        """Release FlashInfer shape wrappers with no remaining HOT Graph."""
+        attn_group_sets = [getattr(self, "attn_groups", ())]
+        speculator_attn_groups = getattr(
+            getattr(self, "speculator", None), "attn_groups", None
+        )
+        if speculator_attn_groups is not None:
+            attn_group_sets.append(speculator_attn_groups)
+
+        builders: list[Any] = []
+        seen: set[int] = set()
+        for attn_groups in attn_group_sets:
+            for groups in attn_groups:
+                for group in groups:
+                    builder = group.get_metadata_builder(0)
+                    trim = getattr(builder, "trim_dynamic_cudagraph_wrappers", None)
+                    if trim is None or id(builder) in seen:
+                        continue
+                    seen.add(id(builder))
+                    builders.append(builder)
+        if not builders:
+            return 0, 0
+
+        keep_request_batch_sizes = working_set.hot_request_counts
+        keep_token_batch_sizes = working_set.hot_token_counts
+        # Graph managers have already removed future consumers. Complete the
+        # last possible replay before dropping FlashInfer wrapper generations;
+        # their native metadata addresses are embedded in captured kernels.
+        torch.cuda.synchronize(self.device)
+        removed = sum(
+            builder.trim_dynamic_cudagraph_wrappers(
+                keep_request_batch_sizes=keep_request_batch_sizes,
+                keep_token_batch_sizes=keep_token_batch_sizes,
+            )
+            for builder in builders
+        )
+        reclaimed = 0
+        if removed:
+            free_before = torch.accelerator.get_memory_info()[0]
+            gc.collect()
+            torch.accelerator.empty_cache()
+            torch.cuda.synchronize(self.device)
+            reclaimed = max(0, torch.accelerator.get_memory_info()[0] - free_before)
+            logger.info(
+                "Dynamic FlashInfer CUDA Graph metadata trimmed: "
+                "removed_wrappers=%d keep_request_batch_sizes=%s "
+                "keep_token_batch_sizes=%s "
+                "local_reclaimed_bytes=%d",
+                removed,
+                sorted(keep_request_batch_sizes),
+                sorted(keep_token_batch_sizes),
+                reclaimed,
+            )
+        return removed, reclaimed
+
+    def _elastic_active_allocator_snapshot(
+        self,
+    ) -> dict[int, tuple[int, int, str, str]]:
+        """Describe active CUDA blocks without retaining allocator objects."""
+        active: dict[int, tuple[int, int, str, str]] = {}
+        for segment in torch.cuda.memory_snapshot():
+            address = int(segment["address"])
+            offset = 0
+            pool = repr(segment.get("segment_pool_id"))
+            for block in segment["blocks"]:
+                size = int(block["size"])
+                block_address = int(block.get("address", address + offset))
+                offset += size
+                if block.get("state") != "active_allocated":
+                    continue
+                frames = block.get("frames") or ()
+                frame = ""
+                if frames:
+                    top = frames[0]
+                    frame = (
+                        f"{top.get('filename', '')}:"
+                        f"{top.get('line', '')}:"
+                        f"{top.get('name', '')}"
+                    )
+                active[block_address] = (
+                    size,
+                    int(block.get("requested_size", size)),
+                    pool,
+                    frame,
+                )
+        return active
+
+    def _elastic_python_cuda_storage_snapshot(
+        self,
+    ) -> dict[int, tuple[int, str, tuple[int, ...]]]:
+        """Describe Python-visible CUDA storages without keeping tensor refs."""
+        storages: dict[int, tuple[int, str, tuple[int, ...]]] = {}
+        device_index = self.device.index
+        for obj in gc.get_objects():
+            try:
+                if not isinstance(obj, torch.Tensor) or obj.device.type != "cuda":
+                    continue
+                if device_index is not None and obj.device.index != device_index:
+                    continue
+                storage = obj.untyped_storage()
+                address = int(storage.data_ptr())
+                if not address:
+                    continue
+                nbytes = int(storage.nbytes())
+                current = storages.get(address)
+                if current is None or nbytes > current[0]:
+                    storages[address] = (
+                        nbytes,
+                        str(obj.dtype),
+                        tuple(int(dim) for dim in obj.shape),
+                    )
+            except Exception:
+                # GC can expose partially destructed tensor subclasses. They
+                # are not safe diagnostic owners and must not break X0.
+                continue
+        return storages
+
+    def _elastic_cublas_workspace_addresses(
+        self,
+        active: dict[int, tuple[int, int, str, str]] | None = None,
+    ) -> frozenset[int]:
+        """Return active classic cuBLAS workspace allocation addresses."""
+        workspace_size = int(torch._C._cuda_getCublasWorkspaceSize())
+        if active is None:
+            active = self._elastic_active_allocator_snapshot()
+        return frozenset(
+            address
+            for address, (_, requested, pool, _) in active.items()
+            if requested == workspace_size and pool == "(0, 0)"
+        )
+
+    def _measure_elastic_cublas_workspace_bytes(self) -> int:
+        """Measure classic cuBLAS workspaces created after the X0 baseline."""
+        baseline = getattr(self, "_elastic_cublas_workspace_baseline", None)
+        if baseline is None:
+            raise RuntimeError(
+                "elastic cuBLAS workspace baseline was not captured before "
+                "the dynamic CUDA Graph step"
+            )
+        active = self._elastic_active_allocator_snapshot()
+        addresses = self._elastic_cublas_workspace_addresses(active)
+        return sum(
+            active[address][0] for address in addresses if address not in baseline
+        )
+
+    @staticmethod
+    def _set_elastic_cublas_workspace_unit(
+        model_runner_output: ModelRunnerOutput,
+    ) -> None:
+        model_runner_output.elastic_cublas_workspace_unit_bytes = int(
+            torch._C._cuda_getCublasWorkspaceSize()
+        )
+
+    def _clear_elastic_cublas_workspaces(
+        self, working_set: DynamicGraphWorkingSet
+    ) -> int:
+        """Release stream workspaces only after the old Graph set is empty."""
+        if working_set.active_graph_bytes:
+            raise RuntimeError(
+                "cannot clear cuBLAS workspaces while dynamic CUDA Graphs are HOT"
+            )
+        torch.cuda.synchronize(self.device)
+        free_before = torch.accelerator.get_memory_info()[0]
+        torch._C._cuda_clearCublasWorkspaces()
+        gc.collect()
+        torch.accelerator.empty_cache()
+        torch.cuda.synchronize(self.device)
+        # All classic cuBLAS workspaces were explicitly released.  Rebuild the
+        # baseline from surviving allocations: a non-cuBLAS block may happen
+        # to have the same requested size, while freed workspace addresses are
+        # absent and will still be charged if the allocator later reuses them.
+        self._elastic_cublas_workspace_baseline = (
+            self._elastic_cublas_workspace_addresses()
+        )
+        reclaimed = max(0, torch.accelerator.get_memory_info()[0] - free_before)
+        if reclaimed:
+            logger.info(
+                "Dynamic cuBLAS workspaces cleared after Graph eviction: "
+                "local_reclaimed_bytes=%d",
+                reclaimed,
+            )
+        return reclaimed
+
+    def _record_elastic_x0_allocation_delta(self, *, dynamic_wave: bool) -> None:
+        active = self._elastic_active_allocator_snapshot()
+        storages = self._elastic_python_cuda_storage_snapshot()
+        baseline_active = getattr(self, "_elastic_x0_active_baseline", None)
+        baseline_storages = getattr(self, "_elastic_x0_storage_baseline", None)
+        if baseline_active is None or baseline_storages is None:
+            self._elastic_x0_active_baseline = frozenset(active)
+            self._elastic_x0_storage_baseline = frozenset(storages)
+            return
+        if not dynamic_wave:
+            return
+
+        new_active = [
+            (address, *metadata)
+            for address, metadata in active.items()
+            if address not in baseline_active
+        ]
+        new_storages = [
+            (address, *metadata)
+            for address, metadata in storages.items()
+            if address not in baseline_storages
+        ]
+        new_active.sort(key=lambda item: item[1], reverse=True)
+        new_storages.sort(key=lambda item: item[1], reverse=True)
+        logger.warning(
+            "Elastic X0 allocation-owner receipt: new_active_bytes=%d "
+            "new_active_blocks=%d top_active=%s new_python_storage_bytes=%d "
+            "new_python_storages=%d top_python=%s",
+            sum(item[1] for item in new_active),
+            len(new_active),
+            new_active[:16],
+            sum(item[1] for item in new_storages),
+            len(new_storages),
+            new_storages[:16],
+        )
+
+    def _finish_dynamic_graph_step(
+        self,
+        *,
+        release_idle_cache: bool = False,
+        transaction_id: str | None = None,
+        step_plan: ElasticStepPlan | None = None,
+        staged_hotset_consumed: bool = False,
+    ) -> tuple[int, int, int]:
+        working_set = self._dynamic_graph_working_set()
+        if not getattr(self, "_elastic_step_measurement_active", False):
+            working_set.finish_step()
+            if transaction_id is not None:
+                working_set.release_leases(transaction_id)
+            if working_set.has_pending_staged_hotset_retirement:
+                pending_tx = working_set.pending_staged_hotset_transaction_id
+                if transaction_id == pending_tx and staged_hotset_consumed:
+                    torch.cuda.synchronize(self.device)
+                    working_set.finish_staged_hotset_after_consumers(transaction_id)
+                elif transaction_id != pending_tx:
+                    torch.cuda.synchronize(self.device)
+                    working_set.finish_staged_hotset_after_successor(step_plan)
+            return getattr(
+                self,
+                "_elastic_cached_graph_receipt",
+                (working_set.resident_bytes, 0, 0),
+            )
+        active_graph_bytes_before = working_set.active_graph_bytes
+        if release_idle_cache:
+            working_set.finish_idle_step()
+        else:
+            working_set.finish_step()
+        if transaction_id is not None:
+            working_set.release_leases(transaction_id)
+        if working_set.has_pending_staged_hotset_retirement:
+            pending_tx = working_set.pending_staged_hotset_transaction_id
+            if transaction_id == pending_tx and staged_hotset_consumed:
+                # A non-empty MAINTENANCE can capture and then execute the
+                # published candidate in the same transaction. Sampling/MTP
+                # settlement proves that consumer complete, so no later USER
+                # fence is needed. Zero-token publication leaves this false.
+                torch.cuda.synchronize(self.device)
+                working_set.finish_staged_hotset_after_consumers(transaction_id)
+            elif transaction_id != pending_tx:
+                # sample(), MTP propose and output preparation enqueue GPU
+                # work. Their Python return does not end the executable/buffer
+                # lifetime.  A request-free MAINTENANCE only publishes the
+                # new set; retain and charge the old physical pools until the
+                # first distinct USER consumer has completed.
+                torch.cuda.synchronize(self.device)
+                working_set.finish_staged_hotset_after_successor(step_plan)
+        # FlashInfer CUDA-Graph wrappers own address-stable planning tensors
+        # that are shared across repeated replays of the live cohort.  A
+        # successor's first synchronized replay is not a wrapper-lifetime
+        # boundary: X32 survived that replay and faulted only after the X16
+        # wrapper was trimmed.  Retain stale wrappers while any product wave
+        # is active; the explicit X0 path evicts unpinned graphs first and is
+        # the proven safe reclamation boundary.
+        trimmed_wrappers = 0
+        wrapper_reclaimed = 0
+        if release_idle_cache:
+            trimmed_wrappers, wrapper_reclaimed = (
+                self._trim_dynamic_attention_cudagraph_state(working_set)
+            )
+        working_set.reconcile_retained_cleanup(wrapper_reclaimed)
+        if working_set.active_graph_bytes == 0:
+            self._clear_elastic_cublas_workspaces(working_set)
+        cublas_workspace_bytes = self._measure_elastic_cublas_workspace_bytes()
+        if active_graph_bytes_before > 0 or trimmed_wrappers > 0:
+            self._elastic_dynamic_wave_observed = True
+        measured_external = working_set.resident_bytes + cublas_workspace_bytes
+        # A non-idle completion only measures what survived the step. Returning
+        # the transient portion here makes the allocator oscillate even when
+        # the next descriptor is identical. X0 is different: it is an explicit
+        # next-step decision and may return everything immediately.
+        retained_transition_floor = getattr(
+            self, "_elastic_retained_transition_floor_bytes", 0
+        )
+        if release_idle_cache:
+            retained_transition_floor = 0
+        if release_idle_cache:
+            # X0 has no live Graph/cuBLAS owner. The retention ledger is a
+            # conservative teardown estimate, not a new allocation request.
+            # Ask VMM for zero and let its rank-safe driver-free preflight
+            # return the actual physical floor. Keeping the ledger in
+            # ``measured_external`` here caused a 0 <-> one-quantum loop.
+            effective_external = self.elastic_kv_controller.reconcile_external_memory(
+                working_set.active_graph_bytes + cublas_workspace_bytes
+            )
+            working_set.clear_idle_retention_after_physical_reconcile()
+        else:
+            effective_external = measured_external + retained_transition_floor
+        physical_floor = max(
+            retained_transition_floor,
+            effective_external
+            - working_set.active_graph_bytes
+            - cublas_workspace_bytes,
+            0,
+        )
+        transition_floor_upper_bound = max(
+            physical_floor,
+            0
+            if release_idle_cache
+            else working_set.transition_floor_upper_bound_bytes(),
+        )
+        baseline_reserved = getattr(self, "_elastic_step_baseline_reserved_bytes", None)
+        baseline_driver_free = getattr(
+            self, "_elastic_step_baseline_driver_free_bytes", None
+        )
+        if baseline_reserved is None or baseline_driver_free is None:
+            local_peak_external = effective_external
+        else:
+            local_peak_external = max(
+                effective_external,
+                max(
+                    0,
+                    torch.cuda.max_memory_reserved(self.device) - baseline_reserved,
+                ),
+                max(
+                    0,
+                    baseline_driver_free - torch.cuda.mem_get_info(self.device)[0],
+                ),
+            )
+        peak = torch.tensor(
+            local_peak_external,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        if self.vllm_config.parallel_config.tensor_parallel_size > 1:
+            torch.distributed.all_reduce(
+                peak,
+                op=torch.distributed.ReduceOp.MAX,
+                group=get_tp_group().device_group,
+            )
+        self._elastic_last_step_peak_external_bytes = int(peak.item())
+        self._elastic_step_baseline_reserved_bytes = None
+        self._elastic_step_baseline_driver_free_bytes = None
+        if release_idle_cache:
+            dynamic_wave = getattr(self, "_elastic_dynamic_wave_observed", False)
+            previous_floor = getattr(self, "_elastic_idle_logged_floor_bytes", None)
+            if (
+                previous_floor != physical_floor
+                or active_graph_bytes_before > 0
+                or dynamic_wave
+            ):
+                allocated = torch.cuda.memory_allocated(self.device)
+                reserved = torch.cuda.memory_reserved(self.device)
+                driver_free, driver_total = torch.cuda.mem_get_info(self.device)
+                logger.warning(
+                    "Elastic X0 physical memory receipt: floor_bytes=%d "
+                    "evicted_graph_bytes=%d "
+                    "active_graph_bytes=%d cublas_workspace_bytes=%d "
+                    "allocator_allocated_bytes=%d "
+                    "allocator_reserved_bytes=%d driver_free_bytes=%d "
+                    "driver_total_bytes=%d",
+                    physical_floor,
+                    max(
+                        0,
+                        active_graph_bytes_before - working_set.active_graph_bytes,
+                    )
+                    + getattr(self, "_elastic_pre_idle_evicted_graph_bytes", 0),
+                    working_set.active_graph_bytes,
+                    cublas_workspace_bytes,
+                    allocated,
+                    reserved,
+                    driver_free,
+                    driver_total,
+                )
+                self._elastic_idle_logged_floor_bytes = physical_floor
+            self._record_elastic_x0_allocation_delta(dynamic_wave=dynamic_wave)
+            self._elastic_dynamic_wave_observed = False
+        receipt = (
+            effective_external,
+            physical_floor,
+            transition_floor_upper_bound,
+        )
+        self._elastic_cached_graph_receipt = receipt
+        self._elastic_step_measurement_active = False
+        return receipt
+
+    def _current_dynamic_graph_receipt(self) -> tuple[int, int, int]:
+        """Return the last boundary measurement without observing HOT replay."""
+        working_set = self._dynamic_graph_working_set()
+        return getattr(
+            self,
+            "_elastic_cached_graph_receipt",
+            (working_set.resident_bytes, 0, 0),
+        )
+
+    def _settle_dynamic_graph_step_after_sampling(
+        self,
+        model_runner_output: ModelRunnerOutput,
+        dynamic_graph_step_started: bool,
+        transaction_id: str | None,
+        step_plan: ElasticStepPlan | None,
+    ) -> None:
+        """Settle only a live step that began the elastic Graph lifecycle.
+
+        Profile and synthetic startup warmups deliberately bypass same-step
+        graph planning.  They may still build FlashInfer wrapper state used by
+        later warmups, so treating them as a completed dynamic step would trim
+        live startup metadata and can surface as an asynchronous illegal
+        memory access on the following CUDA operation.
+        """
+        if not dynamic_graph_step_started:
+            return
+        (
+            model_runner_output.elastic_external_memory_bytes,
+            model_runner_output.elastic_external_memory_floor_bytes,
+            model_runner_output.elastic_external_memory_transition_floor_bytes,
+        ) = self._finish_dynamic_graph_step(
+            transaction_id=transaction_id,
+            step_plan=step_plan,
+            staged_hotset_consumed=True,
+        )
+        model_runner_output.elastic_external_memory_peak_bytes = getattr(
+            self, "_elastic_last_step_peak_external_bytes", 0
+        )
+        self._set_elastic_cublas_workspace_unit(model_runner_output)
+        model_runner_output.elastic_hot_graphs = (
+            self._dynamic_graph_working_set().hot_snapshot()
+        )
+
+    def _begin_elastic_step_measurement(self) -> None:
+        """Start the physical high-water window after KV has been shrunk."""
+        self._elastic_step_measurement_active = True
+        torch.cuda.synchronize(self.device)
+        if getattr(self, "_elastic_cublas_workspace_baseline", None) is None:
+            # Capture the immutable startup floor before this step can create
+            # CUDA Graph or cuBLAS workspaces.  Initializing this lazily in the
+            # post-step measurement hid the entire first-step cuBLAS cost.
+            self._elastic_cublas_workspace_baseline = (
+                self._elastic_cublas_workspace_addresses()
+            )
+        self._elastic_step_baseline_reserved_bytes = torch.cuda.memory_reserved(
+            self.device
+        )
+        self._elastic_step_baseline_driver_free_bytes = torch.cuda.mem_get_info(
+            self.device
+        )[0]
+        torch.cuda.reset_peak_memory_stats(self.device)
+
+    def _prepare_dynamic_graph_idle_kv_return(
+        self,
+        working_set: DynamicGraphWorkingSet,
+        transaction_id: str,
+    ) -> int:
+        """Settle graph owners before an administrative X0 expands KV.
+
+        A zero-token successor cannot consume an evictable executable or its
+        retired attention wrapper.  If KV is expanded first, those CUDA
+        allocations become an unaccounted physical floor on top of the FULL
+        logical KV target.  Settle the idle descriptor and tear down retired
+        wrappers while the old external loan is still mapped.  Pinned HOT
+        entries remain resident and are returned as the minimum external loan.
+        """
+        working_set.finish_idle_step()
+        if working_set.has_pending_staged_hotset_retirement:
+            raise RuntimeError(
+                "idle graph cleanup crossed an unconsumed staged hotset; "
+                "scheduler must issue an explicit candidate abort"
+            )
+        self._elastic_pre_idle_evicted_graph_bytes = (
+            working_set.evict_unpinned_for_idle(transaction_id)
+        )
+        _trimmed_wrappers, wrapper_reclaimed = (
+            self._trim_dynamic_attention_cudagraph_state(working_set)
+        )
+        working_set.reconcile_retained_cleanup(wrapper_reclaimed)
+        if working_set.active_graph_bytes == 0:
+            self._clear_elastic_cublas_workspaces(working_set)
+        return (
+            working_set.resident_bytes + self._measure_elastic_cublas_workspace_bytes()
+        )
+
+    def _apply_next_elastic_kv_step(
+        self,
+        transition: tuple[int, int] | None,
+        requested_external: int,
+    ) -> int:
+        """Apply the next known loan after incompatible owners were released."""
+        if requested_external < self.elastic_kv_controller.external_memory_bytes:
+            # Sampling/transient allocations from the completed step may
+            # remain cached even after incompatible Graph owners are gone.
+            # Trim only on a real downward transition; equal plateaus avoid
+            # synchronization and allocator churn entirely.
+            torch.cuda.synchronize(self.device)
+            gc.collect()
+            torch.accelerator.empty_cache()
+            torch.cuda.synchronize(self.device)
+        effective_external = self.elastic_kv_controller.apply_scheduler_step(
+            transition,
+            requested_external,
+        )
+        if effective_external != requested_external:
+            logger.warning(
+                "Elastic next-step loan retained a measured physical floor: "
+                "requested_bytes=%d effective_bytes=%d",
+                requested_external,
+                effective_external,
+            )
+        self._elastic_retained_transition_floor_bytes = max(
+            0, effective_external - requested_external
+        )
+        return effective_external
+
+    @torch.inference_mode()
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -1522,12 +2104,64 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        elastic_transition_applied = False
+        elastic_dynamic_graph_step_started = False
+        elastic_transaction_id = scheduler_output.elastic_transaction_id
+        # Dummy/profile execution bypasses the dynamic residency transaction,
+        # but ExecuteModelState still carries the immutable scheduler plan.
+        # Resolve it before the branch so startup profiling cannot observe an
+        # unbound local.
+        elastic_plan = scheduler_output.elastic_step_plan
+        is_synthetic_warmup = scheduler_output.is_synthetic_warmup
         if (
             not dummy_run
             and not is_profile
+            and not is_synthetic_warmup
             and self.cudagraph_manager is not None
+            and not scheduler_output.elastic_preserve_graph_residency
         ):
-            safety_required = False
+            working_set = self._dynamic_graph_working_set()
+            working_set.begin_step()
+            elastic_dynamic_graph_step_started = True
+            if scheduler_output.elastic_abort_staged_hotset:
+                if elastic_plan is not None:
+                    raise RuntimeError("staged hotset abort cannot carry a graph plan")
+                torch.cuda.synchronize(self.device)
+                working_set.abort_pending_staged_hotset(
+                    scheduler_output.elastic_staged_hotset_origin_transaction_id,
+                    elastic_transaction_id,
+                )
+            if elastic_plan is not None:
+                if elastic_transaction_id != elastic_plan.transaction_id:
+                    raise RuntimeError(
+                        "elastic transaction id differs from immutable plan"
+                    )
+                if (
+                    scheduler_output.elastic_plan_fingerprint
+                    != elastic_plan.fingerprint
+                ):
+                    raise RuntimeError(
+                        "elastic plan fingerprint changed in scheduler transport"
+                    )
+                if elastic_plan.kv_transition != scheduler_output.elastic_kv_transition:
+                    raise RuntimeError(
+                        "elastic KV transition differs from immutable plan"
+                    )
+                if (
+                    elastic_plan.capture_loan_bytes
+                    != scheduler_output.elastic_external_memory_bytes
+                ):
+                    raise RuntimeError(
+                        "elastic capture loan differs from immutable plan"
+                    )
+                working_set.require_rank_consensus(
+                    elastic_plan,
+                    collective=elastic_plan.kind != ElasticPlanKind.USER,
+                )
+                working_set.apply_plan(elastic_plan)
+            early_num_reqs = 0
+            early_num_toks = 0
+            early_uniform_tok_count = None
             if (
                 self.lora_config is None
                 and scheduler_output.total_num_scheduled_tokens > 0
@@ -1542,38 +2176,243 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     early_num_toks,
                     early_max_query_len,
                 )
-                safety_required = (
-                    self.cudagraph_manager.ensure_piecewise_safety_for_first_use(
+            speculative_active = scheduler_output.num_spec_tokens_to_schedule > 0
+            semantic_short_decode = bool(
+                scheduler_output.is_pure_decode_step
+                and speculative_active
+                and early_uniform_tok_count == self.decode_query_len
+                and early_num_toks == early_num_reqs * self.decode_query_len
+            )
+            active_graph_bytes_before_shape_release = working_set.active_graph_bytes
+            if elastic_plan is None:
+                managers_to_queue = working_set.managers
+            else:
+                # A configured compiled-only target or MTP-prefill carrier has
+                # no physical CUDA Graph key in the immutable plan. It still
+                # needs the exact same-step descriptor so dispatch can enter
+                # the compiled PIECEWISE path; no other missing owner is allowed.
+                managers_to_queue = tuple(
+                    manager
+                    for manager in working_set.managers
+                    if manager.is_compiled_piecewise_shape(
                         early_num_toks,
-                        early_uniform_tok_count,
+                        num_reqs=early_num_reqs,
+                        semantic_decode=semantic_short_decode,
+                    )
+                    and (
+                        manager.elastic_graph_activation == "always"
+                        or speculative_active
+                    )
+                    and not manager._dynamic_step_planned
+                )
+            if managers_to_queue:
+                for manager in managers_to_queue:
+                    if (
+                        manager.elastic_graph_activation == "speculative"
+                        and not speculative_active
+                    ):
+                        num_reqs, num_tokens, uniform_token_count = (0, 0, None)
+                    elif manager.elastic_graph_token_source == "step":
+                        num_reqs, num_tokens, uniform_token_count = (
+                            early_num_reqs,
+                            early_num_toks,
+                            early_uniform_tok_count,
+                        )
+                    elif manager.elastic_graph_token_source == "requests":
+                        num_reqs, num_tokens, uniform_token_count = (
+                            early_num_reqs,
+                            early_num_reqs,
+                            1,
+                        )
+                    elif manager.elastic_graph_token_source == "fixed_query":
+                        query_len = manager.elastic_graph_fixed_query_len
+                        if query_len is None:
+                            raise RuntimeError(
+                                "fixed-query Graph manager omitted its query length"
+                            )
+                        num_reqs, num_tokens, uniform_token_count = (
+                            early_num_reqs,
+                            early_num_reqs * query_len,
+                            query_len,
+                        )
+                    else:
+                        raise RuntimeError(
+                            "Graph manager omitted its runtime token-source contract: "
+                            f"owner={manager.dynamic_graph_owner!r} "
+                            f"source={manager.elastic_graph_token_source!r}"
+                        )
+                    allow_full = bool(
+                        manager.elastic_graph_token_source
+                        in {"requests", "fixed_query"}
+                        or scheduler_output.is_pure_decode_step
+                    )
+                    manager.queue_runtime_descriptor(
+                        num_reqs,
+                        num_tokens,
+                        uniform_token_count,
                         0,
+                        allow_full=allow_full,
+                        semantic_decode=semantic_short_decode,
                     )
+            idle_external_floor = None
+            if (
+                scheduler_output.total_num_scheduled_tokens == 0
+                and _release_idle_graph_cache(scheduler_output)
+            ):
+                # Request-free MAINTENANCE is a capture/publication phase, not
+                # X0. Its staged victims must remain HOT until the newly
+                # published set and every downstream consumer have completed;
+                # pre-idle eviction here destroyed them before the deferred
+                # post-consumer commit could validate transaction ownership.
+                idle_external_floor = self._prepare_dynamic_graph_idle_kv_return(
+                    working_set,
+                    elastic_transaction_id or "",
                 )
-            if self.cudagraph_manager.has_pending_dynamic_capture():
-                with self.maybe_setup_dummy_loras(self.lora_config):
-                    captured = self.cudagraph_manager.capture_next_dynamic(
-                        self.model,
-                        self.model_state,
-                        self.input_buffers,
-                        self.intermediate_tensors,
-                        self.block_tables,
-                        self.attn_groups,
-                        self.kv_cache_config,
-                        has_lora=self.lora_config is not None,
-                        use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
-                        lora_capture_hook=create_lora_capture_hook(
-                            self.lora_config, self
-                        ),
-                    )
-                if safety_required and not captured:
-                    raise RuntimeError(
-                        "Required PIECEWISE safety graph could not be captured"
-                    )
-        if not dummy_run:
+                self._elastic_dynamic_wave_observed = True
+            elif (
+                active_graph_bytes_before_shape_release > 0
+                and working_set.active_graph_bytes == 0
+            ):
+                # FlashInfer/TVM wrapper teardown is not safe in the narrow
+                # lifetime gap between evicting one descriptor and planning
+                # the successor: PIECEWISE64 -> FULL18 reproduced a native
+                # use-after-lifetime on the successor's first warmup.  Keep
+                # the retired wrapper through successor capture/replay.  The
+                # ordinary post-step _finish_dynamic_graph_step() trims it
+                # against the newly HOT working set, so this is one-transition
+                # deferred reclamation rather than permanent residency.
+                self._clear_elastic_cublas_workspaces(working_set)
+                self._elastic_dynamic_wave_observed = True
+            requested_external = scheduler_output.elastic_external_memory_bytes
+            transition = scheduler_output.elastic_kv_transition
+            if (
+                idle_external_floor is not None
+                and idle_external_floor > requested_external
+            ):
+                # Scheduler X0 describes the logical no-work target. Pinned
+                # graphs and physically retained teardown pages still consume
+                # part of the invariant budget, so keep the prior minimum KV
+                # geometry and fill only the actually available remainder.
+                requested_external = idle_external_floor
+                transition = None
+            capture_managers = working_set.pending_managers()
+            measurement_required = bool(capture_managers) or (
+                requested_external != self.elastic_kv_controller.external_memory_bytes
+            )
+            if (
+                working_set.has_pending_staged_hotset_retirement
+                and elastic_plan is not None
+                and elastic_plan.kind == ElasticPlanKind.USER
+                and elastic_plan.transaction_id
+                != working_set.pending_staged_hotset_transaction_id
+            ):
+                # The first real successor must publish the post-retirement
+                # physical receipt. Reusing the maintenance receipt would keep
+                # KV permanently charged for the temporary overlap.
+                measurement_required = True
             with record_function_or_nullcontext("ag2.elastic_kv_transition"):
-                self.elastic_kv_controller.apply(
-                    scheduler_output.elastic_kv_transition
+                self._apply_next_elastic_kv_step(
+                    transition,
+                    requested_external,
                 )
+            elastic_transition_applied = True
+            if measurement_required:
+                self._begin_elastic_step_measurement()
+            if capture_managers:
+                with self.maybe_setup_dummy_loras(self.lora_config):
+                    try:
+                        for capture_manager in capture_managers:
+                            if not working_set.prepare_manager_capture(
+                                capture_manager,
+                                scheduler_output.elastic_external_memory_bytes,
+                            ):
+                                raise RuntimeError(
+                                    "scheduler loan is insufficient for same-step "
+                                    f"CUDA Graph capture: owner="
+                                    f"{capture_manager.dynamic_graph_owner}"
+                                )
+                            if capture_manager is self.cudagraph_manager:
+                                captured = capture_manager.capture_next_dynamic(
+                                    self.model,
+                                    self.model_state,
+                                    self.input_buffers,
+                                    self.intermediate_tensors,
+                                    self.block_tables,
+                                    self.attn_groups,
+                                    self.kv_cache_config,
+                                    has_lora=self.lora_config is not None,
+                                    use_aux_hidden_state_outputs=(
+                                        self.use_aux_hidden_state_outputs
+                                    ),
+                                    lora_capture_hook=create_lora_capture_hook(
+                                        self.lora_config, self
+                                    ),
+                                )
+                            else:
+                                capture_speculator = getattr(
+                                    self.speculator, "capture_next_dynamic", None
+                                )
+                                if capture_speculator is None:
+                                    raise RuntimeError(
+                                        "draft CUDA Graph manager has no dynamic "
+                                        "capture lifecycle"
+                                    )
+                                captured = capture_speculator(capture_manager)
+                            if not captured:
+                                rejection = getattr(
+                                    capture_manager,
+                                    "last_dynamic_capture_rejection",
+                                    None,
+                                )
+                                raise RuntimeError(
+                                    "same-step CUDA Graph capture failed closed: "
+                                    f"owner={capture_manager.dynamic_graph_owner} "
+                                    f"discriminator={rejection!r}"
+                                )
+                    except Exception:
+                        if elastic_plan is not None:
+                            working_set.abort_staged_hotset_candidate(elastic_plan)
+                        # A failed capture has no downstream consumer, so
+                        # reclaim its loan immediately before propagating the
+                        # fail-closed error. Successful capture/replay keeps
+                        # the same-step loan through target execution and the
+                        # separate sampling RPC; _finish_dynamic_graph_step
+                        # returns it only after those consumers complete.
+                        self.elastic_kv_controller.reconcile_external_memory(
+                            working_set.resident_bytes
+                        )
+                        raise
+                    if elastic_plan is not None and elastic_plan.staged_hotset_replace:
+                        try:
+                            working_set.validate_staged_hotset_candidate(
+                                elastic_plan,
+                                external_overhead_bytes=(
+                                    self._measure_elastic_cublas_workspace_bytes()
+                                ),
+                            )
+                        except Exception:
+                            working_set.abort_staged_hotset_candidate(elastic_plan)
+                            self.elastic_kv_controller.reconcile_external_memory(
+                                working_set.resident_bytes
+                            )
+                            raise
+                        # Publication is complete and under cap, but target,
+                        # MTP and sampling still consume this step's CUDA
+                        # state. Retire the old set only at post-consumer
+                        # settlement in _finish_dynamic_graph_step().
+                        working_set.stage_hotset_victim_commit(elastic_plan)
+            if elastic_transaction_id is None:
+                raise RuntimeError(
+                    "elastic CUDA Graph execution requires scheduler transaction id"
+                )
+            working_set.acquire_leases(elastic_transaction_id)
+        if not dummy_run:
+            if not elastic_transition_applied:
+                with record_function_or_nullcontext("ag2.elastic_kv_transition"):
+                    self.elastic_kv_controller.apply_scheduler_step(
+                        scheduler_output.elastic_kv_transition,
+                        scheduler_output.elastic_external_memory_bytes,
+                    )
             if self.gdn_checkpoint_manager is not None:
                 self.gdn_checkpoint_manager.update_request_blocks(scheduler_output)
             # Update the request states.
@@ -1584,9 +2423,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.update_requests(scheduler_output)
             self.block_tables.apply_staged_writes()
             additional_config = self.vllm_config.additional_config
-            if (
-                isinstance(additional_config, dict)
-                and additional_config.get("p3_block_range_diagnostic", False)
+            if isinstance(additional_config, dict) and additional_config.get(
+                "p3_block_range_diagnostic", False
             ):
                 validate_elastic_attention_block_tables(
                     self.block_tables,
@@ -1613,6 +2451,50 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
+                if isinstance(empty_output, ModelRunnerOutput):
+                    empty_output = copy(empty_output)
+                if elastic_dynamic_graph_step_started:
+                    (
+                        external_request,
+                        external_floor,
+                        transition_floor,
+                    ) = self._finish_dynamic_graph_step(
+                        release_idle_cache=_release_idle_graph_cache(scheduler_output),
+                        transaction_id=elastic_transaction_id,
+                        step_plan=elastic_plan,
+                    )
+                    if isinstance(empty_output, ModelRunnerOutput):
+                        empty_output.elastic_external_memory_bytes = external_request
+                        empty_output.elastic_external_memory_floor_bytes = (
+                            external_floor
+                        )
+                        empty_output.elastic_external_memory_transition_floor_bytes = (
+                            transition_floor
+                        )
+                        empty_output.elastic_external_memory_peak_bytes = getattr(
+                            self, "_elastic_last_step_peak_external_bytes", 0
+                        )
+                        self._set_elastic_cublas_workspace_unit(empty_output)
+                        empty_output.elastic_hot_graphs = working_set.hot_snapshot()
+                elif scheduler_output.elastic_preserve_graph_residency and isinstance(
+                    empty_output, ModelRunnerOutput
+                ):
+                    (
+                        empty_output.elastic_external_memory_bytes,
+                        empty_output.elastic_external_memory_floor_bytes,
+                        empty_output.elastic_external_memory_transition_floor_bytes,
+                    ) = self._current_dynamic_graph_receipt()
+                    empty_output.elastic_external_memory_peak_bytes = (
+                        empty_output.elastic_external_memory_bytes
+                    )
+                    self._set_elastic_cublas_workspace_unit(empty_output)
+                    empty_output.elastic_hot_graphs = (
+                        self._dynamic_graph_working_set().hot_snapshot()
+                    )
+                if isinstance(empty_output, ModelRunnerOutput):
+                    empty_output.elastic_mm_activation_loan_bytes = (
+                        scheduler_output.elastic_mm_activation_loan_bytes
+                    )
                 return empty_output
 
         # Get batch descriptor and sync across DP ranks.
@@ -1642,17 +2524,48 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             uniform_tok_count,
             self.dp_size,
             self.dp_rank,
-            need_eager=is_profile or skip_compiled,
+            # Compile/profile dummy runs have no scheduler admission and must
+            # execute the compiled direct path, never an elastic Graph. Live
+            # execution remains fail-closed on same-step planning below.
+            need_eager=(
+                dummy_run or is_profile or is_synthetic_warmup or skip_compiled
+            ),
             num_active_loras=num_active_loras,
         )
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
+            if isinstance(empty_output, ModelRunnerOutput):
+                empty_output = copy(empty_output)
+            if elastic_dynamic_graph_step_started:
+                (
+                    external_request,
+                    external_floor,
+                    transition_floor,
+                ) = self._finish_dynamic_graph_step(
+                    release_idle_cache=_release_idle_graph_cache(scheduler_output),
+                    transaction_id=elastic_transaction_id,
+                    step_plan=elastic_plan,
+                )
+                if isinstance(empty_output, ModelRunnerOutput):
+                    empty_output.elastic_external_memory_bytes = external_request
+                    empty_output.elastic_external_memory_floor_bytes = external_floor
+                    empty_output.elastic_external_memory_transition_floor_bytes = (
+                        transition_floor
+                    )
+                    empty_output.elastic_hot_graphs = (
+                        self._dynamic_graph_working_set().hot_snapshot()
+                    )
+                    self._set_elastic_cublas_workspace_unit(empty_output)
+            if isinstance(empty_output, ModelRunnerOutput):
+                empty_output.elastic_mm_activation_loan_bytes = (
+                    scheduler_output.elastic_mm_activation_loan_bytes
+                )
             return empty_output
 
         graph_receipt = None
-        if _AG2_GRAPH_MODE_RECEIPT and not dummy_run:
+        if _AG2_GRAPH_MODE_RECEIPT and not dummy_run and not is_synthetic_warmup:
             graph_receipt_key = (
                 self.cudagraph_manager.dynamic_graph_owner,
                 batch_desc.cg_mode.name,
@@ -1687,6 +2600,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Prepare all the inputs and copy to the input buffers.
             with record_function_or_nullcontext("ag2.target_prepare_inputs"):
                 input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+            self._validate_elastic_calibration_sampling_indices(
+                input_batch,
+                hidden_rows=input_batch.num_tokens_after_padding,
+                phase="pre_forward",
+                only_single_token_prefill=True,
+            )
             with record_function_or_nullcontext("ag2.target_prepare_attention"):
                 block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
@@ -1747,8 +2666,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # FULL replay reads capture-time metadata buffers. Re-stage them
                     # from zeroed dummy block tables instead of retaining state
                     # indices from the previous real batch.
-                    for_capture=dummy_run
-                    and batch_desc.cg_mode == CUDAGraphMode.FULL,
+                    for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
                 )
 
         input_ids = input_batch.input_ids
@@ -1865,11 +2783,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             tp3_sd_phase_reduce = (
                 envs.VLLM_TP3_SD_PHASE_REDUCE and scheduler_output.is_pure_decode_step
             )
+            tp3_owner_prequant_decode = bool(
+                self.cudagraph_manager is not None
+                and self.cudagraph_manager.uses_tp3_owner_prequant_decode(batch_desc)
+            )
             batch_descriptor = BatchDescriptor(
                 num_tokens=input_batch.num_tokens_after_padding,
                 has_lora=self.lora_config is not None,
                 num_active_loras=batch_desc.num_active_loras,
                 tp3_sd_phase_reduce=tp3_sd_phase_reduce,
+                tp3_owner_prequant_decode=tp3_owner_prequant_decode,
+                # Memory profiling runs before the CUDA Graph manager exists.
+                # That eager path cannot publish a graph, but it still needs a
+                # stable target identity. Live Graph execution always uses the
+                # manager's explicit owner.
+                cudagraph_owner=(
+                    self.cudagraph_manager.dynamic_graph_owner
+                    if self.cudagraph_manager is not None
+                    else "target"
+                ),
+                physical_num_reqs=batch_desc.physical_num_reqs,
+                runtime_generation=batch_desc.runtime_generation,
             )
 
             with set_forward_context(
@@ -1884,6 +2818,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 is_padding=input_batch.is_padding,
                 num_tokens_unpadded=input_batch.num_tokens,
                 tp3_sd_phase_reduce=tp3_sd_phase_reduce,
+                tp3_owner_prequant_decode=tp3_owner_prequant_decode,
                 marlin_request_layout_cpu=(
                     self.input_buffers.marlin_request_layout_cpu
                     if envs.AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL
@@ -1908,12 +2843,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             self.model, model_inputs
                         )
                 else:
-                    # Eager (NONE): call the raw model directly.
+                    compiled_no_cudagraph = bool(
+                        self.cudagraph_manager is not None
+                        and self.cudagraph_manager.defer_startup_graphs
+                        and input_batch.num_tokens_after_padding
+                        in self.cudagraph_manager.compiled_piecewise_sizes
+                    )
+                    if compiled_no_cudagraph and skip_compiled:
+                        raise RuntimeError(
+                            "compiled-only PIECEWISE carrier attempted to skip "
+                            "torch.compile"
+                        )
                     forward_scope = (
                         torch.profiler.record_function(graph_receipt)
                         if graph_receipt is not None
                         else record_function_or_nullcontext(
-                            "ag2.target_forward.eager"
+                            "ag2.target_forward.compiled_no_cudagraph"
+                            if compiled_no_cudagraph
+                            else "ag2.target_forward.eager"
                         )
                     )
                     with forward_scope:
@@ -1968,8 +2915,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                 ]
                             ],
                             num_scheduled_tokens=[
-                                int(value)
-                                for value in input_batch.num_scheduled_tokens
+                                int(value) for value in input_batch.num_scheduled_tokens
                             ],
                             num_computed_tokens=[
                                 int(value)
@@ -2014,6 +2960,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if not dummy_run and self.gdn_checkpoint_manager is not None
             else None
         )
+        elastic_external_memory_bytes = 0
+        elastic_external_memory_floor_bytes = 0
+        # Generation finishes the elastic measurement only after sampling (and
+        # MTP proposal, when enabled). Ending it here omits the sampler
+        # high-water from the next-step feasibility receipt.
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
             attn_metadata=attn_metadata,
@@ -2024,12 +2975,107 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             routed_experts=routed_experts,
             num_spec_tokens_to_schedule=(scheduler_output.num_spec_tokens_to_schedule),
             gdn_checkpoint_keys=gdn_checkpoint_keys,
+            elastic_external_memory_bytes=elastic_external_memory_bytes,
+            elastic_external_memory_floor_bytes=(elastic_external_memory_floor_bytes),
+            elastic_mm_activation_loan_bytes=(
+                scheduler_output.elastic_mm_activation_loan_bytes
+            ),
+            elastic_dynamic_graph_step_started=elastic_dynamic_graph_step_started,
+            elastic_transaction_id=elastic_transaction_id,
+            elastic_step_plan=elastic_plan,
+            is_synthetic_warmup=is_synthetic_warmup,
         )
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
             return output_intermediate_tensors
         return None
+
+    @staticmethod
+    def _expected_sampling_indices(input_batch: InputBatch) -> np.ndarray:
+        """Reconstruct sampling rows from the authoritative CPU schedule."""
+        pieces: list[np.ndarray] = []
+        for req_idx in range(input_batch.num_reqs):
+            logit_start = int(input_batch.cu_num_logits_np[req_idx])
+            logit_end = int(input_batch.cu_num_logits_np[req_idx + 1])
+            num_logits = logit_end - logit_start
+            query_start = int(input_batch.query_start_loc_np[req_idx])
+            query_end = int(input_batch.query_start_loc_np[req_idx + 1])
+            row_start = query_end - num_logits
+            if num_logits < 0 or row_start < query_start or row_start > query_end:
+                raise RuntimeError(
+                    "invalid CPU sampling-index contract: "
+                    f"request={req_idx} query=[{query_start},{query_end}) "
+                    f"logits=[{logit_start},{logit_end})"
+                )
+            pieces.append(np.arange(row_start, query_end, dtype=np.int64))
+        if not pieces:
+            return np.empty(0, dtype=np.int64)
+        return np.concatenate(pieces)
+
+    def _validate_elastic_calibration_sampling_indices(
+        self,
+        input_batch: InputBatch,
+        *,
+        hidden_rows: int,
+        phase: str,
+        only_single_token_prefill: bool = False,
+    ) -> None:
+        """Fail before unsafe advanced indexing during pre-READY calibration.
+
+        A CUDA device-side bounds assertion poisons every rank and leaves the
+        GPUs requiring an owner reset. Calibration requests can afford one
+        synchronization here: compare the device-produced rows with the
+        authoritative CPU schedule before launching ``IndexKernel``. The
+        check is deliberately absent from the serving critical path.
+        """
+        if not input_batch.req_ids or not all(
+            req_id.startswith("_elastic_cal_") for req_id in input_batch.req_ids
+        ):
+            return
+        if only_single_token_prefill and not (
+            input_batch.num_reqs == 1
+            and input_batch.query_start_loc_np.tolist() == [0, 1]
+            and input_batch.cu_num_logits_np.tolist() == [0, 1]
+            and input_batch.req_ids[0].startswith("_elastic_cal_prefill_")
+        ):
+            return
+        expected = self._expected_sampling_indices(input_batch)
+        actual = input_batch.logits_indices.detach().cpu().numpy()
+        device_query_start_loc = input_batch.query_start_loc.detach().cpu().tolist()
+        device_cu_num_logits = input_batch.cu_num_logits.detach().cpu().tolist()
+        if (
+            actual.shape != expected.shape
+            or not np.array_equal(actual, expected)
+            or (
+                actual.size
+                and (int(actual.min()) < 0 or int(actual.max()) >= hidden_rows)
+            )
+        ):
+            raise RuntimeError(
+                "elastic calibration sampling indices failed closed before "
+                "CUDA advanced indexing: "
+                f"phase={phase} requests={input_batch.req_ids} "
+                f"hidden_rows={hidden_rows} "
+                f"query_start_loc={input_batch.query_start_loc_np.tolist()} "
+                f"device_query_start_loc={device_query_start_loc} "
+                f"cu_num_logits={input_batch.cu_num_logits_np.tolist()} "
+                f"device_cu_num_logits={device_cu_num_logits} "
+                f"idx_mapping_shape={tuple(input_batch.idx_mapping.shape)} "
+                f"expected={expected.tolist()} actual={actual.tolist()}"
+            )
+        if only_single_token_prefill:
+            logger.warning(
+                "Elastic single-token prefill sampling boundary passed: "
+                "phase=%s expected=%s actual=%s device_query_start_loc=%s "
+                "device_cu_num_logits=%s idx_mapping_shape=%s",
+                phase,
+                expected.tolist(),
+                actual.tolist(),
+                device_query_start_loc,
+                device_cu_num_logits,
+                tuple(input_batch.idx_mapping.shape),
+            )
 
     @torch.inference_mode()
     @step_eplb_after()
@@ -2051,6 +3097,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.execute_model_state.num_spec_tokens_to_schedule
         )
         gdn_checkpoint_keys = self.execute_model_state.gdn_checkpoint_keys
+        elastic_external_memory_bytes = (
+            self.execute_model_state.elastic_external_memory_bytes
+        )
+        elastic_external_memory_floor_bytes = (
+            self.execute_model_state.elastic_external_memory_floor_bytes
+        )
+        elastic_mm_activation_loan_bytes = (
+            self.execute_model_state.elastic_mm_activation_loan_bytes
+        )
+        is_synthetic_warmup = self.execute_model_state.is_synthetic_warmup
+        dynamic_graph_step_started = (
+            self.execute_model_state.elastic_dynamic_graph_step_started
+        )
+        elastic_transaction_id = self.execute_model_state.elastic_transaction_id
+        elastic_step_plan = getattr(self.execute_model_state, "elastic_step_plan", None)
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -2069,11 +3130,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             # Post-step KV connector related operations.
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
-            return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            output = ModelRunnerOutput.with_kv_conn_output_only(
+                kv_connector_output,
+                elastic_external_memory_bytes,
+                elastic_external_memory_floor_bytes,
+            )
+            output.elastic_mm_activation_loan_bytes = elastic_mm_activation_loan_bytes
+            return output
 
         # Last rank: sample tokens
         hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
             self.pcp_manager, hidden_states, input_batch
+        )
+        self._validate_elastic_calibration_sampling_indices(
+            input_batch,
+            hidden_rows=int(hidden_states.shape[0]),
+            phase="post_forward",
         )
 
         with record_function_or_nullcontext("ag2.target_sample_or_reject"):
@@ -2112,6 +3184,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
             gdn_checkpoint_keys=gdn_checkpoint_keys,
+            elastic_external_memory_bytes=elastic_external_memory_bytes,
+            elastic_external_memory_floor_bytes=(elastic_external_memory_floor_bytes),
+            elastic_mm_activation_loan_bytes=elastic_mm_activation_loan_bytes,
         )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(
@@ -2175,6 +3250,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler.sampling_states.temperature.gpu,
                     self.sampler.sampling_states.seeds.gpu,
                     mm_inputs=mm_inputs,
+                    is_profile=is_synthetic_warmup,
                 )
             if num_spec_tokens_to_schedule < draft_tokens.shape[1]:
                 draft_tokens = draft_tokens[:, :num_spec_tokens_to_schedule]
@@ -2200,6 +3276,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 draft_tokens_for_output,
             )
 
+        self._settle_dynamic_graph_step_after_sampling(
+            model_runner_output,
+            dynamic_graph_step_started,
+            elastic_transaction_id,
+            elastic_step_plan,
+        )
+
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
@@ -2219,6 +3302,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch = self.execute_model_state.input_batch
         hidden_states = self.execute_model_state.hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        elastic_external_memory_bytes = (
+            self.execute_model_state.elastic_external_memory_bytes
+        )
+        elastic_external_memory_floor_bytes = (
+            self.execute_model_state.elastic_external_memory_floor_bytes
+        )
+        elastic_mm_activation_loan_bytes = (
+            self.execute_model_state.elastic_mm_activation_loan_bytes
+        )
         self.execute_model_state = None
 
         # Post-step KV connector related operations.
@@ -2226,7 +3318,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not self.is_last_pp_rank:
             self.postprocess_num_computed_tokens(input_batch)
-            return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            output = ModelRunnerOutput.with_kv_conn_output_only(
+                kv_connector_output,
+                elastic_external_memory_bytes,
+                elastic_external_memory_floor_bytes,
+            )
+            output.elastic_mm_activation_loan_bytes = elastic_mm_activation_loan_bytes
+            return output
 
         assert self.pooling_runner is not None
         pooler_output, finished_mask = self.pooling_runner.pool(
@@ -2238,6 +3336,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_ids=input_batch.req_ids,
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             kv_connector_output=kv_connector_output,
+            elastic_external_memory_bytes=elastic_external_memory_bytes,
+            elastic_external_memory_floor_bytes=(elastic_external_memory_floor_bytes),
+            elastic_mm_activation_loan_bytes=elastic_mm_activation_loan_bytes,
         )
         async_output = AsyncPoolingOutput(
             model_runner_output=model_runner_output,
@@ -2327,6 +3428,13 @@ class ExecuteModelState(NamedTuple):
     routed_experts: RoutedExpertsTensors | None
     num_spec_tokens_to_schedule: int
     gdn_checkpoint_keys: tuple[bytes, ...] | None
+    elastic_external_memory_bytes: int
+    elastic_external_memory_floor_bytes: int
+    elastic_mm_activation_loan_bytes: int
+    elastic_dynamic_graph_step_started: bool
+    elastic_transaction_id: str | None
+    elastic_step_plan: ElasticStepPlan | None
+    is_synthetic_warmup: bool
 
 
 def sort_batch_req_ids(
@@ -2352,9 +3460,7 @@ def sort_batch_req_ids(
     def key(req_id: str) -> tuple[bool, bool, int]:
         num_tokens = num_tokens_per_req[req_id]
         return (
-            False
-            if is_prefilling_by_req is None
-            else is_prefilling_by_req[req_id],
+            False if is_prefilling_by_req is None else is_prefilling_by_req[req_id],
             num_tokens != decode_query_len,
             num_tokens,
         )

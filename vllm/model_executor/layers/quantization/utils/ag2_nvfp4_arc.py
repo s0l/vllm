@@ -6,7 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -23,11 +23,33 @@ class _Sidecar:
     manifest: dict
     by_suffix: dict[str, dict]
     tensors: dict[str, torch.Tensor]
+    applied_prefixes: set[str] = field(default_factory=set)
 
 
 _CACHE: dict[tuple[str, int, str], _Sidecar] = {}
 _OWNER_WIDTHS = (2048, 2048, 1024)
 _OWNER_OFFSETS = (0, 2048, 4096)
+
+
+def _record_applied_prefix(sidecar: _Sidecar, prefix: str, rank: int) -> None:
+    """Record exact manifest coverage without emitting one INFO line per layer."""
+    if prefix in sidecar.applied_prefixes:
+        raise RuntimeError(f"ARC sidecar applied twice to {prefix}")
+    sidecar.applied_prefixes.add(prefix)
+    applied_count = len(sidecar.applied_prefixes)
+    expected_count = len(sidecar.by_suffix)
+    if applied_count > expected_count:
+        raise RuntimeError(
+            "ARC applied-prefix count exceeded manifest: "
+            f"rank={rank} applied={applied_count} expected={expected_count}"
+        )
+    if applied_count == expected_count:
+        logger.info(
+            "AG2 ARC application complete rank=%d records=%d sha256=%s",
+            rank,
+            expected_count,
+            sidecar.manifest["sidecar_sha256"],
+        )
 
 
 def _sha256(path: Path) -> str:
@@ -107,7 +129,7 @@ def _load(directory: Path, rank: int, device: torch.device) -> _Sidecar:
         raise RuntimeError("ARC runtime suffix set is incomplete or duplicated")
     result = _Sidecar(manifest=manifest, by_suffix=by_suffix, tensors=tensors)
     _CACHE[cache_key] = result
-    logger.warning(
+    logger.info(
         "Loaded AG2 ARC sidecar rank=%d sha256=%s records=%d bytes=%d schema=%s",
         rank,
         actual_sha,
@@ -258,7 +280,8 @@ def maybe_apply_ag2_nvfp4_arc_sidecar(
         )
     layer._ag2_nvfp4_arc_runtime_suffix = suffix
     layer._ag2_nvfp4_arc_sidecar_sha256 = sidecar.manifest["sidecar_sha256"]
-    logger.info(
+    _record_applied_prefix(sidecar, prefix, rank)
+    logger.debug(
         "AG2 ARC appended prefix=%s rank=%d K=%d->%d",
         prefix,
         rank,

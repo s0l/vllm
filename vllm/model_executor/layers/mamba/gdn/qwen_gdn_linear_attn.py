@@ -48,6 +48,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from vllm.model_executor.layers.projection_capture import projection_capture_copy
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
@@ -1372,7 +1373,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 core_attn_out,
                 self._ag2_projection_capture_row_indices,
             )
-            self._ag2_projection_capture_gated_norm.copy_(selected)
+            projection_capture_copy(
+                selected,
+                self._ag2_projection_capture_gated_norm,
+            )
         if self._ag2_aux_boundaries_enabled:
             self._ag2_aux_gated_norm = core_attn_out
         if self._ag2_aux_compact_boundaries_enabled:

@@ -10,6 +10,7 @@ from vllm.platforms import current_platform
 if not current_platform.is_cuda():
     pytest.skip("FlashInfer backend requires CUDA.", allow_module_level=True)
 
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.flashinfer import (
     FlashInferMetadataBuilder,
     _semantic_attention_token_counts,
@@ -24,20 +25,46 @@ def _builder(*, enabled: bool = True) -> FlashInferMetadataBuilder:
     return builder
 
 
+def test_dcp_overlapping_gqa_head_select_validates_before_cuda_launch():
+    builder = FlashInferMetadataBuilder.__new__(FlashInferMetadataBuilder)
+    builder._local_kv_head_index_tensors = {}
+    key = torch.arange(2 * 4 * 8, dtype=torch.float32, device="cuda").view(2, 4, 8)
+    value = key + 1000
+
+    selected_key, selected_value = builder._select_local_kv_heads(
+        key, value, (0, 0, 0, 1)
+    )
+
+    assert torch.equal(selected_key, key[:, (0, 0, 0, 1)])
+    assert torch.equal(selected_value, value[:, (0, 0, 0, 1)])
+
+
+def test_dcp_overlapping_gqa_head_select_rejects_invalid_geometry_synchronously():
+    builder = FlashInferMetadataBuilder.__new__(FlashInferMetadataBuilder)
+    builder._local_kv_head_index_tensors = {}
+    key = torch.empty((2, 1, 128), dtype=torch.bfloat16, device="cuda")
+    value = torch.empty_like(key)
+
+    with pytest.raises(RuntimeError, match="head map exceeds"):
+        builder._select_local_kv_heads(key, value, (0, 0, 0, 1))
+
+    # The negative control must not enqueue a device-side assert.
+    torch.cuda.synchronize()
+
+
 def _metadata(
     query_start_loc: list[int],
     *,
     is_prefilling: list[bool],
     draft_counts: list[int] | None,
     causal: bool = True,
+    full_cudagraph: bool = True,
 ):
     return type(
         "SyntheticMetadata",
         (),
         {
-            "query_start_loc_cpu": torch.tensor(
-                query_start_loc, dtype=torch.int32
-            ),
+            "query_start_loc_cpu": torch.tensor(query_start_loc, dtype=torch.int32),
             "is_prefilling": torch.tensor(is_prefilling, dtype=torch.bool),
             "num_decode_draft_tokens_cpu": (
                 None
@@ -45,6 +72,7 @@ def _metadata(
                 else torch.tensor(draft_counts, dtype=torch.int32)
             ),
             "causal": causal,
+            "full_cudagraph": full_cudagraph,
         },
     )()
 
@@ -63,6 +91,33 @@ def test_dcp_prefill_cudagraph_accepts_uniform_mtp_with_padding():
             num_prefills=4,
         )
         == 4
+    )
+
+
+def test_dcp_prefill_piecewise_uses_replannable_wrapper():
+    metadata = _metadata(
+        [0, 3, 6],
+        is_prefilling=[False, False],
+        draft_counts=[2, 2],
+        full_cudagraph=False,
+    )
+
+    assert (
+        _builder()._dcp_prefill_cudagraph_batch_size(
+            metadata,
+            num_decodes=0,
+            num_prefills=2,
+        )
+        is None
+    )
+
+
+def test_batched_q1_verifier_forces_qlen_greater_than_one_piecewise(monkeypatch):
+    monkeypatch.setenv("AG2_VLLM_MTP_DCP_BATCHED_DECODE", "1")
+
+    assert (
+        FlashInferMetadataBuilder.get_cudagraph_support(object(), object())
+        == AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     )
 
 
@@ -208,9 +263,7 @@ def test_dcp_prefill_cudagraph_rejects_non_target_shapes(metadata, num_decodes):
 
 
 def test_dcp_prefill_cudagraph_is_default_off():
-    metadata = _metadata(
-        [0, 3], is_prefilling=[False], draft_counts=[2]
-    )
+    metadata = _metadata([0, 3], is_prefilling=[False], draft_counts=[2])
 
     assert (
         _builder(enabled=False)._dcp_prefill_cudagraph_batch_size(

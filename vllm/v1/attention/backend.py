@@ -454,6 +454,13 @@ class CommonAttentionMetadata:
     block_table_tensor: torch.Tensor
     slot_mapping: torch.Tensor
 
+    full_cudagraph: bool = False
+    """Whether attention is owned by one outer FULL CUDA Graph.
+
+    PIECEWISE attention is a graph breakpoint and must use ordinary
+    replannable backend state rather than shape-owned FULL-graph buffers.
+    """
+
     causal: bool | torch.Tensor = True
 
     # Needed by FastPrefillAttentionBuilder

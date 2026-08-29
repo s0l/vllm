@@ -49,8 +49,12 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_DCP_NATIVE_RS_MAX_ROWS: int = 0
     VLLM_TP3_CE_REDUCE: bool = False
+    VLLM_TP3_CE_MAX_ROWS: int = 12288
+    VLLM_TP3_LL_REDUCE: bool = False
+    VLLM_TP3_LL_MAX_ROWS: int = 16
     VLLM_TP3_SD_CANONICAL_REDUCE: bool = False
     VLLM_TP3_SD_DETERMINISTIC_REDUCE: bool = False
+    VLLM_TP3_SD_DETERMINISTIC_MAX_ROWS: int = 24
     VLLM_TP3_SD_PHASE_REDUCE: bool = False
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
@@ -915,6 +919,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("VLLM_DCP_NATIVE_RS_MAX_ROWS", "0")
     ),
     "VLLM_TP3_CE_REDUCE": lambda: os.environ.get("VLLM_TP3_CE_REDUCE", "0") == "1",
+    "VLLM_TP3_CE_MAX_ROWS": lambda: int(
+        os.environ.get("VLLM_TP3_CE_MAX_ROWS", "12288")
+    ),
+    "VLLM_TP3_LL_REDUCE": lambda: os.environ.get("VLLM_TP3_LL_REDUCE", "0")
+    == "1",
+    "VLLM_TP3_LL_MAX_ROWS": lambda: int(
+        os.environ.get("VLLM_TP3_LL_MAX_ROWS", "16")
+    ),
     "VLLM_TP3_SD_CANONICAL_REDUCE": lambda: os.environ.get(
         "VLLM_TP3_SD_CANONICAL_REDUCE", "0"
     )
@@ -923,6 +935,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_TP3_SD_DETERMINISTIC_REDUCE", "0"
     )
     == "1",
+    "VLLM_TP3_SD_DETERMINISTIC_MAX_ROWS": lambda: int(
+        os.environ.get("VLLM_TP3_SD_DETERMINISTIC_MAX_ROWS", "24")
+    ),
     "VLLM_TP3_SD_PHASE_REDUCE": lambda: os.environ.get(
         "VLLM_TP3_SD_PHASE_REDUCE", "0"
     )

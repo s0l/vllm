@@ -89,6 +89,24 @@ logger = init_logger(__name__)
 
 _KV_REDUNDANCY_BUFFER_BYTES = 150 * (1 << 20)
 
+
+def _startup_kv_memory_deductions(
+    *,
+    elastic_dynamic_kv: bool,
+    cudagraph_memory_estimate: int,
+    estimate_cudagraphs: bool,
+) -> tuple[int, int]:
+    """Return startup-only graph and generic-buffer deductions.
+
+    Elastic on-demand owners are charged later from the exact step loan, so
+    neither a hypothetical graph estimate nor a generic buffer may reduce the
+    physical KV arena here.
+    """
+    if elastic_dynamic_kv:
+        return 0, 0
+    graph_bytes = cudagraph_memory_estimate if estimate_cudagraphs else 0
+    return graph_bytes, _KV_REDUNDANCY_BUFFER_BYTES
+
 if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -533,12 +551,22 @@ class Worker(WorkerBase):
             cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
         # Respect the opt-in flag as originally designed.
-        cudagraph_memory_estimate_applied = (
-            cudagraph_memory_estimate
-            if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
-            else 0
-        )
         additional_config = self.vllm_config.additional_config
+        elastic_dynamic_kv = bool(
+            isinstance(additional_config, dict)
+            and additional_config.get("elastic_gdn_backing", False)
+        )
+        # On-demand graphs are paid from the elastic KV tail at the exact
+        # next step. Applying the startup profiler's hypothetical graph size
+        # here would recreate a permanent reserve before any graph exists.
+        (
+            cudagraph_memory_estimate_applied,
+            redundancy_buffer_memory,
+        ) = _startup_kv_memory_deductions(
+            elastic_dynamic_kv=elastic_dynamic_kv,
+            cudagraph_memory_estimate=cudagraph_memory_estimate,
+            estimate_cudagraphs=envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS,
+        )
         dynamic_graph_budget_mb = (
             additional_config.get("dynamic_cudagraph_budget_mb", 0)
             if isinstance(additional_config, dict)
@@ -550,13 +578,18 @@ class Worker(WorkerBase):
             or dynamic_graph_budget_mb < 0
         ):
             raise ValueError("dynamic_cudagraph_budget_mb must be an integer >= 0")
-        dynamic_graph_reserve_bytes = dynamic_graph_budget_mb * 1024 * 1024
-        cudagraph_memory_estimate_applied += dynamic_graph_reserve_bytes
-        if dynamic_graph_reserve_bytes:
+        if dynamic_graph_budget_mb and not bool(
+            additional_config.get("elastic_gdn_backing", False)
+        ):
+            raise ValueError(
+                "dynamic CUDA Graph residency requires elastic_gdn_backing so "
+                "its physical memory can be borrowed from KV at step time"
+            )
+        if dynamic_graph_budget_mb:
             logger.info_once(
-                "Reserved %.2f GiB for dynamic CUDA Graph residency before "
-                "KV cache sizing",
-                dynamic_graph_reserve_bytes / (1 << 30),
+                "Dynamic CUDA Graph ceiling is %.2f GiB; no startup memory is "
+                "withheld from KV",
+                dynamic_graph_budget_mb / 1024,
             )
 
         self.total_consumed = profile_result.total_consumed
@@ -581,7 +614,7 @@ class Worker(WorkerBase):
             self.requested_memory
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
-            - _KV_REDUNDANCY_BUFFER_BYTES
+            - redundancy_buffer_memory
         )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
@@ -783,8 +816,19 @@ class Worker(WorkerBase):
             # empirically observed that the memory profiling may
             # slightly underestimate the memory consumption.
             # So leave a small buffer (=150MiB) to avoid OOM.
-            redundancy_buffer_memory = _KV_REDUNDANCY_BUFFER_BYTES
-
+            additional_config = self.vllm_config.additional_config
+            elastic_dynamic_kv = bool(
+                isinstance(additional_config, dict)
+                and additional_config.get("elastic_gdn_backing", False)
+            )
+            _, redundancy_buffer_memory = _startup_kv_memory_deductions(
+                elastic_dynamic_kv=elastic_dynamic_kv,
+                cudagraph_memory_estimate=0,
+                estimate_cudagraphs=False,
+            )
+            # Elastic startup calibration measures every post-profile owner
+            # against the real KV tail. A generic 150 MiB subtraction is an
+            # unowned reserve and would make the published KV capacity false.
             non_kv_cache_memory = (
                 self.total_consumed
                 + self.peak_activation_memory
@@ -1401,6 +1445,47 @@ class Worker(WorkerBase):
 
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
+
+    def get_elastic_graph_hot_snapshot(self) -> tuple[tuple[object, ...], ...]:
+        """Return CPU-only physical Graph residency after startup/restore."""
+        manager = getattr(self.model_runner, "cudagraph_manager", None)
+        if manager is None:
+            return ()
+        return self.model_runner._dynamic_graph_working_set().hot_snapshot()
+
+    def prune_elastic_pinned_full_above(
+        self, max_x: int, transaction_id: str
+    ) -> tuple[int, int, int]:
+        """Remove only calibration probes outside the accepted FULL prefix."""
+        return self.model_runner._dynamic_graph_working_set().prune_pinned_full_above(
+            max_x, transaction_id
+        )
+
+    def set_elastic_runtime_generation(self, generation: str) -> str:
+        """Bind deferred worker recipes to the scheduler's post-KV epoch."""
+        manager = getattr(self.model_runner, "cudagraph_manager", None)
+        if manager is None:
+            return "static"
+        from vllm.v1.core.elastic_graph import RuntimeGeneration
+
+        self.model_runner._dynamic_graph_working_set().rebind_runtime_generation(
+            RuntimeGeneration(generation)
+        )
+        return generation
+
+    def get_elastic_graph_execution_policy(self) -> dict[str, Any] | None:
+        """Return the effective post-backend Graph representation policy."""
+        manager = getattr(self.model_runner, "cudagraph_manager", None)
+        if manager is None or not manager.defer_startup_graphs:
+            return None
+        from vllm.v1.worker.gpu.cudagraph_utils import (
+            graph_execution_policy_from_managers,
+        )
+
+        policy = graph_execution_policy_from_managers(
+            self.model_runner._dynamic_graph_working_set().managers
+        )
+        return policy.to_payload()
 
 
 def init_worker_distributed_environment(

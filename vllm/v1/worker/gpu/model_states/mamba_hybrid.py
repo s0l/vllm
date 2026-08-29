@@ -297,7 +297,10 @@ class MambaHybridModelState(DefaultModelState):
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
     ) -> dict[str, Any]:
-        if cudagraph_mode == CUDAGraphMode.FULL:
+        if (
+            cudagraph_mode == CUDAGraphMode.FULL
+            or input_batch.num_reqs_after_padding > input_batch.num_reqs
+        ):
             num_reqs = input_batch.num_reqs_after_padding
             num_tokens = input_batch.num_tokens_after_padding
         else:
@@ -390,6 +393,7 @@ class MambaHybridModelState(DefaultModelState):
             num_prompt_tokens_cpu=num_prompt_tokens_cpu,
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,
+            full_cudagraph=cudagraph_mode == CUDAGraphMode.FULL,
             rswa_prefix_lens=input_batch.prompt_lens,
         )
 

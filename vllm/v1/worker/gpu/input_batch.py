@@ -26,6 +26,12 @@ class InputBuffers:
         self.query_start_loc = torch.zeros(
             max_num_reqs + 1, dtype=torch.int32, device=device
         )
+        # Sampling runs in a separate RPC after model execution. Keep its row
+        # indices in storage allocated before any CUDA Graph capture so a
+        # graph-private pool can never reuse the address between the two RPCs.
+        self.logits_indices = torch.empty(
+            max_num_tokens, dtype=torch.int64, device=device
+        )
         # Stable CPU layout consumed by the default-off request-isolated
         # NVFP4 Marlin prefill path. Layout: [num_reqs, num_decodes,
         # query_start_loc[0:max_num_reqs+1]].
@@ -370,20 +376,26 @@ def _combine_sampled_and_draft_tokens_kernel(
 
     seq_len = tl.load(seq_lens_ptr + batch_idx)
     prefill_len = tl.load(prefill_len_ptr + req_state_idx)
-    if seq_len <= prefill_len:
-        # Handling prefill tokens. No sampled or draft tokens.
-        return
+    is_decode = seq_len > prefill_len
 
     # Keep prompt-tail slots intact; only rewrite generated-token slots.
     first_logit_seq_pos = seq_len - num_logits
-    if NUM_NEW_SAMPLED_TOKENS > 0 and first_logit_seq_pos >= prefill_len:
+    if NUM_NEW_SAMPLED_TOKENS > 0:
         # Write the last sampled token ID to input_ids.
-        last_token_id = tl.load(last_sampled_tokens_ptr + req_state_idx)
-        tl.store(input_ids_ptr + logits_start, last_token_id)
+        write_last_sampled = is_decode & (first_logit_seq_pos >= prefill_len)
+        last_token_id = tl.load(
+            last_sampled_tokens_ptr + req_state_idx,
+            mask=write_last_sampled,
+        )
+        tl.store(
+            input_ids_ptr + logits_start,
+            last_token_id,
+            mask=write_last_sampled,
+        )
 
     # Write the draft tokens (if any) to input_ids.
     if num_draft_tokens > 0:
-        mask = block < num_draft_tokens
+        mask = is_decode & (block < num_draft_tokens)
         draft_tokens = tl.load(
             draft_tokens_ptr + req_state_idx * draft_tokens_stride + block,
             mask=mask,
@@ -406,6 +418,7 @@ def combine_sampled_and_draft_tokens(
     cu_num_logits: torch.Tensor,
     num_logits: int,
     num_new_sampled_tokens: int = 1,  # excl accepted draft tokens, a.k.a bonus tokens
+    logits_indices_buffer: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert num_new_sampled_tokens in (0, 1), (
         f"num_new_sampled_tokens must be 0 or 1, got {num_new_sampled_tokens}"
@@ -414,11 +427,25 @@ def combine_sampled_and_draft_tokens(
     num_reqs = idx_mapping.shape[0]
     num_speculative_steps = draft_tokens.shape[-1]
 
-    logits_indices = torch.empty(
-        num_logits,
-        dtype=torch.int64,
-        device=input_ids.device,
-    )
+    if logits_indices_buffer is None:
+        logits_indices = torch.empty(
+            num_logits,
+            dtype=torch.int64,
+            device=input_ids.device,
+        )
+    else:
+        if logits_indices_buffer.dtype != torch.int64:
+            raise ValueError("logits_indices_buffer must have dtype torch.int64")
+        if logits_indices_buffer.device != input_ids.device:
+            raise ValueError(
+                "logits_indices_buffer must be on the same device as input_ids"
+            )
+        if logits_indices_buffer.numel() < num_logits:
+            raise ValueError(
+                "logits_indices_buffer is too small: "
+                f"need={num_logits}, capacity={logits_indices_buffer.numel()}"
+            )
+        logits_indices = logits_indices_buffer[:num_logits]
     _combine_sampled_and_draft_tokens_kernel[(num_reqs,)](
         input_ids,
         idx_mapping,

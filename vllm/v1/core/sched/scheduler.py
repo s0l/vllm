@@ -4,12 +4,13 @@ import itertools
 import os
 import time
 from collections import defaultdict, deque
-from collections.abc import Iterable
-from dataclasses import replace
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorBase,
     ECConnectorMetadata,
@@ -32,6 +33,21 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.v1.core.elastic_graph import (
+    ElasticGraphCache,
+    ElasticPlanKind,
+    ElasticStepPlan,
+    GraphExecutionPolicy,
+    GraphPrice,
+    LogicalDispatchKey,
+    PhysicalReplayKey,
+    RuntimeGeneration,
+    SemanticGraphStep,
+    bind_runtime_generation_to_policy,
+    configured_compiled_piecewise_sizes,
+    derive_short_decode_graph_inventory,
+    resolve_step_physical_keys,
+)
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -42,7 +58,11 @@ from vllm.v1.core.kv_cache_coordinator import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import BlockHashListWithBlockSize, KVCacheBlock
+from vllm.v1.core.kv_cache_utils import (
+    BlockHashListWithBlockSize,
+    KVCacheBlock,
+    get_num_blocks_per_request_for_kv_cache_config,
+)
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -58,7 +78,11 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    MambaSpec,
+    elastic_piecewise_token_boundary,
+)
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -70,8 +94,19 @@ from vllm.v1.spec_decode.dynamic.utils import (
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker.startup_plan import compute_elastic_runtime_generation
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class ElasticAdmissionGrant:
+    step_key: tuple[int, ...]
+    physical_keys: tuple[PhysicalReplayKey, ...]
+    external_memory_bytes: int
+    previous_external_memory_bytes: int
+    minimum_free_primary_blocks: int
+    requirements: KVCacheBlockPoolRequirements
 
 
 def _nonnegative_env_int(name: str, default: int = 0) -> int:
@@ -81,7 +116,94 @@ def _nonnegative_env_int(name: str, default: int = 0) -> int:
     return value
 
 
+def _elastic_catalog_cold_residency_envelope(row: Mapping[str, Any]) -> int:
+    """Return the minimum safe loan for rebuilding a sealed owner set.
+
+    A historical cold high-water can be smaller than the subsequently
+    stabilized HOT residency when the calibration loan capped the KV-priced
+    portion of capture.  Rebuilding the set from X0 must nevertheless fund
+    every byte that remains resident after publication.  The physical floor
+    is included for legacy rows whose resident sidecar did not carry it.
+    """
+    return max(
+        int(row["cold_peak_bytes"]),
+        int(row.get("resident_bytes", 0)),
+        int(row.get("floor_bytes", 0)),
+    )
+
+
 class Scheduler(SchedulerInterface):
+    @staticmethod
+    def _validate_elastic_batch_lifecycle(
+        async_scheduling: bool, max_concurrent_batches: int
+    ) -> None:
+        if async_scheduling or max_concurrent_batches > 1:
+            raise RuntimeError(
+                "elastic CUDA Graph/KV ownership requires one physical batch "
+                "until an overlapping working-set union is measured"
+            )
+
+    @staticmethod
+    def _resolve_elastic_mm_activation_loan(
+        additional_config: object,
+        *,
+        env_value: str = "",
+        elastic_on_demand_graphs: bool,
+        multimodal_config: object | None,
+        elastic_mapping_quantum: int,
+    ) -> int:
+        config_loan_bytes = (
+            additional_config.get("elastic_mm_activation_loan_bytes", 0)
+            if isinstance(additional_config, dict)
+            else 0
+        )
+        if (
+            isinstance(config_loan_bytes, bool)
+            or not isinstance(config_loan_bytes, int)
+            or config_loan_bytes < 0
+        ):
+            raise ValueError(
+                "elastic_mm_activation_loan_bytes must be an integer >= 0"
+            )
+        try:
+            env_loan_bytes = int(env_value) if env_value else 0
+        except ValueError as error:
+            raise ValueError(
+                "AG2_VLLM_ELASTIC_MM_ACTIVATION_LOAN_BYTES must be an integer"
+            ) from error
+        if env_loan_bytes < 0:
+            raise ValueError(
+                "AG2_VLLM_ELASTIC_MM_ACTIVATION_LOAN_BYTES must be >= 0"
+            )
+        if config_loan_bytes and env_value and config_loan_bytes != env_loan_bytes:
+            raise ValueError("elastic MM activation loan config/env disagree")
+        loan_bytes = env_loan_bytes or config_loan_bytes
+        skip_mm_profiling = bool(
+            multimodal_config is not None
+            and getattr(multimodal_config, "skip_mm_profiling", False)
+        )
+        if loan_bytes:
+            if not elastic_on_demand_graphs:
+                raise ValueError(
+                    "elastic_mm_activation_loan_bytes requires elastic KV/Graph"
+                )
+            if multimodal_config is None or not skip_mm_profiling:
+                raise ValueError(
+                    "elastic_mm_activation_loan_bytes requires a multimodal "
+                    "model with skip_mm_profiling"
+                )
+            if not elastic_mapping_quantum or loan_bytes % elastic_mapping_quantum:
+                raise ValueError(
+                    "elastic_mm_activation_loan_bytes must align to the elastic "
+                    "mapping quantum"
+                )
+        elif elastic_on_demand_graphs and skip_mm_profiling:
+            raise ValueError(
+                "skip_mm_profiling requires a nonzero scheduler-visible "
+                "elastic_mm_activation_loan_bytes"
+            )
+        return loan_bytes
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -130,8 +252,7 @@ class Scheduler(SchedulerInterface):
                 effective_max_resident_seqs,
             )
             logger.info(
-                "Elastic scheduler resident cap enabled: configured=%d, "
-                "effective=%d",
+                "Elastic scheduler resident cap enabled: configured=%d, effective=%d",
                 self.scheduler_config.max_num_seqs,
                 self.max_num_running_reqs,
             )
@@ -139,6 +260,279 @@ class Scheduler(SchedulerInterface):
             self.scheduler_config.max_num_scheduled_tokens
             if self.scheduler_config.max_num_scheduled_tokens is not None
             else self.scheduler_config.max_num_batched_tokens
+        )
+        additional_config = self.vllm_config.additional_config
+        self.elastic_on_demand_graphs = bool(
+            isinstance(additional_config, dict)
+            and additional_config.get("elastic_gdn_backing", False)
+            and not self.vllm_config.model_config.enforce_eager
+            and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        )
+        self._elastic_compiled_piecewise_sizes = (
+            configured_compiled_piecewise_sizes(self.vllm_config)
+        )
+        if self._elastic_compiled_piecewise_sizes and not self.elastic_on_demand_graphs:
+            raise ValueError(
+                "elastic_compiled_piecewise_sizes requires elastic on-demand graphs"
+            )
+        if self.elastic_on_demand_graphs:
+            self._validate_elastic_batch_lifecycle(
+                self.scheduler_config.async_scheduling,
+                self.vllm_config.max_concurrent_batches,
+            )
+            policy_payload = kv_cache_config.elastic_graph_execution_policy
+            if policy_payload is None:
+                raise RuntimeError(
+                    "elastic Graph execution policy was not resolved before "
+                    "scheduler construction"
+                )
+            self._elastic_graph_execution_policy = (
+                GraphExecutionPolicy.from_payload(policy_payload)
+            )
+        else:
+            self._elastic_graph_execution_policy = None
+        config_hotset_cap_mb = (
+            additional_config.get("elastic_graph_hotset_cap_mb", 0)
+            if isinstance(additional_config, dict)
+            else 0
+        )
+        env_hotset_cap = os.environ.get(
+            "AG2_VLLM_ELASTIC_GRAPH_HOTSET_CAP_MB", ""
+        )
+        try:
+            env_hotset_cap_mb = int(env_hotset_cap) if env_hotset_cap else 0
+        except ValueError as error:
+            raise ValueError(
+                "AG2_VLLM_ELASTIC_GRAPH_HOTSET_CAP_MB must be an integer"
+            ) from error
+        if config_hotset_cap_mb and env_hotset_cap and (
+            config_hotset_cap_mb != env_hotset_cap_mb
+        ):
+            raise ValueError("elastic graph hotset cap config/env disagree")
+        hotset_cap_mb = env_hotset_cap_mb or config_hotset_cap_mb
+        if (
+            isinstance(hotset_cap_mb, bool)
+            or not isinstance(hotset_cap_mb, int)
+            or hotset_cap_mb < 0
+        ):
+            raise ValueError("elastic_graph_hotset_cap_mb must be an integer >= 0")
+        if hotset_cap_mb and not self.elastic_on_demand_graphs:
+            raise ValueError(
+                "elastic_graph_hotset_cap_mb requires elastic on-demand graphs"
+            )
+        self._elastic_graph_hotset_cap_bytes = hotset_cap_mb * 1024 * 1024
+        mm_config = self.vllm_config.model_config.multimodal_config
+        self._elastic_mm_activation_loan_bytes = (
+            self._resolve_elastic_mm_activation_loan(
+                additional_config,
+                env_value=os.environ.get(
+                    "AG2_VLLM_ELASTIC_MM_ACTIVATION_LOAN_BYTES", ""
+                ),
+                elastic_on_demand_graphs=self.elastic_on_demand_graphs,
+                multimodal_config=mm_config,
+                elastic_mapping_quantum=kv_cache_config.elastic_mapping_quantum,
+            )
+        )
+        runtime_generation = compute_elastic_runtime_generation(vllm_config)
+        if self._elastic_graph_execution_policy is not None:
+            runtime_generation = bind_runtime_generation_to_policy(
+                runtime_generation,
+                self._elastic_graph_execution_policy,
+            )
+        self._elastic_runtime_generation = RuntimeGeneration(runtime_generation)
+        self._elastic_graph_cache = ElasticGraphCache(
+            self._elastic_runtime_generation
+        )
+        self._elastic_pending_maintenance_plan: ElasticStepPlan | None = None
+        self._elastic_pending_maintenance_step_key: tuple[int, ...] | None = None
+        # A zero-token staged replacement keeps its victims as physical
+        # lifetime fences until its exact USER shape consumes the candidate.
+        # If live request/cache state resolves a different next shape, abort the
+        # unused candidate and restore the old set before replanning.
+        self._elastic_staged_hotset_plan: ElasticStepPlan | None = None
+        self._elastic_staged_hotset_step_key: tuple[int, ...] | None = None
+        self._elastic_staged_hotset_abort_pending = False
+        # FIFO scheduler outputs may overlap under async scheduling. Keep every
+        # unsettled grant reserved until its worker result returns; otherwise an
+        # older result could shrink KV-external residency while a newer batch is
+        # still capturing or replaying from the same aggregate grant.
+        self._elastic_pending_graph_loans: deque[tuple[tuple[int, ...] | None, int]] = (
+            deque()
+        )
+        self._elastic_transaction_seq = 0
+        self._elastic_maintenance_started: dict[str, tuple[float, Any, int]] = {}
+        self._elastic_useful_started: dict[str, float] = {}
+        self._elastic_maintenance_wall_ms_total = 0.0
+        self._elastic_maintenance_transactions_total = 0
+        self._elastic_useful_wall_ms_total = 0.0
+        self._elastic_useful_transactions_total = 0
+        self._elastic_graph_key_outcomes: dict[str, int] = defaultdict(int)
+        self._elastic_rate_limited_logs_total = 0
+        self._elastic_graph_step_key: tuple[int, ...] | None = None
+        # The last worker request is an execution shape. A live speculative
+        # cohort separately owns the complete q=K+1 decode carrier needed by
+        # its later verification steps, including while the current step is a
+        # mixed/prefill shape.
+        self._elastic_graph_carrier_step_key: tuple[int, ...] | None = None
+        # Key whose first capture after a shape transition has not settled yet.
+        # Async copies of that exact step inherit its discovery envelope only
+        # until the first result supplies a fresh physical measurement.
+        self._elastic_graph_recapture_pending_key: tuple[int, ...] | None = None
+        # An unseen capture has no factual byte price. Admission loans exactly
+        # the physical tail left after the prospective KV/GDN requirements,
+        # then the worker reports the measured resident aggregate. Do not turn
+        # historical intercepts, per-token slopes or cuBLAS upper bounds into a
+        # reserve or a false feasibility result.
+        # Current settled executable envelope.  After a cold capture this is
+        # temporarily its measured cold high-water so the immediate HOT replay
+        # cannot fall back to an older catalog value; HOT settlement replaces
+        # it with the observed replay envelope.
+        self._elastic_graph_measured_bytes: dict[tuple[int, ...], int] = {}
+        # Measured recapture envelopes are runtime evidence, not startup
+        # reserve. A cold descriptor may provisionally receive the whole
+        # available tail, but that discovery grant must never become history:
+        # settlement replaces it with the worker-observed resident aggregate
+        # plus the exact sampling bytes for this step. Only floor growth and
+        # sampling-shape changes relative to that measurement are additive.
+        self._elastic_graph_capture_envelopes: dict[
+            tuple[int, ...], tuple[int, int, int]
+        ] = {}
+        self._elastic_calibration_mode = (
+            os.environ.get("AG2_VLLM_ELASTIC_CALIBRATION", "0") == "1"
+        )
+        self._elastic_restore_mode = False
+        self._elastic_require_catalog = (
+            os.environ.get("AG2_VLLM_ELASTIC_REQUIRE_CATALOG", "0") == "1"
+        )
+        self._elastic_graph_catalog: dict[tuple[int, ...], dict[str, int]] = {}
+        self._elastic_graph_catalog_coverage: dict[str, Any] = {}
+        self._elastic_calibration_boundary: dict[str, int] = {}
+        if self.elastic_on_demand_graphs and not self._elastic_calibration_mode:
+            from vllm.v1.worker.startup_plan import (
+                load_elastic_graph_catalog,
+                load_elastic_graph_catalog_coverage,
+            )
+
+            self._elastic_graph_catalog = load_elastic_graph_catalog(
+                self.vllm_config, kv_cache_config
+            )
+            if self._elastic_graph_catalog:
+                self._elastic_graph_catalog_coverage = (
+                    load_elastic_graph_catalog_coverage(
+                        self.vllm_config, kv_cache_config
+                    )
+                )
+                self.max_num_running_reqs = min(
+                    self.max_num_running_reqs,
+                    self._elastic_graph_catalog_coverage["mixed_max_x"],
+                )
+                logger.info(
+                    "Elastic sealed product boundary enabled: decode_max_x=%d "
+                    "mixed_max_x=%d full_context_max_x=%d scheduler_cap=%d",
+                    self._elastic_graph_catalog_coverage["decode_max_x"],
+                    self._elastic_graph_catalog_coverage["mixed_max_x"],
+                    self._elastic_graph_catalog_coverage["full_context_max_x"],
+                    self.max_num_running_reqs,
+                )
+            for catalog_key, row in self._elastic_graph_catalog.items():
+                self._record_elastic_capture_envelope(
+                    catalog_key,
+                    (
+                        _elastic_catalog_cold_residency_envelope(row),
+                        row["floor_bytes"],
+                        0,
+                    ),
+                )
+                # A bounded short PIECEWISE request has one prefill step and
+                # must reclaim before a fresh cohort crosses admission.  Its
+                # repeated cold-capture envelope is therefore the conservative
+                # same-key replay price; a synthetic inter-cohort HOT counter
+                # is neither reachable nor required.
+                self._elastic_graph_measured_bytes[catalog_key] = (
+                    max(row["cold_peak_bytes"], row["hot_peak_bytes"])
+                    if (
+                        self._elastic_graph_catalog_coverage.get(
+                            "representation"
+                        )
+                        == "bounded_exact_hotset"
+                        and catalog_key[0] == 0
+                    )
+                    else row["hot_peak_bytes"]
+                )
+            if self._elastic_require_catalog and not self._elastic_graph_catalog:
+                raise RuntimeError(
+                    "elastic CUDA Graph catalog is empty; run isolated startup "
+                    "calibration before serving"
+                )
+        if self.elastic_on_demand_graphs and self._elastic_calibration_mode:
+            from vllm.v1.worker.startup_plan import (
+                load_elastic_graph_calibration_boundary,
+                load_elastic_graph_calibration_checkpoint,
+            )
+
+            self._elastic_graph_catalog = (
+                load_elastic_graph_calibration_checkpoint(
+                    self.vllm_config, kv_cache_config
+                )
+            )
+            self._elastic_calibration_boundary = (
+                load_elastic_graph_calibration_boundary(
+                    self.vllm_config, kv_cache_config
+                )
+            )
+            for catalog_key, row in self._elastic_graph_catalog.items():
+                self._record_elastic_capture_envelope(
+                    catalog_key,
+                    (
+                        _elastic_catalog_cold_residency_envelope(row),
+                        row["floor_bytes"],
+                        0,
+                    ),
+                )
+            logger.warning(
+                "Elastic CUDA Graph CALIBRATION mode: synchronized partial "
+                "rows=%d; unseen shapes may consume the exact KV tail before "
+                "READY acceptance",
+                len(self._elastic_graph_catalog),
+            )
+        self._elastic_graph_resident_bytes = 0
+        self._elastic_cublas_workspace_unit_bytes = 0
+        self._elastic_graph_last_maintenance_step_key: tuple[int, ...] | None = None
+        self._elastic_pinned_graph_resident_bytes = 0
+        self._elastic_evictable_graph_resident_bytes = 0
+        # The worker applies the external-memory value carried by a scheduler
+        # output before executing it.  An empty tail step can evict the last
+        # graph and report a smaller resident value, but that smaller value is
+        # only scheduler-local until one more output applies it physically.
+        # Keep the engine alive for that final X0 reconciliation.
+        self._elastic_graph_cleanup_required = False
+        # Ordinary idle/service ticks retain the last HOT graph. Tests,
+        # shutdown and explicit recovery may opt into one X0 teardown step.
+        self._elastic_force_idle_cleanup = False
+        # A serving HOT-set replacement keeps its predecessor executables as
+        # lifetime fences through the first successor replay. Once that
+        # request wave fully drains, an X0 epoch must retire the accumulated
+        # evictable set before a later independent wave is admitted.
+        self._elastic_serving_idle_cleanup_pending = False
+        # A physical floor can outlive the first idle reconciliation while the
+        # preceding async output is still being consumed. Keep issuing X0
+        # cleanup steps for a bounded interval, then fail closed instead of
+        # silently accepting lost KV or spinning forever.
+        self._elastic_graph_idle_cleanup_started_at: float | None = None
+        self._elastic_graph_idle_cleanup_timeout_s = 5.0
+        # Worker-measured bytes that remain physically unavailable after HOT
+        # graph executables are excluded. A changed shape must add this floor
+        # to its capture envelope instead of treating it as reusable headroom.
+        self._elastic_graph_floor_bytes = 0
+        # Proven upper bound for the allocator floor that would remain if the
+        # currently HOT entries were evicted before the next descriptor. This
+        # is distinct from the actual settled floor above and is reported by
+        # the worker from each entry's charged/pool byte ledger.
+        self._elastic_graph_transition_floor_bytes = 0
+        self._elastic_last_graph_admission_rejection: tuple[object, ...] | None = None
+        self._elastic_last_capacity_receipt: tuple[object, ...] | None = None
+        self._elastic_primary_blocks_per_max_request = (
+            get_num_blocks_per_request_for_kv_cache_config(vllm_config, kv_cache_config)
         )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
@@ -272,6 +666,22 @@ class Scheduler(SchedulerInterface):
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
+        self._elastic_short_decode_inventory: Mapping[
+            int, tuple[PhysicalReplayKey, ...]
+        ] = {}
+        if self.elastic_on_demand_graphs:
+            decode_max_x = int(
+                self._elastic_graph_catalog_coverage.get(
+                    "decode_max_x",
+                    self._elastic_calibration_boundary.get(
+                        # A fresh calibration has no sealed boundary yet.  Its
+                        # physical ceiling is the KV-derived resident cap, not
+                        # the configured scheduler width (commonly X64).
+                        "decode_max_x", self.max_num_running_reqs
+                    ),
+                )
+            )
+            self._rebuild_elastic_short_decode_inventory(decode_max_x)
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
         if speculative_config is not None:
@@ -316,6 +726,8 @@ class Scheduler(SchedulerInterface):
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
         )
+        if self.elastic_on_demand_graphs and self._elastic_graph_catalog:
+            self._publish_elastic_startup_capacity()
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
@@ -506,9 +918,7 @@ class Scheduler(SchedulerInterface):
             return None
         return bytes(block_hashes[block_idx])
 
-    def _should_save_gdn_checkpoint(
-        self, request: Request, boundary: int
-    ) -> bool:
+    def _should_save_gdn_checkpoint(self, request: Request, boundary: int) -> bool:
         coordinator = getattr(self, "_gdn_checkpoint_coordinator", None)
         if coordinator is None or not getattr(
             coordinator, "enable_dcp_fine_prefix", False
@@ -643,9 +1053,7 @@ class Scheduler(SchedulerInterface):
             # EAGLE/MTP consumes one matching hash unit as recompute overlap.
             # Materialize exact recurrent state there before continuing to the
             # attention match boundary.
-            fine_resume_boundary
-            if start < fine_resume_boundary < end
-            else 0,
+            fine_resume_boundary if start < fine_resume_boundary < end else 0,
             # Cache the proven shared-prefix junction. The DCP fine-prefix POC
             # pairs this partial attention boundary with an exact host GDN
             # checkpoint; the default path remains block-floored.
@@ -735,6 +1143,7 @@ class Scheduler(SchedulerInterface):
         if (
             self.prefill_admission_delay_s <= 0
             or self.max_concurrent_partial_prefills <= 1
+            or self._elastic_calibration_mode
             or self.running
             or self.num_waiting_for_streaming_input > 0
         ):
@@ -778,8 +1187,670 @@ class Scheduler(SchedulerInterface):
             return True
         return now - newest_arrival_time < self.prefill_admission_delay_s
 
+    def _preflight_elastic_running_text_wave(
+        self,
+        *,
+        token_budget: int,
+        prefill_chunk_cap: int,
+        defer_prefills: bool,
+    ) -> tuple[tuple[int, ...] | None, bool]:
+        """Price one complete visible text wave before prefix admission.
+
+        The model executes the final assembled batch, not each prefix visited
+        by the scheduler loop. Preparing maintenance for those prefixes makes
+        X1, X2, ... evict and recapture each other while assembling a larger
+        steady cohort. This preflight covers the complete encoder-free RUNNING
+        text wave, including partial-prefill and mixed waves. It mirrors the
+        running loop's token caps and deferrals, but performs no request, KV,
+        or draft mutation. Encoder work remains fail-closed because its
+        separate budget and cache planning can change the visible text shape.
+
+        Returns the final canonical key and whether request-free maintenance
+        was prepared for the next scheduler output.
+        """
+        self._elastic_preflight_joint_waiting_request_ids: tuple[str, ...] = ()
+        self._elastic_preflight_waiting_ignore_prefix_request_ids: tuple[str, ...] = ()
+        if (
+            not self.elastic_on_demand_graphs
+            or getattr(self, "_elastic_calibration_mode", False)
+            or token_budget <= 0
+            or self._pending_elastic_maintenance_requires_exclusive_tick()
+            or self.num_waiting_for_streaming_input
+        ):
+            return None, False
+
+        prospective_tokens: dict[str, int] = {}
+        prospective_drafts: dict[str, list[int]] = {}
+        computed_overrides: dict[str, int] = {}
+        remaining_budget = token_budget
+        for request in self.running:
+            if (
+                request.num_output_placeholders > 0
+                and request.num_computed_tokens
+                + 2
+                - request.num_output_placeholders
+                >= request.num_prompt_tokens + request.max_tokens
+            ):
+                continue
+            if self.current_step < request.next_decode_eligible_step:
+                continue
+            if defer_prefills and request.is_prefill_chunk:
+                continue
+            if request.has_encoder_inputs:
+                return None, False
+
+            num_new_tokens = (
+                request.num_tokens_with_spec
+                + request.num_output_placeholders
+                - request.num_computed_tokens
+            )
+            num_new_tokens = self._cap_prefill_chunk(
+                request, num_new_tokens, prefill_chunk_cap
+            )
+            long_prefill_chunk_cap = self._long_prefill_chunk_cap(request)
+            if 0 < long_prefill_chunk_cap < num_new_tokens:
+                num_new_tokens = long_prefill_chunk_cap
+            num_new_tokens = min(num_new_tokens, remaining_budget)
+            num_new_tokens = min(
+                num_new_tokens,
+                self.max_model_len
+                - request.num_computed_tokens
+                - self.num_sampled_tokens_per_step,
+            )
+            if num_new_tokens <= 0:
+                continue
+            if self.need_mamba_block_aligned_split:
+                num_new_tokens = self._mamba_block_aligned_split(
+                    request, num_new_tokens
+                )
+                if num_new_tokens <= 0:
+                    continue
+
+            prospective_tokens[request.request_id] = num_new_tokens
+            remaining_budget -= num_new_tokens
+            if request.spec_token_ids:
+                prospective_spec_count = (
+                    num_new_tokens
+                    + request.num_computed_tokens
+                    - request.num_tokens
+                    - request.num_output_placeholders
+                )
+                if prospective_spec_count > 0:
+                    prospective_drafts[request.request_id] = (
+                        request.spec_token_ids[:prospective_spec_count]
+                    )
+            if remaining_budget <= 0:
+                break
+
+        running_wave_tokens = dict(prospective_tokens)
+        running_wave_drafts = dict(prospective_drafts)
+        running_wave_remaining_budget = remaining_budget
+
+        # A product retry can arrive while the preceding cohort is still
+        # decoding (for example, repetition recovery changes X32 to
+        # Running31+Waiting1).  Price the exact combined wave up front instead
+        # of disabling complete-wave preflight and repeatedly probing a cold
+        # X1 prefix.  Keep this fast path deliberately narrow: unsupported
+        # connector/encoder/LoRA/streaming state falls back to running-only
+        # progress and is reconsidered without mutating the waiting request.
+        joint_waiting_tokens = dict(prospective_tokens)
+        joint_waiting_drafts = dict(prospective_drafts)
+        joint_computed_overrides: dict[str, int] = {}
+        joint_remaining_budget = remaining_budget
+        joint_waiting_count = 0
+        joint_waiting_supported = bool(prospective_tokens) and bool(
+            self.waiting or self.skipped_waiting
+        ) and not (
+            self.policy != SchedulingPolicy.FCFS
+            or self.num_waiting_for_streaming_input
+            or self.connector is not None
+            or self.ec_connector is not None
+            or self.lora_config is not None
+            or self.kv_cache_manager.enable_kv_cache_events
+            or self.canonical_prefill_admission
+        )
+        if joint_waiting_supported:
+            available_slots = max(
+                0,
+                self.max_num_running_reqs
+                - len(self.running)
+                - self.num_waiting_for_streaming_input,
+            )
+            waiting_candidates = self._elastic_schedulable_waiting_snapshot()
+            running_wave_is_pure_decode = self._is_pure_decode_step(
+                prospective_tokens,
+                prospective_drafts,
+            )
+            for request in waiting_candidates or ():
+                if joint_waiting_count >= available_slots:
+                    break
+                if (
+                    request.num_computed_tokens != 0
+                    or request.num_stale_output_tokens > 0
+                    or request.has_encoder_inputs
+                ):
+                    break
+                _blocks, num_computed_tokens, _junction = (
+                    self.kv_cache_manager.get_computed_blocks(request)
+                )
+                if defer_prefills and num_computed_tokens < request.num_tokens - 1:
+                    break
+                num_new_tokens = request.num_tokens - num_computed_tokens
+                pad_spec_decode = bool(
+                    self.num_spec_tokens > 0
+                    and self.dynamic_sd_lookup is None
+                    and self.num_sampled_tokens_per_step > 0
+                    and num_new_tokens == 1
+                    and prospective_tokens
+                    and running_wave_is_pure_decode
+                )
+                if pad_spec_decode:
+                    num_new_tokens = 1 + self.num_spec_tokens
+                    if (
+                        num_new_tokens > joint_remaining_budget
+                        or num_computed_tokens + num_new_tokens
+                        > self.max_model_len
+                    ):
+                        break
+                num_new_tokens = self._cap_prefill_chunk(
+                    request, num_new_tokens, prefill_chunk_cap
+                )
+                long_prefill_chunk_cap = self._long_prefill_chunk_cap(request)
+                if 0 < long_prefill_chunk_cap < num_new_tokens:
+                    num_new_tokens = long_prefill_chunk_cap
+                if (
+                    not self.scheduler_config.enable_chunked_prefill
+                    and num_new_tokens > joint_remaining_budget
+                ):
+                    break
+                num_new_tokens = min(num_new_tokens, joint_remaining_budget)
+                if self.need_mamba_block_aligned_split:
+                    num_new_tokens = self._mamba_block_aligned_split(
+                        request,
+                        num_new_tokens,
+                        num_computed_tokens,
+                        0,
+                    )
+                if num_new_tokens <= 0:
+                    break
+                joint_waiting_tokens[request.request_id] = num_new_tokens
+                joint_computed_overrides[request.request_id] = num_computed_tokens
+                if pad_spec_decode:
+                    joint_waiting_drafts[request.request_id] = (
+                        [-1] * self.num_spec_tokens
+                    )
+                joint_remaining_budget -= num_new_tokens
+                joint_waiting_count += 1
+                if joint_remaining_budget <= 0:
+                    break
+            if joint_waiting_count:
+                prospective_tokens = joint_waiting_tokens
+                prospective_drafts = joint_waiting_drafts
+                computed_overrides = joint_computed_overrides
+                remaining_budget = joint_remaining_budget
+                self._elastic_preflight_joint_waiting_request_ids = tuple(
+                    joint_computed_overrides
+                )
+
+        if not prospective_tokens:
+            if self._elastic_staged_hotset_step_key is not None:
+                self._elastic_staged_hotset_abort_pending = True
+            return None, False
+        is_pure_decode = self._is_pure_decode_step(
+            prospective_tokens,
+            prospective_drafts,
+            computed_token_overrides=computed_overrides,
+        )
+        num_spec_tokens = self._num_spec_tokens_for_step(
+            prospective_tokens,
+            is_pure_decode,
+        )
+        final_key = self._canonical_elastic_graph_step_key(
+            prospective_tokens,
+            num_spec_tokens,
+            is_pure_decode,
+        )
+        staged_step_key = self._elastic_staged_hotset_step_key
+        if staged_step_key is not None and final_key != staged_step_key:
+            self._elastic_staged_hotset_abort_pending = True
+            return None, False
+        remaining_requirements = self._elastic_remaining_resource_requirements(
+            prospective_tokens
+        )
+        minimum_free_primary_blocks = (
+            self._elastic_successor_primary_headroom(
+                prospective_tokens,
+                computed_token_overrides=computed_overrides,
+            )
+            + remaining_requirements.primary
+        )
+        fits, required_external, available_external = (
+            self._can_fund_elastic_graph_step(
+                final_key,
+                minimum_free_primary_blocks=minimum_free_primary_blocks,
+                gdn_blocks=(
+                    self.kv_cache_manager.coordinator
+                    .elastic_gdn_blocks_after_allocation(
+                        remaining_requirements.mamba
+                    )
+                ),
+                allow_maintenance=True,
+            )
+        )
+        if fits and self._reserve_elastic_admission(
+            final_key,
+            external_memory_bytes=required_external,
+            minimum_free_primary_blocks=minimum_free_primary_blocks,
+            requirements=remaining_requirements,
+        ):
+            return final_key, False
+        if self._elastic_pending_maintenance_plan is not None:
+            if joint_waiting_count:
+                # Prefix-cache peeks for new arrivals are not jointly leased
+                # with the running cohort. If the optimistic combined shape is
+                # COLD, bind the same full request cohort to a conservative
+                # no-prefix view rather than capturing an unstable owner set.
+                self._elastic_pending_maintenance_plan = None
+                self._elastic_pending_maintenance_step_key = None
+                prospective_tokens = running_wave_tokens
+                prospective_drafts = running_wave_drafts
+                computed_overrides = {}
+                remaining_budget = running_wave_remaining_budget
+                conservative_waiting_ids: list[str] = []
+                available_slots = max(
+                    0,
+                    self.max_num_running_reqs
+                    - len(self.running)
+                    - self.num_waiting_for_streaming_input,
+                )
+                for request in waiting_candidates or ():
+                    if len(conservative_waiting_ids) >= available_slots:
+                        break
+                    num_new_tokens = self._cap_prefill_chunk(
+                        request, request.num_tokens, prefill_chunk_cap
+                    )
+                    long_prefill_chunk_cap = self._long_prefill_chunk_cap(request)
+                    if 0 < long_prefill_chunk_cap < num_new_tokens:
+                        num_new_tokens = long_prefill_chunk_cap
+                    num_new_tokens = min(num_new_tokens, remaining_budget)
+                    if self.need_mamba_block_aligned_split:
+                        num_new_tokens = self._mamba_block_aligned_split(
+                            request, num_new_tokens, 0, 0
+                        )
+                    if num_new_tokens <= 0:
+                        break
+                    prospective_tokens[request.request_id] = num_new_tokens
+                    computed_overrides[request.request_id] = 0
+                    conservative_waiting_ids.append(request.request_id)
+                    remaining_budget -= num_new_tokens
+                    if remaining_budget <= 0:
+                        break
+                is_pure_decode = self._is_pure_decode_step(
+                    prospective_tokens,
+                    prospective_drafts,
+                    computed_token_overrides=computed_overrides,
+                )
+                num_spec_tokens = self._num_spec_tokens_for_step(
+                    prospective_tokens, is_pure_decode
+                )
+                final_key = self._canonical_elastic_graph_step_key(
+                    prospective_tokens, num_spec_tokens, is_pure_decode
+                )
+                remaining_requirements = (
+                    self._elastic_remaining_resource_requirements(
+                        prospective_tokens
+                    )
+                )
+                minimum_free_primary_blocks = (
+                    self._elastic_successor_primary_headroom(
+                        prospective_tokens,
+                        computed_token_overrides=computed_overrides,
+                    )
+                    + remaining_requirements.primary
+                )
+                fits, required_external, available_external = (
+                    self._can_fund_elastic_graph_step(
+                        final_key,
+                        minimum_free_primary_blocks=minimum_free_primary_blocks,
+                        gdn_blocks=(
+                            self.kv_cache_manager.coordinator
+                            .elastic_gdn_blocks_after_allocation(
+                                remaining_requirements.mamba
+                            )
+                        ),
+                        allow_maintenance=True,
+                    )
+                )
+                conservative_ids = tuple(conservative_waiting_ids)
+                self._elastic_preflight_joint_waiting_request_ids = conservative_ids
+                self._elastic_preflight_waiting_ignore_prefix_request_ids = (
+                    conservative_ids
+                )
+                if fits and self._reserve_elastic_admission(
+                    final_key,
+                    external_memory_bytes=required_external,
+                    minimum_free_primary_blocks=minimum_free_primary_blocks,
+                    requirements=remaining_requirements,
+                ):
+                    return final_key, False
+                if (
+                    self._elastic_pending_maintenance_plan is not None
+                    and self._reserve_pending_elastic_maintenance_admission(
+                        final_key,
+                        minimum_free_primary_blocks=minimum_free_primary_blocks,
+                        requirements=remaining_requirements,
+                    )
+                ):
+                    return final_key, True
+                self._elastic_preflight_joint_waiting_request_ids = ()
+                self._elastic_preflight_waiting_ignore_prefix_request_ids = ()
+                return None, False
+            if self._reserve_pending_elastic_maintenance_admission(
+                final_key,
+                minimum_free_primary_blocks=minimum_free_primary_blocks,
+                requirements=remaining_requirements,
+            ):
+                return final_key, True
+            return None, False
+        logger.debug(
+            "Complete RUNNING text wave deferred before KV mutation: "
+            "required_bytes=%d available_bytes=%d step_key=%r reason=%s",
+            required_external,
+            available_external,
+            final_key,
+            getattr(self, "_elastic_last_defer_reason", None),
+        )
+        return None, False
+
+    def _preflight_elastic_waiting_text_wave(
+        self,
+        *,
+        token_budget: int,
+        prefill_chunk_cap: int,
+        defer_prefills: bool,
+    ) -> tuple[tuple[int, ...] | None, bool, tuple[str, ...]]:
+        """Price one complete idle text-admission wave before its prefixes.
+
+        This is intentionally narrower than the general waiting scheduler: a
+        connector, encoder/MM input, LoRA conflict, stale output, blocked
+        status, or KV-event side effect remains fail-closed.  The supported
+        product lane peeks the local prefix cache, derives every candidate's
+        exact token contribution, and prepares at most one final owner set.
+        No request status, block ownership, or candidate lease changes here.
+        Ready structured grammars are viewed semantically as WAITING while
+        remaining in ``skipped_waiting`` until the normal commit loop promotes
+        them. The returned IDs bind the reservation to that exact readiness
+        snapshot, so a newly-ready request cannot substitute a different shape.
+        """
+        if (
+            not self.elastic_on_demand_graphs
+            or getattr(self, "_elastic_calibration_mode", False)
+            or token_budget <= 0
+            or self._pending_elastic_maintenance_requires_exclusive_tick()
+            or self.running
+            or not (self.waiting or self.skipped_waiting)
+            or self.policy != SchedulingPolicy.FCFS
+            or self.num_waiting_for_streaming_input
+            or defer_prefills
+            or self.connector is not None
+            or self.ec_connector is not None
+            or self.lora_config is not None
+            or self.kv_cache_manager.enable_kv_cache_events
+        ):
+            return None, False, ()
+
+        prospective_tokens: dict[str, int] = {}
+        computed_overrides: dict[str, int] = {}
+        remaining_budget = token_budget
+        waiting_candidates = self._elastic_schedulable_waiting_snapshot()
+        if waiting_candidates is None:
+            return None, False, ()
+        for request in waiting_candidates:
+            if len(prospective_tokens) >= self.max_num_running_reqs:
+                break
+            if (
+                request.num_computed_tokens != 0
+                or request.num_stale_output_tokens > 0
+                or request.has_encoder_inputs
+            ):
+                return None, False, ()
+            _blocks, num_computed_tokens, _junction = (
+                self.kv_cache_manager.get_computed_blocks(request)
+            )
+            num_new_tokens = request.num_tokens - num_computed_tokens
+            num_new_tokens = self._cap_prefill_chunk(
+                request, num_new_tokens, prefill_chunk_cap
+            )
+            long_prefill_chunk_cap = self._long_prefill_chunk_cap(request)
+            if 0 < long_prefill_chunk_cap < num_new_tokens:
+                num_new_tokens = long_prefill_chunk_cap
+            num_new_tokens = min(num_new_tokens, remaining_budget)
+            if self.need_mamba_block_aligned_split:
+                num_new_tokens = self._mamba_block_aligned_split(
+                    request,
+                    num_new_tokens,
+                    num_computed_tokens,
+                    0,
+                )
+            if num_new_tokens <= 0:
+                return None, False, ()
+            prospective_tokens[request.request_id] = num_new_tokens
+            computed_overrides[request.request_id] = num_computed_tokens
+            remaining_budget -= num_new_tokens
+            if remaining_budget <= 0:
+                break
+
+        if not prospective_tokens:
+            if self._elastic_staged_hotset_step_key is not None:
+                self._elastic_staged_hotset_abort_pending = True
+            return None, False, ()
+        is_pure_decode = self._is_pure_decode_step(
+            prospective_tokens,
+            {},
+            computed_token_overrides=computed_overrides,
+        )
+        num_spec_tokens = self._num_spec_tokens_for_step(
+            prospective_tokens,
+            is_pure_decode,
+        )
+        final_key = self._canonical_elastic_graph_step_key(
+            prospective_tokens,
+            num_spec_tokens,
+            is_pure_decode,
+        )
+        staged_step_key = self._elastic_staged_hotset_step_key
+        if staged_step_key is not None and final_key != staged_step_key:
+            self._elastic_staged_hotset_abort_pending = True
+            return None, False, ()
+        remaining_requirements = self._elastic_remaining_resource_requirements(
+            prospective_tokens
+        )
+        minimum_free_primary_blocks = (
+            self._elastic_successor_primary_headroom(
+                prospective_tokens,
+                computed_token_overrides=computed_overrides,
+            )
+            + remaining_requirements.primary
+        )
+        fits, required_external, available_external = (
+            self._can_fund_elastic_graph_step(
+                final_key,
+                minimum_free_primary_blocks=minimum_free_primary_blocks,
+                gdn_blocks=(
+                    self.kv_cache_manager.coordinator
+                    .elastic_gdn_blocks_after_allocation(
+                        remaining_requirements.mamba
+                    )
+                ),
+                allow_maintenance=True,
+            )
+        )
+        if fits and self._reserve_elastic_admission(
+            final_key,
+            external_memory_bytes=required_external,
+            minimum_free_primary_blocks=minimum_free_primary_blocks,
+            requirements=remaining_requirements,
+        ):
+            return final_key, False, tuple(prospective_tokens)
+        if self._elastic_pending_maintenance_plan is not None:
+            if any(computed_overrides.values()):
+                # Independent prefix-cache peeks can overbook the same
+                # reclaimable blocks across a joint waiting wave. The normal
+                # allocator mutates ownership request by request and may then
+                # commit a radically different prefill shape. For a COLD graph
+                # transition only, reprice the exact wave without speculative
+                # prefix adoption and bind normal admission to that view.
+                self._elastic_pending_maintenance_plan = None
+                self._elastic_pending_maintenance_step_key = None
+                prospective_tokens = {}
+                computed_overrides = {}
+                remaining_budget = token_budget
+                for request in waiting_candidates:
+                    if len(prospective_tokens) >= self.max_num_running_reqs:
+                        break
+                    num_new_tokens = self._cap_prefill_chunk(
+                        request, request.num_tokens, prefill_chunk_cap
+                    )
+                    long_prefill_chunk_cap = self._long_prefill_chunk_cap(request)
+                    if 0 < long_prefill_chunk_cap < num_new_tokens:
+                        num_new_tokens = long_prefill_chunk_cap
+                    num_new_tokens = min(num_new_tokens, remaining_budget)
+                    if self.need_mamba_block_aligned_split:
+                        num_new_tokens = self._mamba_block_aligned_split(
+                            request, num_new_tokens, 0, 0
+                        )
+                    if num_new_tokens <= 0:
+                        break
+                    prospective_tokens[request.request_id] = num_new_tokens
+                    computed_overrides[request.request_id] = 0
+                    remaining_budget -= num_new_tokens
+                    if remaining_budget <= 0:
+                        break
+                is_pure_decode = self._is_pure_decode_step(
+                    prospective_tokens,
+                    {},
+                    computed_token_overrides=computed_overrides,
+                )
+                num_spec_tokens = self._num_spec_tokens_for_step(
+                    prospective_tokens, is_pure_decode
+                )
+                final_key = self._canonical_elastic_graph_step_key(
+                    prospective_tokens, num_spec_tokens, is_pure_decode
+                )
+                remaining_requirements = (
+                    self._elastic_remaining_resource_requirements(
+                        prospective_tokens
+                    )
+                )
+                minimum_free_primary_blocks = (
+                    self._elastic_successor_primary_headroom(
+                        prospective_tokens,
+                        computed_token_overrides=computed_overrides,
+                    )
+                    + remaining_requirements.primary
+                )
+                fits, required_external, available_external = (
+                    self._can_fund_elastic_graph_step(
+                        final_key,
+                        minimum_free_primary_blocks=minimum_free_primary_blocks,
+                        gdn_blocks=(
+                            self.kv_cache_manager.coordinator
+                            .elastic_gdn_blocks_after_allocation(
+                                remaining_requirements.mamba
+                            )
+                        ),
+                        allow_maintenance=True,
+                    )
+                )
+                request_ids = tuple(prospective_tokens)
+                if fits and self._reserve_elastic_admission(
+                    final_key,
+                    external_memory_bytes=required_external,
+                    minimum_free_primary_blocks=minimum_free_primary_blocks,
+                    requirements=remaining_requirements,
+                ):
+                    self._elastic_preflight_waiting_ignore_prefix_request_ids = (
+                        request_ids
+                    )
+                    return final_key, False, request_ids
+                if (
+                    self._elastic_pending_maintenance_plan is not None
+                    and self._reserve_pending_elastic_maintenance_admission(
+                        final_key,
+                        minimum_free_primary_blocks=minimum_free_primary_blocks,
+                        requirements=remaining_requirements,
+                    )
+                ):
+                    self._elastic_preflight_waiting_ignore_prefix_request_ids = (
+                        request_ids
+                    )
+                    return final_key, True, request_ids
+                return None, False, ()
+            if self._reserve_pending_elastic_maintenance_admission(
+                final_key,
+                minimum_free_primary_blocks=minimum_free_primary_blocks,
+                requirements=remaining_requirements,
+            ):
+                return final_key, True, tuple(prospective_tokens)
+            return None, False, ()
+        logger.debug(
+            "Complete WAITING text wave deferred before KV mutation: "
+            "required_bytes=%d available_bytes=%d step_key=%r reason=%s",
+            required_external,
+            available_external,
+            final_key,
+            getattr(self, "_elastic_last_defer_reason", None),
+        )
+        return None, False, ()
+
+    def _elastic_schedulable_waiting_snapshot(
+        self,
+    ) -> tuple[Request, ...] | None:
+        """Return the exact FCFS text candidates schedulable in this tick.
+
+        Structured grammar readiness is observed without moving queue entries.
+        Other blocked states are skipped exactly as the normal waiting loop
+        skips them. Unsupported ready state fails closed instead of pricing a
+        wave different from the one the commit loop can assemble.
+        """
+        if self.policy != SchedulingPolicy.FCFS:
+            return None
+        candidates: list[Request] = []
+        for request in itertools.chain(self.skipped_waiting, self.waiting):
+            status = request.status
+            if status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
+                structured = request.structured_output_request
+                grammar = structured.grammar if structured is not None else None
+                if grammar is None:
+                    continue
+                if isinstance(grammar, Exception):
+                    self.grammar_compile_error_reqs.add(request.request_id)
+                    continue
+                status = RequestStatus.WAITING
+            elif self._is_blocked_waiting_status(status):
+                continue
+            if status != RequestStatus.WAITING:
+                return None
+            if (
+                request.num_computed_tokens != 0
+                or request.num_stale_output_tokens > 0
+                or request.has_encoder_inputs
+            ):
+                return None
+            candidates.append(request)
+        return tuple(candidates)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        if not self.running and not self.waiting and not self.skipped_waiting:
+            self._elastic_graph_carrier_step_key = None
+        if (
+            self._elastic_staged_hotset_plan is not None
+            and not self.running
+            and not self.waiting
+            and not self.skipped_waiting
+        ):
+            self._elastic_staged_hotset_abort_pending = True
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -803,6 +1874,14 @@ class Scheduler(SchedulerInterface):
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
+        elif self._elastic_staged_hotset_abort_pending:
+            token_budget = 0
+        elif self._pending_elastic_maintenance_requires_exclusive_tick():
+            # Startup calibration/restore and explicit reclaim have no USER
+            # consumer and therefore retain a request-free transaction. A
+            # serving COLD plan must instead be rebound to an exact USER wave
+            # below so capture and first replay share one resource commit.
+            token_budget = 0
         prefill_target_count = self._partial_prefill_target_count()
         prefill_chunk_cap = self._partial_prefill_chunk_cap(prefill_target_count)
 
@@ -815,6 +1894,9 @@ class Scheduler(SchedulerInterface):
         prefill_scheduled = False
         # For logging.
         scheduled_timestamp = time.monotonic()
+        calibration_execution_step_key = getattr(
+            self, "_elastic_calibration_execution_step_key", None
+        )
 
         self.kv_cache_manager.new_step_starts()
 
@@ -823,6 +1905,31 @@ class Scheduler(SchedulerInterface):
         defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
+
+        elastic_preplanned_running_step_key, _prepared_running_maintenance = (
+            self._preflight_elastic_running_text_wave(
+                token_budget=token_budget,
+                prefill_chunk_cap=prefill_chunk_cap,
+                defer_prefills=defer_prefills,
+            )
+        )
+        serving_pending_maintenance = bool(
+            self._elastic_pending_maintenance_plan is not None
+            and not self._pending_elastic_maintenance_requires_exclusive_tick()
+        )
+        if (
+            serving_pending_maintenance
+            and self.running
+            and elastic_preplanned_running_step_key is None
+        ):
+            # The pending owner set is not authority to mutate a different or
+            # not-yet-observable wave. Preserve it until exact preflight can
+            # bind and reserve the first USER consumer.
+            token_budget = 0
+        if self._elastic_staged_hotset_abort_pending:
+            token_budget = 0
+        elastic_preplanned_waiting_step_key: tuple[int, ...] | None = None
+        elastic_preplanned_waiting_request_ids: tuple[str, ...] = ()
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -882,6 +1989,7 @@ class Scheduler(SchedulerInterface):
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
             external_load_encoder_input: list[int] = []
+            cached_encoder_inputs: list[int] = []
             new_encoder_compute_budget = encoder_compute_budget
             if request.has_encoder_inputs:
                 (
@@ -889,6 +1997,7 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens,
                     new_encoder_compute_budget,
                     external_load_encoder_input,
+                    cached_encoder_inputs,
                 ) = self._try_schedule_encoder_inputs(
                     request,
                     request.num_computed_tokens,
@@ -919,6 +2028,91 @@ class Scheduler(SchedulerInterface):
                 # allow the lower-priority requests to be scheduled.
                 req_index += 1
                 continue
+
+            # A RUNNING request can change the physical owner set at the
+            # prefill -> decode boundary.  Waiting admission already performs
+            # this preflight, but historically the running loop reached
+            # allocate_slots first and discovered a COLD FULL owner only at
+            # the user commit boundary.  Price the exact prospective shape
+            # before any request/KV/spec mutation.  An empty-prefix miss emits
+            # the scheduler-owned maintenance step; a later miss simply stops
+            # this batch at the already executable prefix.
+            if (
+                self.elastic_on_demand_graphs
+                and calibration_execution_step_key is None
+                and elastic_preplanned_running_step_key is None
+            ):
+                prospective_tokens = dict(num_scheduled_tokens)
+                prospective_tokens[request.request_id] = num_new_tokens
+                prospective_drafts = dict(scheduled_spec_decode_tokens)
+                if request.spec_token_ids:
+                    prospective_spec_count = (
+                        num_new_tokens
+                        + request.num_computed_tokens
+                        - request.num_tokens
+                        - request.num_output_placeholders
+                    )
+                    if prospective_spec_count > 0:
+                        prospective_drafts[request.request_id] = (
+                            request.spec_token_ids[:prospective_spec_count]
+                        )
+                prospective_is_pure_decode = self._is_pure_decode_step(
+                    prospective_tokens,
+                    prospective_drafts,
+                )
+                prospective_k = self._num_spec_tokens_for_step(
+                    prospective_tokens,
+                    prospective_is_pure_decode,
+                )
+                prospective_step_key = self._canonical_elastic_graph_step_key(
+                    prospective_tokens,
+                    prospective_k,
+                    prospective_is_pure_decode,
+                )
+                remaining_requirements = (
+                    self._elastic_remaining_resource_requirements(
+                        prospective_tokens
+                    )
+                )
+                graph_fits, required_external, available_external = (
+                    self._can_fund_elastic_graph_step(
+                        prospective_step_key,
+                        minimum_free_primary_blocks=(
+                            self._elastic_successor_primary_headroom(
+                                prospective_tokens
+                            )
+                            + remaining_requirements.primary
+                        ),
+                        gdn_blocks=(
+                            self.kv_cache_manager.coordinator
+                            .elastic_gdn_blocks_after_allocation(
+                                remaining_requirements.mamba
+                            )
+                        ),
+                        allow_maintenance=(
+                            not num_scheduled_tokens and len(self.running) == 1
+                        ),
+                        mm_activation_loan_bytes=(
+                            self._elastic_mm_activation_loan_bytes
+                            if encoder_inputs_to_schedule
+                            else 0
+                        ),
+                    )
+                )
+                if not graph_fits:
+                    if not num_scheduled_tokens:
+                        logger.debug(
+                            "Minimum RUNNING Graph step deferred: "
+                            "required_bytes=%d available_bytes=%d "
+                            "step_key=%r reason=%s",
+                            required_external,
+                            available_external,
+                            prospective_step_key,
+                            getattr(self, "_elastic_last_defer_reason", None),
+                        )
+                    if not num_scheduled_tokens:
+                        token_budget = 0
+                    break
 
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
@@ -1034,19 +2228,15 @@ class Scheduler(SchedulerInterface):
                 request.spec_token_ids = []
 
             # Encoder-related.
+            self._commit_encoder_cache_plan(
+                request,
+                cached_encoder_inputs,
+                encoder_inputs_to_schedule,
+                external_load_encoder_input,
+            )
             if encoder_inputs_to_schedule:
                 scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
-                # Allocate the encoder cache.
-                for i in encoder_inputs_to_schedule:
-                    self.encoder_cache_manager.allocate(request, i)
-                    if self.ec_connector is not None:
-                        self.ec_connector.update_state_after_alloc(request, i)
                 encoder_compute_budget = new_encoder_compute_budget
-            if external_load_encoder_input:
-                for i in external_load_encoder_input:
-                    self.encoder_cache_manager.allocate(request, i)
-                    if self.ec_connector is not None:
-                        self.ec_connector.update_state_after_alloc(request, i)
 
         # Record the LoRAs in scheduled_running_reqs
         scheduled_loras: set[int] = set()
@@ -1059,20 +2249,85 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
+        calibration_wave_step_key = getattr(
+            self, "_elastic_calibration_wave_step_key", None
+        )
+        calibration_wave_stop_reason: str | None = None
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
-            self._reserve_elastic_waiting_wave(token_budget)
             delay_waiting_prefills = self._should_delay_waiting_prefill_admission()
+            joint_waiting_request_ids = getattr(
+                self, "_elastic_preflight_joint_waiting_request_ids", ()
+            )
+            if elastic_preplanned_running_step_key is not None:
+                if num_scheduled_tokens and joint_waiting_request_ids:
+                    elastic_preplanned_waiting_step_key = (
+                        elastic_preplanned_running_step_key
+                    )
+                    elastic_preplanned_waiting_request_ids = (
+                        joint_waiting_request_ids
+                    )
+                    delay_waiting_prefills = False
+                else:
+                    # The running reservation cannot be expanded by an
+                    # unpriced waiting candidate in this commit.
+                    delay_waiting_prefills = True
+            if not num_scheduled_tokens and not delay_waiting_prefills:
+                (
+                    elastic_preplanned_waiting_step_key,
+                    _prepared_waiting_maintenance,
+                    elastic_preplanned_waiting_request_ids,
+                ) = self._preflight_elastic_waiting_text_wave(
+                    token_budget=token_budget,
+                    prefill_chunk_cap=prefill_chunk_cap,
+                    defer_prefills=defer_prefills,
+                )
+                if self._elastic_staged_hotset_abort_pending:
+                    token_budget = 0
+                if (
+                    serving_pending_maintenance
+                    and elastic_preplanned_waiting_step_key is None
+                ):
+                    token_budget = 0
 
             while (
                 not delay_waiting_prefills
                 and (self.waiting or self.skipped_waiting)
                 and token_budget > 0
             ):
+                calibration_wave_target = getattr(
+                    self, "_elastic_calibration_wave_target", 0
+                )
+                if (
+                    elastic_preplanned_waiting_request_ids
+                    and all(
+                        request_id in num_scheduled_tokens
+                        for request_id in elastic_preplanned_waiting_request_ids
+                    )
+                ):
+                    calibration_wave_stop_reason = "preplanned_ids_complete"
+                    break
+                if (
+                    self._elastic_calibration_mode
+                    and calibration_wave_target
+                    and len(num_scheduled_tokens) >= calibration_wave_target
+                ):
+                    # ``prepare_elastic_calibration_admission`` has committed
+                    # one exact finite prefix. Incremental candidate leases can
+                    # become less restrictive after that layout transition,
+                    # but they may not expand the declared transaction. The
+                    # next probe will redistribute the same workload over the
+                    # returned prefix and price that exact final shape.
+                    calibration_wave_stop_reason = "prepared_target_complete"
+                    break
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
                 if num_running >= self.max_num_running_reqs:
+                    calibration_wave_stop_reason = (
+                        "resident_cap:"
+                        f"running={num_running}:cap={self.max_num_running_reqs}"
+                    )
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
@@ -1090,6 +2345,17 @@ class Scheduler(SchedulerInterface):
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request_id,
                         )
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
+                if (
+                    elastic_preplanned_waiting_step_key is not None
+                    and request_id not in elastic_preplanned_waiting_request_ids
+                ):
+                    # Readiness may change after preflight. Never substitute a
+                    # new request for one of the exact IDs whose Graph/KV wave
+                    # was priced before mutation.
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -1120,6 +2386,31 @@ class Scheduler(SchedulerInterface):
                     step_skipped_waiting.prepend_request(request)
                     continue
 
+                if self._has_prepared_elastic_waiting_admission(
+                    elastic_preplanned_waiting_step_key,
+                    calibration_wave_target,
+                ):
+                    # The joint product grant or explicit calibration-wave
+                    # grant already mapped the complete KV/GDN/Graph envelope.
+                    # A per-candidate wave would replace that atomic layout
+                    # with current+lookahead and can underfill the declared
+                    # X before the final Graph commit (observed as X43 -> X42
+                    # at K3/B4096). Consume the prepared reservation directly.
+                    elastic_candidate_lease = 2
+                else:
+                    elastic_candidate_lease = self._apply_elastic_waiting_candidate(
+                        request,
+                        token_budget=token_budget,
+                        waiting_count=len(self.waiting) + len(self.skipped_waiting),
+                    )
+                if (
+                    self.kv_cache_manager.kv_cache_config.elastic_mapping_quantum
+                    and elastic_candidate_lease == 0
+                ):
+                    calibration_wave_stop_reason = "elastic_candidate_lease_zero"
+                    break
+                stop_after_elastic_candidate = elastic_candidate_lease == 1
+
                 num_external_computed_tokens = 0
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
@@ -1127,10 +2418,19 @@ class Scheduler(SchedulerInterface):
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
-                    did_prefix_cache_lookup = True
+                    ignore_prefix = request_id in (
+                        self._elastic_preflight_waiting_ignore_prefix_request_ids
+                    )
+                    did_prefix_cache_lookup = not ignore_prefix
                     hit_diverged = False
                     # Get locally-cached tokens.
-                    if self.connector is not None:
+                    if ignore_prefix:
+                        new_computed_blocks = (
+                            self.kv_cache_manager.empty_kv_cache_blocks
+                        )
+                        num_new_local_computed_tokens = 0
+                        request.shared_prefix_boundary = 0
+                    elif self.connector is not None:
                         # A KV connector transfers the missing suffix, which needs a
                         # hybrid-aware lookup that can diverge across groups.
                         (
@@ -1149,12 +2449,11 @@ class Scheduler(SchedulerInterface):
                             request.shared_prefix_boundary,
                         ) = self.kv_cache_manager.get_computed_blocks(request)
 
-                    if request.prefix_cache_hint_tokens:
-                        if (
-                            request.prefix_cache_hint_tokens
-                            % self.hash_block_size
-                            != 0
-                        ):
+                    if (
+                        request.prefix_cache_hint_tokens
+                        and not ignore_prefix
+                    ):
+                        if request.prefix_cache_hint_tokens % self.hash_block_size != 0:
                             raise RuntimeError(
                                 "Validated prefix-cache hint is not hash aligned"
                             )
@@ -1258,6 +2557,7 @@ class Scheduler(SchedulerInterface):
 
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
+                cached_encoder_inputs = []
                 new_encoder_compute_budget = encoder_compute_budget
                 pad_spec_decode = False
 
@@ -1350,6 +2650,7 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens,
                             new_encoder_compute_budget,
                             external_load_encoder_input,
+                            cached_encoder_inputs,
                         ) = self._try_schedule_encoder_inputs(
                             request,
                             num_computed_tokens,
@@ -1400,6 +2701,119 @@ class Scheduler(SchedulerInterface):
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
 
+                if (
+                    self.elastic_on_demand_graphs
+                    and not load_kv_async
+                    and elastic_preplanned_waiting_step_key is None
+                ):
+                    prospective_tokens = dict(num_scheduled_tokens)
+                    prospective_tokens[request_id] = num_new_tokens
+                    prospective_drafts = dict(scheduled_spec_decode_tokens)
+                    if pad_spec_decode:
+                        prospective_drafts[request_id] = [-1] * self.num_spec_tokens
+                    prospective_is_pure_decode = self._is_pure_decode_step(
+                        prospective_tokens,
+                        prospective_drafts,
+                        computed_token_overrides={request_id: num_computed_tokens},
+                    )
+                    prospective_k = self._num_spec_tokens_for_step(
+                        prospective_tokens,
+                        prospective_is_pure_decode,
+                    )
+                    prospective_step_key = self._canonical_elastic_graph_step_key(
+                        prospective_tokens,
+                        prospective_k,
+                        prospective_is_pure_decode,
+                    )
+                    remaining_requirements = self._request_remaining_blocks(request)
+                    reserved_requirements = (
+                        reserved_blocks
+                        if isinstance(
+                            reserved_blocks, KVCacheBlockPoolRequirements
+                        )
+                        else KVCacheBlockPoolRequirements(
+                            primary=reserved_blocks
+                        )
+                    )
+                    joint_remaining = (
+                        remaining_requirements + reserved_requirements
+                    )
+                    minimum_attention_blocks = max(
+                        (
+                            block.block_id + 1
+                            for blocks in new_computed_blocks.blocks
+                            for block in blocks
+                        ),
+                        default=0,
+                    )
+                    prepared_calibration_wave = bool(
+                        self._elastic_calibration_mode
+                        and calibration_wave_target
+                        and calibration_wave_step_key is not None
+                    )
+                    # The request-free calibration preflight already admitted
+                    # the exact final Graph envelope, full-sequence KV, decode
+                    # successor and shared watermark as one atomic layout.
+                    # Rechecking only the final member through the incremental
+                    # serving estimator used a different headroom ledger: X1
+                    # through X42 consumed the prepared grant, then X43 was
+                    # spuriously stopped even though 447 tokens and one resident
+                    # slot remained and allocate_slots had not rejected it.
+                    # Commit identity below remains fail-closed, so a changed
+                    # K/X/M can never consume this calibration-only grant.
+                    if not prepared_calibration_wave:
+                        graph_fits, required_external, available_external = (
+                            self._can_fund_elastic_graph_step(
+                                prospective_step_key,
+                                minimum_free_primary_blocks=(
+                                    self._elastic_successor_primary_headroom(
+                                        prospective_tokens,
+                                        computed_token_overrides={
+                                            request_id: num_computed_tokens
+                                        },
+                                    )
+                                    + joint_remaining.primary
+                                ),
+                                minimum_attention_blocks=minimum_attention_blocks,
+                                gdn_blocks=(
+                                    self.kv_cache_manager.coordinator.elastic_gdn_blocks_after_allocation(
+                                        joint_remaining.mamba,
+                                        new_computed_blocks.blocks,
+                                    )
+                                ),
+                                allow_maintenance=(
+                                    not num_scheduled_tokens
+                                and len(self.waiting) + len(self.skipped_waiting)
+                                == 1
+                                ),
+                                mm_activation_loan_bytes=(
+                                    self._elastic_mm_activation_loan_bytes
+                                    if encoder_inputs_to_schedule
+                                    else 0
+                                ),
+                            )
+                        )
+                    if not prepared_calibration_wave and not graph_fits:
+                        rejection = (
+                            prospective_step_key,
+                            required_external,
+                            available_external,
+                        )
+                        if rejection != self._elastic_last_graph_admission_rejection:
+                            logger.debug(
+                                "Elastic CUDA Graph MaxX admission deferred: "
+                                "feasible_x=%d rejected_x=%d required_bytes=%d "
+                                "available_bytes=%d step_key=%s",
+                                len(num_scheduled_tokens),
+                                len(prospective_tokens),
+                                required_external,
+                                available_external,
+                                prospective_step_key,
+                            )
+                        self._elastic_last_graph_admission_rejection = rejection
+                        break
+                    self._elastic_last_graph_admission_rejection = None
+
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -1416,11 +2830,11 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
-
-                    # NOTE: we need to untouch the request from the encode cache
-                    # manager
-                    if request.has_encoder_inputs:
-                        self.encoder_cache_manager.free(request)
+                    calibration_wave_stop_reason = (
+                        "allocate_slots_none:"
+                        f"request={request_id}:"
+                        f"rejection={self.kv_cache_manager.last_allocation_rejection!r}"
+                    )
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1494,7 +2908,7 @@ class Scheduler(SchedulerInterface):
                         and coordinator.has_gdn_checkpoint(checkpoint_key, touch=True)
                     ):
                         gdn_checkpoint_restore[request_id] = checkpoint_key
-                        logger.info(
+                        logger.debug(
                             "Exact GDN prefix hit request=%s tokens=%d key=%s",
                             request_id,
                             num_computed_tokens,
@@ -1528,24 +2942,25 @@ class Scheduler(SchedulerInterface):
                 if num_computed_tokens + num_new_tokens < request.num_tokens:
                     self._inflight_prefills.add(request)
                 # Encoder-related.
+                self._commit_encoder_cache_plan(
+                    request,
+                    cached_encoder_inputs,
+                    encoder_inputs_to_schedule,
+                    external_load_encoder_input,
+                )
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
-                    # Allocate the encoder cache.
-                    for i in encoder_inputs_to_schedule:
-                        self.encoder_cache_manager.allocate(request, i)
-                        if self.ec_connector is not None:
-                            self.ec_connector.update_state_after_alloc(request, i)
                     encoder_compute_budget = new_encoder_compute_budget
-                # Allocate for external load encoder cache
-                if external_load_encoder_input:
-                    for i in external_load_encoder_input:
-                        self.encoder_cache_manager.allocate(request, i)
-                        if self.ec_connector is not None:
-                            self.ec_connector.update_state_after_alloc(request, i)
+
+                if stop_after_elastic_candidate:
+                    break
 
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
+            self._elastic_calibration_wave_target = 0
+            self._elastic_calibration_wave_step_key = None
+            self._elastic_calibration_execution_step_key = None
 
             # DP prefill balancing: on a step that admitted prefills (release),
             # record whether it was capacity-bound.
@@ -1642,25 +3057,10 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens, scheduled_spec_decode_tokens
         )
 
-        # Dynamic speculative decoding: compute optimal K
-        num_spec_tokens_to_schedule = self.num_spec_tokens
-        if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
-            num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
-                len(num_scheduled_tokens)
-            ]
-            speculative_config = self.vllm_config.speculative_config
-            assert speculative_config is not None
-            if (
-                speculative_config.disable_speculation_on_non_decode
-                and not is_pure_decode_step
-            ):
-                num_spec_tokens_to_schedule = 0
-        num_spec_tokens_to_schedule = apply_force_non_speculative_override(
-            num_spec_tokens_to_schedule,
-            [
-                self.requests[request_id].force_non_speculative
-                for request_id in num_scheduled_tokens
-            ],
+        # Dynamic speculative decoding: compute optimal K.
+        num_spec_tokens_to_schedule = self._num_spec_tokens_for_step(
+            num_scheduled_tokens,
+            is_pure_decode_step,
         )
 
         scheduled_encoder_input_stats = None
@@ -1680,9 +3080,8 @@ class Scheduler(SchedulerInterface):
                 boundary = request.num_computed_tokens + scheduled_tokens
                 # The hash covers only finalized input tokens. A sampled token
                 # is not part of this state until it is scheduled next step.
-                if (
-                    boundary <= request.num_tokens
-                    and self._should_save_gdn_checkpoint(request, boundary)
+                if boundary <= request.num_tokens and self._should_save_gdn_checkpoint(
+                    request, boundary
                 ):
                     checkpoint_key = self._gdn_boundary_key(request, boundary)
                     if (
@@ -1692,11 +3091,379 @@ class Scheduler(SchedulerInterface):
                         gdn_checkpoint_save[req_id] = checkpoint_key
                         checkpoint_keys_to_save.add(checkpoint_key)
 
-        self.kv_cache_manager.coordinator.rebalance_elastic_capacity()
-        self._reserve_elastic_incremental_headroom()
+        elastic_graph_step_key = self._canonical_elastic_graph_step_key(
+            num_scheduled_tokens,
+            num_spec_tokens_to_schedule,
+            is_pure_decode_step,
+        )
+        if (
+            calibration_wave_step_key is not None
+            and num_scheduled_tokens
+            and elastic_graph_step_key != calibration_wave_step_key
+        ):
+            raise RuntimeError(
+                "prepared elastic calibration wave changed before commit: "
+                f"prepared={calibration_wave_step_key!r} "
+                f"commit={elastic_graph_step_key!r} "
+                f"scheduled_requests={len(num_scheduled_tokens)} "
+                f"scheduled_tokens={sum(num_scheduled_tokens.values())} "
+                f"remaining_token_budget={token_budget} "
+                f"scheduler_cap={self.max_num_running_reqs} "
+                f"running={len(self.running)} waiting={len(self.waiting)} "
+                f"skipped_waiting={len(self.skipped_waiting)} "
+                f"stop_reason={calibration_wave_stop_reason!r} "
+                "last_allocation_rejection="
+                f"{self.kv_cache_manager.last_allocation_rejection!r}"
+            )
+        if (
+            calibration_execution_step_key is not None
+            and num_scheduled_tokens
+            and elastic_graph_step_key != calibration_execution_step_key
+        ):
+            raise RuntimeError(
+                "prepared elastic calibration execution changed before commit: "
+                f"prepared={calibration_execution_step_key!r} "
+                f"commit={elastic_graph_step_key!r}"
+            )
+        if (
+            elastic_preplanned_running_step_key is not None
+            and num_scheduled_tokens
+            and elastic_graph_step_key != elastic_preplanned_running_step_key
+        ):
+            raise RuntimeError(
+                "preflighted RUNNING decode wave changed before commit: "
+                f"preflight={elastic_preplanned_running_step_key!r} "
+                f"commit={elastic_graph_step_key!r}"
+            )
+        if (
+            elastic_preplanned_waiting_step_key is not None
+            and num_scheduled_tokens
+            and elastic_graph_step_key != elastic_preplanned_waiting_step_key
+        ):
+            raise RuntimeError(
+                "preflighted WAITING text wave changed before commit: "
+                f"preflight={elastic_preplanned_waiting_step_key!r} "
+                f"commit={elastic_graph_step_key!r}"
+            )
+        admission_grant = getattr(
+            self, "_elastic_preflight_admission_grant", None
+        )
+        if admission_grant is not None:
+            if elastic_graph_step_key != admission_grant.step_key:
+                self._rollback_elastic_admission()
+            elif (
+                self._resolve_elastic_step_physical_keys(
+                    self._elastic_graph_carrier_closure_step_key(
+                        elastic_graph_step_key
+                    )
+                )
+                != admission_grant.physical_keys
+            ):
+                self._rollback_elastic_admission()
+                raise RuntimeError(
+                    "preflighted elastic physical owner set changed before commit"
+                )
+        if num_scheduled_tokens:
+            self._commit_elastic_graph_carrier_step_key(elastic_graph_step_key)
+        maintenance_plan = None
+        if self._should_commit_pending_elastic_maintenance(
+            has_user_tokens=bool(num_scheduled_tokens)
+        ):
+            maintenance_plan = self._elastic_pending_maintenance_plan
+            maintenance_step_key = self._elastic_pending_maintenance_step_key
+            if num_scheduled_tokens:
+                if admission_grant is None:
+                    raise RuntimeError(
+                        "serving elastic maintenance reached USER commit "
+                        "without an atomic admission grant"
+                    )
+                if elastic_graph_step_key is None:
+                    raise RuntimeError(
+                        "scheduled elastic maintenance lost its execution shape"
+                    )
+                maintenance_step_key = (
+                    self._bind_pending_elastic_maintenance_commit(
+                        elastic_graph_step_key,
+                        maintenance_step_key,
+                    )
+                )
+            elastic_graph_step_key = maintenance_step_key
+            if (
+                elastic_graph_step_key is None
+                and maintenance_plan.kind != ElasticPlanKind.RECLAIM
+            ):
+                raise RuntimeError("elastic maintenance lost its scheduler shape")
+        abort_staged_hotset = bool(
+            self._elastic_staged_hotset_abort_pending
+            and not num_scheduled_tokens
+            and maintenance_plan is None
+        )
+        # Candidate admission may keep one immediate GDN lookahead mapped so a
+        # cache hit cannot pin the tail needed by the next request. Return it
+        # only at a real resource commit. An administrative zero-token output
+        # has no consumer or physical admission and must preserve KV geometry.
+        self._rebalance_elastic_capacity_before_commit(
+            has_user_tokens=bool(num_scheduled_tokens),
+            maintenance_plan=maintenance_plan,
+            abort_staged_hotset=abort_staged_hotset,
+        )
+        elastic_mm_activation_loan = (
+            self._elastic_mm_activation_loan_bytes
+            if scheduled_encoder_inputs
+            else 0
+        )
+        elastic_successor_primary_headroom = (
+            self._elastic_successor_primary_headroom(num_scheduled_tokens)
+        )
+        if abort_staged_hotset:
+            elastic_graph_step_grant = (
+                self._prepare_elastic_staged_abort_loan(
+                    minimum_free_primary_blocks=(
+                        elastic_successor_primary_headroom
+                    )
+                )
+            )
+        else:
+            elastic_graph_step_grant = self._plan_elastic_graph_loan(
+                elastic_graph_step_key,
+                minimum_free_primary_blocks=elastic_successor_primary_headroom,
+                mm_activation_loan_bytes=elastic_mm_activation_loan,
+            )
+        self._elastic_preflight_admission_grant = None
+        if (
+            maintenance_plan is not None
+            and maintenance_plan.kind == ElasticPlanKind.RECLAIM
+        ):
+            coordinator = self.kv_cache_manager.coordinator
+            elastic_graph_step_grant = coordinator.normalize_elastic_external_memory(
+                max(
+                    self._elastic_pinned_graph_resident_bytes,
+                    maintenance_plan.capture_loan_bytes,
+                )
+            )
+            if not coordinator.set_elastic_external_memory(
+                elastic_graph_step_grant,
+                minimum_free_primary_blocks=elastic_successor_primary_headroom,
+            ):
+                raise RuntimeError("scheduler could not commit planned graph reclaim")
+            self._elastic_pending_graph_loans[-1] = (
+                None,
+                elastic_graph_step_grant,
+            )
+
         elastic_kv_transition = (
             self.kv_cache_manager.coordinator.take_elastic_transition()
         )
+        elastic_transaction_id = (
+            maintenance_plan.transaction_id
+            if maintenance_plan is not None
+            else self._next_elastic_transaction_id()
+        )
+        elastic_step_plan = maintenance_plan
+        if elastic_graph_step_key is not None:
+            residency_step_key = self._elastic_graph_carrier_closure_step_key(
+                elastic_graph_step_key
+            )
+            physical_keys = self._resolve_elastic_step_physical_keys(
+                residency_step_key
+            )
+            if elastic_step_plan is None:
+                available_external = (
+                    self.kv_cache_manager.coordinator.max_elastic_external_memory(
+                        minimum_free_primary_blocks=(
+                            elastic_successor_primary_headroom
+                        )
+                    )
+                )
+                desired_external, _ = self._estimate_elastic_graph_step_bytes(
+                    residency_step_key
+                )
+                elastic_step_plan = self._elastic_graph_cache.plan(
+                    elastic_transaction_id,
+                    physical_keys,
+                    request_bytes=self._elastic_graph_resident_bytes,
+                    available_bytes=available_external,
+                    owner_set_capture_envelope_bytes=desired_external,
+                    retained_transition_overlap_bytes=(
+                        getattr(self, "_elastic_cublas_workspace_unit_bytes", 0)
+                        if self._elastic_graph_resident_bytes
+                        and any(
+                            not (
+                                (entry := self._elastic_graph_cache.entries.get(key))
+                                and entry.hot
+                            )
+                            for key in physical_keys
+                        )
+                        else 0
+                    ),
+                    shared_resident_bytes=max(
+                        0,
+                        self._elastic_graph_resident_bytes
+                        - self._elastic_pinned_graph_resident_bytes
+                        - self._elastic_evictable_graph_resident_bytes,
+                    ),
+                    kv_transition=elastic_kv_transition,
+                    replace_unleased_on_miss=bool(
+                        self._elastic_graph_hotset_cap_bytes
+                    ),
+                    residency_cap_bytes=self._elastic_graph_hotset_cap_bytes,
+                )
+                if elastic_step_plan.kind == ElasticPlanKind.MAINTENANCE:
+                    raise RuntimeError(
+                        "COLD elastic promotion crossed the user commit boundary"
+                    )
+                if elastic_step_plan.kind == ElasticPlanKind.DEFER:
+                    entry_states = tuple(
+                        (
+                            key.identity,
+                            (
+                                None
+                                if (entry := self._elastic_graph_cache.entries.get(key))
+                                is None
+                                else entry.state.value
+                            ),
+                            None if entry is None else bool(entry.leases),
+                        )
+                        for key in physical_keys
+                    )
+                    hot_hit_ids = tuple(
+                        key.identity for key in elastic_step_plan.hot_hits
+                    )
+                    cold_miss_ids = tuple(
+                        key.identity for key in elastic_step_plan.cold_misses
+                    )
+                    raise RuntimeError(
+                        "deferred elastic plan crossed the scheduler commit boundary: "
+                        f"reason={elastic_step_plan.defer_reason} "
+                        f"step_key={elastic_graph_step_key!r} "
+                        f"residency_step_key={residency_step_key!r} "
+                        f"entries={entry_states!r} "
+                        f"hot_hits={hot_hit_ids!r} "
+                        f"cold_misses={cold_miss_ids!r} "
+                        f"request_bytes={elastic_step_plan.request_bytes} "
+                        f"available_bytes={elastic_step_plan.available_bytes} "
+                        f"capture_loan_bytes={elastic_step_plan.capture_loan_bytes} "
+                        f"desired_external={desired_external} "
+                        f"resident_bytes={self._elastic_graph_resident_bytes} "
+                        f"hotset_cap_bytes={self._elastic_graph_hotset_cap_bytes}"
+                    )
+                elastic_step_plan = replace(
+                    elastic_step_plan,
+                    kv_transition=elastic_kv_transition,
+                    capture_loan_bytes=elastic_graph_step_grant,
+                )
+            else:
+                if elastic_step_plan.physical_keys != physical_keys:
+                    raise RuntimeError(
+                        "maintenance physical owner set changed after defer"
+                    )
+                elastic_step_plan = replace(
+                    elastic_step_plan,
+                    kv_transition=elastic_kv_transition,
+                    capture_loan_bytes=elastic_graph_step_grant,
+                )
+                serving_staged_replace = bool(
+                    elastic_step_plan.staged_hotset_replace
+                    and elastic_step_plan.victim_keys
+                    and not num_scheduled_tokens
+                    and not getattr(self, "_elastic_calibration_mode", False)
+                    and not getattr(self, "_elastic_restore_mode", False)
+                )
+                if serving_staged_replace:
+                    if self._elastic_staged_hotset_plan is not None:
+                        raise RuntimeError("overlapping staged hotset replacement")
+                    self._elastic_staged_hotset_plan = elastic_step_plan
+                    self._elastic_staged_hotset_step_key = elastic_graph_step_key
+                self._elastic_pending_maintenance_plan = None
+                self._elastic_pending_maintenance_step_key = None
+            retained_physical_keys = getattr(
+                self, "_elastic_calibration_retained_physical_keys", ()
+            )
+            if retained_physical_keys:
+                elastic_step_plan = replace(
+                    elastic_step_plan,
+                    protected_keys=tuple(
+                        dict.fromkeys(
+                            (*elastic_step_plan.protected_keys, *retained_physical_keys)
+                        )
+                    ),
+                )
+            if elastic_step_plan.kind == ElasticPlanKind.USER:
+                self._elastic_graph_cache.commit_user(elastic_step_plan)
+                useful_started = getattr(self, "_elastic_useful_started", None)
+                if useful_started is None:
+                    useful_started = self._elastic_useful_started = {}
+                useful_started[elastic_step_plan.transaction_id] = time.monotonic()
+            elif elastic_step_plan.kind == ElasticPlanKind.MAINTENANCE:
+                stats_before = self._elastic_graph_cache.stats
+                external_before = self._elastic_graph_resident_bytes
+                self._elastic_graph_cache.begin_maintenance(elastic_step_plan)
+                self._elastic_maintenance_started[
+                    elastic_step_plan.transaction_id
+                ] = (time.monotonic(), stats_before, external_before)
+                logger.info(
+                    "Elastic Graph transaction start: tx=%s kind=%s final_key=%s "
+                    "captures=%d evictions=%d external_before=%d loan=%d reason=cold",
+                    elastic_step_plan.transaction_id,
+                    elastic_step_plan.kind.value,
+                    elastic_graph_step_key,
+                    len(elastic_step_plan.cold_misses),
+                    len(elastic_step_plan.victim_keys),
+                    external_before,
+                    elastic_step_plan.capture_loan_bytes,
+                )
+        elif elastic_step_plan is not None:
+            if elastic_step_plan.kind != ElasticPlanKind.RECLAIM:
+                raise RuntimeError("shape-less elastic plan is not a reclaim")
+            elastic_step_plan = replace(
+                elastic_step_plan,
+                kv_transition=elastic_kv_transition,
+                capture_loan_bytes=elastic_graph_step_grant,
+            )
+            stats_before = self._elastic_graph_cache.stats
+            external_before = self._elastic_graph_resident_bytes
+            self._elastic_graph_cache.begin_reclaim(elastic_step_plan)
+            self._elastic_maintenance_started[elastic_step_plan.transaction_id] = (
+                time.monotonic(),
+                stats_before,
+                external_before,
+            )
+            logger.info(
+                "Elastic Graph transaction start: tx=%s kind=%s final_key=None "
+                "captures=0 evictions=%d external_before=%d loan=%d "
+                "reason=explicit_pressure",
+                elastic_step_plan.transaction_id,
+                elastic_step_plan.kind.value,
+                len(elastic_step_plan.victim_keys),
+                external_before,
+                elastic_step_plan.capture_loan_bytes,
+            )
+            self._elastic_pending_maintenance_plan = None
+            self._elastic_pending_maintenance_step_key = None
+
+        if abort_staged_hotset:
+            staged_plan = self._elastic_staged_hotset_plan
+            if staged_plan is None:
+                raise RuntimeError("staged hotset abort lost its maintenance plan")
+            self._elastic_graph_cache.abort_staged_hotset_replace(staged_plan)
+
+        if (
+            elastic_step_plan is not None
+            and os.environ.get("AG2_VLLM_GRAPH_MODE_RECEIPT", "0") == "1"
+        ):
+            logger.debug(
+                "AG2 elastic plan receipt: transaction=%s kind=%s step_key=%s "
+                "hot_hits=%s cold_misses=%s victims=%s capture_order=%s "
+                "staged_replace=%s",
+                elastic_step_plan.transaction_id,
+                elastic_step_plan.kind.value,
+                elastic_graph_step_key,
+                tuple(key.identity for key in elastic_step_plan.hot_hits),
+                tuple(key.identity for key in elastic_step_plan.cold_misses),
+                tuple(key.identity for key in elastic_step_plan.victim_keys),
+                tuple(key.identity for key in elastic_step_plan.capture_order),
+                elastic_step_plan.staged_hotset_replace,
+            )
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
@@ -1722,8 +3489,48 @@ class Scheduler(SchedulerInterface):
             gdn_checkpoint_save=gdn_checkpoint_save or None,
             gdn_checkpoint_restore=gdn_checkpoint_restore or None,
             elastic_kv_transition=elastic_kv_transition,
+            elastic_external_memory_bytes=(elastic_graph_step_grant),
+            elastic_graph_external_memory_bytes=(
+                elastic_graph_step_grant - elastic_mm_activation_loan
+            ),
+            elastic_mm_activation_loan_bytes=elastic_mm_activation_loan,
+            elastic_successor_primary_headroom=(
+                elastic_successor_primary_headroom
+            ),
+            elastic_transaction_id=elastic_transaction_id,
+            elastic_step_plan=elastic_step_plan,
+            elastic_plan_fingerprint=(
+                elastic_step_plan.fingerprint
+                if elastic_step_plan is not None
+                else None
+            ),
+            elastic_abort_staged_hotset=abort_staged_hotset,
+            elastic_staged_hotset_origin_transaction_id=(
+                self._elastic_staged_hotset_plan.transaction_id
+                if abort_staged_hotset
+                and self._elastic_staged_hotset_plan is not None
+                else None
+            ),
+            elastic_preserve_graph_residency=(
+                elastic_graph_step_key is None
+                and elastic_step_plan is None
+                and not abort_staged_hotset
+                and not getattr(self, "_elastic_force_idle_cleanup", False)
+            ),
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
+        self._elastic_preflight_waiting_ignore_prefix_request_ids = ()
+        if abort_staged_hotset:
+            self._elastic_staged_hotset_abort_pending = False
+            self._elastic_staged_hotset_plan = None
+            self._elastic_staged_hotset_step_key = None
+        elif (
+            elastic_step_plan is not None
+            and elastic_step_plan.kind == ElasticPlanKind.USER
+            and self._elastic_staged_hotset_step_key == elastic_graph_step_key
+        ):
+            self._elastic_staged_hotset_plan = None
+            self._elastic_staged_hotset_step_key = None
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1753,6 +3560,7 @@ class Scheduler(SchedulerInterface):
         self,
         num_scheduled_tokens: dict[str, int],
         scheduled_spec_decode_tokens: dict[str, list[int]],
+        computed_token_overrides: dict[str, int] | None = None,
     ) -> bool:
         """Return whether every scheduled row is an autoregressive decode row.
 
@@ -1766,12 +3574,2436 @@ class Scheduler(SchedulerInterface):
             return False
         for req_id, num_tokens in num_scheduled_tokens.items():
             request = self.requests[req_id]
-            if request.num_computed_tokens < request.num_prompt_tokens:
+            num_computed_tokens = (
+                computed_token_overrides.get(req_id, request.num_computed_tokens)
+                if computed_token_overrides is not None
+                else request.num_computed_tokens
+            )
+            if num_computed_tokens < request.num_prompt_tokens:
                 return False
             num_draft_tokens = len(scheduled_spec_decode_tokens.get(req_id, ()))
             if num_tokens != self.num_sampled_tokens_per_step + num_draft_tokens:
                 return False
         return True
+
+    def _num_spec_tokens_for_step(
+        self,
+        num_scheduled_tokens: dict[str, int],
+        is_pure_decode_step: bool,
+    ) -> int:
+        num_spec_tokens = self.num_spec_tokens
+        if self.dynamic_sd_lookup is not None and num_scheduled_tokens:
+            num_spec_tokens = self.dynamic_sd_lookup[len(num_scheduled_tokens)]
+        speculative_config = self.vllm_config.speculative_config
+        if speculative_config is None:
+            if num_spec_tokens != 0:
+                raise RuntimeError(
+                    "scheduler has speculative tokens without a speculative config"
+                )
+        elif (
+            speculative_config.disable_speculation_on_non_decode
+            and not is_pure_decode_step
+        ):
+            num_spec_tokens = 0
+        return apply_force_non_speculative_override(
+            num_spec_tokens,
+            [
+                self.requests[request_id].force_non_speculative
+                for request_id in num_scheduled_tokens
+            ],
+        )
+
+    def _rebuild_elastic_short_decode_inventory(self, max_x: int) -> None:
+        """Bind runtime-derived decode carriers to one proved terminal MaxX."""
+        if max_x <= 0:
+            raise ValueError("short-decode terminal X must be positive")
+        if not self.elastic_on_demand_graphs or self.num_spec_tokens < 0:
+            raise RuntimeError("short-decode inventory requires elastic K>=0")
+        self._elastic_short_decode_inventory = dict(
+            derive_short_decode_graph_inventory(
+                max_x=max_x,
+                num_spec_tokens=self.num_spec_tokens,
+                generation=self._elastic_runtime_generation,
+                max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+                compiled_piecewise_sizes=self._elastic_compiled_piecewise_sizes,
+                policy=self._elastic_graph_execution_policy,
+            )
+        )
+        logger.info(
+            "Elastic short-decode Graph inventory: K=%d MaxX=%d X/M=%s",
+            self.num_spec_tokens,
+            max_x,
+            ",".join(
+                f"{x}/{x * (self.num_spec_tokens + 1)}"
+                for x in self._elastic_short_decode_inventory
+            ),
+        )
+
+    @staticmethod
+    def _make_elastic_graph_step_key(
+        num_scheduled_tokens: dict[str, int],
+        num_spec_tokens_to_schedule: int,
+        is_pure_decode_step: bool,
+    ) -> SemanticGraphStep | None:
+        if not num_scheduled_tokens:
+            return None
+        token_counts = tuple(num_scheduled_tokens.values())
+        num_reqs = len(token_counts)
+        total_num_tokens = sum(token_counts)
+        if total_num_tokens <= 0:
+            return None
+        uniform_token_count = token_counts[0] if len(set(token_counts)) == 1 else 0
+        uniform_decode = is_pure_decode_step and uniform_token_count > 0
+        owners = (
+            ("target", "mtp_prefill", "mtp_decode")
+            if num_spec_tokens_to_schedule > 0
+            else ("target",)
+        )
+        return SemanticGraphStep(
+            num_spec_tokens=num_spec_tokens_to_schedule,
+            num_reqs=num_reqs,
+            num_tokens=total_num_tokens,
+            uniform_query_len=uniform_token_count if uniform_decode else None,
+            phase="decode" if uniform_decode else "mixed",
+            active_owners=owners,
+        )
+
+    def _canonical_elastic_graph_step_key(
+        self,
+        num_scheduled_tokens: dict[str, int],
+        num_spec_tokens_to_schedule: int,
+        is_pure_decode_step: bool,
+    ) -> tuple[int, ...] | None:
+        semantic = self._make_elastic_graph_step_key(
+            num_scheduled_tokens,
+            num_spec_tokens_to_schedule,
+            is_pure_decode_step,
+        )
+        if semantic is None:
+            return None
+        policy = self._elastic_graph_execution_policy
+        if policy is None:
+            raise RuntimeError("elastic step routing requires an execution policy")
+        batched_q1_verifier = (
+            policy.verifier_contract == "batched-causal-q1-v1"
+        )
+        # Semantic X remains in scheduler_output for request metadata, sampling
+        # and output cropping. CUDA Graph identity uses the smallest declared
+        # physical cohort covering it, so X8 -> X7 reuses HOT X8/M32. DCP is
+        # intentionally absent: it partitions attention context, not rows.
+        qlen = semantic.uniform_query_len
+        target_mode = policy.mode_for("target", qlen)
+        physical_x = semantic.num_reqs
+        if semantic.phase == "decode":
+            from vllm.v1.core.elastic_graph import select_short_decode_physical_x
+
+            inventory_xs = tuple(
+                getattr(self, "_elastic_short_decode_inventory", {})
+            )
+            if not inventory_xs:
+                coverage = getattr(self, "_elastic_graph_catalog_coverage", {})
+                max_x = coverage.get("decode_max_x")
+                if (
+                    isinstance(max_x, bool)
+                    or not isinstance(max_x, int)
+                    or max_x <= 0
+                ):
+                    configured_max_x = getattr(
+                        self.scheduler_config, "max_num_seqs", None
+                    )
+                    max_x = (
+                        configured_max_x
+                        if isinstance(configured_max_x, int)
+                        and not isinstance(configured_max_x, bool)
+                        and configured_max_x > 0
+                        else semantic.num_reqs
+                    )
+                buckets: list[int] = []
+                inventory_x = 1
+                while inventory_x <= max_x:
+                    buckets.append(inventory_x)
+                    inventory_x <<= 1
+                if buckets[-1] != max_x:
+                    buckets.append(max_x)
+                inventory_xs = tuple(buckets)
+            physical_x = select_short_decode_physical_x(
+                semantic.num_reqs, inventory_xs
+            )
+        # A live K>0 cohort owns one physical request carrier until a real
+        # request-free drain. Shrinking semantic X changes masks and output
+        # cropping, not executable identity. This applies to both pure decode
+        # and mixed prefill/decode execution because the latter is projected
+        # onto the same full-owner q=K+1 carrier closure before admission.
+        current_key = getattr(self, "_elastic_graph_carrier_step_key", None)
+        if (
+            (
+                getattr(self, "running", ())
+                or getattr(self, "waiting", ())
+                or getattr(self, "skipped_waiting", ())
+            )
+            and current_key is not None
+            and current_key[1] == semantic.num_spec_tokens
+            and current_key[2] >= semantic.num_reqs
+        ):
+            physical_x = current_key[2]
+        if semantic.phase == "decode" and target_mode == "FULL":
+            return (
+                1,
+                semantic.num_spec_tokens,
+                physical_x,
+                physical_x * (qlen or 0),
+                qlen or 0,
+            )
+        exact_batched_decode_m = bool(
+            semantic.phase == "decode"
+            and batched_q1_verifier
+            and qlen == 1 + semantic.num_spec_tokens
+        )
+        exact_uniform_query_len = qlen if exact_batched_decode_m else 0
+        if exact_batched_decode_m:
+            canonical_tokens = physical_x * (semantic.num_spec_tokens + 1)
+            return (
+                0,
+                semantic.num_spec_tokens,
+                physical_x,
+                canonical_tokens,
+                exact_uniform_query_len,
+            )
+        scheduler_config = getattr(self, "scheduler_config", None)
+        if scheduler_config is None:
+            return (
+                0,
+                semantic.num_spec_tokens,
+                semantic.num_reqs,
+                semantic.num_tokens,
+                0,
+            )
+        canonical_tokens = elastic_piecewise_token_boundary(
+            semantic.num_tokens, self.scheduler_config.max_num_batched_tokens
+        )
+        return (
+            0,
+            semantic.num_spec_tokens,
+            physical_x,
+            canonical_tokens,
+            0,
+        )
+
+    def _elastic_graph_carrier_closure_step_key(
+        self, step_key: tuple[int, ...] | None
+    ) -> tuple[int, ...] | None:
+        """Return the phase-correct full-owner closure for an execution key."""
+        if step_key is None or step_key[1] <= 0:
+            return step_key
+        if getattr(self, "_elastic_calibration_mode", False):
+            # Calibration measures each declared execution DAG. Product
+            # residency coalesces those observations only after the catalog is
+            # sealed; collapsing here would erase the evidence used to price
+            # the closure itself.
+            return step_key
+        if step_key[0] == 1 and step_key[4] == 1:
+            # A shrinking pure-decode tail may reuse the cohort's physical X,
+            # but it cannot execute the target's q=1 invocation through a
+            # mixed q=K+1 PIECEWISE descriptor. Keep the phase identity while
+            # the canonicalizer above preserves the carrier cardinality.
+            return step_key
+        num_spec_tokens = step_key[1]
+        physical_x = step_key[2]
+        query_len = num_spec_tokens + 1
+        policy = self._elastic_graph_execution_policy
+        if policy is None:
+            raise RuntimeError("elastic carrier routing requires an execution policy")
+        target_full = int(policy.mode_for("target", query_len) == "FULL")
+        return (
+            target_full,
+            num_spec_tokens,
+            physical_x,
+            physical_x * query_len,
+            query_len,
+        )
+
+    def _commit_elastic_graph_carrier_step_key(
+        self, execution_step_key: tuple[int, ...] | None
+    ) -> None:
+        """Commit a speculative carrier without letting transient K0 replace it."""
+        if execution_step_key is None:
+            return
+        current = getattr(self, "_elastic_graph_carrier_step_key", None)
+        if execution_step_key[1] == 0 and current is not None and current[1] > 0:
+            # A target-only prefill/acceptance tail must not replace the live
+            # speculative carrier.  K0 runtimes have no such owner and commit
+            # their target carrier normally.
+            return
+        self._elastic_graph_carrier_step_key = (
+            self._elastic_graph_carrier_closure_step_key(execution_step_key)
+        )
+
+    def _resolve_elastic_step_physical_keys(
+        self, step_key: tuple[int, ...] | None
+    ) -> tuple[PhysicalReplayKey, ...]:
+        return resolve_step_physical_keys(
+            step_key,
+            self._elastic_runtime_generation,
+            self.scheduler_config.max_num_batched_tokens,
+            getattr(self, "_elastic_compiled_piecewise_sizes", frozenset()),
+            self._elastic_graph_execution_policy,
+        )
+
+    def _elastic_successor_primary_headroom(
+        self,
+        num_scheduled_tokens: dict[str, int],
+        *,
+        computed_token_overrides: dict[str, int] | None = None,
+    ) -> int:
+        """Return exact primary blocks needed by the next sampled boundary."""
+        overrides = computed_token_overrides or {}
+        headroom = 0
+        for request_id, scheduled_tokens in num_scheduled_tokens.items():
+            request = self.requests[request_id]
+            computed_tokens = overrides.get(
+                request_id, request.num_computed_tokens
+            )
+            boundary = min(
+                computed_tokens + scheduled_tokens,
+                self.max_model_len,
+            )
+            if boundary >= self.max_model_len:
+                continue
+            current_blocks = (
+                boundary + self.block_size - 1
+            ) // self.block_size
+            successor_boundary = min(
+                boundary + self.num_sampled_tokens_per_step,
+                self.max_model_len,
+            )
+            successor_blocks = (
+                successor_boundary + self.block_size - 1
+            ) // self.block_size
+            headroom += successor_blocks - current_blocks
+        return headroom
+
+    def _elastic_remaining_resource_requirements(
+        self,
+        request_ids: Iterable[str],
+    ) -> KVCacheBlockPoolRequirements:
+        """Return full-sequence KV/GDN demand not yet allocated.
+
+        Elastic serving reserves the declared sequence before admitting a
+        request. Graph admission must price the same future state; using only
+        this tick's chunk lets a long request consume the headroom between the
+        graph preflight and its final commit.
+        """
+        requirements = KVCacheBlockPoolRequirements()
+        for request_id in request_ids:
+            requirements += self._request_remaining_blocks(
+                self.requests[request_id]
+            )
+        return requirements
+
+    def _reserve_elastic_admission(
+        self,
+        step_key: tuple[int, ...],
+        *,
+        external_memory_bytes: int,
+        minimum_free_primary_blocks: int,
+        requirements: KVCacheBlockPoolRequirements,
+    ) -> bool:
+        """Atomically map the joint Graph/KV/GDN envelope before allocation."""
+        existing = getattr(self, "_elastic_preflight_admission_grant", None)
+        if existing is not None:
+            if (
+                existing.step_key == step_key
+                and existing.external_memory_bytes == external_memory_bytes
+                and existing.minimum_free_primary_blocks
+                == minimum_free_primary_blocks
+                and existing.requirements == requirements
+            ):
+                return True
+            raise RuntimeError("elastic admission attempted two different grants")
+
+        coordinator = self.kv_cache_manager.coordinator
+        previous_external = coordinator.elastic_external_memory_bytes
+        if not coordinator.set_elastic_external_memory(
+            external_memory_bytes,
+            minimum_free_primary_blocks=minimum_free_primary_blocks,
+        ):
+            return False
+        if not coordinator.ensure_elastic_capacity(requirements):
+            coordinator.rebalance_elastic_capacity()
+            if not coordinator.set_elastic_external_memory(previous_external):
+                raise RuntimeError(
+                    "failed elastic admission could not restore external memory"
+                )
+            return False
+        self._elastic_preflight_admission_grant = ElasticAdmissionGrant(
+            step_key=step_key,
+            physical_keys=self._resolve_elastic_step_physical_keys(
+                self._elastic_graph_carrier_closure_step_key(step_key)
+            ),
+            external_memory_bytes=external_memory_bytes,
+            previous_external_memory_bytes=previous_external,
+            minimum_free_primary_blocks=minimum_free_primary_blocks,
+            requirements=requirements,
+        )
+        return True
+
+    def _reserve_pending_elastic_maintenance_admission(
+        self,
+        step_key: tuple[int, ...],
+        *,
+        minimum_free_primary_blocks: int,
+        requirements: KVCacheBlockPoolRequirements,
+    ) -> bool:
+        """Reserve a COLD capture and its complete user wave before mutation."""
+        plan = self._elastic_pending_maintenance_plan
+        if plan is None or plan.kind != ElasticPlanKind.MAINTENANCE:
+            return False
+        residency_step_key = self._elastic_graph_carrier_closure_step_key(step_key)
+        if self._elastic_pending_maintenance_step_key != residency_step_key:
+            raise RuntimeError("pending maintenance reservation shape mismatch")
+        if self._reserve_elastic_admission(
+            step_key,
+            external_memory_bytes=plan.capture_loan_bytes,
+            minimum_free_primary_blocks=minimum_free_primary_blocks,
+            requirements=requirements,
+        ):
+            return True
+        self._elastic_pending_maintenance_plan = None
+        self._elastic_pending_maintenance_step_key = None
+        self._elastic_last_defer_reason = "maintenance_admission_reservation_failed"
+        return False
+
+    def _bind_pending_elastic_maintenance_commit(
+        self,
+        execution_step_key: tuple[int, ...],
+        prepared_residency_step_key: tuple[int, ...] | None,
+    ) -> tuple[int, ...]:
+        """Bind a committed execution to its prepared physical carrier."""
+        committed_residency_step_key = (
+            self._elastic_graph_carrier_closure_step_key(execution_step_key)
+        )
+        if (
+            prepared_residency_step_key is None
+            or committed_residency_step_key != prepared_residency_step_key
+        ):
+            raise RuntimeError(
+                "prepared elastic maintenance shape changed before commit: "
+                f"execution={execution_step_key!r} "
+                f"committed_residency={committed_residency_step_key!r} "
+                f"prepared_residency={prepared_residency_step_key!r}"
+            )
+        return prepared_residency_step_key
+
+    def _rebalance_elastic_capacity_before_commit(
+        self,
+        *,
+        has_user_tokens: bool,
+        maintenance_plan: ElasticStepPlan | None,
+        abort_staged_hotset: bool,
+    ) -> bool:
+        """Rebalance KV geometry only when this output owns a real commit."""
+        if not (
+            has_user_tokens
+            or maintenance_plan is not None
+            or abort_staged_hotset
+            or getattr(self, "_elastic_force_idle_cleanup", False)
+        ):
+            return False
+        self.kv_cache_manager.coordinator.rebalance_elastic_capacity()
+        return True
+
+    def _pending_elastic_maintenance_requires_exclusive_tick(self) -> bool:
+        """Return whether pending work has no serving USER consumer."""
+        plan = getattr(self, "_elastic_pending_maintenance_plan", None)
+        if plan is None:
+            return False
+        return bool(
+            plan.kind == ElasticPlanKind.RECLAIM
+            or getattr(self, "_elastic_calibration_mode", False)
+            or getattr(self, "_elastic_restore_mode", False)
+        )
+
+    def _should_commit_pending_elastic_maintenance(
+        self, *, has_user_tokens: bool
+    ) -> bool:
+        """Keep serving capture pending until its first USER can execute."""
+        if getattr(self, "_elastic_pending_maintenance_plan", None) is None:
+            return False
+        return bool(
+            has_user_tokens
+            or self._pending_elastic_maintenance_requires_exclusive_tick()
+        )
+
+    def _prepare_elastic_staged_abort_loan(
+        self, *, minimum_free_primary_blocks: int
+    ) -> int:
+        """Keep both sets mapped while an unused candidate is discarded."""
+        coordinator = self.kv_cache_manager.coordinator
+        grant = coordinator.normalize_elastic_external_memory(
+            self._elastic_graph_resident_bytes
+        )
+        if not coordinator.set_elastic_external_memory(
+            grant,
+            minimum_free_primary_blocks=minimum_free_primary_blocks,
+        ):
+            raise RuntimeError(
+                "staged hotset abort loan could not preserve the measured "
+                "physical residency"
+            )
+        self._elastic_pending_graph_loans.append((None, grant))
+        return grant
+
+    def _rollback_elastic_admission(self) -> None:
+        grant = getattr(self, "_elastic_preflight_admission_grant", None)
+        if grant is None:
+            return
+        coordinator = self.kv_cache_manager.coordinator
+        coordinator.rebalance_elastic_capacity()
+        if not coordinator.set_elastic_external_memory(
+            grant.previous_external_memory_bytes
+        ):
+            raise RuntimeError(
+                "cancelled elastic admission could not restore external memory"
+            )
+        self._elastic_preflight_admission_grant = None
+
+    @staticmethod
+    def _elastic_graph_owner_key(
+        step_key: tuple[int, ...] | None,
+    ) -> tuple[int, ...] | None:
+        if step_key is None:
+            return None
+        # FULL is exact-X. PIECEWISE executable identity remains exact-X too,
+        # but its first-capture price may use a conservative class envelope
+        # proven for the same K/owner-set and padded token carrier.
+        if step_key[0]:
+            return step_key
+        return (0, step_key[1], 0, step_key[3], 0)
+
+    @staticmethod
+    def _elastic_graph_global_owner_key(
+        step_key: tuple[int, ...] | None,
+    ) -> tuple[int, ...] | None:
+        """Return the worst-form PIECEWISE envelope key for one owner set."""
+        if step_key is None or step_key[0]:
+            return None
+        return (0, step_key[1], 0, 0, 0)
+
+    def _elastic_capture_envelope(
+        self,
+        step_key: tuple[int, ...] | None,
+    ) -> tuple[int, int, int] | None:
+        owner_key = self._elastic_graph_owner_key(step_key)
+        if owner_key is None:
+            return None
+        physical_keys: tuple[PhysicalReplayKey, ...] = ()
+        if (
+            step_key is not None
+            and hasattr(self, "_elastic_runtime_generation")
+            and hasattr(self, "_elastic_graph_cache")
+        ):
+            physical_keys = self._resolve_elastic_step_physical_keys(step_key)
+            # A semantic PIECEWISE carrier is not necessarily a PIECEWISE
+            # CUDA Graph. Generic B4096 target/MTP-prefill work is compiled
+            # only, while the same step can still consume a small FULL
+            # mtp_decode owner. Price that exact physical subset from sealed
+            # aggregate observations of the same physical DAG before
+            # consulting PIECEWISE rows. Per-owner GraphPrice entries are not
+            # a complete cold envelope: they exclude shared capture/floor
+            # workspace and underfunded the first live X1/B128 replay.
+            if physical_keys and not any(
+                key.logical.mode == "PIECEWISE" for key in physical_keys
+            ):
+                requested = frozenset(physical_keys)
+                exact_physical_envelopes = tuple(
+                    (
+                        int(row.get("cold_peak_bytes", 0)),
+                        int(row.get("floor_bytes", 0)),
+                        0,
+                    )
+                    for catalog_key, row in getattr(
+                        self, "_elastic_graph_catalog", {}
+                    ).items()
+                    if frozenset(
+                        self._resolve_elastic_step_physical_keys(catalog_key)
+                    )
+                    == requested
+                    and int(row.get("cold_peak_bytes", 0)) > 0
+                )
+                if exact_physical_envelopes:
+                    return tuple(
+                        max(row[index] for row in exact_physical_envelopes)
+                        for index in range(3)
+                    )
+        envelopes = getattr(self, "_elastic_graph_capture_envelopes", {})
+        envelope = envelopes.get(owner_key)
+        if envelope is None and (
+            not physical_keys
+            or any(key.logical.mode == "PIECEWISE" for key in physical_keys)
+        ):
+            envelope = envelopes.get(self._elastic_graph_global_owner_key(step_key))
+        if envelope is not None:
+            return envelope
+
+        # A diagnostic/product request may disable speculative decoding for
+        # one request.  Its K0 FULL target descriptor is byte-for-byte the
+        # target member of the sealed K3 FULL owner set; K is not part of the
+        # target PhysicalReplayKey.  Requiring a second logical catalog row for
+        # that strict subset made the scheduler call the physical planner with
+        # an exact price but no step envelope.  The planner correctly produced
+        # MAINTENANCE and the contradictory scheduler assertion killed the
+        # engine.  Reuse only a sealed row whose complete physical owner set is
+        # a superset of the requested set.  Its aggregate cold envelope is a
+        # conservative loan for the identical subset; unrelated topology,
+        # geometry and generation remain UNKNOWN.
+        if (
+            not getattr(self, "_elastic_calibration_mode", False)
+            and step_key is not None
+            and hasattr(self, "_elastic_runtime_generation")
+        ):
+            requested = frozenset(
+                physical_keys or self._resolve_elastic_step_physical_keys(step_key)
+            )
+            if requested:
+                compatible = []
+                for catalog_key, row in getattr(
+                    self, "_elastic_graph_catalog", {}
+                ).items():
+                    catalog_owners = frozenset(
+                        self._resolve_elastic_step_physical_keys(catalog_key)
+                    )
+                    if requested < catalog_owners:
+                        compatible.append(
+                            (
+                                int(row.get("cold_peak_bytes", 0)),
+                                int(row.get("floor_bytes", 0)),
+                                0,
+                            )
+                        )
+                if compatible:
+                    return tuple(
+                        max(envelope[index] for envelope in compatible)
+                        for index in range(3)
+                    )
+        return None
+
+    def _record_elastic_capture_envelope(
+        self,
+        step_key: tuple[int, ...],
+        envelope: tuple[int, int, int],
+        *,
+        publish_global: bool = True,
+    ) -> None:
+        """Publish exact-M and cross-M worst-form PIECEWISE envelopes."""
+        owner_key = self._elastic_graph_owner_key(step_key)
+        assert owner_key is not None
+        if not hasattr(self, "_elastic_graph_capture_envelopes"):
+            self._elastic_graph_capture_envelopes = {}
+        self._elastic_graph_capture_envelopes[owner_key] = envelope
+        global_key = self._elastic_graph_global_owner_key(step_key)
+        if global_key is not None and publish_global:
+            prior = self._elastic_graph_capture_envelopes.get(
+                global_key, (0, 0, 0)
+            )
+            self._elastic_graph_capture_envelopes[global_key] = (
+                max(prior[0], envelope[0]),
+                max(prior[1], envelope[1]),
+                max(prior[2], envelope[2]),
+            )
+
+    def _elastic_piecewise_physical_floor_bytes(
+        self,
+        step_key: tuple[int, ...] | None,
+    ) -> int:
+        """Return a proven lower bound for the same PIECEWISE physical DAG.
+
+        PIECEWISE target/speculator entries are keyed by their padded token
+        boundary and are recaptured when the runtime request count changes.
+        A settled cold observation at one X is therefore a real lower bound
+        for the same K/M/query lane at another X.  Reusing that fact for
+        admission prevents a larger-X calibration wave from reaching the
+        worker with a loan smaller than an already resident descriptor.
+
+        This is not a reserve: calibration still borrows the exact remaining
+        KV tail for the step and settlement returns the excess immediately.
+        FULL graphs retain exact-X pricing.
+        """
+        if step_key is None or step_key[0]:
+            return 0
+        if (
+            hasattr(self, "_elastic_runtime_generation")
+            and hasattr(self, "_elastic_graph_cache")
+            and not any(
+                key.logical.mode == "PIECEWISE"
+                for key in self._resolve_elastic_step_physical_keys(step_key)
+            )
+        ):
+            return 0
+        physical_lane = (step_key[0], step_key[1], step_key[3], step_key[4])
+        return max(
+            (
+                int(row.get("cold_peak_bytes", 0))
+                for key, row in getattr(
+                    self, "_elastic_graph_catalog", {}
+                ).items()
+                if (key[0], key[1], key[3], key[4]) == physical_lane
+            ),
+            default=0,
+        )
+
+    @staticmethod
+    def _adjust_elastic_capture_envelope(
+        prior_capture: tuple[int, int, int],
+        current_floor: int,
+        sampling_workspace: int,
+    ) -> tuple[int, int, int]:
+        prior_grant, prior_floor, prior_sampling_workspace = prior_capture
+        # A destination catalog row already includes the floor observed while
+        # measuring that row.  A smaller pre-transition floor is not proof that
+        # eviction/capture of the next descriptor will retain fewer bytes; the
+        # first live K3 PIECEWISE->FULL transition demonstrated the opposite.
+        # Add newly observed floor growth, but never subtract historical floor
+        # from a measured destination envelope.
+        floor_delta = max(0, current_floor - prior_floor)
+        sampling_delta = sampling_workspace - prior_sampling_workspace
+        desired_external = max(
+            0,
+            prior_grant + floor_delta + sampling_delta,
+        )
+        return desired_external, floor_delta, sampling_delta
+
+    def _estimate_elastic_graph_step_bytes(
+        self,
+        step_key: tuple[int, ...] | None,
+    ) -> tuple[int, bool]:
+        """Return the step grant and whether it opens a capture envelope.
+
+        This is deliberately side-effect free so waiting admission can test the
+        next runtime X/M before allocating KV blocks or changing request state.
+        The worker-facing planner below remains the sole owner of committing the
+        loan, publishing a provisional envelope and advancing FIFO state.
+        """
+        pending_same_key_grant = next(
+            (
+                grant
+                for pending_key, grant in reversed(
+                    self._elastic_pending_graph_loans
+                )
+                if self._elastic_graph_carrier_closure_step_key(pending_key)
+                == step_key
+            ),
+            0,
+        )
+        current_residency_step_key = (
+            self._elastic_graph_carrier_closure_step_key(
+                self._elastic_graph_step_key
+            )
+        )
+        physical_owner_set_cold = False
+        if step_key is None:
+            # X0 is itself the next-step decision. The worker evicts every
+            # dynamic owner before applying this grant, so carrying the prior
+            # step's residency through an extra empty output only delays the
+            # return to KV and creates a false two-step cleanup protocol.
+            return 0, False
+        if (
+            hasattr(self, "_elastic_graph_cache")
+            and hasattr(self, "_elastic_runtime_generation")
+        ):
+            physical_keys = self._resolve_elastic_step_physical_keys(step_key)
+            if not physical_keys:
+                # Some semantic PIECEWISE carriers (notably pure K0/B4096)
+                # intentionally execute through torch.compile and own no
+                # persistent CUDA Graph.  This consumed contract is identical
+                # during calibration and serving.  Falling through to a
+                # logical/global capture envelope in calibration can turn the
+                # full prospective KV tail from an earlier witness into a
+                # fictitious multi-GiB Graph floor after request allocation.
+                return self._elastic_graph_resident_bytes, False
+        if (
+            getattr(self, "_elastic_calibration_mode", False)
+            and hasattr(self, "_elastic_graph_cache")
+            and hasattr(self, "_elastic_runtime_generation")
+            and all(
+                (entry := self._elastic_graph_cache.entries.get(key)) is not None
+                and entry.hot
+                for key in physical_keys
+            )
+        ):
+            return max(
+                self._elastic_graph_resident_bytes,
+                self._elastic_graph_measured_bytes.get(step_key, 0),
+            ), False
+        if (
+            not getattr(self, "_elastic_calibration_mode", False)
+            and hasattr(self, "_elastic_graph_cache")
+            and hasattr(self, "_elastic_runtime_generation")
+        ):
+            physical_owner_set_hot = bool(physical_keys) and all(
+                (entry := self._elastic_graph_cache.entries.get(key)) is not None
+                and entry.hot
+                for key in physical_keys
+            )
+            physical_owner_set_cold = bool(physical_keys) and not (
+                physical_owner_set_hot
+            )
+            if physical_owner_set_hot:
+                # Physical residency, not the preceding logical step key, is
+                # authoritative. Alternating K3 verification/acceptance FULL
+                # shapes and retained PIECEWISE hits must not reopen their cold
+                # catalog envelopes, remap KV, or enter capture accounting.
+                # The graph entries are not the whole executable envelope:
+                # replay can also materialize a shape-specific cuBLAS/runtime
+                # workspace.  Maintenance publishes the entries before that
+                # replay, so resident_bytes alone would underfund the first
+                # real HOT hit.  A sealed exact row's HOT measurement is the
+                # consumed-path price for this already-resident owner set.
+                hot_envelope = self._elastic_graph_measured_bytes.get(step_key, 0)
+                first_replay_workspace = (
+                    getattr(self, "_elastic_cublas_workspace_unit_bytes", 0)
+                    if getattr(
+                        self,
+                        "_elastic_graph_last_maintenance_step_key",
+                        None,
+                    )
+                    == step_key
+                    else 0
+                )
+                return max(
+                    self._elastic_graph_resident_bytes + first_replay_workspace,
+                    hot_envelope,
+                ), False
+        if (
+            step_key == current_residency_step_key
+            and pending_same_key_grant
+            and (
+                step_key not in self._elastic_graph_measured_bytes
+                or self._elastic_graph_recapture_pending_key == step_key
+            )
+        ):
+            return pending_same_key_grant, False
+        if step_key == current_residency_step_key and getattr(
+            self, "_elastic_calibration_mode", False
+        ):
+            # The cold epoch may have expanded a known row.  Its immediate HOT
+            # replay must inherit that just-measured maximum, not the smaller
+            # hot value from an earlier epoch.  After seal, the independently
+            # stabilized hot envelope remains authoritative.
+            row = getattr(self, "_elastic_graph_catalog", {}).get(step_key)
+            cold_peak = 0 if row is None else int(row.get("cold_peak_bytes", 0))
+            if cold_peak:
+                return cold_peak, False
+        if (
+            step_key == current_residency_step_key
+            and step_key in self._elastic_graph_measured_bytes
+        ):
+            return self._elastic_graph_measured_bytes[step_key], False
+
+        prior_capture = self._elastic_capture_envelope(step_key)
+        if (
+            step_key == current_residency_step_key
+            and prior_capture is not None
+            and not physical_owner_set_cold
+        ):
+            # The first replay after cold calibration still uses the cold
+            # envelope; its settlement records the smaller HOT high-water.
+            return prior_capture[0], False
+        measured_external = self._elastic_graph_measured_bytes.get(step_key)
+        if prior_capture is not None:
+            desired_external, _floor_delta, _sampling_delta = (
+                self._adjust_elastic_capture_envelope(
+                    prior_capture,
+                    getattr(
+                        self,
+                        "_elastic_graph_transition_floor_bytes",
+                        self._elastic_graph_floor_bytes,
+                    ),
+                    0,
+                )
+            )
+            # A changed-key cold transition captures the destination while
+            # the completed source step's cuBLAS/runtime workspace is still a
+            # physical owner.  The destination catalog envelope contains its
+            # own stabilized workspace, but not the overlap with that retained
+            # source unit.  Workers publish the exact unit after settlement;
+            # compose one measured unit here instead of guessing a reserve.
+            # Same-key and already-HOT paths return above and therefore never
+            # accumulate this charge on steady replay.
+            if (
+                not getattr(self, "_elastic_calibration_mode", False)
+                and (
+                    physical_owner_set_cold
+                    or step_key != current_residency_step_key
+                )
+                and self._elastic_graph_resident_bytes
+            ):
+                desired_external += getattr(
+                    self, "_elastic_cublas_workspace_unit_bytes", 0
+                )
+            if (
+                step_key is not None
+                and not step_key[0]
+                and not getattr(self, "_elastic_calibration_mode", False)
+            ):
+                # A catalog PIECEWISE envelope is already an aggregate owner-set
+                # endpoint: it includes the pinned FULL baseline present in its
+                # calibration generation.  Compose only residency above that
+                # proven baseline. Adding the entire settled set double-counts
+                # pinned FULL on every miss, eventually evicts every retained
+                # PIECEWISE entry, and can make even X1 appear impossible.
+                #
+                # The catalog baseline is intentionally used instead of the
+                # current process's (usually slightly larger) pinned snapshot:
+                # current + envelope - catalog_baseline preserves that runtime
+                # variance as safety margin. A legacy/unsealed fixture without
+                # coverage retains the fully additive fail-closed bound.
+                catalog_pinned_baseline = int(
+                    getattr(self, "_elastic_graph_catalog_coverage", {}).get(
+                        "pinned_full_bytes", 0
+                    )
+                )
+                retained_excess = self._elastic_graph_resident_bytes
+                if (
+                    catalog_pinned_baseline > 0
+                    and desired_external >= catalog_pinned_baseline
+                ):
+                    retained_excess = max(
+                        0,
+                        retained_excess - catalog_pinned_baseline,
+                    )
+                # An old/small exact row below the pinned baseline cannot be an
+                # aggregate product endpoint; it is a marginal pre-pinning
+                # capture measurement. Compose it with the whole live set.
+                desired_external += retained_excess
+        elif measured_external is not None:
+            desired_external = max(measured_external, self._elastic_graph_floor_bytes)
+        else:
+            # Zero is an explicit UNKNOWN sentinel here, not a claim that a
+            # capture is free. _can_fund/_plan replace it with the exact
+            # prospective physical tail returned by the coordinator.
+            desired_external = 0
+        desired_external = max(
+            desired_external,
+            self._elastic_piecewise_physical_floor_bytes(step_key),
+        )
+        return desired_external, True
+
+    def _can_fund_elastic_graph_step(
+        self,
+        step_key: tuple[int, ...] | None,
+        *,
+        minimum_free_primary_blocks: int,
+        minimum_attention_blocks: int = 0,
+        gdn_blocks: int | None = None,
+        allow_maintenance: bool = False,
+        mm_activation_loan_bytes: int = 0,
+    ) -> tuple[bool, int, int]:
+        """Check prospective graph/KV coexistence without mutating either pool."""
+        if mm_activation_loan_bytes < 0:
+            raise ValueError("MM activation loan cannot be negative")
+        if not getattr(self, "elastic_on_demand_graphs", False):
+            return True, 0, 0
+        residency_step_key = self._elastic_graph_carrier_closure_step_key(
+            step_key
+        )
+        coordinator = self.kv_cache_manager.coordinator
+        desired_external, capture_envelope_planned = (
+            self._estimate_elastic_graph_step_bytes(residency_step_key)
+        )
+        prior_capture = self._elastic_capture_envelope(residency_step_key)
+        cold_unknown = (
+            capture_envelope_planned
+            and prior_capture is None
+            and residency_step_key not in self._elastic_graph_measured_bytes
+        )
+        unsettled_grant = max(
+            (grant for _key, grant in self._elastic_pending_graph_loans),
+            default=0,
+        )
+        available_external = coordinator.max_elastic_external_memory(
+            minimum_free_primary_blocks=minimum_free_primary_blocks,
+            minimum_attention_blocks=minimum_attention_blocks,
+            gdn_blocks=gdn_blocks,
+        )
+        current_external = coordinator.elastic_external_memory_bytes
+        settled_entry_bytes = (
+            getattr(self, "_elastic_pinned_graph_resident_bytes", 0)
+            + getattr(self, "_elastic_evictable_graph_resident_bytes", 0)
+        )
+        shared_resident_bytes = max(
+            0,
+            getattr(self, "_elastic_graph_resident_bytes", current_external)
+            - settled_entry_bytes,
+        )
+        physical_keys = (
+            self._resolve_elastic_step_physical_keys(residency_step_key)
+            if hasattr(self, "_elastic_runtime_generation")
+            and hasattr(self, "_elastic_graph_cache")
+            else ()
+        )
+        compiled_only_step = bool(
+            step_key is not None
+            and not physical_keys
+            and step_key[0] == 0
+            and step_key[1] == 0
+            and step_key[3]
+            in getattr(self, "_elastic_compiled_piecewise_sizes", frozenset())
+        )
+        cold_keys = tuple(
+            key
+            for key in physical_keys
+            if not (
+                (entry := self._elastic_graph_cache.entries.get(key))
+                and entry.hot
+            )
+        )
+        # Retaining the current HOT endpoint while capturing a COLD owner set
+        # is an atomic physical DAG.  ``request_bytes`` already contains the
+        # source runtime workspace, while the destination capture can create
+        # one additional worker-measured unit before the source lifetime ends.
+        # Carry that overlap as its own graph-cache term: embedding it only in
+        # the owner-set envelope is insufficient because the retained-entry
+        # branch may be dominated by ``request_bytes + per-owner peaks``.
+        retained_transition_overlap_bytes = (
+            getattr(self, "_elastic_cublas_workspace_unit_bytes", 0)
+            if cold_keys and self._elastic_graph_resident_bytes
+            else 0
+        )
+        if cold_keys and mm_activation_loan_bytes:
+            self._elastic_last_defer_reason = "mm_cold_transition_exclusion"
+            if allow_maintenance:
+                transaction_id = self._next_elastic_transaction_id()
+                plan = self._elastic_graph_cache.plan(
+                    transaction_id,
+                    physical_keys,
+                    request_bytes=current_external,
+                    available_bytes=available_external,
+                    owner_set_capture_envelope_bytes=desired_external,
+                    retained_transition_overlap_bytes=(
+                        retained_transition_overlap_bytes
+                    ),
+                    shared_resident_bytes=shared_resident_bytes,
+                    replace_unleased_on_miss=bool(
+                        self._elastic_graph_hotset_cap_bytes
+                    ),
+                    residency_cap_bytes=self._elastic_graph_hotset_cap_bytes,
+                )
+                if plan.kind == ElasticPlanKind.MAINTENANCE:
+                    self._elastic_pending_maintenance_plan = plan
+                    self._elastic_pending_maintenance_step_key = (
+                        residency_step_key
+                    )
+            return (
+                False,
+                desired_external + mm_activation_loan_bytes,
+                available_external,
+            )
+        calibration_cold_capture = bool(
+            cold_keys and getattr(self, "_elastic_calibration_mode", False)
+        )
+        priced_product_cold_capture = bool(
+            cold_keys
+            and not getattr(self, "_elastic_calibration_mode", False)
+            and not cold_unknown
+        )
+        if calibration_cold_capture or priced_product_cold_capture:
+            # Discovery is safe before scheduler mutation. The immutable plan
+            # is bound to this exact preflight key and, when admission commits,
+            # capture and the first USER consumer execute in the same
+            # transaction. This removes the request-free shape-drift window.
+            if not allow_maintenance:
+                self._elastic_last_defer_reason = "final_shape_maintenance_required"
+                self._elastic_last_defer_step_key = residency_step_key
+                self._elastic_last_defer_physical_keys = tuple(
+                    key.identity for key in physical_keys
+                )
+                return False, desired_external, available_external
+            if self._elastic_pending_maintenance_plan is None:
+                transaction_id = self._next_elastic_transaction_id()
+                capture_envelope_bytes = (
+                    available_external
+                    if calibration_cold_capture
+                    else desired_external
+                )
+                plan = self._elastic_graph_cache.plan(
+                    transaction_id,
+                    physical_keys,
+                    request_bytes=current_external,
+                    available_bytes=available_external,
+                    owner_set_capture_envelope_bytes=capture_envelope_bytes,
+                    retained_transition_overlap_bytes=(
+                        retained_transition_overlap_bytes
+                    ),
+                    shared_resident_bytes=shared_resident_bytes,
+                    replace_unleased_on_miss=bool(
+                        self._elastic_graph_hotset_cap_bytes
+                    ),
+                    residency_cap_bytes=self._elastic_graph_hotset_cap_bytes,
+                )
+                if plan.kind == ElasticPlanKind.MAINTENANCE:
+                    self._elastic_pending_maintenance_plan = plan
+                    self._elastic_pending_maintenance_step_key = (
+                        residency_step_key
+                    )
+                    self._elastic_last_defer_reason = "cold_promotion_pending"
+                    return False, plan.capture_loan_bytes, available_external
+                self._elastic_last_defer_reason = plan.defer_reason
+                if plan.kind == ElasticPlanKind.DEFER:
+                    self._elastic_graph_cache.observe_defer(plan)
+            return False, desired_external, available_external
+        physical_resident_lower_bound = (
+            getattr(self, "_elastic_graph_resident_bytes", 0)
+            if step_key is not None
+            else 0
+        )
+        proven_required = coordinator.normalize_elastic_external_memory(
+            max(
+                desired_external + mm_activation_loan_bytes,
+                physical_resident_lower_bound,
+            )
+        )
+        if step_key is not None and getattr(self, "_elastic_calibration_mode", False):
+            # Before seal, every logical witness is a measurement epoch. Two
+            # mixed request distributions can share one graph descriptor yet
+            # exercise different eager workspaces, so even a HOT descriptor
+            # receives the exact prospective tail during calibration.
+            desired_external = available_external
+        elif cold_unknown:
+            # Accepted product execution never turns "all remaining bytes"
+            # into a capture-price proof.  The candidate remains uncommitted
+            # until startup/calibration publishes an identity-compatible exact
+            # price or conservative class envelope.
+            self._elastic_last_defer_reason = (
+                "missing_exact_price_or_class_envelope"
+            )
+            if allow_maintenance and physical_keys:
+                deferred = self._elastic_graph_cache.plan(
+                    self._next_elastic_transaction_id(),
+                    physical_keys,
+                    request_bytes=current_external,
+                    available_bytes=available_external,
+                )
+                if deferred.kind != ElasticPlanKind.DEFER:
+                    raise RuntimeError("unpriced graph unexpectedly produced a plan")
+                self._elastic_graph_cache.observe_defer(deferred)
+            return False, 0, available_external
+        desired_external = coordinator.normalize_elastic_external_memory(
+            desired_external + mm_activation_loan_bytes
+        )
+        transition_external = (
+            current_external
+            if residency_step_key is not None
+            and self._elastic_graph_step_key is not None
+            and residency_step_key
+            != self._elastic_graph_carrier_closure_step_key(
+                self._elastic_graph_step_key
+            )
+            else 0
+        )
+        # The next worker step releases owners that its descriptor cannot use
+        # before applying this loan. The current step's grant is therefore not
+        # a permanent lower bound. Only older FIFO work and the proposed step
+        # must coexist in scheduler state.
+        required_external = max(
+            unsettled_grant,
+            desired_external,
+            proven_required,
+            transition_external,
+            current_external if step_key is not None else 0,
+        )
+        return (
+            (step_key is None or required_external > 0 or compiled_only_step)
+            and proven_required <= available_external
+            and required_external <= available_external,
+            required_external,
+            available_external,
+        )
+
+    def _elastic_idle_cleanup_outstanding(self) -> bool:
+        """Return whether administrative X0 still has reclaimable work.
+
+        Pinned HOT residency remains a valid steady-state cache and therefore
+        does not keep calibration alive. Only an evictable executable or a
+        measured physical teardown floor requires another X0 tick.
+        """
+        return bool(
+            getattr(self, "_elastic_evictable_graph_resident_bytes", 0)
+            or self._elastic_graph_floor_bytes
+        )
+
+    def _maybe_arm_elastic_serving_idle_cleanup(self) -> None:
+        """Start or finish an X0 cleanup at a true serving-idle boundary."""
+        if not getattr(self, "_elastic_serving_idle_cleanup_pending", False):
+            return
+        if (
+            self.running
+            or len(getattr(self, "waiting", ()))
+            or len(getattr(self, "skipped_waiting", ()))
+            or self._elastic_pending_graph_loans
+        ):
+            return
+        if self._elastic_idle_cleanup_outstanding():
+            self._elastic_force_idle_cleanup = True
+            self._elastic_graph_cleanup_required = True
+            return
+        self._elastic_serving_idle_cleanup_pending = False
+        self._elastic_force_idle_cleanup = False
+        self._elastic_graph_cleanup_required = False
+
+    def _record_elastic_serving_hotset_replacement(
+        self, plan: ElasticStepPlan | None
+    ) -> None:
+        if (
+            plan is not None
+            and plan.staged_hotset_replace
+            and plan.victim_keys
+            and self.elastic_on_demand_graphs
+            and not self._elastic_calibration_mode
+            and not self._elastic_restore_mode
+        ):
+            self._elastic_serving_idle_cleanup_pending = True
+
+    def _plan_elastic_graph_loan(
+        self,
+        step_key: tuple[int, ...] | None,
+        *,
+        minimum_free_primary_blocks: int,
+        mm_activation_loan_bytes: int = 0,
+    ) -> int:
+        if not self.elastic_on_demand_graphs:
+            return 0
+        if mm_activation_loan_bytes < 0:
+            raise ValueError("MM activation loan cannot be negative")
+        if step_key is None and mm_activation_loan_bytes:
+            raise RuntimeError("an MM activation loan requires an execution shape")
+        residency_step_key = self._elastic_graph_carrier_closure_step_key(
+            step_key
+        )
+        coordinator = self.kv_cache_manager.coordinator
+        if minimum_free_primary_blocks < 0:
+            raise ValueError("elastic successor headroom cannot be negative")
+        minimum_free = minimum_free_primary_blocks
+        unsettled_grant = max(
+            (grant for _key, grant in self._elastic_pending_graph_loans),
+            default=0,
+        )
+        current_external = coordinator.elastic_external_memory_bytes
+        pending_maintenance = getattr(
+            self, "_elastic_pending_maintenance_plan", None
+        )
+        if mm_activation_loan_bytes:
+            physical_keys = self._resolve_elastic_step_physical_keys(
+                residency_step_key
+            )
+            if any(
+                not (
+                    (entry := self._elastic_graph_cache.entries.get(key))
+                    and entry.hot
+                )
+                for key in physical_keys
+            ):
+                raise RuntimeError(
+                    "MM activation cannot overlap a cold Graph transition"
+                )
+        if (
+            pending_maintenance is not None
+            and pending_maintenance.kind == ElasticPlanKind.MAINTENANCE
+            and step_key
+            == getattr(self, "_elastic_pending_maintenance_step_key", None)
+        ):
+            step_grant = coordinator.normalize_elastic_external_memory(
+                pending_maintenance.capture_loan_bytes
+            )
+            available_external = coordinator.max_elastic_external_memory(
+                minimum_free_primary_blocks=minimum_free
+            )
+            if step_grant <= 0 or step_grant > available_external:
+                raise RuntimeError(
+                    "planned maintenance capture no longer fits the prospective "
+                    "KV boundary: "
+                    f"required_bytes={step_grant} "
+                    f"available_bytes={available_external} step_key={step_key!r}"
+                )
+            if not coordinator.set_elastic_external_memory(
+                step_grant,
+                minimum_free_primary_blocks=minimum_free,
+            ):
+                raise RuntimeError(
+                    "planned maintenance capture loan could not be committed"
+                )
+            self._elastic_pending_graph_loans.append((step_key, step_grant))
+            self._elastic_graph_recapture_pending_key = residency_step_key
+            return step_grant
+        if step_key is None and not getattr(
+            self, "_elastic_force_idle_cleanup", False
+        ):
+            # There is no next execution shape yet, so neither graph nor KV is
+            # a useful consumer. Preserve the last settled HOT working set and
+            # defer eviction until real admission can price the successor.
+            step_grant = max(unsettled_grant, current_external)
+            self._elastic_pending_graph_loans.append((None, step_grant))
+            return step_grant
+        sampling_workspace = 0
+        owner_key = self._elastic_graph_owner_key(residency_step_key)
+        desired_external, capture_envelope_planned = (
+            self._estimate_elastic_graph_step_bytes(residency_step_key)
+        )
+        proven_required = coordinator.normalize_elastic_external_memory(
+            desired_external
+        )
+        calibration_step = step_key is not None and getattr(
+            self, "_elastic_calibration_mode", False
+        )
+        prior_capture = None
+        cold_unknown = False
+        if capture_envelope_planned:
+            available_external = coordinator.max_elastic_external_memory(
+                minimum_free_primary_blocks=minimum_free
+            )
+            capture_envelopes = getattr(self, "_elastic_graph_capture_envelopes", None)
+            if capture_envelopes is None:
+                capture_envelopes = {}
+                self._elastic_graph_capture_envelopes = capture_envelopes
+            prior_capture = self._elastic_capture_envelope(residency_step_key)
+            cold_unknown = (
+                prior_capture is None
+                and residency_step_key not in self._elastic_graph_measured_bytes
+            )
+            if prior_capture is not None:
+                prior_grant = prior_capture[0]
+                desired_external, floor_delta, sampling_delta = (
+                    self._adjust_elastic_capture_envelope(
+                        prior_capture,
+                        getattr(
+                            self,
+                            "_elastic_graph_transition_floor_bytes",
+                            self._elastic_graph_floor_bytes,
+                        ),
+                        sampling_workspace,
+                    )
+                )
+                logger.debug(
+                    "Elastic CUDA Graph measured envelope reused: "
+                    "owner_key=%s step_key=%s prior_grant=%d "
+                    "floor_delta=%d sampling_delta=%d desired_bytes=%d",
+                    owner_key,
+                    step_key,
+                    prior_grant,
+                    floor_delta,
+                    sampling_delta,
+                    desired_external,
+                )
+            elif cold_unknown and not calibration_step:
+                raise RuntimeError(
+                    "unpriced elastic CUDA Graph reached committed product "
+                    "execution; candidate admission must defer before KV/request "
+                    f"mutation: owner_key={owner_key!r} step_key={step_key!r}"
+                )
+            if getattr(self, "_elastic_calibration_mode", False):
+                # A measured row is not trusted until every declared witness
+                # has observed a non-expanding replay. Discovery therefore
+                # borrows the full rank-safe tail and settlement immediately
+                # returns the excess to KV.
+                if proven_required > available_external:
+                    raise RuntimeError(
+                        "scheduler admitted a calibration step below its proven "
+                        "PIECEWISE physical floor: "
+                        f"required_bytes={proven_required} "
+                        f"available_bytes={available_external} "
+                        f"step_key={step_key!r}"
+                    )
+                desired_external = available_external
+            if desired_external <= 0 or desired_external > available_external:
+                raise RuntimeError(
+                    "current scheduler admission cannot fund the measured "
+                    "CUDA Graph capture estimate: "
+                    f"required_bytes={desired_external} "
+                    f"available_bytes={available_external} "
+                    f"step_key={step_key!r} owner_key={owner_key!r} "
+                    f"current_step_key={self._elastic_graph_step_key!r}"
+                )
+            self._elastic_graph_recapture_pending_key = residency_step_key
+        elif calibration_step:
+            # PIECEWISE graph identity intentionally coalesces request-length
+            # distributions. Their eager attention/sampling workspaces can
+            # still have different high-water marks, so a new logical witness
+            # must not execute against the smaller envelope measured by an
+            # earlier witness of the same HOT descriptor.
+            available_external = coordinator.max_elastic_external_memory(
+                minimum_free_primary_blocks=minimum_free
+            )
+            if proven_required > available_external:
+                raise RuntimeError(
+                    "scheduler admitted a calibration witness below its proven "
+                    "physical floor: "
+                    f"required_bytes={proven_required} "
+                    f"available_bytes={available_external} "
+                    f"step_key={step_key!r}"
+                )
+            desired_external = available_external
+        step_grant = coordinator.normalize_elastic_external_memory(desired_external)
+        if residency_step_key is not None:
+            # Settled worker residency can include quarantined wrappers that
+            # are intentionally retained until X0. It is a lower bound for
+            # every useful step even when execution keys share one carrier.
+            # With no pending FIFO work the coordinator is authoritative and
+            # may include retained physical state not split out in the graph
+            # counter. With pending work it also includes older reservations;
+            # keep those only in ``safe_external`` below so their larger grant
+            # does not become this output's identity.
+            settled_external = (
+                current_external
+                if not self._elastic_pending_graph_loans
+                else getattr(self, "_elastic_graph_resident_bytes", 0)
+            )
+            step_grant = max(
+                step_grant,
+                settled_external,
+            )
+        if capture_envelope_planned and step_grant > available_external:
+            raise RuntimeError(
+                "current scheduler admission cannot carry changed-key CUDA "
+                "Graph residency through capture: "
+                f"required_bytes={step_grant} "
+                f"available_bytes={available_external} "
+                f"step_key={step_key!r} "
+                f"current_step_key={self._elastic_graph_step_key!r}"
+            )
+        if capture_envelope_planned:
+            # Admission is already fail-closed above. Publish the normalized
+            # provisional envelope immediately so async duplicates can share
+            # it. Settlement must replace both its bytes and floor with worker
+            # measurement; retaining a cold full-tail grant here would turn
+            # discovery into a permanent fake reserve on every recapture.
+            assert owner_key is not None
+            self._record_elastic_capture_envelope(
+                residency_step_key,
+                (
+                    step_grant,
+                    self._elastic_graph_floor_bytes,
+                    sampling_workspace,
+                ),
+                publish_global=False,
+            )
+        graph_step_grant = step_grant
+        if mm_activation_loan_bytes:
+            step_grant = coordinator.normalize_elastic_external_memory(
+                graph_step_grant + mm_activation_loan_bytes
+            )
+            available_external = coordinator.max_elastic_external_memory(
+                minimum_free_primary_blocks=minimum_free
+            )
+            if step_grant > available_external:
+                raise RuntimeError(
+                    "same-step Graph+MM external loan exceeds the prospective KV "
+                    f"boundary: required_bytes={step_grant} "
+                    f"available_bytes={available_external} step_key={step_key!r}"
+                )
+        # KV admission must remain safe for older outstanding work. Changed-key
+        # transition residency is already included in step_grant above; it is
+        # deliberately excluded for same-key replay and X0 so it cannot become
+        # a sticky reserve or require a redundant cleanup output.
+        safe_external = max(unsettled_grant, step_grant)
+        if not coordinator.set_elastic_external_memory(
+            safe_external,
+            minimum_free_primary_blocks=minimum_free,
+        ):
+            raise RuntimeError(
+                "same-step CUDA Graph loan could not be committed after "
+                "admission: "
+                f"step_key={step_key!r} requested_bytes={safe_external} "
+                f"current_bytes={current_external} "
+                f"minimum_free_primary_blocks={minimum_free} "
+                f"rejection={coordinator.last_elastic_rejection!r}"
+            )
+        # The coordinator holds the global FIFO-safe maximum, while step_grant
+        # is the authoritative quantum-normalized value propagated to this
+        # SchedulerOutput and observed by the worker.
+        committed_external = coordinator.elastic_external_memory_bytes
+        if committed_external < safe_external:
+            raise RuntimeError(
+                "elastic CUDA Graph loan commit returned less than requested: "
+                f"requested_bytes={safe_external} "
+                f"committed_bytes={committed_external}"
+            )
+        self._elastic_pending_graph_loans.append((step_key, step_grant))
+        # This is the latest worker state requested in FIFO order. Do not roll it
+        # back when an older asynchronous result settles.
+        self._elastic_graph_step_key = step_key
+        capacity_known = prior_capture is not None or (
+            residency_step_key in self._elastic_graph_measured_bytes
+            and self._elastic_graph_recapture_pending_key != residency_step_key
+        )
+        if (
+            step_key is not None
+            and step_key[0] == 0
+            and step_key[1] == 0
+            and step_key[3]
+            in getattr(self, "_elastic_compiled_piecewise_sizes", frozenset())
+            and not self._resolve_elastic_step_physical_keys(step_key)
+        ):
+            capacity_known = True
+        self._log_elastic_executable_capacity(
+            step_key,
+            step_grant,
+            known=capacity_known,
+        )
+        return step_grant
+
+    def _next_elastic_transaction_id(self) -> str:
+        self._elastic_transaction_seq += 1
+        return f"elastic-{self._elastic_transaction_seq:020d}"
+
+    def _log_elastic_executable_capacity(
+        self,
+        step_key: tuple[int, ...] | None,
+        external_memory_bytes: int,
+        *,
+        known: bool,
+    ) -> None:
+        """Publish executable capacity without turning estimates into facts."""
+        primary_blocks_per_request = getattr(
+            self, "_elastic_primary_blocks_per_max_request", None
+        )
+        if primary_blocks_per_request is None:
+            return
+        if step_key is None:
+            receipt: tuple[object, ...] = ("X0", external_memory_bytes)
+            if receipt != self._elastic_last_capacity_receipt:
+                logger.debug(
+                    "Elastic graph loan released: no executable capacity claim "
+                    "changes until the next catalog-proven step; external_bytes=%d",
+                    external_memory_bytes,
+                )
+                self._elastic_last_capacity_receipt = receipt
+            return
+
+        if not known:
+            receipt = ("UNKNOWN", step_key, external_memory_bytes)
+            if receipt != self._elastic_last_capacity_receipt:
+                logger.debug(
+                    "Elastic executable KV calibration pending for cold step; "
+                    "step_key=%s provisional_external_bytes=%d",
+                    step_key,
+                    external_memory_bytes,
+                )
+                self._elastic_last_capacity_receipt = receipt
+            return
+
+        coordinator = self.kv_cache_manager.coordinator
+        max_requests = max(
+            self.scheduler_config.max_num_seqs,
+            self.kv_cache_config.num_blocks,
+        )
+        executable_x = coordinator.max_elastic_full_context_requests(
+            primary_blocks_per_request,
+            external_memory_bytes,
+            max_requests,
+        )
+        receipt = (
+            "KNOWN",
+            step_key,
+            external_memory_bytes,
+            executable_x,
+        )
+        if receipt != self._elastic_last_capacity_receipt:
+            kv = coordinator.elastic_kv_authority_receipt(
+                primary_blocks_per_request,
+                external_memory_bytes,
+            )
+            logger.debug(
+                "Elastic executable KV capacity: max_full_context_x=%d "
+                "max_model_len=%d external_bytes=%d step_key=%s "
+                "raw_attention_blocks_per_rank=%s "
+                "raw_attention_bytes_per_rank=%s "
+                "raw_attention_token_equivalent_per_rank=%s "
+                "effective_attention_blocks_per_rank=%s "
+                "effective_attention_bytes_per_rank=%s "
+                "effective_attention_token_equivalent_per_rank=%s "
+                "active_gdn_blocks=%d primary_blocks_per_max_request=%d",
+                executable_x,
+                self.max_model_len,
+                external_memory_bytes,
+                step_key,
+                kv["raw_attention_blocks_per_rank"],
+                kv["raw_attention_bytes_per_rank"],
+                kv["raw_attention_token_equivalent_per_rank"],
+                kv["effective_attention_blocks_per_rank"],
+                kv["effective_attention_bytes_per_rank"],
+                kv["effective_attention_token_equivalent_per_rank"],
+                kv["active_gdn_blocks"],
+                kv["primary_blocks_per_max_request"],
+            )
+            self._elastic_last_capacity_receipt = receipt
+
+    def _publish_elastic_startup_capacity(self) -> None:
+        """Publish distinct catalog-proven KV and execution guarantees."""
+        coordinator = self.kv_cache_manager.coordinator
+        primary_blocks = self._elastic_primary_blocks_per_max_request
+        coverage = getattr(self, "_elastic_graph_catalog_coverage", {})
+        product_k = int(getattr(self, "num_spec_tokens", 0))
+        speculative_config = getattr(
+            getattr(self, "vllm_config", None), "speculative_config", None
+        )
+        product_prefill_k = (
+            0
+            if speculative_config is not None
+            and speculative_config.disable_speculation_on_non_decode
+            else product_k
+        )
+        startup_kv = coordinator.elastic_kv_authority_receipt(
+            primary_blocks,
+            getattr(self, "_elastic_graph_resident_bytes", 0),
+        )
+        # Synthetic Scheduler unit fixtures predate the concrete coordinator
+        # receipt and use an open Mock. The coordinator's dedicated tests own
+        # this ABI; production always returns the validated dictionary.
+        if isinstance(startup_kv, dict):
+            logger.info(
+                "Elastic KV authority before READY: max_model_len=%d "
+                "raw_attention_blocks_per_rank=%s "
+                "raw_attention_bytes_per_rank=%s "
+                "raw_attention_token_equivalent_per_rank=%s "
+                "effective_attention_blocks_per_rank=%s "
+                "effective_attention_bytes_per_rank=%s "
+                "effective_attention_token_equivalent_per_rank=%s "
+                "graph_steady_bytes=%d graph_transition_floor_bytes=%d "
+                "graph_workspace_unit_bytes=%d mm_activation_loan_bytes=%d "
+                "active_gdn_blocks=%d primary_blocks_per_max_request=%d "
+                "rank_budget_bytes=%s",
+                startup_kv["max_model_len"],
+                startup_kv["raw_attention_blocks_per_rank"],
+                startup_kv["raw_attention_bytes_per_rank"],
+                startup_kv["raw_attention_token_equivalent_per_rank"],
+                startup_kv["effective_attention_blocks_per_rank"],
+                startup_kv["effective_attention_bytes_per_rank"],
+                startup_kv["effective_attention_token_equivalent_per_rank"],
+                startup_kv["graph_external_bytes"],
+                getattr(self, "_elastic_graph_transition_floor_bytes", 0),
+                getattr(self, "_elastic_cublas_workspace_unit_bytes", 0),
+                getattr(self, "_elastic_mm_activation_loan_bytes", 0),
+                startup_kv["active_gdn_blocks"],
+                startup_kv["primary_blocks_per_max_request"],
+                startup_kv["rank_budget_bytes"],
+            )
+        sealed_decode_max = int(coverage.get("decode_max_x", 0))
+        sealed_mixed_max = int(coverage.get("mixed_max_x", 0))
+        sealed_full_context_max = int(coverage.get("full_context_max_x", 0))
+        by_k: dict[int, dict[str, dict[int, int]]] = defaultdict(
+            lambda: {"decode": {}, "mixed_b": {}, "full_context": {}}
+        )
+        complete_shapes = 0
+        from vllm.v1.worker.startup_plan import (
+            elastic_graph_catalog_row_complete,
+        )
+
+        representation = coverage.get("representation", "pinned_full_family")
+        for step_key, row in self._elastic_graph_catalog.items():
+            # Every advertised boundary must coexist with the whole pinned
+            # FULL family that is simultaneously resident after startup. A
+            # per-shape cold observation from an earlier calibration epoch is
+            # an alternative measurement, not the aggregate product floor.
+            cold_peak = max(
+                _elastic_catalog_cold_residency_envelope(row),
+                getattr(self, "_elastic_pinned_graph_resident_bytes", 0),
+            )
+            complete = elastic_graph_catalog_row_complete(
+                step_key,
+                {**row, "cold_peak_bytes": cold_peak},
+                representation=representation,
+            )
+            if not complete:
+                continue
+            complete_shapes += 1
+            x = step_key[2]
+            if step_key[0]:
+                if (
+                    step_key[1] == product_prefill_k
+                    and sealed_decode_max
+                    and x > sealed_decode_max
+                ):
+                    continue
+                by_k[step_key[1]]["decode"][x] = max(
+                    cold_peak,
+                    by_k[step_key[1]]["decode"].get(x, 0),
+                )
+                # A short decode shape and simultaneous max-model-length KV
+                # residency are different contracts.  Test the latter against
+                # this exact shape without filtering it out of DecodeMaxX.
+                full_context_x = coordinator.max_elastic_full_context_requests(
+                    primary_blocks,
+                    cold_peak,
+                    x,
+                )
+                if full_context_x >= x:
+                    by_k[step_key[1]]["full_context"][x] = max(
+                        cold_peak,
+                        by_k[step_key[1]]["full_context"].get(x, 0),
+                    )
+            elif step_key[3] == self.scheduler_config.max_num_batched_tokens:
+                if (
+                    step_key[1] == product_k
+                    and sealed_mixed_max
+                    and x > sealed_mixed_max
+                ):
+                    continue
+                by_k[step_key[1]]["mixed_b"][x] = max(
+                    cold_peak,
+                    by_k[step_key[1]]["mixed_b"].get(x, 0),
+                )
+        # A configured compiled-only max-B carrier deliberately has no CUDA
+        # Graph row.  The sealed boundary still needs an exact phase-split
+        # witness at MixedMaxX, while the intersecting decode row continues to
+        # carry the physical Graph/KV envelope.  A zero here means "no distinct
+        # Graph owner", not "execution is free".
+        compiled_sizes = getattr(
+            self, "_elastic_compiled_piecewise_sizes", frozenset()
+        )
+        max_b = self.scheduler_config.max_num_batched_tokens
+        if max_b in compiled_sizes and sealed_mixed_max:
+            by_k[product_prefill_k]["mixed_b"][sealed_mixed_max] = 0
+        for k, classes in sorted(by_k.items()):
+            decode_max = max(classes["decode"], default=0)
+            guaranteed_max = max(
+                classes["decode"].keys() & classes["mixed_b"].keys(),
+                default=0,
+            )
+            full_context_max = max(classes["full_context"], default=0)
+            if k == product_k and coverage:
+                if decode_max != sealed_decode_max:
+                    raise RuntimeError(
+                        "sealed DecodeMaxX lacks an exact complete FULL row: "
+                        f"sealed={sealed_decode_max} catalog={decode_max} K={k}"
+                    )
+                if (
+                    product_prefill_k == product_k
+                    and guaranteed_max != sealed_mixed_max
+                ):
+                    raise RuntimeError(
+                        "sealed MixedMaxX lacks an exact complete max-B row: "
+                        f"sealed={sealed_mixed_max} catalog={guaranteed_max} K={k}"
+                    )
+                full_context_max = sealed_full_context_max
+            decode_envelope = classes["decode"].get(decode_max, 0)
+            max_b_envelope = max(
+                classes["decode"].get(guaranteed_max, 0),
+                classes["mixed_b"].get(guaranteed_max, 0),
+            )
+            full_context_envelope = classes["full_context"].get(
+                full_context_max, 0
+            )
+            capacity = coordinator.elastic_full_context_capacity_receipt(
+                primary_blocks,
+                full_context_envelope,
+                full_context_max,
+            )
+            if capacity["residual_attention_blocks"] < 0:
+                raise RuntimeError(
+                    "sealed elastic catalog published an impossible startup "
+                    f"capacity: K={k} receipt={capacity}"
+                )
+            logger.info(
+                "Elastic calibrated startup capacity: DecodeMaxX[K%d]=%d "
+                "GuaranteedMaxX[K%d,B%d]=%d GuaranteedFullContextX[K%d]=%d "
+                "decode_cold_envelope_bytes=%d max_b_cold_envelope_bytes=%d "
+                "full_context_cold_envelope_bytes=%d "
+                "attention_blocks=%d required_attention_blocks=%d "
+                "residual_attention_blocks=%d gdn_blocks=%d "
+                "complete_catalog_shapes=%d catalog_shapes=%d",
+                k,
+                decode_max,
+                k,
+                self.scheduler_config.max_num_batched_tokens,
+                guaranteed_max,
+                k,
+                full_context_max,
+                decode_envelope,
+                max_b_envelope,
+                full_context_envelope,
+                capacity["attention_blocks"],
+                capacity["required_attention_blocks"],
+                capacity["residual_attention_blocks"],
+                capacity["gdn_blocks"],
+                complete_shapes,
+                len(self._elastic_graph_catalog),
+            )
+        if product_prefill_k != product_k:
+            decode_rows = by_k[product_k]["decode"]
+            mixed_rows = by_k[product_prefill_k]["mixed_b"]
+            combined_max = max(decode_rows.keys() & mixed_rows.keys(), default=0)
+            if coverage and combined_max != sealed_mixed_max:
+                raise RuntimeError(
+                    "sealed phase-split MixedMaxX lacks exact complete decode "
+                    "and max-B rows: "
+                    f"sealed={sealed_mixed_max} catalog={combined_max} "
+                    f"decode_k={product_k} prefill_k={product_prefill_k}"
+                )
+            logger.info(
+                "Elastic calibrated phase-split capacity: "
+                "GuaranteedMaxX[decodeK%d,prefillK%d,B%d]=%d "
+                "decode_cold_envelope_bytes=%d "
+                "max_b_cold_envelope_bytes=%d",
+                product_k,
+                product_prefill_k,
+                self.scheduler_config.max_num_batched_tokens,
+                combined_max,
+                decode_rows.get(combined_max, 0),
+                mixed_rows.get(combined_max, 0),
+            )
+
+    def _sync_elastic_hot_graphs(
+        self,
+        rows: tuple[tuple[object, ...], ...],
+        plan: ElasticStepPlan | None = None,
+    ) -> None:
+        parsed: list[tuple[PhysicalReplayKey, GraphPrice, bool, int]] = []
+        for row in rows:
+            if len(row) != 13:
+                raise RuntimeError(
+                    "invalid elastic HOT receipt width: "
+                    f"expected=13 actual={len(row)}"
+                )
+            (
+                identity,
+                owner,
+                mode,
+                tokens,
+                physical_x,
+                uniform_query_len,
+                active_loras,
+                generation,
+                pinned,
+                resident_bytes,
+                _pool_bytes,
+                reclaimable_bytes,
+                active_leases,
+            ) = row
+            if int(active_leases):
+                raise RuntimeError(
+                    "worker published a HOT receipt before releasing leases"
+                )
+            logical_x = int(physical_x) if str(mode) == "FULL" else None
+            key = PhysicalReplayKey(
+                logical=LogicalDispatchKey(
+                    owner=str(owner),
+                    mode=str(mode),
+                    token_bucket=int(tokens),
+                    logical_num_reqs=logical_x,
+                    uniform_query_len=(
+                        int(uniform_query_len)
+                        if uniform_query_len is not None
+                        else None
+                    ),
+                    active_loras=int(active_loras),
+                ),
+                physical_num_reqs=int(physical_x),
+                generation=RuntimeGeneration(str(generation)),
+            )
+            if key.identity != identity:
+                raise RuntimeError("worker HOT receipt physical identity mismatch")
+            group_id = f"private-pool:{key.identity}"
+            resident = int(resident_bytes)
+            parsed.append(
+                (
+                    key,
+                    GraphPrice(
+                        resident_bytes=resident,
+                        capture_peak_bytes=resident,
+                        reclaim_group=group_id,
+                    ),
+                    bool(pinned),
+                    int(reclaimable_bytes),
+                )
+            )
+        if plan is not None and plan.staged_hotset_replace:
+            prices = {key: graph_price for key, graph_price, _pinned, _proof in parsed}
+            pinned_keys = {
+                key for key, _price, pinned, _proof in parsed if pinned
+            }
+            self._elastic_graph_cache.finish_maintenance(
+                plan,
+                prices,
+                pinned_keys=pinned_keys,
+            )
+        self._elastic_graph_cache.synchronize_hot(parsed)
+        self._elastic_pinned_graph_resident_bytes = sum(
+            price.resident_bytes for _key, price, pinned, _proof in parsed if pinned
+        )
+        self._elastic_evictable_graph_resident_bytes = sum(
+            price.resident_bytes
+            for _key, price, pinned, _proof in parsed
+            if not pinned
+        )
+
+    def _settle_elastic_graph_loan(
+        self,
+        scheduler_output: SchedulerOutput,
+        worker_resident_bytes: int,
+        worker_floor_bytes: int,
+        worker_peak_bytes: int = 0,
+        worker_transition_floor_bytes: int | None = None,
+        worker_hot_graphs: tuple[tuple[object, ...], ...] = (),
+        worker_cublas_workspace_unit_bytes: int = 0,
+    ) -> None:
+        coordinator = self.kv_cache_manager.coordinator
+        transaction_id = scheduler_output.elastic_transaction_id
+        plan = scheduler_output.elastic_step_plan
+        staged_replace = bool(plan is not None and plan.staged_hotset_replace)
+        active_retention_without_receipt = bool(
+            getattr(self, "_elastic_calibration_retention_id", None)
+            and not worker_hot_graphs
+        )
+        preserved_noop_without_receipt = bool(
+            scheduler_output.elastic_preserve_graph_residency
+            and plan is None
+            and scheduler_output.total_num_scheduled_tokens == 0
+            and not worker_hot_graphs
+        )
+        receiptless_preservation = bool(
+            active_retention_without_receipt
+            or preserved_noop_without_receipt
+        )
+        if receiptless_preservation:
+            # Some calibration output paths omit the optional HOT sidecar. An
+            # active retention epoch has already validated and leased every
+            # protected key on each worker before execution; a missing key is
+            # rejected there. Thus an absent sidecar is not an authoritative
+            # empty set until the retention epoch ends. The ordinary serving
+            # path and every non-retained step remain strict below.
+            worker_resident_bytes = max(
+                worker_resident_bytes,
+                getattr(self, "_elastic_graph_resident_bytes", 0),
+            )
+            worker_floor_bytes = max(
+                worker_floor_bytes,
+                getattr(self, "_elastic_graph_floor_bytes", 0),
+            )
+            if worker_transition_floor_bytes is None:
+                worker_transition_floor_bytes = getattr(
+                    self, "_elastic_graph_transition_floor_bytes", worker_floor_bytes
+                )
+            worker_peak_bytes = max(worker_peak_bytes, worker_resident_bytes)
+            worker_cublas_workspace_unit_bytes = max(
+                worker_cublas_workspace_unit_bytes,
+                getattr(self, "_elastic_cublas_workspace_unit_bytes", 0),
+            )
+        if (
+            transaction_id is not None
+            and hasattr(self, "_elastic_graph_cache")
+            and not staged_replace
+        ):
+            self._elastic_graph_cache.release(transaction_id)
+        if (
+            hasattr(self, "_elastic_graph_cache")
+            and not receiptless_preservation
+        ):
+            self._sync_elastic_hot_graphs(
+                worker_hot_graphs,
+                plan,
+            )
+        if (
+            transaction_id is not None
+            and hasattr(self, "_elastic_graph_cache")
+            and staged_replace
+        ):
+            self._elastic_graph_cache.release(transaction_id)
+        minimum_free = scheduler_output.elastic_successor_primary_headroom
+        if minimum_free < 0:
+            raise RuntimeError(
+                "scheduler output carries negative elastic successor headroom: "
+                f"{minimum_free}"
+            )
+        if worker_transition_floor_bytes is None:
+            worker_transition_floor_bytes = worker_floor_bytes
+        if worker_floor_bytes < 0 or worker_floor_bytes > worker_resident_bytes:
+            raise RuntimeError(
+                "worker CUDA Graph physical floor is outside aggregate "
+                f"external memory: floor_bytes={worker_floor_bytes} "
+                f"resident_bytes={worker_resident_bytes}"
+            )
+        if not (
+            worker_floor_bytes
+            <= worker_transition_floor_bytes
+            <= worker_resident_bytes
+        ):
+            raise RuntimeError(
+                "worker CUDA Graph prospective transition floor is outside "
+                "aggregate external memory: "
+                f"floor_bytes={worker_floor_bytes} "
+                f"transition_floor_bytes={worker_transition_floor_bytes} "
+                f"resident_bytes={worker_resident_bytes}"
+            )
+        if worker_peak_bytes < worker_resident_bytes:
+            worker_peak_bytes = worker_resident_bytes
+        if worker_cublas_workspace_unit_bytes < 0:
+            raise RuntimeError("worker returned a negative cuBLAS workspace unit")
+        prior_workspace_unit = getattr(
+            self, "_elastic_cublas_workspace_unit_bytes", 0
+        )
+        if (
+            prior_workspace_unit
+            and worker_cublas_workspace_unit_bytes
+            and prior_workspace_unit != worker_cublas_workspace_unit_bytes
+        ):
+            raise RuntimeError(
+                "worker cuBLAS workspace unit changed within one runtime: "
+                f"prior={prior_workspace_unit} "
+                f"actual={worker_cublas_workspace_unit_bytes}"
+            )
+        if not getattr(self, "elastic_on_demand_graphs", False):
+            if not coordinator.set_elastic_external_memory(
+                worker_resident_bytes,
+                minimum_free_primary_blocks=minimum_free,
+            ):
+                raise RuntimeError(
+                    "worker CUDA Graph residency could not be committed to the "
+                    "scheduler KV layout: "
+                    f"requested_bytes={worker_resident_bytes}"
+                )
+            return
+
+        observed_step_key = self._canonical_elastic_graph_step_key(
+            scheduler_output.num_scheduled_tokens,
+            scheduler_output.num_spec_tokens_to_schedule,
+            scheduler_output.is_pure_decode_step,
+        )
+        if not self._elastic_pending_graph_loans:
+            raise RuntimeError(
+                "worker returned CUDA Graph residency without a pending scheduler loan"
+            )
+        pending_key, granted_bytes = self._elastic_pending_graph_loans.popleft()
+        if pending_key is not None and pending_key[3] <= 0:
+            # Async completion can retain a finished request dictionary whose
+            # physical step contained no work. It owns no executable shape.
+            pending_key = None
+        maintenance = (
+            scheduler_output.elastic_step_plan is not None
+            and scheduler_output.elastic_step_plan.kind
+            == ElasticPlanKind.MAINTENANCE
+        )
+        step_key = pending_key if maintenance else observed_step_key
+        if not maintenance and pending_key != observed_step_key:
+            raise RuntimeError(
+                "asynchronous CUDA Graph loan settled out of FIFO order: "
+                f"expected={pending_key!r} actual={observed_step_key!r}"
+            )
+        residency_step_key = self._elastic_graph_carrier_closure_step_key(
+            step_key
+        )
+        compiled_only_step = bool(
+            residency_step_key is not None
+            and not self._resolve_elastic_step_physical_keys(
+                residency_step_key
+            )
+        )
+        if granted_bytes != scheduler_output.elastic_external_memory_bytes:
+            raise RuntimeError(
+                "scheduler output CUDA Graph grant identity changed in flight: "
+                f"expected={granted_bytes} actual="
+                f"{scheduler_output.elastic_external_memory_bytes}"
+            )
+        mm_activation_loan_bytes = (
+            scheduler_output.elastic_mm_activation_loan_bytes
+        )
+        graph_granted_bytes = scheduler_output.elastic_graph_external_memory_bytes
+        if graph_granted_bytes == 0 and mm_activation_loan_bytes == 0:
+            # Compatibility for synthetic/unit outputs created before the
+            # explicit breakdown; production always fills both fields.
+            graph_granted_bytes = granted_bytes
+        if graph_granted_bytes + mm_activation_loan_bytes != granted_bytes:
+            raise RuntimeError(
+                "scheduler external-loan breakdown changed in flight: "
+                f"graph_bytes={graph_granted_bytes} "
+                f"mm_bytes={mm_activation_loan_bytes} total_bytes={granted_bytes}"
+            )
+        idle_floor_retained = (
+            step_key is None
+            and worker_floor_bytes == worker_resident_bytes
+            and worker_resident_bytes > granted_bytes
+        )
+        idle_pinned_residency_retained = (
+            step_key is None
+            and not self.running
+            and getattr(self, "_elastic_force_idle_cleanup", False)
+            and worker_resident_bytes > granted_bytes
+            and bool(worker_hot_graphs)
+            and all(bool(row[8]) for row in worker_hot_graphs)
+        )
+        was_cold_capture = (
+            residency_step_key is not None
+            and self._elastic_graph_recapture_pending_key
+            == residency_step_key
+        )
+        if was_cold_capture and mm_activation_loan_bytes:
+            raise RuntimeError("MM activation overlapped a cold Graph capture")
+        if worker_resident_bytes > graph_granted_bytes and not (
+            idle_floor_retained
+            or idle_pinned_residency_retained
+            or receiptless_preservation
+        ):
+            raise RuntimeError(
+                "worker CUDA Graph residency exceeds its Graph loan component: "
+                f"resident_bytes={worker_resident_bytes} "
+                f"graph_granted_bytes={graph_granted_bytes}"
+            )
+        graph_observation_peak_bytes = (
+            worker_resident_bytes
+            if mm_activation_loan_bytes
+            else worker_peak_bytes
+        )
+        if residency_step_key is not None and not compiled_only_step:
+            owner_key = self._elastic_graph_owner_key(residency_step_key)
+            assert owner_key is not None
+            catalog = getattr(self, "_elastic_graph_catalog", None)
+            if catalog is None:
+                catalog = {}
+                self._elastic_graph_catalog = catalog
+            row = catalog.setdefault(
+                residency_step_key,
+                {
+                    "cold_peak_bytes": 0,
+                    "hot_peak_bytes": 0,
+                    "resident_bytes": 0,
+                    "floor_bytes": 0,
+                    "cold_observations": 0,
+                    "cold_stable_replays": 0,
+                    "hot_observations": 0,
+                    "hot_stable_replays": 0,
+                },
+            )
+            # A canonical physical class can have multiple logical witnesses
+            # (for example balanced prefill and decode+prefill at the same
+            # padded M/X).  Retain the observed envelope, never whichever
+            # witness happened to run last.
+            row["resident_bytes"] = max(row["resident_bytes"], worker_resident_bytes)
+            row["floor_bytes"] = max(row["floor_bytes"], worker_floor_bytes)
+            if was_cold_capture:
+                physical_envelope = max(
+                    graph_observation_peak_bytes,
+                    worker_resident_bytes,
+                    worker_floor_bytes,
+                )
+                # The catalog prices how many bytes must be borrowed from KV,
+                # not total CUDA high-water.  A capture that published all
+                # Graph owners inside its granted loan can transiently consume
+                # additional non-KV allocator/driver slack; charging that same
+                # physical delta to KV double-counts it.  Real residency/floor
+                # overruns remain fail-closed and retain the full physical
+                # envelope so calibration can downshift MaxX.
+                measured_envelope = (
+                    min(physical_envelope, granted_bytes)
+                    if max(worker_resident_bytes, worker_floor_bytes)
+                    <= granted_bytes
+                    else physical_envelope
+                )
+                measured_envelope = coordinator.normalize_elastic_external_memory(
+                    measured_envelope
+                )
+                prior_capture = self._elastic_capture_envelope(
+                    residency_step_key
+                )
+                prior_sampling = 0 if prior_capture is None else prior_capture[2]
+                self._record_elastic_capture_envelope(
+                    residency_step_key,
+                    (
+                        max(row["cold_peak_bytes"], measured_envelope),
+                        max(row["floor_bytes"], worker_floor_bytes),
+                        prior_sampling,
+                    ),
+                )
+                self._elastic_graph_measured_bytes[residency_step_key] = max(
+                    self._elastic_graph_measured_bytes.get(
+                        residency_step_key, 0
+                    ),
+                    measured_envelope,
+                )
+                prior_cold_peak = row["cold_peak_bytes"]
+                row["cold_observations"] = row.get("cold_observations", 0) + 1
+                bounded_restore_envelope = (
+                    max(prior_cold_peak, row.get("hot_peak_bytes", 0))
+                    if getattr(self, "_elastic_restore_mode", False)
+                    and self._elastic_graph_catalog_coverage.get(
+                        "representation"
+                    )
+                    == "bounded_exact_hotset"
+                    else prior_cold_peak
+                )
+                if (
+                    prior_cold_peak
+                    and measured_envelope <= bounded_restore_envelope
+                ):
+                    row["cold_stable_replays"] = row.get("cold_stable_replays", 0) + 1
+                else:
+                    row["cold_stable_replays"] = 0
+                row["cold_peak_bytes"] = max(prior_cold_peak, measured_envelope)
+                logger.debug(
+                    "Elastic CUDA Graph cold envelope measured: "
+                    "owner_key=%s step_key=%s "
+                    "granted_bytes=%d resident_bytes=%d floor_bytes=%d "
+                    "peak_bytes=%d measured_loan_envelope_bytes=%d "
+                    "cold_observations=%d cold_stable_replays=%d",
+                    owner_key,
+                    step_key,
+                    granted_bytes,
+                    worker_resident_bytes,
+                    worker_floor_bytes,
+                    worker_peak_bytes,
+                    measured_envelope,
+                    row["cold_observations"],
+                    row["cold_stable_replays"],
+                )
+            else:
+                observed_hot_envelope = coordinator.normalize_elastic_external_memory(
+                    max(
+                        graph_observation_peak_bytes,
+                        worker_resident_bytes,
+                        worker_floor_bytes,
+                    )
+                )
+                prior_hot_peak = row["hot_peak_bytes"]
+                row["hot_observations"] = row.get("hot_observations", 0) + 1
+                if prior_hot_peak and observed_hot_envelope <= prior_hot_peak:
+                    row["hot_stable_replays"] = row.get("hot_stable_replays", 0) + 1
+                else:
+                    row["hot_stable_replays"] = 0
+                hot_envelope = max(prior_hot_peak, observed_hot_envelope)
+                cold_growth = (
+                    hot_envelope - prior_hot_peak if prior_hot_peak else 0
+                )
+                if cold_growth:
+                    # A coalesced PIECEWISE descriptor can encounter a larger
+                    # eager-workspace witness without recapturing its compiled
+                    # segments. Compose that measured HOT delta with the prior
+                    # cold envelope so a later cold replay is funded by a
+                    # mathematical upper bound, not the smaller witness that
+                    # happened to capture first.
+                    row["cold_peak_bytes"] = (
+                        coordinator.normalize_elastic_external_memory(
+                            row["cold_peak_bytes"] + cold_growth
+                        )
+                    )
+                    prior_capture = self._elastic_capture_envelope(
+                        residency_step_key
+                    )
+                    capture_grant, capture_floor, capture_sampling = (
+                        prior_capture
+                        if prior_capture is not None
+                        else (row["cold_peak_bytes"] - cold_growth, 0, 0)
+                    )
+                    self._record_elastic_capture_envelope(
+                        residency_step_key,
+                        (
+                            max(
+                                row["cold_peak_bytes"],
+                                coordinator.normalize_elastic_external_memory(
+                                    capture_grant + cold_growth
+                                ),
+                            ),
+                            max(capture_floor, worker_floor_bytes),
+                            capture_sampling,
+                        ),
+                    )
+                self._elastic_graph_measured_bytes[residency_step_key] = (
+                    hot_envelope
+                )
+                row["hot_peak_bytes"] = hot_envelope
+                logger.debug(
+                    "Elastic CUDA Graph hot envelope measured: step_key=%s "
+                    "resident_bytes=%d floor_bytes=%d peak_bytes=%d "
+                    "hot_envelope_bytes=%d cold_growth_bytes=%d "
+                    "cold_envelope_bytes=%d hot_observations=%d "
+                    "hot_stable_replays=%d",
+                    step_key,
+                    worker_resident_bytes,
+                    worker_floor_bytes,
+                    worker_peak_bytes,
+                    hot_envelope,
+                    cold_growth,
+                    row["cold_peak_bytes"],
+                    row["hot_observations"],
+                    row["hot_stable_replays"],
+                )
+            catalog_path = None
+            if (
+                getattr(self, "_elastic_calibration_mode", False)
+                and not getattr(self, "_elastic_restore_mode", False)
+                and hasattr(self, "vllm_config")
+                and hasattr(self, "kv_cache_config")
+            ):
+                from vllm.v1.worker.startup_plan import save_elastic_graph_catalog
+
+                catalog_path = save_elastic_graph_catalog(
+                    self.vllm_config,
+                    self.kv_cache_config,
+                    self._elastic_graph_catalog,
+                )
+            if catalog_path is not None:
+                logger.debug(
+                    "Elastic CUDA Graph catalog updated: path=%s complete=%d total=%d",
+                    catalog_path,
+                    sum(
+                        bool(
+                            row["cold_peak_bytes"]
+                            and row["hot_peak_bytes"]
+                            and row.get("cold_stable_replays", 0)
+                            and row.get("hot_stable_replays", 0)
+                        )
+                        for row in self._elastic_graph_catalog.values()
+                    ),
+                    len(self._elastic_graph_catalog),
+                )
+            if was_cold_capture:
+                self._elastic_graph_recapture_pending_key = None
+        self._elastic_graph_resident_bytes = worker_resident_bytes
+        if worker_cublas_workspace_unit_bytes:
+            self._elastic_cublas_workspace_unit_bytes = (
+                worker_cublas_workspace_unit_bytes
+            )
+        self._elastic_graph_last_maintenance_step_key = (
+            residency_step_key if maintenance else None
+        )
+        self._elastic_graph_floor_bytes = worker_floor_bytes
+        self._elastic_graph_transition_floor_bytes = worker_transition_floor_bytes
+
+        # A cold capture borrows the whole prospective KV tail so measurement
+        # cannot OOM merely because its price was previously unknown.  Once
+        # the worker has synchronized and reported actual residency, only
+        # that residency (or an older FIFO grant) still has to remain outside
+        # KV.  Keeping the provisional peak here starves waiting-request
+        # admission before the next step shape can even be formed.
+        settled_external = coordinator.normalize_elastic_external_memory(
+            max(
+                worker_resident_bytes,
+                max(
+                    (grant for _key, grant in self._elastic_pending_graph_loans),
+                    default=0,
+                ),
+            )
+        )
+        current_external = coordinator.elastic_external_memory_bytes
+        if (
+            settled_external != current_external
+            and not coordinator.set_elastic_external_memory(
+                settled_external,
+                minimum_free_primary_blocks=minimum_free,
+            )
+        ):
+            raise RuntimeError(
+                "worker CUDA Graph residency could not be synchronized with "
+                "the scheduler KV layout after settlement: "
+                f"current_bytes={current_external} "
+                f"settled_bytes={settled_external} "
+                f"worker_resident_bytes={worker_resident_bytes}"
+            )
+
+        if (
+            plan is not None
+            and plan.kind in (ElasticPlanKind.MAINTENANCE, ElasticPlanKind.RECLAIM)
+            and transaction_id is not None
+        ):
+            started = self._elastic_maintenance_started.pop(transaction_id, None)
+            if started is None:
+                raise RuntimeError(
+                    "elastic Graph transaction settled without a start receipt: "
+                    f"tx={transaction_id}"
+                )
+            started_at, stats_before, external_before = started
+            stats_after = self._elastic_graph_cache.stats
+            wall_ms = (time.monotonic() - started_at) * 1000.0
+            self._elastic_maintenance_wall_ms_total = getattr(
+                self, "_elastic_maintenance_wall_ms_total", 0.0
+            ) + wall_ms
+            self._elastic_maintenance_transactions_total = getattr(
+                self, "_elastic_maintenance_transactions_total", 0
+            ) + 1
+            key_outcomes = getattr(self, "_elastic_graph_key_outcomes", None)
+            if key_outcomes is None:
+                key_outcomes = self._elastic_graph_key_outcomes = defaultdict(int)
+            for physical_key in plan.physical_keys:
+                logical = physical_key.logical
+                outcome_key = (
+                    f"{logical.owner}|{logical.mode}|"
+                    f"{logical.token_bucket}|HOT"
+                )
+                key_outcomes[outcome_key] += 1
+            logger.info(
+                "Elastic Graph transaction end: tx=%s kind=%s final_key=%s "
+                "wall_ms=%.3f captures=%d evictions=%d evicted_bytes=%d "
+                "external_before=%d external_after=%d floor=%d peak=%d outcome=HOT",
+                transaction_id,
+                plan.kind.value,
+                step_key,
+                wall_ms,
+                stats_after.promotions - stats_before.promotions,
+                stats_after.evictions - stats_before.evictions,
+                stats_after.evicted_bytes - stats_before.evicted_bytes,
+                external_before,
+                settled_external,
+                worker_floor_bytes,
+                worker_peak_bytes,
+            )
+        elif (
+            plan is not None
+            and plan.kind == ElasticPlanKind.USER
+            and transaction_id is not None
+        ):
+            started_at = getattr(self, "_elastic_useful_started", {}).pop(
+                transaction_id, None
+            )
+            if started_at is not None:
+                self._elastic_useful_wall_ms_total = getattr(
+                    self, "_elastic_useful_wall_ms_total", 0.0
+                ) + (time.monotonic() - started_at) * 1000.0
+                self._elastic_useful_transactions_total = getattr(
+                    self, "_elastic_useful_transactions_total", 0
+                ) + 1
+            key_outcomes = getattr(self, "_elastic_graph_key_outcomes", None)
+            if key_outcomes is None:
+                key_outcomes = self._elastic_graph_key_outcomes = defaultdict(int)
+            for physical_key in plan.physical_keys:
+                logical = physical_key.logical
+                outcome_key = (
+                    f"{logical.owner}|{logical.mode}|"
+                    f"{logical.token_bucket}|HIT"
+                )
+                key_outcomes[outcome_key] += 1
+
+        # Settlement returns only unused provisional capacity. The next call
+        # to _plan_elastic_graph_loan remains the sole owner of the next
+        # physical target; the worker releases incompatible Graph owners
+        # before applying that target.
+        no_pending_loans = not self._elastic_pending_graph_loans
+        # Async scheduling can return a zero-token output whose request-key
+        # dictionary still reflects an older in-flight batch. Scheduler
+        # ownership is the authoritative idle state here, not that stale key.
+        idle_physical_floor = not self.running and worker_floor_bytes > 0
+        cleanup_required = (
+            no_pending_loans
+            and idle_physical_floor
+            and getattr(self, "_elastic_force_idle_cleanup", False)
+        )
+        if cleanup_required:
+            now = time.monotonic()
+            cleanup_started_at = getattr(
+                self, "_elastic_graph_idle_cleanup_started_at", None
+            )
+            if cleanup_started_at is None:
+                self._elastic_graph_idle_cleanup_started_at = now
+            elif now - cleanup_started_at >= getattr(
+                self, "_elastic_graph_idle_cleanup_timeout_s", 5.0
+            ):
+                raise RuntimeError(
+                    "idle CUDA Graph physical floor did not return to KV "
+                    "within the cleanup deadline: "
+                    f"floor_bytes={worker_floor_bytes} "
+                    f"resident_bytes={worker_resident_bytes} "
+                    f"granted_bytes={granted_bytes}"
+                )
+        else:
+            self._elastic_graph_idle_cleanup_started_at = None
+        self._elastic_graph_cleanup_required = cleanup_required
+        self._record_elastic_serving_hotset_replacement(plan)
+        self._maybe_arm_elastic_serving_idle_cleanup()
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
@@ -1994,7 +6226,7 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         encoder_compute_budget: int,
         shift_computed_tokens: int = 0,
-    ) -> tuple[list[int], int, int, list[int]]:
+    ) -> tuple[list[int], int, int, list[int], list[int]]:
         """
         Determine which encoder inputs need to be scheduled in the current step,
         and update `num_new_tokens` and encoder token budget accordingly.
@@ -2016,8 +6248,9 @@ class Scheduler(SchedulerInterface):
         blocks and externally cached blocks (via KVConnector).
         """
         if num_new_tokens == 0 or not request.has_encoder_inputs:
-            return [], num_new_tokens, encoder_compute_budget, []
+            return [], num_new_tokens, encoder_compute_budget, [], []
         encoder_inputs_to_schedule: list[int] = []
+        cached_encoder_inputs: list[int] = []
         mm_features = request.mm_features
         assert mm_features is not None
         assert len(mm_features) > 0
@@ -2028,6 +6261,8 @@ class Scheduler(SchedulerInterface):
         # trackers for accounting at the encoder input level.
         mm_hashes_to_schedule = set()
         num_embeds_to_schedule = 0
+        planned_cache_claims: set[str] = set()
+        unavailable_freeable_slots = 0
 
         lo, hi = get_mm_features_in_window(
             mm_features,
@@ -2069,7 +6304,15 @@ class Scheduler(SchedulerInterface):
                     # current step.
                     continue
 
-                if self.encoder_cache_manager.check_and_update_cache(request, i):
+                if self.encoder_cache_manager.contains(request, i):
+                    cached_encoder_inputs.append(i)
+                    if item_identifier not in planned_cache_claims:
+                        unavailable_freeable_slots += (
+                            self.encoder_cache_manager.unreferenced_input_size(
+                                request, i
+                            )
+                        )
+                        planned_cache_claims.add(item_identifier)
                     # The encoder input is already computed and cached from a
                     # previous step.
                     continue
@@ -2091,7 +6334,12 @@ class Scheduler(SchedulerInterface):
                 )
                 break
             if not self.encoder_cache_manager.can_allocate(
-                request, i, encoder_compute_budget, num_embeds_to_schedule
+                request,
+                i,
+                encoder_compute_budget,
+                num_embeds_to_schedule,
+                evict=False,
+                unavailable_freeable_slots=unavailable_freeable_slots,
             ):
                 # The encoder cache is full or the encoder budget is exhausted.
                 # NOTE(woosuk): We assume that the encoder input tokens should
@@ -2145,7 +6393,42 @@ class Scheduler(SchedulerInterface):
             num_new_tokens,
             encoder_compute_budget,
             external_load_encoder_input,
+            cached_encoder_inputs,
         )
+
+    def _commit_encoder_cache_plan(
+        self,
+        request: Request,
+        cached_input_ids: list[int],
+        computed_input_ids: list[int] | None,
+        external_input_ids: list[int],
+    ) -> None:
+        """Commit a read-only encoder plan after Graph and KV admission."""
+        for input_id in cached_input_ids:
+            if not self.encoder_cache_manager.check_and_update_cache(
+                request, input_id
+            ):
+                raise RuntimeError(
+                    "encoder cache membership changed after admission preflight"
+                )
+
+        allocation_ids = sorted(
+            set(computed_input_ids or ()).union(external_input_ids)
+        )
+        for input_id in allocation_ids:
+            num_embeds = request.get_num_encoder_embeds(input_id)
+            if not self.encoder_cache_manager.can_allocate(
+                request,
+                input_id,
+                num_embeds,
+                0,
+            ):
+                raise RuntimeError(
+                    "encoder cache capacity changed after admission preflight"
+                )
+            self.encoder_cache_manager.allocate(request, input_id)
+            if self.ec_connector is not None:
+                self.ec_connector.update_state_after_alloc(request, input_id)
 
     def _make_scheduled_encoder_input_stats(
         self, scheduled_encoder_inputs: dict[str, list[int]]
@@ -2217,6 +6500,25 @@ class Scheduler(SchedulerInterface):
         if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
             self.processed_step_seq += 1
             self._drain_deferred_frees()
+
+        if (
+            model_runner_output.elastic_mm_activation_loan_bytes
+            != scheduler_output.elastic_mm_activation_loan_bytes
+        ):
+            raise RuntimeError(
+                "worker MM activation loan echo differs from scheduler output: "
+                f"scheduler={scheduler_output.elastic_mm_activation_loan_bytes} "
+                f"worker={model_runner_output.elastic_mm_activation_loan_bytes}"
+            )
+        self._settle_elastic_graph_loan(
+            scheduler_output,
+            model_runner_output.elastic_external_memory_bytes,
+            model_runner_output.elastic_external_memory_floor_bytes,
+            model_runner_output.elastic_external_memory_peak_bytes,
+            model_runner_output.elastic_external_memory_transition_floor_bytes,
+            model_runner_output.elastic_hot_graphs,
+            model_runner_output.elastic_cublas_workspace_unit_bytes,
+        )
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -2493,6 +6795,21 @@ class Scheduler(SchedulerInterface):
             self.waiting.remove_requests(stopped_preempted_reqs)
             self.skipped_waiting.remove_requests(stopped_preempted_reqs)
 
+        # Loan settlement runs before terminal outputs are applied. If this
+        # result removed the final running request, preserve one scheduler tick
+        # so the next explicit X0 step can evict the last Graph and return its
+        # loan before the engine sleeps.
+        if (
+            getattr(self, "elastic_on_demand_graphs", False)
+            and getattr(self, "_elastic_force_idle_cleanup", False)
+            and not self.running
+            and not self._elastic_pending_graph_loans
+            and self._elastic_idle_cleanup_outstanding()
+        ):
+            self._elastic_graph_cleanup_required = True
+        if getattr(self, "elastic_on_demand_graphs", False):
+            self._maybe_arm_elastic_serving_idle_cleanup()
+
         error_req_ids = set(self.grammar_compile_error_reqs)
         self.grammar_compile_error_reqs.clear()
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
@@ -2597,84 +6914,492 @@ class Scheduler(SchedulerInterface):
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
 
-    def _reserve_elastic_waiting_wave(self, token_budget: int) -> int:
-        """Reserve schedulable and imminently grammar-ready requests.
+    def _has_prepared_elastic_waiting_admission(
+        self,
+        preplanned_step_key: tuple[int, ...] | None,
+        calibration_wave_target: int,
+    ) -> bool:
+        """Whether the complete waiting-wave layout already has one owner."""
+        return preplanned_step_key is not None or bool(
+            self._elastic_calibration_mode and calibration_wave_target
+        )
 
-        Grammar compilation is asynchronous, but excluding its pending requests
-        lets the first ready subset pin the logical tail needed by the rest of
-        the same burst. Remote/streaming waits have no similarly bounded
-        readiness contract and are excluded until they can be promoted.
+    def _apply_elastic_waiting_candidate(
+        self,
+        request: Request,
+        *,
+        token_budget: int,
+        waiting_count: int,
+    ) -> int:
+        """Map only the current GDN candidate and one immediate lookahead.
+
+        The lookahead is acquired before prefix-cache lookup so that lookup
+        cannot pin the exact attention tail required by the next candidate. It
+        is not a wave reserve: every scheduler step returns an unused lookahead
+        before the CUDA Graph loan is planned.
         """
         if (
             token_budget <= 0
             or not self.kv_cache_manager.kv_cache_config.elastic_mapping_quantum
         ):
             return 0
-
-        candidate_skipped = []
-        for request in self.skipped_waiting:
-            if self._is_blocked_waiting_status(request.status):
-                self._try_promote_blocked_waiting_request(request)
-            if not self._is_blocked_waiting_status(request.status):
-                candidate_skipped.append(request)
-                continue
-            if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
-                structured = request.structured_output_request
-                if structured is not None and structured.grammar is None:
-                    candidate_skipped.append(request)
-
-        available_request_slots = max(
-            self.max_num_running_reqs
-            - len(self.running)
-            - self.num_waiting_for_streaming_input,
-            0,
-        )
-        if self.policy == SchedulingPolicy.FCFS:
-            ready_requests = candidate_skipped + list(self.waiting)
-        else:
-            ready_requests = sorted((*candidate_skipped, *self.waiting))
-        # Every admitted request consumes at least one scheduled token.
-        candidate_count = min(
-            len(ready_requests),
-            available_request_slots,
-            token_budget,
-        )
-        primary_requirements = [
+        current_primary = (
             self.kv_cache_manager.estimate_uncached_full_sequence_requirements(
                 request
             ).primary
-            for request in ready_requests[:candidate_count]
-        ]
-        # Keep one admission slot ahead of the currently visible burst. Requests
-        # can arrive between scheduler iterations. Without this lookahead, the
-        # first wave may reference a cached attention block in the exact tail
-        # that the next request must hand to GDN, making a physically feasible
-        # incremental admission fail with ``attention_tail_pinned``.
-        if candidate_count < available_request_slots:
+        )
+        if self.running:
+            current_primary += self.kv_cache_manager.watermark_blocks
+        primary_requirements = [current_primary]
+        occupied_slots = len(self.running) + self.num_waiting_for_streaming_input
+        has_immediate_lookahead = (
+            waiting_count > 1
+            and occupied_slots + 1 < self.max_num_running_reqs
+            and token_budget > 1
+        )
+        if has_immediate_lookahead:
+            # One primary block is enough to keep the next GDN handoff tail
+            # clear. Its full-sequence primary requirement is checked when that
+            # request becomes the current candidate.
             primary_requirements.append(1)
-        if primary_requirements and self.running:
-            primary_requirements[0] += self.kv_cache_manager.watermark_blocks
-        return self.kv_cache_manager.coordinator.reserve_elastic_admission_wave(
+        admitted = self.kv_cache_manager.coordinator.apply_elastic_admission_wave(
             tuple(primary_requirements)
         )
-
-    def _reserve_elastic_incremental_headroom(self) -> int:
-        """Keep one GDN lease available across scheduler iterations.
-
-        The ordinary end-of-step rebalance intentionally releases unused GDN
-        mappings. While a request is still running, fully releasing them lets
-        decode or a prefix-cache hit pin the newly exposed attention tail before
-        the next request arrives. One request of lookahead is sufficient:
-        requests already visible are reserved as a wave, and every later
-        scheduler iteration advances the frontier by one more admission.
-        """
         if (
-            not self.running
-            or len(self.running) >= self.max_num_running_reqs
-            or not self.kv_cache_manager.kv_cache_config.elastic_mapping_quantum
+            admitted == 0
+            and self.elastic_on_demand_graphs
+            and self._elastic_pending_maintenance_plan is None
         ):
-            return 0
-        return self.kv_cache_manager.coordinator.reserve_elastic_admission_wave((1,))
+            reclaim = self._elastic_graph_cache.plan_reclaim_all(
+                self._next_elastic_transaction_id(),
+                request_bytes=self._elastic_graph_resident_bytes,
+                available_bytes=0,
+            )
+            if reclaim.kind == ElasticPlanKind.RECLAIM:
+                self._elastic_pending_maintenance_plan = reclaim
+                self._elastic_pending_maintenance_step_key = None
+            elif reclaim.kind == ElasticPlanKind.DEFER:
+                self._elastic_graph_cache.observe_defer(reclaim)
+        return admitted
+
+    def prepare_elastic_calibration_idle_reclaim(
+        self,
+        rebuild_step_keys: Sequence[tuple[int, ...]] = (),
+    ) -> bool:
+        """Prepare a shape-less reclaim before a calibration wave exists.
+
+        Reclaim must precede ``add_request``.  Merely requiring an empty
+        ``running`` list is insufficient because WAITING requests are already
+        across the scheduler commit boundary and may be selected by the same
+        step that executes maintenance.
+        """
+        if not self._elastic_calibration_mode:
+            raise RuntimeError("elastic idle reclaim is calibration-only")
+        if self.has_requests() or self.num_waiting_for_streaming_input:
+            raise RuntimeError(
+                "elastic idle reclaim must precede every request commit"
+            )
+        if self._elastic_pending_maintenance_plan is not None:
+            raise RuntimeError("elastic idle reclaim found pending maintenance")
+        if not self._elastic_graph_resident_bytes:
+            return False
+        rebuild_physical_keys = tuple(
+            dict.fromkeys(
+                physical_key
+                for step_key in rebuild_step_keys
+                for physical_key in self._resolve_elastic_step_physical_keys(
+                    self._elastic_graph_carrier_closure_step_key(step_key)
+                )
+            )
+        )
+        self._elastic_graph_cache.unpin_idle(rebuild_physical_keys)
+        reclaim = self._elastic_graph_cache.plan_reclaim_all(
+            self._next_elastic_transaction_id(),
+            request_bytes=self._elastic_graph_resident_bytes,
+            available_bytes=0,
+        )
+        if reclaim.kind != ElasticPlanKind.RECLAIM:
+            hot_entries = tuple(
+                entry
+                for entry in self._elastic_graph_cache.entries.values()
+                if entry.hot
+            )
+            if (
+                reclaim.kind == ElasticPlanKind.DEFER
+                and hot_entries
+                and all(entry.pinned for entry in hot_entries)
+                and not self._elastic_graph_floor_bytes
+            ):
+                return False
+            raise RuntimeError(
+                "idle elastic calibration could not reclaim the preceding "
+                f"HOT set: reason={reclaim.defer_reason}"
+            )
+        self._elastic_pending_maintenance_plan = reclaim
+        self._elastic_pending_maintenance_step_key = None
+        self._elastic_calibration_wave_target = 0
+        self._elastic_calibration_wave_step_key = None
+        return True
+
+    def has_pending_elastic_maintenance(self) -> bool:
+        """Whether ``schedule`` owes one explicit request-free transaction."""
+        return self._elastic_pending_maintenance_plan is not None
+
+    def prepare_elastic_calibration_capture(
+        self,
+        step_key: tuple[int, ...],
+    ) -> bool:
+        """Prepare one COLD calibration owner set before KV admission.
+
+        Returns whether the next scheduler output must execute request-free
+        maintenance.  A HOT or compiled-only owner set needs no transaction.
+        """
+        if not self._elastic_calibration_mode:
+            raise RuntimeError("elastic capture preparation is calibration-only")
+        if self.running or self.num_waiting_for_streaming_input:
+            raise RuntimeError(
+                "elastic calibration capture requires no committed requests"
+            )
+        if self._elastic_pending_maintenance_plan is not None:
+            raise RuntimeError("elastic calibration already has pending maintenance")
+
+        fits, required_external, available_external = (
+            self._can_fund_elastic_graph_step(
+                step_key,
+                minimum_free_primary_blocks=0,
+                allow_maintenance=True,
+            )
+        )
+        if self._elastic_pending_maintenance_plan is not None:
+            return True
+        if fits:
+            return False
+        raise RuntimeError(
+            "elastic calibration owner set could not be prepared before KV "
+            "admission: "
+            f"step_key={step_key!r} required_bytes={required_external} "
+            f"available_bytes={available_external} "
+            f"reason={getattr(self, '_elastic_last_defer_reason', None)!r}"
+        )
+
+    def assert_elastic_calibration_captures_hot(
+        self,
+        step_keys: Sequence[tuple[int, ...]],
+    ) -> None:
+        """Require the complete declared physical sequence before admission."""
+        missing = tuple(
+            physical_key
+            for step_key in step_keys
+            for physical_key in self._resolve_elastic_step_physical_keys(
+                self._elastic_graph_carrier_closure_step_key(step_key)
+            )
+            if not (
+                (entry := self._elastic_graph_cache.entries.get(physical_key))
+                and entry.hot
+            )
+        )
+        if missing:
+            raise RuntimeError(
+                "elastic calibration physical sequence did not remain HOT "
+                "through request-free preparation: "
+                f"missing={tuple(key.identity for key in missing)}"
+            )
+
+    def retain_elastic_calibration_captures(
+        self,
+        step_keys: Sequence[tuple[int, ...]],
+    ) -> str:
+        """Retain one declared physical DAG across multiple user steps."""
+        if not self._elastic_calibration_mode:
+            raise RuntimeError("elastic retention is calibration-only")
+        physical_keys = tuple(
+            dict.fromkeys(
+                physical_key
+                for step_key in step_keys
+                for physical_key in self._resolve_elastic_step_physical_keys(
+                    self._elastic_graph_carrier_closure_step_key(step_key)
+                )
+            )
+        )
+        if getattr(self, "_elastic_calibration_retention_id", None) is not None:
+            raise RuntimeError("elastic calibration retention is already active")
+        transaction_id = self._next_elastic_transaction_id()
+        self._elastic_graph_cache.retain_hot(transaction_id, physical_keys)
+        self._elastic_calibration_retention_id = transaction_id
+        self._elastic_calibration_retained_physical_keys = physical_keys
+        return transaction_id
+
+    def release_elastic_calibration_retention(
+        self, transaction_id: str
+    ) -> None:
+        if not self._elastic_calibration_mode:
+            raise RuntimeError("elastic retention release is calibration-only")
+        if getattr(self, "_elastic_calibration_retention_id", None) != transaction_id:
+            raise RuntimeError("elastic calibration retention identity changed")
+        self._elastic_graph_cache.release(transaction_id)
+        self._elastic_calibration_retention_id = None
+        self._elastic_calibration_retained_physical_keys = ()
+
+    def prepare_elastic_calibration_execution(
+        self, step_key: tuple[int, ...]
+    ) -> None:
+        """Bind one retained final shape across incremental RUNNING assembly.
+
+        Calibration constructs some product waves from an already-running
+        decode cohort plus a new prefill.  The normal product preflight sees
+        the complete cohort before the RUNNING loop, while calibration has
+        already captured and retained that final owner set.  Bind that same
+        final identity here so incremental X1..Xn prefixes do not request
+        unrelated COLD graphs.  KV allocation and waiting admission remain on
+        their ordinary paths; only Graph prefix discovery is bypassed.
+        """
+        if not self._elastic_calibration_mode:
+            raise RuntimeError("elastic execution binding is calibration-only")
+        if self._elastic_pending_maintenance_plan is not None:
+            raise RuntimeError("elastic execution binding found pending maintenance")
+        if getattr(self, "_elastic_calibration_execution_step_key", None) is not None:
+            raise RuntimeError("elastic calibration execution is already bound")
+        retained = frozenset(
+            getattr(self, "_elastic_calibration_retained_physical_keys", ())
+        )
+        physical_keys = self._resolve_elastic_step_physical_keys(
+            self._elastic_graph_carrier_closure_step_key(step_key)
+        )
+        if not physical_keys or not set(physical_keys) <= retained:
+            raise RuntimeError(
+                "elastic calibration execution is outside its retained epoch"
+            )
+        if any(
+            not (
+                (entry := self._elastic_graph_cache.entries.get(physical_key))
+                and entry.hot
+            )
+            for physical_key in physical_keys
+        ):
+            raise RuntimeError("elastic calibration execution lost a HOT owner")
+        self._elastic_calibration_execution_step_key = step_key
+
+    def prepare_elastic_calibration_admission(
+        self,
+        request_ids: Sequence[str],
+        *,
+        retain_hot_graphs: bool = False,
+    ) -> int:
+        """Map one declared calibration wave before its first allocation.
+
+        Normal serving deliberately maps only the current waiting request and
+        one lookahead. A calibration probe instead asks how many members of
+        one exact finite wave can coexist. Preparing that layout here keeps
+        the serving lease policy intact and prevents a one-candidate tick from
+        being mistaken for the physical MaxX boundary.
+        """
+        if not self._elastic_calibration_mode:
+            raise RuntimeError("elastic wave preparation is calibration-only")
+        if self.running or self.num_waiting_for_streaming_input:
+            raise RuntimeError(
+                "elastic calibration wave preparation requires an idle scheduler"
+            )
+        if not request_ids or len(set(request_ids)) != len(request_ids):
+            raise ValueError("elastic calibration wave requires unique requests")
+        requests = []
+        for request_id in request_ids:
+            request = self.requests.get(request_id)
+            if request is None or request.status != RequestStatus.WAITING:
+                raise RuntimeError(
+                    "elastic calibration wave contains a non-waiting request: "
+                    f"request_id={request_id!r}"
+                )
+            requests.append(request)
+        graph_resident_bytes = int(self._elastic_graph_resident_bytes)
+        if graph_resident_bytes and not retain_hot_graphs:
+            raise RuntimeError(
+                "elastic calibration admission retained a preceding HOT set; "
+                "idle reclaim must complete before requests are added"
+            )
+        if retain_hot_graphs and not graph_resident_bytes:
+            raise RuntimeError(
+                "retained-HOT calibration admission requires an existing "
+                "graph working set"
+            )
+        # Price the final prefill and its immediate decode successor in one
+        # finite-wave fixed point. Successor headroom is a block-boundary
+        # delta, not one whole block per request.
+        requirements = []
+        for request in requests:
+            estimate = (
+                self.kv_cache_manager.estimate_uncached_full_sequence_requirements(
+                    request
+                )
+            )
+            primary = estimate.primary
+            # The immediate decode token normally reuses the writable tail of
+            # the block allocated by prefill. Charge an additional primary
+            # block only when the declared sequence ends exactly on the real
+            # scheduler block boundary. The old unconditional +1 reproduced
+            # v9's false X27 ceiling: X40 required 82 blocks although its
+            # two-token prompts consume only 42 including null+watermark.
+            current_blocks = (
+                request.num_tokens + self.block_size - 1
+            ) // self.block_size
+            successor_blocks = (
+                request.num_tokens + 1 + self.block_size - 1
+            ) // self.block_size
+            requirements.append(primary + successor_blocks - current_blocks)
+        # ``allocate_slots`` preserves the block manager watermark once these
+        # requests become RUNNING.  The finite-wave preflight starts from an
+        # idle scheduler, so no ordinary running-request admission call has
+        # priced that shared (not per-request) attention tail yet.  Reserve it
+        # exactly once here.  Without it X23 consumed null + 2*X == 47 blocks,
+        # leaving no free watermark block when the measured graph envelope
+        # settled one attention block below the provisional layout.
+        requirements[0] += self.kv_cache_manager.watermark_blocks
+        prospective_tokens = {
+            request_id: request.num_tokens
+            for request_id, request in zip(request_ids, requests, strict=True)
+        }
+        # Use the same request-aware K selector as the eventual commit.  The
+        # calibration inventory deliberately includes a forced-K0 control in
+        # a globally K3 runtime; using ``self.num_spec_tokens`` here prepared a
+        # K3 owner set while schedule() correctly committed those requests as
+        # K0, turning the resulting physical-key mismatch into a misleading
+        # atomic-hotset budget failure.
+        prospective_k = self._num_spec_tokens_for_step(
+            prospective_tokens,
+            is_pure_decode_step=False,
+        )
+        step_key = self._canonical_elastic_graph_step_key(
+            prospective_tokens,
+            prospective_k,
+            False,
+        )
+        capture_envelope = self._elastic_capture_envelope(step_key)
+        capture_envelope_bytes = (
+            0 if capture_envelope is None else int(capture_envelope[0])
+        )
+        # Use the same complete physical-loan estimator as commit.  A catalog
+        # row can describe only the resident graph subset (125.8 MiB for the
+        # observed K3/X43/B4096 carrier), while the already measured logical
+        # witness also owns eager/cuBLAS runtime workspace (528.5 MiB).  Pricing
+        # only ``_elastic_capture_envelope`` admitted KV that left no room for
+        # the proven commit floor.  The estimator is side-effect free and folds
+        # the exact HOT owner set, measured witness bytes and carrier closure.
+        prospective_graph_bytes, _capture_planned = (
+            self._estimate_elastic_graph_step_bytes(
+                self._elastic_graph_carrier_closure_step_key(step_key)
+            )
+        )
+        # Rebuilding request KV around an intentionally retained executable
+        # must coexist with the current physical Graph charge.  A prefill
+        # envelope can be smaller than that already-live decode owner set.
+        external_memory_bytes = max(
+            graph_resident_bytes if retain_hot_graphs else 0,
+            capture_envelope_bytes,
+            prospective_graph_bytes,
+        )
+        admitted = self.kv_cache_manager.coordinator.apply_elastic_admission_wave(
+            tuple(requirements),
+            external_memory_bytes=external_memory_bytes,
+        )
+        self._elastic_calibration_wave_target = admitted
+        self._elastic_calibration_wave_step_key = step_key
+        return admitted
+
+    def cancel_unexecuted_elastic_calibration_step(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Release graph transaction state when a synthetic wave is not run."""
+        if not self._elastic_calibration_mode:
+            raise RuntimeError("unexecuted-step cancellation is calibration-only")
+        if not self._elastic_pending_graph_loans:
+            raise RuntimeError("unexecuted calibration step lost its graph loan")
+        pending_step_key, pending_grant = self._elastic_pending_graph_loans[-1]
+        plan = scheduler_output.elastic_step_plan
+        transaction_id = scheduler_output.elastic_transaction_id
+        if plan is not None:
+            if plan.kind == ElasticPlanKind.USER:
+                assert transaction_id is not None
+                self._elastic_graph_cache.cancel(transaction_id)
+                getattr(self, "_elastic_useful_started", {}).pop(
+                    transaction_id, None
+                )
+            elif plan.kind == ElasticPlanKind.MAINTENANCE:
+                self._elastic_graph_cache.fail_maintenance(plan)
+                started = self._elastic_maintenance_started.pop(
+                    plan.transaction_id, None
+                )
+                if started is not None:
+                    started_at, stats_before, external_before = started
+                    stats_after = self._elastic_graph_cache.stats
+                    wall_ms = (time.monotonic() - started_at) * 1000.0
+                    self._elastic_maintenance_wall_ms_total = getattr(
+                        self, "_elastic_maintenance_wall_ms_total", 0.0
+                    ) + wall_ms
+                    self._elastic_maintenance_transactions_total = getattr(
+                        self, "_elastic_maintenance_transactions_total", 0
+                    ) + 1
+                    key_outcomes = getattr(
+                        self, "_elastic_graph_key_outcomes", None
+                    )
+                    if key_outcomes is None:
+                        key_outcomes = self._elastic_graph_key_outcomes = defaultdict(
+                            int
+                        )
+                    for physical_key in plan.physical_keys:
+                        logical = physical_key.logical
+                        outcome_key = (
+                            f"{logical.owner}|{logical.mode}|"
+                            f"{logical.token_bucket}|CANCELLED"
+                        )
+                        key_outcomes[outcome_key] += 1
+                    logger.info(
+                        "Elastic Graph transaction end: tx=%s kind=%s "
+                        "final_key=%s wall_ms=%.3f captures=%d evictions=%d "
+                        "evicted_bytes=%d external_before=%d external_after=%d "
+                        "floor=%d peak=%d outcome=CANCELLED",
+                        plan.transaction_id,
+                        plan.kind.value,
+                        pending_step_key,
+                        wall_ms,
+                        stats_after.promotions - stats_before.promotions,
+                        stats_after.evictions - stats_before.evictions,
+                        stats_after.evicted_bytes - stats_before.evicted_bytes,
+                        external_before,
+                        self._elastic_graph_resident_bytes,
+                        self._elastic_graph_floor_bytes,
+                        0,
+                    )
+            elif plan.kind == ElasticPlanKind.RECLAIM:
+                raise RuntimeError(
+                    "cannot cancel an unexecuted physical reclaim transaction"
+                )
+        pending_key, popped_grant = self._elastic_pending_graph_loans.pop()
+        if pending_key != pending_step_key or popped_grant != pending_grant:
+            raise RuntimeError("unexecuted calibration step FIFO tail changed")
+        if pending_grant != scheduler_output.elastic_external_memory_bytes:
+            raise RuntimeError(
+                "unexecuted calibration step graph loan is not the FIFO tail"
+            )
+        self._elastic_graph_step_key = (
+            self._elastic_pending_graph_loans[-1][0]
+            if self._elastic_pending_graph_loans
+            else None
+        )
+
+    def finish_unexecuted_elastic_calibration_step(self) -> None:
+        """Reconcile KV after EngineCore aborts the synthetic cohort."""
+        coordinator = self.kv_cache_manager.coordinator
+        coordinator.rebalance_elastic_capacity()
+        required_external = max(
+            [
+                self._elastic_graph_resident_bytes,
+                *(grant for _key, grant in self._elastic_pending_graph_loans),
+            ]
+        )
+        if not coordinator.set_elastic_external_memory(required_external):
+            raise RuntimeError(
+                "unexecuted calibration cancellation could not restore KV/graph "
+                f"layout: external_bytes={required_external}"
+            )
 
     def _enqueue_waiting_request(self, request: Request) -> None:
         if self._is_blocked_waiting_status(request.status):
@@ -2903,6 +7628,9 @@ class Scheduler(SchedulerInterface):
             self.waiting.remove_requests(waiting_requests_to_remove)
             self.skipped_waiting.remove_requests(waiting_requests_to_remove)
 
+        if getattr(self, "elastic_on_demand_graphs", False):
+            self._maybe_arm_elastic_serving_idle_cleanup()
+
         # Second pass: set status and free requests
         for request in valid_requests:
             delay_free_blocks = False
@@ -3034,6 +7762,7 @@ class Scheduler(SchedulerInterface):
         return (
             self.has_unfinished_requests()
             or self.has_finished_requests()
+            or self._elastic_graph_cleanup_required
             or (self.connector is not None and self.connector.has_pending_push_work())
             or (
                 self.ec_connector is not None
@@ -3143,6 +7872,7 @@ class Scheduler(SchedulerInterface):
             self.num_canonical_prefill_deferrals_since_last_stats
         )
         self.num_canonical_prefill_deferrals_since_last_stats = 0
+        elastic_stats = self._elastic_graph_cache.stats
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
@@ -3151,6 +7881,37 @@ class Scheduler(SchedulerInterface):
             num_canonical_prefill_admission_deferrals=(
                 num_canonical_prefill_admission_deferrals
             ),
+            elastic_graph_stats={
+                "hot_hits": elastic_stats.hot_hits,
+                "cold_misses": elastic_stats.cold_misses,
+                "promotions": elastic_stats.promotions,
+                "evictions": elastic_stats.evictions,
+                "evicted_bytes": elastic_stats.evicted_bytes,
+                "deferrals": elastic_stats.deferrals,
+                "defer_reasons": dict(elastic_stats.defer_reasons),
+                "pinned_bytes": self._elastic_pinned_graph_resident_bytes,
+                "evictable_bytes": self._elastic_evictable_graph_resident_bytes,
+                "external_bytes": self._elastic_graph_resident_bytes,
+                "external_floor_bytes": self._elastic_graph_floor_bytes,
+                "maintenance_wall_ms_total": getattr(
+                    self, "_elastic_maintenance_wall_ms_total", 0.0
+                ),
+                "maintenance_transactions_total": getattr(
+                    self, "_elastic_maintenance_transactions_total", 0
+                ),
+                "useful_wall_ms_total": getattr(
+                    self, "_elastic_useful_wall_ms_total", 0.0
+                ),
+                "useful_transactions_total": getattr(
+                    self, "_elastic_useful_transactions_total", 0
+                ),
+                "rate_limited_logs_total": getattr(
+                    self, "_elastic_rate_limited_logs_total", 0
+                ),
+                "key_totals": dict(
+                    getattr(self, "_elastic_graph_key_outcomes", {})
+                ),
+            },
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,

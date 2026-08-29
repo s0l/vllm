@@ -112,11 +112,17 @@ def test_v2_dense_full_shapes_do_not_expand_piecewise_family() -> None:
     manager.decode_query_len = 3
     manager.full_decode_query_lens = {1, 3}
     manager.expand_dynamic_decode_query_lens = False
+    manager.defer_startup_graphs = False
+    manager.dynamic_piecewise_coverage_sizes = ()
+    manager.dynamic_piecewise_capture_sizes = ()
+    manager.dynamic_piecewise_safety_sizes = ()
+    manager.dynamic_full_capture_sizes = ()
     manager.max_num_reqs = 44
     manager.max_uniform_decode_reqs = 20
     manager.lora_capture_cases = [0]
     manager.vllm_config = MagicMock(spec=VllmConfig)
     manager.vllm_config.speculative_config = None
+    manager._dynamic_graph_entries = {}
     manager._candidates = {}
     manager._capture_descs = {}
 

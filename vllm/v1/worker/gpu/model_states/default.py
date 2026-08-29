@@ -132,7 +132,10 @@ class DefaultModelState(ModelState):
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
     ) -> dict[str, Any]:
-        if cudagraph_mode == CUDAGraphMode.FULL:
+        if (
+            cudagraph_mode == CUDAGraphMode.FULL
+            or input_batch.num_reqs_after_padding > input_batch.num_reqs
+        ):
             # Use padded sizes - padding is handled by model_runner.prepare_attn.
             num_reqs = input_batch.num_reqs_after_padding
             num_tokens = input_batch.num_tokens_after_padding
@@ -203,6 +206,7 @@ class DefaultModelState(ModelState):
             num_prompt_tokens_cpu=num_prompt_tokens_cpu,
             mm_req_doc_ranges=req_doc_ranges,
             for_cudagraph_capture=for_capture,
+            full_cudagraph=cudagraph_mode == CUDAGraphMode.FULL,
             rswa_prefix_lens=input_batch.prompt_lens,
         )
         return attn_metadata

@@ -121,12 +121,27 @@ class EncoderCacheManager:
         self.request_cached_ids.setdefault(request.request_id, set()).add(input_id)
         return True
 
+    def contains(self, request: Request, input_id: int) -> bool:
+        """Return cache membership without claiming or changing LRU state."""
+        mm_hash = request.mm_features[input_id].identifier
+        return mm_hash in self.cached
+
+    def unreferenced_input_size(self, request: Request, input_id: int) -> int:
+        """Return reclaimable embeds a future cache claim would consume."""
+        mm_hash = request.mm_features[input_id].identifier
+        if mm_hash not in self.cached or self.cached[mm_hash]:
+            return 0
+        return self.freeable[mm_hash]
+
     def can_allocate(
         self,
         request: Request,
         input_id: int,
         encoder_compute_budget: int,
         num_embeds_to_schedule: int,
+        *,
+        evict: bool = True,
+        unavailable_freeable_slots: int = 0,
     ) -> bool:
         """Check if there's sufficient cache space for a multimodal input.
         If there is, return True and update EncoderCacheManager state.
@@ -169,8 +184,19 @@ class EncoderCacheManager:
             return True
 
         # Not enough reclaimable slots
-        if num_embeds > self.num_freeable_slots:
+        available_freeable_slots = (
+            self.num_freeable_slots - unavailable_freeable_slots
+        )
+        if available_freeable_slots < 0:
+            raise RuntimeError(
+                "encoder cache read-only plan consumed more freeable slots "
+                "than exist"
+            )
+        if num_embeds > available_freeable_slots:
             return False
+
+        if not evict:
+            return True
 
         # Not enough free slots but enough reclaimable slots
         # NOTE: Eviction takes place here, but physical memory is not freed
@@ -340,12 +366,21 @@ class EncoderDecoderCacheManager(EncoderCacheManager):
     def check_and_update_cache(self, request: Request, input_id: int) -> bool:
         return False
 
+    def contains(self, request: Request, input_id: int) -> bool:
+        return False
+
+    def unreferenced_input_size(self, request: Request, input_id: int) -> int:
+        return 0
+
     def can_allocate(
         self,
         request: Request,
         input_id: int,
         encoder_compute_budget: int,
         num_embeds_to_schedule: int,
+        *,
+        evict: bool = True,
+        unavailable_freeable_slots: int = 0,
     ) -> bool:
         num_encoder_embeds = request.get_num_encoder_embeds(input_id)
         # Not enough compute budget

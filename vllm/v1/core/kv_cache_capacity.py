@@ -49,19 +49,27 @@ class PhysicalPoolCapacityPlanner:
             raise ValueError("secondary block count must be non-negative")
         return self._mapped_bytes(num_blocks * self.secondary_block_stride)
 
+    def external_mapped_bytes(self, external_bytes: int) -> int:
+        """Return physical quanta temporarily loaned to an external owner."""
+        return self._mapped_bytes(external_bytes)
+
     def max_primary_blocks(
         self,
         secondary_blocks: int,
         *,
         upper_bound: int,
+        external_bytes: int = 0,
     ) -> int:
         """Return the largest primary capacity within the physical budget."""
         if upper_bound < 0:
             raise ValueError("primary block upper bound must be non-negative")
         secondary_bytes = self.secondary_mapped_bytes(secondary_blocks)
+        external_mapped = self.external_mapped_bytes(external_bytes)
         for primary_blocks in range(upper_bound, -1, -1):
             if (
-                self.primary_mapped_bytes(primary_blocks) + secondary_bytes
+                self.primary_mapped_bytes(primary_blocks)
+                + secondary_bytes
+                + external_mapped
                 <= self.budget_bytes
             ):
                 return primary_blocks

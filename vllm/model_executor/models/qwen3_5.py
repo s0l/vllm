@@ -89,8 +89,8 @@ from .qwen3_next import (
     QwenNextMixtureOfExperts,
     _ag2_internal_trace_layer_enabled,
     _ag2_selected_stages,
-    _ag2_tp3_owner_prequant_enabled,
     _ag2_tp3_mtp_block5_enabled,
+    _ag2_tp3_owner_prequant_enabled,
     _is_shared_expert_fse_compatible,
 )
 from .qwen3_vl import (
@@ -802,6 +802,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(path.suffix + ".tmp")
         layers = self.language_model.model.layers
+        owner_prequant = bool(layers and layers[0]._ag2_tp3_owner_prequant)
         buffer_bytes = 0
         for layer in layers:
             buffer_bytes += (
@@ -816,6 +817,15 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
                 layer._ag2_projection_capture_mlp_input.numel()
                 * layer._ag2_projection_capture_mlp_input.element_size()
             )
+            if owner_prequant:
+                buffer_bytes += (
+                    layer._ag2_projection_capture_attention_residual.numel()
+                    * layer._ag2_projection_capture_attention_residual.element_size()
+                )
+                buffer_bytes += (
+                    layer._ag2_projection_capture_mlp_residual.numel()
+                    * layer._ag2_projection_capture_mlp_residual.element_size()
+                )
             operator = (
                 layer.self_attn._ag2_projection_capture_gated
                 if layer.layer_type == "full_attention"
@@ -827,7 +837,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         temporary.write_text(
             json.dumps(
                 {
-                    "schema": "ag2-projection-calibration-fixed-buffer-v2",
+                    "schema": "ag2-projection-calibration-fixed-buffer-v3",
+                    "capture_mode": (
+                        "owner_prequant_inputs"
+                        if owner_prequant
+                        else "projection_inputs"
+                    ),
                     "state": state,
                     "rank": rank,
                     "positions": list(self._ag2_projection_calibration_positions),
@@ -886,6 +901,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
 
         torch.cuda.current_stream().synchronize()
         layers = self.language_model.model.layers
+        owner_prequant = bool(layers and layers[0]._ag2_tp3_owner_prequant)
         rank = get_tp_group().rank_in_group
         for row, req_index, req_id, position in matches:
             if self._ag2_projection_calibration_saved >= (
@@ -915,20 +931,45 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
                 mlp = layer.mlp._ag2_projection_capture_activation
                 attention_input = layer._ag2_projection_capture_attention_input
                 mlp_input = layer._ag2_projection_capture_mlp_input
+                values = [attention_input, operator, mlp_input, mlp]
+                if owner_prequant:
+                    attention_residual = (
+                        layer._ag2_projection_capture_attention_residual
+                    )
+                    mlp_residual = layer._ag2_projection_capture_mlp_residual
+                    values.extend((attention_residual, mlp_residual))
                 if any(
                     value.dtype != torch.bfloat16
-                    for value in (attention_input, operator, mlp_input, mlp)
+                    for value in values
                 ):
                     raise RuntimeError("projection calibration requires BF16 buffers")
-                stages[f"attention_input_projection_input.{layer_index}"] = (
+                attention_label = (
+                    "attention_prequant_contribution"
+                    if owner_prequant
+                    else "attention_input_projection_input"
+                )
+                mlp_label = (
+                    "mlp_prequant_contribution"
+                    if owner_prequant
+                    else "mlp_gate_up_projection_input"
+                )
+                stages[f"{attention_label}.{layer_index}"] = (
                     attention_input[slot].detach().cpu().clone()
                 )
+                if owner_prequant:
+                    stages[f"attention_prequant_residual.{layer_index}"] = (
+                        attention_residual[slot].detach().cpu().clone()
+                    )
                 stages[f"operator_projection_input.{layer_index}"] = (
                     operator[slot].detach().cpu().clone()
                 )
-                stages[f"mlp_gate_up_projection_input.{layer_index}"] = (
+                stages[f"{mlp_label}.{layer_index}"] = (
                     mlp_input[slot].detach().cpu().clone()
                 )
+                if owner_prequant:
+                    stages[f"mlp_prequant_residual.{layer_index}"] = (
+                        mlp_residual[slot].detach().cpu().clone()
+                    )
                 stages[f"mlp_down_projection_input.{layer_index}"] = (
                     mlp[slot].detach().cpu().clone()
                 )
@@ -940,7 +981,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             if path.exists():
                 raise RuntimeError(f"refusing to overwrite projection capture: {path}")
             payload = {
-                "schema": "ag2-projection-calibration-fixed-buffer-v2",
+                "schema": "ag2-projection-calibration-fixed-buffer-v3",
+                "capture_mode": (
+                    "owner_prequant_inputs"
+                    if owner_prequant
+                    else "projection_inputs"
+                ),
                 "rank": rank,
                 "match": match,
                 "req_id": req_id,

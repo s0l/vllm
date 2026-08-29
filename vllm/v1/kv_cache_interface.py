@@ -8,7 +8,7 @@ from collections import Counter
 from dataclasses import dataclass, fields, replace
 from enum import Enum, IntEnum
 from math import prod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from typing_extensions import Self
@@ -23,6 +23,20 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
+
+def elastic_piecewise_token_boundary(num_tokens: int, max_tokens: int) -> int:
+    """Return a runtime-derived PIECEWISE Graph class.
+
+    Logical M values are canonicalized to powers of two plus the configured B
+    tail. The class list is derived from ``max_num_batched_tokens`` and is
+    never supplied by an env capture-size list.
+    """
+    if num_tokens <= 0 or max_tokens <= 0 or num_tokens > max_tokens:
+        raise ValueError(
+            "elastic PIECEWISE tokens must satisfy 0 < num_tokens <= max_tokens"
+        )
+    boundary = 1 << (num_tokens - 1).bit_length()
+    return min(boundary, max_tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -762,8 +776,7 @@ class MambaSpec(KVCacheSpec):
         return all(
             isinstance(spec, MambaSpec)
             and spec.num_speculative_blocks == self.num_speculative_blocks
-            and spec.state_update_chunk_alignment
-            == self.state_update_chunk_alignment
+            and spec.state_update_chunk_alignment == self.state_update_chunk_alignment
             for spec in kv_cache_specs.values()
         )
 
@@ -1022,8 +1035,13 @@ class KVCacheConfig:
     elastic_gdn_blocks_per_request: int = 0
     elastic_budget_bytes: int = 0
     elastic_attention_capacity_by_gdn_blocks: tuple[int, ...] = ()
+    elastic_rank_primary_mapped_bytes: tuple[tuple[int, ...], ...] = ()
+    elastic_rank_gdn_mapped_bytes: tuple[tuple[int, ...], ...] = ()
+    elastic_rank_budget_bytes: tuple[int, ...] = ()
     effective_max_resident_seqs: int = 0
     """Post-profile hard residency cap for elastic KV; 0 leaves it disabled."""
+    elastic_graph_execution_policy: dict[str, Any] | None = None
+    """All-rank effective Graph representation policy for scheduler startup."""
 
     @property
     def has_mamba_layers(self) -> bool:

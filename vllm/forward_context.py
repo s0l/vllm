@@ -62,6 +62,22 @@ class BatchDescriptor:
     the fixed TP3 speculative-decoding reduction. This is part of graph
     identity: a short prefill can have the same tensor shape as decode.
     """
+    tp3_owner_prequant_decode: bool = False
+    """
+    Whether this executable consumes the TP3 owner-prequant decode math lane.
+    Equal M/X shapes from mixed prefill and exact K+1 decode are not
+    interchangeable, so this is part of inner compiled CUDA Graph identity.
+    """
+    cudagraph_owner: str = "default"
+    """
+    Physical CUDA Graph owner. Equal tensor shapes from the target and draft
+    models may traverse shared compiled wrappers but must never overwrite one
+    another's graph entries or private pools.
+    """
+    physical_num_reqs: int | None = None
+    """Exact request cardinality of a concrete dynamic replay artifact."""
+    runtime_generation: str = "static"
+    """Content namespace preventing stale executable/catalog reuse."""
 
 
 def _compute_sp_num_tokens(

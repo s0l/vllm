@@ -86,16 +86,27 @@ def maybe_convert_block_hash(hash_bytes: BlockHash) -> ExternalBlockHash:
 logger = init_logger(__name__)
 
 
+def _additional_config(vllm_config: VllmConfig) -> dict[str, Any]:
+    config = getattr(vllm_config, "additional_config", None)
+    return config if isinstance(config, dict) else {}
+
+
 def _use_separate_gdn_pool(vllm_config: VllmConfig) -> bool:
-    return bool(vllm_config.additional_config.get("gdn_separate_pool", False))
+    return bool(_additional_config(vllm_config).get("gdn_separate_pool", False))
 
 
 def _use_elastic_gdn_backing(vllm_config: VllmConfig) -> bool:
-    return bool(vllm_config.additional_config.get("elastic_gdn_backing", False))
+    config = _additional_config(vllm_config)
+    if "elastic_runtime_reserve_mb" in config:
+        raise ValueError(
+            "elastic_runtime_reserve_mb is retired; elastic runtime memory "
+            "is borrowed from KV only for an admitted step"
+        )
+    return bool(config.get("elastic_gdn_backing", False))
 
 
 def _use_gdn_mtp_replay_commit(vllm_config: VllmConfig) -> bool:
-    return bool(vllm_config.additional_config.get("gdn_mtp_replay_commit", False))
+    return bool(_additional_config(vllm_config).get("gdn_mtp_replay_commit", False))
 
 
 def _elastic_gdn_blocks_per_seq(vllm_config: VllmConfig, num_mamba_groups: int) -> int:
@@ -404,6 +415,19 @@ class FreeKVCacheBlockQueue:
             self.fake_free_list_head.next_free_block = curr_block
             curr_block.prev_free_block = self.fake_free_list_head
         return ret
+
+    def peek_left_n(self, n: int) -> list[KVCacheBlock]:
+        """Return the next ``n`` allocation candidates without mutating order."""
+        if not 0 <= n <= self.num_free_blocks:
+            raise ValueError("invalid free-block peek length")
+        current = self.fake_free_list_head.next_free_block
+        blocks: list[KVCacheBlock] = []
+        for _ in range(n):
+            if current is None or current is self.fake_free_list_tail:
+                raise RuntimeError("free-block queue ended before its reported length")
+            blocks.append(current)
+            current = current.next_free_block
+        return blocks
 
     def remove(self, block: KVCacheBlock) -> None:
         """Remove a block in the free list and reduce num_free_blocks by 1.
@@ -1016,11 +1040,11 @@ def is_kv_cache_spec_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
     return True
 
 
-def get_max_concurrency_for_kv_cache_config(
+def get_num_blocks_per_request_for_kv_cache_config(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
-) -> float:
+) -> int:
     """
-    Get the maximum concurrency for the given KV cache configuration.
+    Get the primary-pool blocks consumed by one max-length request.
 
     A request at max_model_len consumes whole blocks from each group's block
     table — cdiv(per-request bytes, page bytes) of the group's spec — and all
@@ -1043,8 +1067,17 @@ def get_max_concurrency_for_kv_cache_config(
         )
         for group in groups
     )
-    max_concurrency = kv_cache_config.num_blocks / num_blocks_per_request
-    return max_concurrency
+    return num_blocks_per_request
+
+
+def get_max_concurrency_for_kv_cache_config(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> float:
+    """Return raw X0 geometry; elastic executable capacity is step-scoped."""
+    num_blocks_per_request = get_num_blocks_per_request_for_kv_cache_config(
+        vllm_config, kv_cache_config
+    )
+    return kv_cache_config.num_blocks / num_blocks_per_request
 
 
 def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
@@ -1520,29 +1553,15 @@ def get_kv_cache_config_from_groups(
                     )
                     * 1024**2
                 )
-                runtime_reserve = (
-                    int(
-                        vllm_config.additional_config.get(
-                            "elastic_runtime_reserve_mb", 0
-                        )
-                    )
-                    * 1024**2
-                )
                 min_seqs = int(
                     vllm_config.additional_config.get("elastic_gdn_min_seqs", 1)
                 )
                 blocks_per_seq = _elastic_gdn_blocks_per_seq(
                     vllm_config, len(mamba_groups)
                 )
-                if quantum <= 0 or min_seqs < 1 or runtime_reserve < 0:
+                if quantum <= 0 or min_seqs < 1:
                     raise ValueError("invalid elastic GDN geometry")
-                elastic_budget = available_memory - runtime_reserve
-                if elastic_budget <= 0:
-                    raise ValueError(
-                        "elastic runtime reserve leaves no memory for KV cache: "
-                        f"available={format_gib(available_memory)} GiB, "
-                        f"reserve={format_gib(runtime_reserve)} GiB"
-                    )
+                elastic_budget = available_memory
 
                 mamba_stride = sum(
                     page_size * len(slots) for page_size, slots in mamba_buckets.items()
@@ -1616,14 +1635,13 @@ def get_kv_cache_config_from_groups(
                     "Experimental elastic GDN backing: attention_blocks=%d, "
                     "gdn_virtual_blocks=%d, gdn_initial_blocks=%d, "
                     "attention_mapped=%s GiB, gdn_mapped=%s GiB, "
-                    "runtime_reserve=%s GiB, profiled_available=%s GiB, "
+                    "profiled_available=%s GiB, "
                     "quantum=%d MiB",
                     num_blocks,
                     mamba_num_blocks,
                     initial_mamba_blocks,
                     format_gib(attention_reserved),
                     format_gib(mamba_committed),
-                    format_gib(runtime_reserve),
                     format_gib(available_memory),
                     quantum // 1024**2,
                 )
@@ -2213,13 +2231,10 @@ def generate_scheduler_kv_cache_config(
         if len(quanta) != 1:
             raise ValueError("elastic KV mapping quantum differs across workers")
         blocks_per_request = {
-            worker_cfg.elastic_gdn_blocks_per_request
-            for worker_cfg in elastic_configs
+            worker_cfg.elastic_gdn_blocks_per_request for worker_cfg in elastic_configs
         }
         if len(blocks_per_request) != 1:
-            raise ValueError(
-                "elastic GDN blocks per request differs across workers"
-            )
+            raise ValueError("elastic GDN blocks per request differs across workers")
         scheduler_blocks_per_request = blocks_per_request.pop()
         if scheduler_blocks_per_request <= 0:
             raise ValueError("elastic GDN blocks per request must be positive")
@@ -2247,6 +2262,24 @@ def generate_scheduler_kv_cache_config(
                     budget_bytes=worker_cfg.elastic_budget_bytes,
                 )
             )
+        max_gdn_blocks_value = max_gdn_blocks.pop()
+        cfg.elastic_rank_primary_mapped_bytes = tuple(
+            tuple(
+                planner.primary_mapped_bytes(primary_blocks)
+                for primary_blocks in range(cfg.num_blocks + 1)
+            )
+            for planner in rank_planners
+        )
+        cfg.elastic_rank_gdn_mapped_bytes = tuple(
+            tuple(
+                planner.secondary_mapped_bytes(gdn_blocks)
+                for gdn_blocks in range(max_gdn_blocks_value + 1)
+            )
+            for planner in rank_planners
+        )
+        cfg.elastic_rank_budget_bytes = tuple(
+            planner.budget_bytes for planner in rank_planners
+        )
         cfg.elastic_attention_capacity_by_gdn_blocks = tuple(
             min(
                 planner.max_primary_blocks(
@@ -2255,7 +2288,7 @@ def generate_scheduler_kv_cache_config(
                 )
                 for planner in rank_planners
             )
-            for gdn_blocks in range(max_gdn_blocks.pop() + 1)
+            for gdn_blocks in range(max_gdn_blocks_value + 1)
         )
         if enable_auto_resident_cap:
             if configured_max_num_seqs is None:
@@ -2360,6 +2393,28 @@ def update_kv_cache_capacity(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> None:
     """Store and log the resolved KV cache capacity."""
+    if kv_cache_config.elastic_mapping_quantum:
+        blocks_per_request = get_num_blocks_per_request_for_kv_cache_config(
+            vllm_config, kv_cache_config
+        )
+        # BlockPool owns block zero as its null block. More importantly, this
+        # startup geometry has not yet paid the GDN growth or the executable
+        # footprint for any runtime X/M/K. Publishing it as token capacity or
+        # max concurrency produced the fictitious 538,851 / 2.06x promise.
+        vllm_config.cache_config.kv_cache_size_tokens = None
+        vllm_config.cache_config.kv_cache_max_concurrency = None
+        logger.info_once(
+            "Elastic KV raw X0 geometry: attention_blocks=%d "
+            "usable_attention_blocks=%d blocks_per_%s_token_request=%d; "
+            "executable capacity: UNKNOWN until the runtime step footprint "
+            "is measured",
+            kv_cache_config.num_blocks,
+            max(0, kv_cache_config.num_blocks - 1),
+            f"{vllm_config.model_config.max_model_len:,}",
+            blocks_per_request,
+        )
+        return
+
     num_tokens, max_concurrency = get_kv_cache_capacity(vllm_config, kv_cache_config)
     vllm_config.cache_config.kv_cache_size_tokens = num_tokens
     vllm_config.cache_config.kv_cache_max_concurrency = max_concurrency

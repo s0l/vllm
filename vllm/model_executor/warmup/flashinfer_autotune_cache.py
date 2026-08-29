@@ -22,6 +22,32 @@ def flashinfer_autotune_cache_hash(runner: "GPUModelRunner") -> str:
 
 
 def resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
+    accepted_file = os.environ.get("AG2_FLASHINFER_ACCEPTED_AUTOTUNE_FILE", "")
+    accepted_sha256 = os.environ.get(
+        "AG2_FLASHINFER_ACCEPTED_AUTOTUNE_SHA256", ""
+    )
+    if bool(accepted_file) != bool(accepted_sha256):
+        raise RuntimeError(
+            "accepted FlashInfer autotune checkpoint requires both file and SHA256"
+        )
+    if accepted_file:
+        accepted_path = Path(accepted_file).expanduser().resolve()
+        try:
+            contents = accepted_path.read_bytes()
+        except OSError as error:
+            raise RuntimeError(
+                "accepted FlashInfer autotune checkpoint is unreadable: "
+                f"{accepted_path}"
+            ) from error
+        actual_sha256 = hashlib.sha256(contents).hexdigest()
+        if actual_sha256 != accepted_sha256.lower():
+            raise RuntimeError(
+                "accepted FlashInfer autotune checkpoint SHA256 mismatch: "
+                f"expected={accepted_sha256.lower()} actual={actual_sha256} "
+                f"path={accepted_path}"
+            )
+        return accepted_path
+
     override_dir = envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR
     if override_dir:
         root = Path(override_dir).expanduser()
@@ -43,6 +69,11 @@ def resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
 
 def write_flashinfer_autotune_cache(cache_path: Path, contents: bytes) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if cache_path.read_bytes() == contents:
+            return
+    except (FileNotFoundError, OSError):
+        pass
     fd, tmp_path = tempfile.mkstemp(
         dir=cache_path.parent, suffix=".tmp", prefix=f".{cache_path.name}."
     )

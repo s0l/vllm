@@ -229,8 +229,9 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     Without autotuning, FlashInfer will rely on heuristics, which may
     be significantly slower.
 
-    Distributed workers all run tuning so collective kernels stay synchronized.
-    Rank 0's resulting choices are then broadcast and loaded on every rank.
+    A fingerprinted rank-0 cache is loaded and broadcast before any benchmark.
+    On cache miss, distributed workers run tuning so collective kernels stay
+    synchronized, then rank 0's choices are broadcast and persisted.
     """
     import vllm.utils.flashinfer as fi_utils
     from vllm.distributed.parallel_state import get_world_group
@@ -250,6 +251,23 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     cache_path = resolve_flashinfer_autotune_file(runner)
     if is_leader:
         logger.info_once("Using FlashInfer autotune cache file: %s", cache_path)
+
+    from flashinfer.autotuner import AutoTuner
+
+    tuner = AutoTuner.get()
+    if synchronize_flashinfer_autotune_cache(
+        cache_path=cache_path,
+        world=world,
+        tuner=tuner,
+        save_leader=False,
+    ):
+        logger.info_once(
+            "Loaded existing FlashInfer autotune cache on rank %d from %s; "
+            "startup tuning is skipped.",
+            world.rank_in_group,
+            cache_path,
+        )
+        return
 
     # We skip EPLB here since we don't want to record dummy metrics.
     # When autotuning with number of tokens m, flashinfer will autotune
@@ -275,12 +293,10 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         ):
             runner._dummy_run(**dummy_run_kwargs)
 
-    from flashinfer.autotuner import AutoTuner
-
     synchronized = synchronize_flashinfer_autotune_cache(
         cache_path=cache_path,
         world=world,
-        tuner=AutoTuner.get(),
+        tuner=tuner,
         save_leader=is_distributed,
     )
     if not synchronized:

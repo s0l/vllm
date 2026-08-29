@@ -189,6 +189,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 self.kv_cache_config.effective_max_resident_seqs or self.max_num_reqs
             ),
             owner="mtp_prefill",
+            elastic_graph_activation="speculative",
+            elastic_graph_token_source="step",
         )
 
         # PIECEWISE cudagraphs are not supported for draft decodes.
@@ -208,11 +210,70 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 self.kv_cache_config.effective_max_resident_seqs or self.max_num_reqs
             ),
             owner="mtp_decode",
+            elastic_graph_activation="speculative",
+            elastic_graph_token_source="requests",
         )
         if self._ag2_mtp_layer_capture is not None:
-            self.decode_cudagraph_manager.require_capture_output(
-                MTP_LAYER_TRACE_FIELDS
+            self.decode_cudagraph_manager.require_capture_output(MTP_LAYER_TRACE_FIELDS)
+
+    def dynamic_cudagraph_managers(self) -> tuple[SpeculatorCudaGraphManager, ...]:
+        return tuple(
+            manager
+            for manager in (
+                self.prefill_cudagraph_manager,
+                self.decode_cudagraph_manager,
             )
+            if manager is not None
+        )
+
+    def capture_next_dynamic(
+        self, manager: SpeculatorCudaGraphManager
+    ) -> bool:
+        if manager is self.prefill_cudagraph_manager:
+            forward_fn = self._prefill
+            progress_bar_desc = "Promoting dynamic prefill CUDA graph"
+            # Draft prefill consumes the target model's attention metadata and
+            # slot mappings at runtime. Match the accepted startup-capture
+            # contract instead of constructing incompatible metadata from the
+            # drafter's post-prefill decode buffers.
+            capture_input_buffers = self.target_input_buffers
+            capture_attn_groups = self.target_attn_groups
+        elif manager is self.decode_cudagraph_manager:
+            forward_fn = self._generate_draft
+            progress_bar_desc = "Promoting dynamic decode CUDA graph"
+            capture_input_buffers = self.input_buffers
+            capture_attn_groups = self.attn_groups
+        else:
+            raise ValueError("unknown speculator CUDA Graph manager")
+
+        # Dynamic promotion happens before live request state is copied into
+        # the drafter for this step. Clear indices left by earlier warmups so
+        # the dummy capture cannot gather beyond its exact runtime descriptor.
+        self.last_token_indices.zero_()
+
+        def capture_override(capture_descs, capture_complete_hook) -> None:
+            manager.capture(
+                forward_fn,
+                self.model_state,
+                capture_input_buffers,
+                self.block_tables,
+                capture_attn_groups,
+                self.kv_cache_config,
+                progress_bar_desc=progress_bar_desc,
+                capture_descs=capture_descs,
+                capture_complete_hook=capture_complete_hook,
+            )
+
+        return manager.capture_next_dynamic(
+            self.model,
+            self.model_state,
+            self.input_buffers,
+            None,
+            self.block_tables,
+            self.attn_groups,
+            self.kv_cache_config,
+            capture_override=capture_override,
+        )
 
     def capture(self) -> None:
         logger.info("Capturing model for speculator...")
@@ -368,14 +429,38 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         prefill_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.prefill_cudagraph_manager,
             num_reqs,
-            num_tokens,
+            # The target carrier is padded for stable buffers, but the
+            # prefill CUDA Graph safety decision must use live rows. Passing
+            # num_tokens_after_padding here hid underfilled B64 replay from
+            # the manager even after the target correctly selected NONE.
+            input_batch.num_tokens,
             uniform_token_count,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
-            need_eager=is_profile,
+            # Target compile/profile dummy runs propagate into both drafter
+            # phases without scheduler admission. Compile the direct path;
+            # only live admitted work may enter elastic Graph dispatch.
+            need_eager=dummy_run or is_profile,
         )
 
         self._prepare_eplb_forward(input_batch.num_tokens)
+
+        # Target and MTP owners can select different physical modes for the
+        # same live input (for example target FULL M3 and MTP PIECEWISE M4).
+        # The target InputBatch mask is consequently only target-sized. Build
+        # the MTP mask in its own stable buffer and mark its physical tail;
+        # slicing the shorter target mask silently returned three elements for
+        # a four-token MTP replay.
+        self.input_buffers.is_padding[: input_batch.num_tokens].copy_(
+            input_batch.is_padding[: input_batch.num_tokens]
+        )
+        if prefill_batch_desc.num_tokens > input_batch.num_tokens:
+            self.input_buffers.is_padding[
+                input_batch.num_tokens : prefill_batch_desc.num_tokens
+            ].fill_(True)
+        prefill_is_padding = self.input_buffers.is_padding[
+            : prefill_batch_desc.num_tokens
+        ]
 
         prefill_receipt_name = (
             "ag2.mtp_prefill_graph_receipt"
@@ -418,6 +503,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                     num_tokens_across_dp=num_tokens_across_dp,
                     cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
                     mm_inputs=mm_inputs,
+                    physical_num_reqs=prefill_batch_desc.physical_num_reqs,
+                    runtime_generation=prefill_batch_desc.runtime_generation,
+                    num_tokens_unpadded=input_batch.num_tokens,
+                    is_padding=prefill_is_padding,
                 )
 
         self._ag2_snapshot_proposal_step(
@@ -452,8 +541,13 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             uniform_token_count=1,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
-            need_eager=is_profile,
+            need_eager=dummy_run or is_profile,
         )
+        self.input_buffers.is_padding[:num_reqs].fill_(False)
+        if decode_batch_desc.num_tokens > num_reqs:
+            self.input_buffers.is_padding[
+                num_reqs : decode_batch_desc.num_tokens
+            ].fill_(True)
 
         # Generate the remaining num_speculative_steps - 1 draft tokens.
         decode_receipt_name = (
@@ -598,8 +692,26 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         return_ag2_mtp_trace: bool = False,
+        cudagraph_owner: str = "mtp_prefill",
+        physical_num_reqs: int | None = None,
+        runtime_generation: str = "static",
+        num_tokens_unpadded: int | None = None,
+        is_padding: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor] | None]:
-        batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
+        if num_tokens_unpadded is None:
+            num_tokens_unpadded = num_tokens
+        if not 0 < num_tokens_unpadded <= num_tokens:
+            raise RuntimeError("invalid MTP padded/live token contract")
+        if is_padding is None:
+            is_padding = self.input_buffers.is_padding[:num_tokens]
+        if is_padding.numel() != num_tokens:
+            raise RuntimeError("MTP padding mask does not match physical tokens")
+        batch_descriptor = BatchDescriptor(
+            num_tokens=num_tokens,
+            cudagraph_owner=cudagraph_owner,
+            physical_num_reqs=physical_num_reqs,
+            runtime_generation=runtime_generation,
+        )
         with set_forward_context(
             attn_metadata,
             self.vllm_config,
@@ -608,12 +720,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             num_tokens_across_dp=num_tokens_across_dp,
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
+            is_padding=is_padding,
+            num_tokens_unpadded=num_tokens_unpadded,
             # Every call in this model is owned by the MTP drafter. Keep the
             # identity explicit and graph-static so FULL capture cannot alias
             # it with an equal-shaped target decode or short prefill.
-            tp3_mtp_device_ce=(
-                os.environ.get("AG2_VLLM_MTP_DEVICE_CE", "0") == "1"
-            ),
+            tp3_mtp_device_ce=(os.environ.get("AG2_VLLM_MTP_DEVICE_CE", "0") == "1"),
         ):
             inputs_embeds = None
             if self.supports_mm_inputs:
@@ -675,6 +787,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        physical_num_reqs: int | None = None,
+        runtime_generation: str = "static",
+        num_tokens_unpadded: int | None = None,
+        is_padding: torch.Tensor | None = None,
     ) -> None:
         last_token_indices = self.last_token_indices[:num_reqs]
         positions = self.input_buffers.positions[last_token_indices]
@@ -696,6 +812,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             mm_inputs=mm_inputs,
+            cudagraph_owner="mtp_prefill",
+            physical_num_reqs=physical_num_reqs,
+            runtime_generation=runtime_generation,
+            num_tokens_unpadded=num_tokens_unpadded,
+            is_padding=is_padding,
         )
         self._ag2_current_mtp_trace = mtp_trace
         sample_hidden_states = last_hidden_states[last_token_indices]
@@ -773,6 +894,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                     slot_mappings_by_layer,
                     num_tokens_across_dp=num_tokens_across_dp,
                     cudagraph_runtime_mode=batch_desc.cg_mode,
+                    physical_num_reqs=batch_desc.physical_num_reqs,
+                    runtime_generation=batch_desc.runtime_generation,
                 )
             self._ag2_snapshot_proposal_step(step, num_reqs)
 
@@ -784,6 +907,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         slot_mappings: dict[str, torch.Tensor] | None,
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        physical_num_reqs: int | None = None,
+        runtime_generation: str = "static",
     ) -> dict[str, torch.Tensor] | None:
         self._prepare_eplb_forward(num_reqs)
 
@@ -805,6 +930,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             return_ag2_mtp_trace=self._ag2_mtp_layer_capture is not None,
+            cudagraph_owner="mtp_decode",
+            physical_num_reqs=physical_num_reqs,
+            runtime_generation=runtime_generation,
+            num_tokens_unpadded=num_reqs,
+            is_padding=self.input_buffers.is_padding[:num_tokens_padded],
         )
         self._ag2_current_mtp_trace = mtp_trace
         last_hidden_states = last_hidden_states[:num_reqs]

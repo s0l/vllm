@@ -26,7 +26,6 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
 import os
-
 from collections.abc import Iterable
 from itertools import islice
 from typing import Any
@@ -58,6 +57,7 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.projection_capture import projection_capture_copy
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -298,7 +298,10 @@ class Qwen2MoeMLP(nn.Module):
             selected = torch.where(
                 valid.unsqueeze(-1), selected, torch.zeros_like(selected)
             )
-            self._ag2_projection_capture_activation.copy_(selected)
+            projection_capture_copy(
+                selected,
+                self._ag2_projection_capture_activation,
+            )
         out, _ = self.down_proj(out)
         if self._ag2_tp3_unified_exact_reduce:
             out = tensor_model_parallel_unified_exact_all_reduce(out)

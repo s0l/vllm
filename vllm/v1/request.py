@@ -206,7 +206,10 @@ class Request:
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             prompt_token_ids, prompt_embeds
         )
-        if self.prefix_cache_hint_tokens >= self.num_prompt_tokens:
+        if (
+            self.prefix_cache_hint_tokens > 0
+            and self.prefix_cache_hint_tokens >= self.num_prompt_tokens
+        ):
             if self.prefix_cache_hint_is_default:
                 self.prefix_cache_hint_tokens = 0
                 self.prefix_cache_hint_is_default = False
