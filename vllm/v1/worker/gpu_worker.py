@@ -64,6 +64,7 @@ from vllm.utils.gpu_sync_debug import enable_gpu_sync_check, with_gpu_sync_check
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import set_random_seed, set_torch_threads_for_runtime
+from vllm.v1.core.elastic_graph import ElasticResidencyReceipt
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
@@ -1446,12 +1447,25 @@ class Worker(WorkerBase):
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
 
-    def get_elastic_graph_hot_snapshot(self) -> tuple[tuple[object, ...], ...]:
-        """Return CPU-only physical Graph residency after startup/restore."""
+    def get_elastic_graph_residency_receipt(self) -> ElasticResidencyReceipt:
+        """Return complete physical Graph residency after startup/restore."""
         manager = getattr(self.model_runner, "cudagraph_manager", None)
         if manager is None:
-            return ()
-        return self.model_runner._dynamic_graph_working_set().hot_snapshot()
+            raise RuntimeError("elastic residency receipt requires Graph manager")
+        resident, floor, transition_floor = (
+            self.model_runner._current_dynamic_graph_receipt()
+        )
+        return self.model_runner._dynamic_graph_working_set().residency_receipt(
+            transaction_id=None,
+            resident_bytes=resident,
+            floor_bytes=floor,
+            transition_floor_bytes=transition_floor,
+            peak_bytes=max(
+                resident,
+                getattr(self.model_runner, "_elastic_last_step_peak_external_bytes", 0),
+            ),
+            cublas_workspace_bytes=int(torch._C._cuda_getCublasWorkspaceSize()),
+        )
 
     def prune_elastic_pinned_full_above(
         self, max_x: int, transaction_id: str

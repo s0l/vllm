@@ -111,36 +111,6 @@ class WorkerBase:
         """Basic health check (override for device-specific checks)."""
         return
 
-    def get_elastic_graph_workspace_receipt(self) -> tuple[str, int]:
-        """Return generation-bound replay workspace cost before engine READY.
-
-        This control-plane receipt intentionally lives outside the GPU
-        worker's memory-profiling implementation: publishing an already
-        authoritative CUDA runtime constant must not invalidate the persisted
-        KV profiling checkpoint. The EngineCore source identity still binds
-        the consumer ABI and Graph catalog migration.
-        """
-        model_runner = self.model_runner
-        if model_runner is None or not hasattr(
-            model_runner, "_dynamic_graph_working_set"
-        ):
-            raise RuntimeError(
-                "elastic Graph workspace receipt requires a dynamic model runner"
-            )
-        working_set = model_runner._dynamic_graph_working_set()
-        generations = {
-            str(manager.runtime_generation) for manager in working_set.managers
-        }
-        if len(generations) != 1:
-            raise RuntimeError(
-                "elastic Graph workspace receipt requires exactly one worker "
-                f"runtime generation, got {sorted(generations)!r}"
-            )
-        return (
-            next(iter(generations)),
-            int(torch._C._cuda_getCublasWorkspaceSize()),
-        )
-
     def init_device(self) -> None:
         """Initialize device state, such as loading the model or other on-device
         memory allocations.

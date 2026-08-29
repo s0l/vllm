@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.v1.core.elastic_graph import ElasticResidencyReceipt
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
@@ -329,11 +330,9 @@ class ModelRunnerOutput:
     # maintenance -> consumer transition.
     elastic_cublas_workspace_unit_bytes: int = 0
 
-    # CPU-only physical residency receipt. Each row is
-    # (key_identity, owner, mode, tokens, physical_x, uniform_query_len,
-    #  active_loras, generation, pinned, resident_bytes, pool_bytes,
-    #  reclaimable_bytes, active_leases).
-    elastic_hot_graphs: tuple[tuple[object, ...], ...] = ()
+    # Complete CPU-only physical residency publication. A missing receipt is
+    # valid only for paths that did not enter the elastic lifecycle.
+    elastic_residency_receipt: ElasticResidencyReceipt | None = None
 
     # Per-step routed experts data captured by the worker.
     # ``routing_data`` shape: (num_scheduled_tokens, num_layers,

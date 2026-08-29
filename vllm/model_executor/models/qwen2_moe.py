@@ -57,7 +57,6 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.projection_capture import projection_capture_copy
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -191,22 +190,6 @@ class Qwen2MoeMLP(nn.Module):
             persistent=False,
         )
 
-    def ag2_enable_projection_calibration_capture(
-        self, capacity: int, dtype: torch.dtype
-    ) -> None:
-        if capacity < 1:
-            raise ValueError("projection capture capacity must be positive")
-        self._ag2_projection_capture_enabled = True
-        self.register_buffer(
-            "_ag2_projection_capture_activation",
-            torch.full(
-                (capacity, self.down_proj.input_size_per_partition),
-                torch.nan,
-                dtype=dtype,
-            ),
-            persistent=False,
-        )
-
     def enable_bf16_gate_up_scratch(
         self,
         max_num_tokens: int,
@@ -290,18 +273,6 @@ class Qwen2MoeMLP(nn.Module):
 
             self._ag2_aux_compact_gate_up = compact(gate_up)
             self._ag2_aux_compact_activation = compact(out)
-        if getattr(self, "_ag2_projection_capture_enabled", False):
-            row_indices = self._ag2_projection_capture_row_indices
-            valid = row_indices >= 0
-            safe = torch.where(valid, row_indices, torch.zeros_like(row_indices))
-            selected = torch.index_select(out, 0, safe)
-            selected = torch.where(
-                valid.unsqueeze(-1), selected, torch.zeros_like(selected)
-            )
-            projection_capture_copy(
-                selected,
-                self._ag2_projection_capture_activation,
-            )
         out, _ = self.down_proj(out)
         if self._ag2_tp3_unified_exact_reduce:
             out = tensor_model_parallel_unified_exact_all_reduce(out)

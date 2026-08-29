@@ -104,6 +104,8 @@ def test_startup_plan_fingerprint_sensitivity(plan_env):
 
 
 def test_elastic_identities_include_profile_config(plan_env):
+    from vllm.v1.core import elastic_runtime
+
     base = _plan_worker().vllm_config
     maxseq40 = _plan_worker(max_num_seqs=40).vllm_config
     kv = SimpleNamespace(
@@ -119,32 +121,16 @@ def test_elastic_identities_include_profile_config(plan_env):
         elastic_graph_execution_policy=None,
     )
     with patch.object(
-        startup_plan,
-        "_elastic_runtime_source_hashes",
+        elastic_runtime,
+        "elastic_runtime_source_hashes",
         return_value={"source": "same"},
     ):
-        assert startup_plan.compute_elastic_runtime_generation(
+        assert elastic_runtime.compute_elastic_runtime_generation(
             base
-        ) != startup_plan.compute_elastic_runtime_generation(maxseq40)
+        ) != elastic_runtime.compute_elastic_runtime_generation(maxseq40)
         assert startup_plan.compute_elastic_graph_catalog_fingerprint(
             base, kv
         ) != startup_plan.compute_elastic_graph_catalog_fingerprint(maxseq40, kv)
-
-        with patch.dict(
-            "os.environ",
-            {"AG2_VLLM_ELASTIC_GRAPH_HOTSET_CAP_MB": "256"},
-            clear=False,
-        ):
-            bounded_generation = startup_plan.compute_elastic_runtime_generation(base)
-            bounded_catalog = startup_plan.compute_elastic_graph_catalog_fingerprint(
-                base, kv
-            )
-        assert bounded_generation != startup_plan.compute_elastic_runtime_generation(
-            base
-        )
-        assert bounded_catalog != (
-            startup_plan.compute_elastic_graph_catalog_fingerprint(base, kv)
-        )
 
         policy_catalog = startup_plan.compute_elastic_graph_catalog_fingerprint(
             base,
@@ -167,14 +153,50 @@ def test_elastic_identities_include_profile_config(plan_env):
             clear=False,
         ):
             assert base.compute_hash() == "abc123"
-            loan_generation = startup_plan.compute_elastic_runtime_generation(base)
+            loan_generation = elastic_runtime.compute_elastic_runtime_generation(base)
             loan_catalog = startup_plan.compute_elastic_graph_catalog_fingerprint(
                 base, kv
             )
-        assert loan_generation != startup_plan.compute_elastic_runtime_generation(base)
+        assert loan_generation != elastic_runtime.compute_elastic_runtime_generation(
+            base
+        )
         assert loan_catalog != startup_plan.compute_elastic_graph_catalog_fingerprint(
             base, kv
         )
+
+
+def test_catalog_identity_ignores_serving_load_policy(plan_env):
+    from vllm.v1.core import elastic_runtime
+
+    config = _plan_worker().vllm_config
+    kv = SimpleNamespace(
+        num_blocks=64,
+        elastic_attention_stride=86_900_736,
+        elastic_gdn_stride=19_611_648,
+        elastic_mapping_quantum=2 << 20,
+        elastic_gdn_initial_blocks=4,
+        elastic_gdn_blocks_per_request=3,
+        elastic_rank_budget_bytes=(1, 2, 3),
+        elastic_rank_primary_mapped_bytes=(4, 5, 6),
+        elastic_rank_gdn_mapped_bytes=(7, 8, 9),
+        elastic_graph_execution_policy=None,
+    )
+    with patch.object(
+        elastic_runtime,
+        "elastic_runtime_source_hashes",
+        return_value={"source": "same"},
+    ):
+        with patch.dict(
+            "os.environ", {"AG2_VLLM_ELASTIC_REQUIRE_CATALOG": "0"}, clear=False
+        ):
+            discovery = startup_plan.compute_elastic_graph_catalog_fingerprint(
+                config, kv
+            )
+        with patch.dict(
+            "os.environ", {"AG2_VLLM_ELASTIC_REQUIRE_CATALOG": "1"}, clear=False
+        ):
+            serving = startup_plan.compute_elastic_graph_catalog_fingerprint(config, kv)
+    assert discovery == serving
 
 
 def test_startup_plan_apply_gate(plan_env):

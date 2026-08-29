@@ -499,6 +499,12 @@ class KVCacheManager:
         ):
             watermark_blocks = self.watermark_blocks
 
+        reserved = (
+            KVCacheBlockPoolRequirements(primary=reserved_blocks)
+            if isinstance(reserved_blocks, int)
+            else reserved_blocks
+        )
+
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
@@ -513,22 +519,29 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
-            if not self.coordinator.ensure_elastic_capacity(requirements):
+            admission_requirements = KVCacheBlockPoolRequirements(
+                primary=requirements.primary + reserved.primary,
+                mamba=requirements.mamba + reserved.mamba,
+            )
+            if not self.coordinator.ensure_elastic_capacity(admission_requirements):
                 self._record_allocation_rejection(
                     stage="full_sequence_elastic",
                     request_id=request.request_id,
-                    requirements=requirements,
+                    requirements=admission_requirements,
+                    reserved=reserved,
                     primary_watermark_blocks=watermark_blocks,
                 )
                 return None
             if not self.coordinator.can_allocate(
                 requirements,
+                reserved=reserved,
                 primary_watermark_blocks=watermark_blocks,
             ):
                 self._record_allocation_rejection(
                     stage="full_sequence_capacity",
                     request_id=request.request_id,
                     requirements=requirements,
+                    reserved=reserved,
                     primary_watermark_blocks=watermark_blocks,
                 )
                 return None
@@ -565,11 +578,6 @@ class KVCacheManager:
         )
 
         # Check every physical pool before any allocation mutates block state.
-        reserved = (
-            KVCacheBlockPoolRequirements(primary=reserved_blocks)
-            if isinstance(reserved_blocks, int)
-            else reserved_blocks
-        )
         elastic_requirements = KVCacheBlockPoolRequirements(
             primary=requirements.primary + reserved.primary,
             mamba=requirements.mamba + reserved.mamba,

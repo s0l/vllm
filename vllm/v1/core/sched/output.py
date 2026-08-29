@@ -300,6 +300,12 @@ class SchedulerOutput:
     # Immutable transaction identity shared by scheduler and every worker rank.
     elastic_transaction_id: str | None = None
 
+    # Canonical physical Graph shape committed when this output was scheduled.
+    # Request cancellation may change the scheduler's live carrier before the
+    # worker result settles, so settlement must not reconstruct this identity
+    # from mutable scheduler state.
+    elastic_graph_step_key: tuple[int, ...] | None = None
+
     # Complete physical plan selected before worker-side CUDA/KV mutation.
     # Workers validate its runtime generation and rank fingerprint and never
     # reconstruct owner identity or eviction policy from request metadata.
@@ -310,8 +316,6 @@ class SchedulerOutput:
     # publication. Workers retire only the hidden victim fences, keep the new
     # candidate resident, and publish a synchronized physical receipt before
     # the scheduler may observe a changed request/cache shape.
-    elastic_abort_staged_hotset: bool = False
-    elastic_staged_hotset_origin_transaction_id: str | None = None
 
     # A zero-token service tick has no next execution shape and therefore must
     # not evict the last HOT graph merely because the engine is idle. Explicit

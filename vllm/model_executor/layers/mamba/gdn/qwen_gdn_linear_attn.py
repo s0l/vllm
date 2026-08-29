@@ -48,7 +48,6 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from vllm.model_executor.layers.projection_capture import projection_capture_copy
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
@@ -898,22 +897,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._ag2_aux_compact_boundaries_enabled = True
         self.out_proj._ag2_aux_output_parallel_enabled = True
 
-    def ag2_enable_projection_calibration_capture(
-        self, capacity: int, dtype: torch.dtype
-    ) -> None:
-        if capacity < 1:
-            raise ValueError("projection capture capacity must be positive")
-        self._ag2_projection_capture_enabled = True
-        self.register_buffer(
-            "_ag2_projection_capture_gated_norm",
-            torch.full(
-                (capacity, self.padded_local_value_dim),
-                torch.nan,
-                dtype=dtype,
-            ),
-            persistent=False,
-        )
-
     def _record_mtp_replay_journal(
         self,
         *,
@@ -1368,15 +1351,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         core_attn_out = self._pad_local_value_flat(core_attn_out)
-        if getattr(self, "_ag2_projection_capture_enabled", False):
-            selected = _ag2_compact_select_rows(
-                core_attn_out,
-                self._ag2_projection_capture_row_indices,
-            )
-            projection_capture_copy(
-                selected,
-                self._ag2_projection_capture_gated_norm,
-            )
         if self._ag2_aux_boundaries_enabled:
             self._ag2_aux_gated_norm = core_attn_out
         if self._ag2_aux_compact_boundaries_enabled:

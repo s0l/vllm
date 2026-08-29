@@ -166,8 +166,6 @@ def _release_idle_graph_cache(scheduler_output: SchedulerOutput) -> bool:
     before the scheduler can consume it and makes worker/scheduler residency
     diverge. Ordinary request-free steps, including RECLAIM, remain X0.
     """
-    if scheduler_output.elastic_abort_staged_hotset:
-        return False
     plan = scheduler_output.elastic_step_plan
     return not (plan is not None and plan.kind == ElasticPlanKind.MAINTENANCE)
 
@@ -1724,6 +1722,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             torch._C._cuda_getCublasWorkspaceSize()
         )
 
+    def _publish_elastic_residency_receipt(
+        self,
+        model_runner_output: ModelRunnerOutput,
+        transaction_id: str | None,
+    ) -> None:
+        model_runner_output.elastic_residency_receipt = (
+            self._dynamic_graph_working_set().residency_receipt(
+                transaction_id=transaction_id,
+                resident_bytes=model_runner_output.elastic_external_memory_bytes,
+                floor_bytes=model_runner_output.elastic_external_memory_floor_bytes,
+                transition_floor_bytes=(
+                    model_runner_output.elastic_external_memory_transition_floor_bytes
+                ),
+                peak_bytes=model_runner_output.elastic_external_memory_peak_bytes,
+                cublas_workspace_bytes=(
+                    model_runner_output.elastic_cublas_workspace_unit_bytes
+                ),
+            )
+        )
+
     def _clear_elastic_cublas_workspaces(
         self, working_set: DynamicGraphWorkingSet
     ) -> int:
@@ -1796,21 +1814,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         release_idle_cache: bool = False,
         transaction_id: str | None = None,
         step_plan: ElasticStepPlan | None = None,
-        staged_hotset_consumed: bool = False,
     ) -> tuple[int, int, int]:
         working_set = self._dynamic_graph_working_set()
         if not getattr(self, "_elastic_step_measurement_active", False):
             working_set.finish_step()
             if transaction_id is not None:
                 working_set.release_leases(transaction_id)
-            if working_set.has_pending_staged_hotset_retirement:
-                pending_tx = working_set.pending_staged_hotset_transaction_id
-                if transaction_id == pending_tx and staged_hotset_consumed:
-                    torch.cuda.synchronize(self.device)
-                    working_set.finish_staged_hotset_after_consumers(transaction_id)
-                elif transaction_id != pending_tx:
-                    torch.cuda.synchronize(self.device)
-                    working_set.finish_staged_hotset_after_successor(step_plan)
             return getattr(
                 self,
                 "_elastic_cached_graph_receipt",
@@ -1823,23 +1832,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             working_set.finish_step()
         if transaction_id is not None:
             working_set.release_leases(transaction_id)
-        if working_set.has_pending_staged_hotset_retirement:
-            pending_tx = working_set.pending_staged_hotset_transaction_id
-            if transaction_id == pending_tx and staged_hotset_consumed:
-                # A non-empty MAINTENANCE can capture and then execute the
-                # published candidate in the same transaction. Sampling/MTP
-                # settlement proves that consumer complete, so no later USER
-                # fence is needed. Zero-token publication leaves this false.
-                torch.cuda.synchronize(self.device)
-                working_set.finish_staged_hotset_after_consumers(transaction_id)
-            elif transaction_id != pending_tx:
-                # sample(), MTP propose and output preparation enqueue GPU
-                # work. Their Python return does not end the executable/buffer
-                # lifetime.  A request-free MAINTENANCE only publishes the
-                # new set; retain and charge the old physical pools until the
-                # first distinct USER consumer has completed.
-                torch.cuda.synchronize(self.device)
-                working_set.finish_staged_hotset_after_successor(step_plan)
         # FlashInfer CUDA-Graph wrappers own address-stable planning tensors
         # that are shared across repeated replays of the live cohort.  A
         # successor's first synchronized replay is not a wrapper-lifetime
@@ -2002,14 +1994,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ) = self._finish_dynamic_graph_step(
             transaction_id=transaction_id,
             step_plan=step_plan,
-            staged_hotset_consumed=True,
         )
         model_runner_output.elastic_external_memory_peak_bytes = getattr(
             self, "_elastic_last_step_peak_external_bytes", 0
         )
         self._set_elastic_cublas_workspace_unit(model_runner_output)
-        model_runner_output.elastic_hot_graphs = (
-            self._dynamic_graph_working_set().hot_snapshot()
+        self._publish_elastic_residency_receipt(
+            model_runner_output, transaction_id
         )
 
     def _begin_elastic_step_measurement(self) -> None:
@@ -2046,11 +2037,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         entries remain resident and are returned as the minimum external loan.
         """
         working_set.finish_idle_step()
-        if working_set.has_pending_staged_hotset_retirement:
-            raise RuntimeError(
-                "idle graph cleanup crossed an unconsumed staged hotset; "
-                "scheduler must issue an explicit candidate abort"
-            )
         self._elastic_pre_idle_evicted_graph_bytes = (
             working_set.evict_unpinned_for_idle(transaction_id)
         )
@@ -2123,14 +2109,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             working_set = self._dynamic_graph_working_set()
             working_set.begin_step()
             elastic_dynamic_graph_step_started = True
-            if scheduler_output.elastic_abort_staged_hotset:
-                if elastic_plan is not None:
-                    raise RuntimeError("staged hotset abort cannot carry a graph plan")
-                torch.cuda.synchronize(self.device)
-                working_set.abort_pending_staged_hotset(
-                    scheduler_output.elastic_staged_hotset_origin_transaction_id,
-                    elastic_transaction_id,
-                )
             if elastic_plan is not None:
                 if elastic_transaction_id != elastic_plan.transaction_id:
                     raise RuntimeError(
@@ -2299,17 +2277,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             measurement_required = bool(capture_managers) or (
                 requested_external != self.elastic_kv_controller.external_memory_bytes
             )
-            if (
-                working_set.has_pending_staged_hotset_retirement
-                and elastic_plan is not None
-                and elastic_plan.kind == ElasticPlanKind.USER
-                and elastic_plan.transaction_id
-                != working_set.pending_staged_hotset_transaction_id
-            ):
-                # The first real successor must publish the post-retirement
-                # physical receipt. Reusing the maintenance receipt would keep
-                # KV permanently charged for the temporary overlap.
-                measurement_required = True
             with record_function_or_nullcontext("ag2.elastic_kv_transition"):
                 self._apply_next_elastic_kv_step(
                     transition,
@@ -2371,7 +2338,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                 )
                     except Exception:
                         if elastic_plan is not None:
-                            working_set.abort_staged_hotset_candidate(elastic_plan)
+                            working_set.discard_failed_capture(elastic_plan)
                         # A failed capture has no downstream consumer, so
                         # reclaim its loan immediately before propagating the
                         # fail-closed error. Successful capture/replay keeps
@@ -2382,25 +2349,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             working_set.resident_bytes
                         )
                         raise
-                    if elastic_plan is not None and elastic_plan.staged_hotset_replace:
-                        try:
-                            working_set.validate_staged_hotset_candidate(
-                                elastic_plan,
-                                external_overhead_bytes=(
-                                    self._measure_elastic_cublas_workspace_bytes()
-                                ),
-                            )
-                        except Exception:
-                            working_set.abort_staged_hotset_candidate(elastic_plan)
-                            self.elastic_kv_controller.reconcile_external_memory(
-                                working_set.resident_bytes
-                            )
-                            raise
-                        # Publication is complete and under cap, but target,
-                        # MTP and sampling still consume this step's CUDA
-                        # state. Retire the old set only at post-consumer
-                        # settlement in _finish_dynamic_graph_step().
-                        working_set.stage_hotset_victim_commit(elastic_plan)
             if elastic_transaction_id is None:
                 raise RuntimeError(
                     "elastic CUDA Graph execution requires scheduler transaction id"
@@ -2475,7 +2423,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             self, "_elastic_last_step_peak_external_bytes", 0
                         )
                         self._set_elastic_cublas_workspace_unit(empty_output)
-                        empty_output.elastic_hot_graphs = working_set.hot_snapshot()
+                        self._publish_elastic_residency_receipt(
+                            empty_output, elastic_transaction_id
+                        )
                 elif scheduler_output.elastic_preserve_graph_residency and isinstance(
                     empty_output, ModelRunnerOutput
                 ):
@@ -2488,8 +2438,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         empty_output.elastic_external_memory_bytes
                     )
                     self._set_elastic_cublas_workspace_unit(empty_output)
-                    empty_output.elastic_hot_graphs = (
-                        self._dynamic_graph_working_set().hot_snapshot()
+                    self._publish_elastic_residency_receipt(
+                        empty_output, elastic_transaction_id
                     )
                 if isinstance(empty_output, ModelRunnerOutput):
                     empty_output.elastic_mm_activation_loan_bytes = (
@@ -2554,10 +2504,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     empty_output.elastic_external_memory_transition_floor_bytes = (
                         transition_floor
                     )
-                    empty_output.elastic_hot_graphs = (
-                        self._dynamic_graph_working_set().hot_snapshot()
-                    )
                     self._set_elastic_cublas_workspace_unit(empty_output)
+                    self._publish_elastic_residency_receipt(
+                        empty_output, elastic_transaction_id
+                    )
             if isinstance(empty_output, ModelRunnerOutput):
                 empty_output.elastic_mm_activation_loan_bytes = (
                     scheduler_output.elastic_mm_activation_loan_bytes
@@ -2867,15 +2817,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         model_output = self.model(**model_inputs)
 
         if not dummy_run:
-            save_projection_calibration = getattr(
-                self.model, "maybe_save_ag2_projection_calibration", None
-            )
-            if save_projection_calibration is not None:
-                save_projection_calibration(
-                    input_batch=input_batch,
-                    query_len=scheduler_output.total_num_scheduled_tokens,
-                    cudagraph_mode=batch_desc.cg_mode.name,
-                )
             save_layer0_trace = getattr(self.model, "maybe_save_ag2_layer0_trace", None)
             if save_layer0_trace is not None:
                 save_layer0_trace(

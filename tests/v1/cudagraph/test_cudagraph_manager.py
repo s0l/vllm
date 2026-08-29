@@ -20,11 +20,9 @@ from vllm.config import (
 from vllm.distributed.device_communicators import pynccl_allocator
 from vllm.forward_context import BatchDescriptor
 from vllm.v1.core.elastic_graph import (
-    ElasticGraphCache,
+    ElasticAdmissionController,
     ElasticGraphError,
     ElasticPlanKind,
-    GraphPrice,
-    ReclaimGroup,
     RuntimeGeneration,
     resolve_step_physical_keys,
 )
@@ -58,6 +56,7 @@ def _create_vllm_config(
     vllm_config.scheduler_config = SchedulerConfig.default_factory(max_num_seqs=4)
     vllm_config.parallel_config = ParallelConfig()
     vllm_config.model_config.multimodal_config = None
+    vllm_config.model_config.enforce_eager = False
     vllm_config.speculative_config = None
     vllm_config.num_speculative_tokens = 0
     vllm_config.additional_config = additional_config
@@ -85,9 +84,7 @@ def test_worker_policy_publishes_backend_shape_contract_and_order() -> None:
     dflash.elastic_graph_token_source = "fixed_query"
     dflash.elastic_graph_fixed_query_len = 8
 
-    policy = gpu_cudagraph_utils.graph_execution_policy_from_managers(
-        (target, dflash)
-    )
+    policy = gpu_cudagraph_utils.graph_execution_policy_from_managers((target, dflash))
     by_owner = {owner.owner: owner for owner in policy.owners}
 
     assert by_owner["target"].execution_order == 0
@@ -148,9 +145,7 @@ def test_worker_rejects_forbidden_full_before_state_and_recovers() -> None:
     manager._dynamic_pending = None
 
     generation = RuntimeGeneration("policy-control")
-    forbidden = resolve_step_physical_keys((1, 3, 40, 160, 4), generation, 4096)[
-        0
-    ]
+    forbidden = resolve_step_physical_keys((1, 3, 40, 160, 4), generation, 4096)[0]
     before = (
         manager._dynamic_step_planned,
         manager.last_dynamic_capture_rejection,
@@ -223,6 +218,39 @@ def test_bounded_decode_descriptor_matches_semantic_tail_only() -> None:
         num_active_loras=0,
     )
 
+    # Structured-output masking can invalidate the scheduled draft tokens.
+    # The first MTP pass then consumes a qlen=1 semantic tail even though the
+    # request cohort still owns its larger physical carrier.  This is the same
+    # bounded padding contract as qlen=K+1, not an arbitrary PIECEWISE tail.
+    mtp_prefill_q1 = replace(
+        x8,
+        num_tokens=8,
+        uniform_token_count=None,
+    )
+    manager.dynamic_graph_owner = "mtp_prefill"
+    manager.decode_query_len = 4
+    assert manager._dynamic_descriptor_matches_step(
+        mtp_prefill_q1,
+        num_reqs=1,
+        num_tokens=1,
+        uniform_token_count=1,
+        num_active_loras=0,
+    )
+    assert not manager._dynamic_descriptor_matches_step(
+        mtp_prefill_q1,
+        num_reqs=1,
+        num_tokens=2,
+        uniform_token_count=1,
+        num_active_loras=0,
+    )
+    assert not manager._dynamic_descriptor_matches_step(
+        mtp_prefill_q1,
+        num_reqs=1,
+        num_tokens=1,
+        uniform_token_count=None,
+        num_active_loras=0,
+    )
+
 
 def test_effective_batched_verifier_binds_accepted_geometry(
     monkeypatch: pytest.MonkeyPatch,
@@ -238,9 +266,7 @@ def test_effective_batched_verifier_binds_accepted_geometry(
         gpu_cudagraph_utils._effective_mtp_verifier_contract()
     )
     assert verifier == "batched-causal-q1-v1"
-    assert configuration.endswith(
-        "fixed_split=2048:disable_split=1:workspace_mib=96"
-    )
+    assert configuration.endswith("fixed_split=2048:disable_split=1:workspace_mib=96")
     assert math == "accepted-batched-q1-split2048-nosplit-forced-prefix-v1"
 
     monkeypatch.setenv("AG2_VLLM_MTP_DCP_BATCHED_WORKSPACE_MIB", "64")
@@ -250,9 +276,7 @@ def test_effective_batched_verifier_binds_accepted_geometry(
 
 
 def test_owner_prequant_semantics_require_graph_backed_carrier(monkeypatch):
-    monkeypatch.setattr(
-        gpu_cudagraph_utils.envs, "AG2_VLLM_TP3_OWNER_MIN_ROWS", 128
-    )
+    monkeypatch.setattr(gpu_cudagraph_utils.envs, "AG2_VLLM_TP3_OWNER_MIN_ROWS", 128)
     manager = object.__new__(gpu_cudagraph_utils.ModelCudaGraphManager)
     manager.tp3_owner_prequant = True
     manager.decode_query_len = 4
@@ -633,7 +657,9 @@ def test_elastic_target_captures_runtime_descriptor_before_first_dispatch(monkey
 
 @pytest.mark.parametrize("owner", ["target", "mtp_prefill"])
 def test_elastic_owner_dispatches_configured_compiled_piecewise_without_capture(
-    monkeypatch, caplog, owner,
+    monkeypatch,
+    caplog,
+    owner,
 ):
     caplog.set_level("DEBUG")
     monkeypatch.setattr(
@@ -650,7 +676,18 @@ def test_elastic_owner_dispatches_configured_compiled_piecewise_without_capture(
         additional_config={
             "elastic_gdn_backing": True,
             "elastic_compiled_piecewise_sizes": [
-                2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096
+                2,
+                4,
+                8,
+                16,
+                32,
+                64,
+                128,
+                256,
+                512,
+                1024,
+                2048,
+                4096,
             ],
         },
         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
@@ -680,9 +717,7 @@ def test_elastic_owner_dispatches_configured_compiled_piecewise_without_capture(
     assert manager._compiled_piecewise_dispatch_logged == {4096}
 
     manager.begin_dynamic_step()
-    planned_1024 = manager.queue_runtime_descriptor(
-        1, 1024, None, 0, allow_full=False
-    )
+    planned_1024 = manager.queue_runtime_descriptor(1, 1024, None, 0, allow_full=False)
     assert planned_1024 is not None and planned_1024.cg_mode == CUDAGraphMode.NONE
     assert manager.dispatch(1, 1024, None, 0) == planned_1024
     assert not manager._dynamic_step_candidates
@@ -690,9 +725,7 @@ def test_elastic_owner_dispatches_configured_compiled_piecewise_without_capture(
 
     manager.begin_dynamic_step()
     assert manager.is_compiled_piecewise_shape(1152)
-    planned_1152 = manager.queue_runtime_descriptor(
-        2, 1152, None, 0, allow_full=False
-    )
+    planned_1152 = manager.queue_runtime_descriptor(2, 1152, None, 0, allow_full=False)
     assert planned_1152 is not None
     assert planned_1152.cg_mode == CUDAGraphMode.NONE
     assert planned_1152.num_tokens == 2048
@@ -707,7 +740,8 @@ def test_elastic_owner_dispatches_configured_compiled_piecewise_without_capture(
 
 @pytest.mark.parametrize("owner", ["target", "mtp_prefill"])
 def test_elastic_owner_routes_underfilled_tail_compiled_and_recovers_exact_graph(
-    monkeypatch, owner,
+    monkeypatch,
+    owner,
 ):
     monkeypatch.setattr(
         gpu_cudagraph_utils,
@@ -745,9 +779,7 @@ def test_elastic_owner_routes_underfilled_tail_compiled_and_recovers_exact_graph
     # queued the canonical B64 candidate before the user step reveals 48 live
     # tokens. Runtime dispatch must not consume that executable.
     manager.begin_dynamic_step()
-    queued_exact = manager.queue_runtime_descriptor(
-        1, 64, None, 0, allow_full=False
-    )
+    queued_exact = manager.queue_runtime_descriptor(1, 64, None, 0, allow_full=False)
     assert queued_exact is not None
     queued_entry = manager._dynamic_graph_entries[queued_exact]
     queued_entry.state = gpu_cudagraph_utils.DynamicGraphResidency.HOT
@@ -762,11 +794,10 @@ def test_elastic_owner_routes_underfilled_tail_compiled_and_recovers_exact_graph
 
     # Recovery is identity-preserving: the same exact executable is reused.
     manager.begin_dynamic_step()
-    recovered = manager.queue_runtime_descriptor(
-        12, 64, None, 0, allow_full=False
-    )
+    recovered = manager.queue_runtime_descriptor(12, 64, None, 0, allow_full=False)
     assert recovered == exact
     assert manager.dispatch(12, 64, None, 0) == exact
+
 
 def test_elastic_mtp_owner_defers_startup_capture(monkeypatch):
     monkeypatch.setattr(
@@ -801,6 +832,7 @@ def test_elastic_mtp_owner_defers_startup_capture(monkeypatch):
 
 
 def test_elastic_recipe_restores_only_reachable_warm_metadata(monkeypatch):
+    from vllm.v1.core import elastic_runtime
     from vllm.v1.worker import startup_plan
 
     monkeypatch.setattr(
@@ -814,7 +846,7 @@ def test_elastic_recipe_restores_only_reachable_warm_metadata(monkeypatch):
         lambda: object(),
     )
     monkeypatch.setattr(
-        startup_plan,
+        elastic_runtime,
         "compute_elastic_runtime_generation",
         lambda _config: "test-generation",
     )
@@ -867,25 +899,25 @@ def test_elastic_recipe_restores_only_reachable_warm_metadata(monkeypatch):
     )
 
     assert set(manager._dynamic_graph_entries) == {
-            BatchExecutionDescriptor(
+        BatchExecutionDescriptor(
             CUDAGraphMode.FULL,
             4,
             4,
             1,
             0,
             physical_num_reqs=4,
-                runtime_generation="test-generation",
-                semantic_decode=True,
+            runtime_generation="test-generation",
+            semantic_decode=True,
         ),
-            BatchExecutionDescriptor(
+        BatchExecutionDescriptor(
             CUDAGraphMode.PIECEWISE,
             3,
             None,
             None,
             0,
             physical_num_reqs=3,
-                runtime_generation="test-generation",
-                semantic_decode=True,
+            runtime_generation="test-generation",
+            semantic_decode=True,
         ),
     }
     assert all(
@@ -897,6 +929,7 @@ def test_elastic_recipe_restores_only_reachable_warm_metadata(monkeypatch):
 
 
 def test_elastic_recipe_generation_rebinds_before_residency(monkeypatch):
+    from vllm.v1.core import elastic_runtime
     from vllm.v1.core.elastic_graph import RuntimeGeneration
     from vllm.v1.worker import startup_plan
 
@@ -911,7 +944,7 @@ def test_elastic_recipe_generation_rebinds_before_residency(monkeypatch):
         lambda: object(),
     )
     monkeypatch.setattr(
-        startup_plan,
+        elastic_runtime,
         "compute_elastic_runtime_generation",
         lambda _config: "pre-kv-generation",
     )
@@ -931,8 +964,8 @@ def test_elastic_recipe_generation_rebinds_before_residency(monkeypatch):
         owner="target",
     )
     descriptor = manager.runtime_descriptor(4, 4, 1, 0, allow_full=True)
-    manager._dynamic_graph_entries[descriptor] = (
-        gpu_cudagraph_utils.DynamicGraphEntry(descriptor=descriptor)
+    manager._dynamic_graph_entries[descriptor] = gpu_cudagraph_utils.DynamicGraphEntry(
+        descriptor=descriptor
     )
 
     gpu_cudagraph_utils.DynamicGraphWorkingSet((manager,)).rebind_runtime_generation(
@@ -960,6 +993,31 @@ def test_elastic_runtime_rejects_static_graph_shape_and_budget_knobs(monkeypatch
             "elastic_gdn_backing": True,
             "dynamic_cudagraph_capture_sizes": [8],
             "dynamic_cudagraph_budget_mb": 64,
+        },
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+    )
+    with pytest.raises(ValueError, match="runtime-derived"):
+        gpu_cudagraph_utils.CudaGraphManager(
+            vllm_config=config,
+            device=torch.device("cpu"),
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            decode_query_len=1,
+            owner="target",
+        )
+
+
+def test_elastic_runtime_rejects_malformed_legacy_knob_before_validation(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    config = _create_vllm_config(
+        additional_config={
+            "elastic_gdn_backing": True,
+            "dynamic_cudagraph_capture_sizes": "not-a-list",
         },
         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
     )
@@ -1016,15 +1074,13 @@ def test_dynamic_working_set_executes_immutable_piecewise_first_capture_order():
         max_num_batched_tokens=4096,
         compiled_piecewise_sizes=(256, 512, 1024, 2048, 4096),
     )
-    cache = ElasticGraphCache(generation)
+    cache = ElasticAdmissionController(generation)
     plan = cache.plan(
         "worker-m160-order",
         desired,
         request_bytes=0,
         available_bytes=512,
         owner_set_capture_envelope_bytes=200,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=256,
     )
 
     managers = []
@@ -1066,6 +1122,45 @@ def test_dynamic_working_set_executes_immutable_piecewise_first_capture_order():
     assert pending_owners == ["mtp_prefill", "target", "mtp_decode"]
 
 
+@pytest.mark.parametrize(
+    ("kind", "administrative"),
+    [
+        (ElasticPlanKind.RECLAIM, False),
+        (ElasticPlanKind.PRESSURE_RECLAIM, True),
+    ],
+)
+def test_dynamic_working_set_forwards_reclaim_authority(kind, administrative):
+    generation = RuntimeGeneration("worker-idle-reclaim")
+    graph_key = resolve_step_physical_keys(
+        (1, 3, 1, 1, 1),
+        generation,
+        max_num_batched_tokens=4096,
+        compiled_piecewise_sizes=(),
+    )[0]
+    manager = MagicMock()
+    manager.dynamic_graph_owner = graph_key.logical.owner
+    manager._dynamic_pending = None
+    plan = SimpleNamespace(
+        kind=kind,
+        transaction_id="idle-x0",
+        protected_keys=(),
+        victim_keys=(graph_key,),
+        physical_keys=(),
+        hot_hits=(),
+        cold_misses=(),
+        capture_order=(),
+    )
+
+    gpu_cudagraph_utils.DynamicGraphWorkingSet((manager,)).apply_plan(plan)
+
+    manager.evict_physical_key.assert_called_once_with(
+        graph_key,
+        transaction_id="idle-x0",
+        reason="elastic_admission_plan",
+        administrative=administrative,
+    )
+
+
 def test_elastic_target_defers_startup_family_without_manual_budget(monkeypatch):
     monkeypatch.setattr(
         gpu_cudagraph_utils,
@@ -1097,8 +1192,18 @@ def test_elastic_target_defers_startup_family_without_manual_budget(monkeypatch)
     )
 
     assert manager.defer_startup_graphs
-    assert manager.dynamic_graph_budget_bytes == 0
-    assert manager.dynamic_graph_max_entry_bytes == 0
+    legacy_authorities = (
+        "dynamic_graph_budget_bytes",
+        "dynamic_graph_max_entry_bytes",
+        "dynamic_graph_guard_bytes",
+        "dynamic_graph_min_hits",
+        "dynamic_graph_full_min_hits",
+        "dynamic_graph_piecewise_min_hits",
+        "dynamic_graph_piecewise_min_padding_pct",
+        "dynamic_graph_cooldown_steps",
+        "dynamic_graph_pinned_sizes",
+    )
+    assert not any(hasattr(manager, name) for name in legacy_authorities)
     assert not manager.needs_capture()
     assert manager._graphs_captured
     assert manager.dynamic_resident_bytes == 0
@@ -1136,6 +1241,10 @@ def test_elastic_target_defers_startup_family_without_manual_budget(monkeypatch)
         physical_num_reqs=8,
         runtime_generation=manager.runtime_generation,
     )
+    entry = manager._dynamic_graph_entries[desc]
+    manager._cooldown_dynamic_entry(entry)
+    assert entry.state == gpu_cudagraph_utils.DynamicGraphResidency.WARM
+    assert entry.cooldown_until_epoch == 0
 
 
 def test_elastic_multitoken_full_registers_every_reachable_x(monkeypatch):
@@ -1175,9 +1284,7 @@ def test_elastic_multitoken_full_registers_every_reachable_x(monkeypatch):
 
 @pytest.mark.parametrize("owner", ["target", "mtp_prefill"])
 @pytest.mark.parametrize("x", [1, 2, 4, 8, 16, 32, 40])
-def test_elastic_batched_q1_decode_uses_bounded_piecewise_m(
-    monkeypatch, owner, x
-):
+def test_elastic_batched_q1_decode_uses_bounded_piecewise_m(monkeypatch, owner, x):
     """K3 final decode M=4X stays Graph-backed, including M160 terminal."""
     monkeypatch.setattr(
         gpu_cudagraph_utils,
@@ -1193,7 +1300,18 @@ def test_elastic_batched_q1_decode_uses_bounded_piecewise_m(
         additional_config={
             "elastic_gdn_backing": True,
             "elastic_compiled_piecewise_sizes": [
-                2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096
+                2,
+                4,
+                8,
+                16,
+                32,
+                64,
+                128,
+                256,
+                512,
+                1024,
+                2048,
+                4096,
             ],
         },
         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
@@ -1219,9 +1337,7 @@ def test_elastic_batched_q1_decode_uses_bounded_piecewise_m(
     assert desc.physical_num_reqs == x
     assert desc.uniform_token_count == 4
     assert desc.semantic_decode
-    assert not manager.is_compiled_piecewise_shape(
-        m, num_reqs=x, semantic_decode=True
-    )
+    assert not manager.is_compiled_piecewise_shape(m, num_reqs=x, semantic_decode=True)
 
 
 def test_uniform_q4_prompt_prefill_cannot_alias_decode_lane(monkeypatch):
@@ -1258,18 +1374,14 @@ def test_uniform_q4_prompt_prefill_cannot_alias_decode_lane(monkeypatch):
     )
     assert generic is not None
     assert not generic.semantic_decode
-    assert manager.is_compiled_piecewise_shape(
-        32, num_reqs=8, semantic_decode=False
-    )
+    assert manager.is_compiled_piecewise_shape(32, num_reqs=8, semantic_decode=False)
     assert not manager.uses_tp3_owner_prequant_decode(generic)
 
     decode = manager.runtime_descriptor(
         8, 32, 4, 0, allow_full=False, semantic_decode=True
     )
     assert decode is not None and decode.semantic_decode
-    assert not manager.is_compiled_piecewise_shape(
-        32, num_reqs=8, semantic_decode=True
-    )
+    assert not manager.is_compiled_piecewise_shape(32, num_reqs=8, semantic_decode=True)
     assert manager.uses_tp3_owner_prequant_decode(decode)
 
 
@@ -1300,9 +1412,7 @@ def test_elastic_nonexact_piecewise_does_not_claim_uniform_decode_semantics(
     )
 
     padded = manager.runtime_descriptor(39, 160, 4, 0, allow_full=False)
-    missing_semantics = manager.runtime_descriptor(
-        40, 160, None, 0, allow_full=False
-    )
+    missing_semantics = manager.runtime_descriptor(40, 160, None, 0, allow_full=False)
 
     assert padded.uniform_token_count is None
     assert missing_semantics.uniform_token_count is None
@@ -1947,8 +2057,7 @@ def test_compiled_piecewise_eviction_detaches_then_unwinds_in_reverse(monkeypatc
 
     def reset(order):
         assert all(
-            descriptor not in wrapper.concrete_cudagraph_entries
-            for wrapper in wrappers
+            descriptor not in wrapper.concrete_cudagraph_entries for wrapper in wrappers
         )
         assert all(entry.output is None for entry in entries)
         reset_order.append(order)
@@ -1957,9 +2066,7 @@ def test_compiled_piecewise_eviction_detaches_then_unwinds_in_reverse(monkeypatc
     graphs[1].reset.side_effect = lambda: reset(11)
     monkeypatch.setattr(CUDAGraphWrapper, "_all_instances", wrappers)
 
-    assert (
-        CUDAGraphWrapper.evict_batch_descriptor(descriptor, private_pool) == 2
-    )
+    assert CUDAGraphWrapper.evict_batch_descriptor(descriptor, private_pool) == 2
     assert reset_order == [11, 10]
 
 
@@ -2263,305 +2370,6 @@ def test_working_set_counts_device_retention_once_across_owners():
     assert len({id(manager._dynamic_retention_ledger) for manager in managers}) == 1
 
 
-def test_working_set_stages_hotset_victims_until_candidate_is_under_cap():
-    generation = RuntimeGeneration("worker-hotset")
-    old_keys = resolve_step_physical_keys((1, 3, 1, 1, 1), generation, 4096)
-    new_keys = resolve_step_physical_keys((1, 3, 16, 16, 1), generation, 4096)
-    cache = ElasticGraphCache(generation)
-    for graph_key in old_keys:
-        graph_price = GraphPrice(10, 10, f"old:{graph_key.identity}")
-        cache.publish_hot(graph_key, graph_price, pinned=False)
-        cache.install_reclaim_group(
-            ReclaimGroup(graph_price.reclaim_group, (graph_key,), 10)
-        )
-    plan = cache.plan(
-        "worker-replace",
-        new_keys,
-        request_bytes=30,
-        available_bytes=256,
-        owner_set_capture_envelope_bytes=60,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=80,
-    )
-
-    managers = []
-    for old_key, graph_key in zip(old_keys, new_keys, strict=True):
-        manager = MagicMock()
-        manager.dynamic_graph_owner = graph_key.logical.owner
-        desc = BatchExecutionDescriptor(
-            cg_mode=CUDAGraphMode[graph_key.logical.mode],
-            num_tokens=graph_key.logical.token_bucket,
-            num_reqs=graph_key.logical.logical_num_reqs,
-            uniform_token_count=graph_key.logical.uniform_query_len,
-            physical_num_reqs=graph_key.physical_num_reqs,
-            runtime_generation=generation.value,
-        )
-        old_desc = BatchExecutionDescriptor(
-            cg_mode=CUDAGraphMode[old_key.logical.mode],
-            num_tokens=old_key.logical.token_bucket,
-            num_reqs=old_key.logical.logical_num_reqs,
-            uniform_token_count=old_key.logical.uniform_query_len,
-            physical_num_reqs=old_key.physical_num_reqs,
-            runtime_generation=generation.value,
-        )
-        manager._dynamic_graph_entries = {
-            desc: gpu_cudagraph_utils.DynamicGraphEntry(
-                descriptor=desc,
-                state=gpu_cudagraph_utils.DynamicGraphResidency.HOT,
-                charged_bytes=20,
-            ),
-            old_desc: gpu_cudagraph_utils.DynamicGraphEntry(
-                descriptor=old_desc,
-                state=gpu_cudagraph_utils.DynamicGraphResidency.HOT,
-                charged_bytes=10,
-            ),
-        }
-        manager.dynamic_resident_bytes = 30
-        managers.append(manager)
-    managers[0]._dynamic_retention_ledger = (
-        gpu_cudagraph_utils.DynamicGraphRetentionLedger(rank_safe_bytes=5)
-    )
-    managers[0].dynamic_resident_bytes = 35
-    working_set = gpu_cudagraph_utils.DynamicGraphWorkingSet(tuple(managers))
-
-    assert working_set.validate_staged_hotset_candidate(
-        plan, external_overhead_bytes=7
-    ) == 72
-    working_set.stage_hotset_victim_commit(plan)
-    assert {
-        row[0] for row in working_set.hot_snapshot()
-    } == {key.identity for key in new_keys}
-    assert working_set.resident_bytes == 95
-    for manager in managers:
-        manager.evict_physical_key.assert_not_called()
-
-    with pytest.raises(RuntimeError, match="transaction mismatch"):
-        working_set.finish_staged_hotset_after_consumers("wrong-transaction")
-    for manager in managers:
-        manager.evict_physical_key.assert_not_called()
-
-    assert working_set.finish_staged_hotset_after_consumers("worker-replace") == 3
-    assert not working_set.has_pending_staged_hotset_retirement
-    for manager in managers:
-        manager.evict_physical_key.assert_not_called()
-
-
-def test_working_set_defers_victims_until_distinct_successor_transaction():
-    plan = MagicMock()
-    plan.staged_hotset_replace = True
-    plan.transaction_id = "maintenance"
-    candidate = MagicMock()
-    candidate.identity = "candidate"
-    plan.physical_keys = (candidate,)
-    victim = MagicMock()
-    victim.logical.owner = "target"
-    plan.victim_keys = (victim,)
-    manager = MagicMock(dynamic_graph_owner="target")
-    manager._dynamic_graph_entries = {}
-    working_set = gpu_cudagraph_utils.DynamicGraphWorkingSet((manager,))
-
-    working_set.stage_hotset_victim_commit(plan)
-    assert working_set.pending_staged_hotset_transaction_id == "maintenance"
-    same = MagicMock(
-        transaction_id="maintenance",
-        kind=ElasticPlanKind.USER,
-        physical_keys=plan.physical_keys,
-    )
-    with pytest.raises(RuntimeError, match="must differ"):
-        working_set.finish_staged_hotset_after_successor(same)
-    manager.evict_physical_key.assert_not_called()
-
-    wrong = MagicMock(
-        transaction_id="wrong-user",
-        kind=ElasticPlanKind.USER,
-        physical_keys=(MagicMock(identity="wrong-candidate"),),
-    )
-    with pytest.raises(RuntimeError, match="owner set differs"):
-        working_set.apply_plan(wrong)
-    manager.queue_physical_key.assert_not_called()
-    manager.evict_physical_key.assert_not_called()
-
-    successor = MagicMock(
-        transaction_id="first-user",
-        kind=ElasticPlanKind.USER,
-        physical_keys=plan.physical_keys,
-    )
-    assert working_set.finish_staged_hotset_after_successor(successor) == 1
-    assert not working_set.has_pending_staged_hotset_retirement
-    manager.evict_physical_key.assert_not_called()
-
-
-def test_working_set_does_not_arm_probation_without_physical_victims():
-    first = MagicMock(
-        staged_hotset_replace=True,
-        transaction_id="empty-to-first",
-        victim_keys=(),
-    )
-    second = MagicMock(
-        staged_hotset_replace=True,
-        transaction_id="additive-restore",
-        victim_keys=(),
-    )
-    working_set = gpu_cudagraph_utils.DynamicGraphWorkingSet(())
-
-    working_set.stage_hotset_victim_commit(first)
-    working_set.stage_hotset_victim_commit(second)
-
-    assert not working_set.has_pending_staged_hotset_retirement
-    assert working_set.pending_staged_hotset_transaction_id is None
-
-
-def test_working_set_hotset_cap_failure_aborts_only_new_candidates():
-    generation = RuntimeGeneration("worker-hotset-abort")
-    old_keys = resolve_step_physical_keys((1, 3, 1, 1, 1), generation, 4096)
-    new_keys = resolve_step_physical_keys((1, 3, 16, 16, 1), generation, 4096)
-    cache = ElasticGraphCache(generation)
-    for graph_key in old_keys:
-        graph_price = GraphPrice(10, 10, f"old:{graph_key.identity}")
-        cache.publish_hot(graph_key, graph_price, pinned=False)
-        cache.install_reclaim_group(
-            ReclaimGroup(graph_price.reclaim_group, (graph_key,), 10)
-        )
-    plan = cache.plan(
-        "worker-abort",
-        new_keys,
-        request_bytes=30,
-        available_bytes=256,
-        owner_set_capture_envelope_bytes=60,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=80,
-    )
-    managers = []
-    for graph_key in new_keys:
-        manager = MagicMock()
-        manager.dynamic_graph_owner = graph_key.logical.owner
-        desc = BatchExecutionDescriptor(
-            cg_mode=CUDAGraphMode[graph_key.logical.mode],
-            num_tokens=graph_key.logical.token_bucket,
-            num_reqs=graph_key.logical.logical_num_reqs,
-            uniform_token_count=graph_key.logical.uniform_query_len,
-            physical_num_reqs=graph_key.physical_num_reqs,
-            runtime_generation=generation.value,
-        )
-        manager._dynamic_graph_entries = {
-            desc: gpu_cudagraph_utils.DynamicGraphEntry(
-                descriptor=desc,
-                state=gpu_cudagraph_utils.DynamicGraphResidency.HOT,
-                charged_bytes=30,
-            )
-        }
-        managers.append(manager)
-    managers[0]._dynamic_retention_ledger = (
-        gpu_cudagraph_utils.DynamicGraphRetentionLedger(rank_safe_bytes=1)
-    )
-    working_set = gpu_cudagraph_utils.DynamicGraphWorkingSet(tuple(managers))
-
-    with pytest.raises(RuntimeError, match="exceeds rank-safe residency cap"):
-        working_set.validate_staged_hotset_candidate(
-            plan, external_overhead_bytes=20
-        )
-    working_set.abort_staged_hotset_candidate(plan)
-    for manager, new_key in zip(managers, new_keys, strict=True):
-        manager.discard_staged_physical_key.assert_called_once_with(
-            new_key,
-            transaction_id="worker-abort",
-        )
-        manager.evict_physical_key.assert_not_called()
-
-
-def test_working_set_validates_retained_entries_with_new_candidate():
-    generation = RuntimeGeneration("worker-hotset-retain")
-    old_key = resolve_step_physical_keys((1, 0, 1, 1, 1), generation, 4096)[0]
-    new_key = resolve_step_physical_keys((1, 0, 2, 2, 1), generation, 4096)[0]
-    cache = ElasticGraphCache(generation)
-    publish_price = GraphPrice(10, 10, f"old:{old_key.identity}")
-    cache.publish_hot(old_key, publish_price, pinned=False)
-    cache.install_reclaim_group(
-        ReclaimGroup(publish_price.reclaim_group, (old_key,), 10)
-    )
-    cache.register(new_key, price=GraphPrice(20, 24, f"new:{new_key.identity}"))
-    plan = cache.plan(
-        "worker-retain",
-        (new_key,),
-        request_bytes=10,
-        available_bytes=64,
-        owner_set_capture_envelope_bytes=24,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=40,
-    )
-    assert not plan.victim_keys
-
-    manager = MagicMock()
-    manager.dynamic_graph_owner = "target"
-    entries = {}
-    for graph_key, charged in ((old_key, 10), (new_key, 20)):
-        desc = BatchExecutionDescriptor(
-            cg_mode=CUDAGraphMode[graph_key.logical.mode],
-            num_tokens=graph_key.logical.token_bucket,
-            num_reqs=graph_key.logical.logical_num_reqs,
-            uniform_token_count=graph_key.logical.uniform_query_len,
-            physical_num_reqs=graph_key.physical_num_reqs,
-            runtime_generation=generation.value,
-        )
-        entries[desc] = gpu_cudagraph_utils.DynamicGraphEntry(
-            descriptor=desc,
-            state=gpu_cudagraph_utils.DynamicGraphResidency.HOT,
-            charged_bytes=charged,
-        )
-    manager._dynamic_graph_entries = entries
-    manager._dynamic_retention_ledger = (
-        gpu_cudagraph_utils.DynamicGraphRetentionLedger(rank_safe_bytes=5)
-    )
-    working_set = gpu_cudagraph_utils.DynamicGraphWorkingSet((manager,))
-
-    assert working_set.validate_staged_hotset_candidate(plan) == 35
-
-
-def test_working_set_abort_clears_deferred_hotset_retirement():
-    generation = RuntimeGeneration("worker-hotset-abort-deferred")
-    old_keys = resolve_step_physical_keys((1, 3, 1, 1, 1), generation, 4096)
-    new_keys = resolve_step_physical_keys((1, 3, 16, 16, 1), generation, 4096)
-    cache = ElasticGraphCache(generation)
-    for graph_key in old_keys:
-        graph_price = GraphPrice(10, 10, f"old:{graph_key.identity}")
-        cache.publish_hot(graph_key, graph_price, pinned=False)
-        cache.install_reclaim_group(
-            ReclaimGroup(graph_price.reclaim_group, (graph_key,), 10)
-        )
-    plan = cache.plan(
-        "worker-abort-deferred",
-        new_keys,
-        request_bytes=30,
-        available_bytes=256,
-        owner_set_capture_envelope_bytes=60,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=80,
-    )
-    managers = []
-    for graph_key in new_keys:
-        manager = MagicMock()
-        manager.dynamic_graph_owner = graph_key.logical.owner
-        manager._dynamic_graph_entries = {}
-        managers.append(manager)
-    managers[0]._dynamic_retention_ledger = (
-        gpu_cudagraph_utils.DynamicGraphRetentionLedger()
-    )
-    working_set = gpu_cudagraph_utils.DynamicGraphWorkingSet(tuple(managers))
-
-    working_set.stage_hotset_victim_commit(plan)
-    working_set.abort_staged_hotset_candidate(plan)
-
-    assert working_set.finish_staged_hotset_after_consumers(
-        "worker-abort-deferred"
-    ) == 0
-    for manager, new_key in zip(managers, new_keys, strict=True):
-        manager.discard_staged_physical_key.assert_called_once_with(
-            new_key,
-            transaction_id="worker-abort-deferred",
-        )
-        manager.evict_physical_key.assert_not_called()
-
-
 def test_working_set_prices_future_eviction_floor_from_physical_pool_ledger():
     mib = 1 << 20
     managers = []
@@ -2618,9 +2426,7 @@ def test_working_set_reuses_one_lazy_capture_stream_across_owners(monkeypatch):
             gpu_cudagraph_utils.DynamicGraphRetentionLedger()
         )
         manager._owns_dynamic_retention_ledger = True
-        manager._dynamic_capture_state = (
-            gpu_cudagraph_utils.DynamicGraphCaptureState()
-        )
+        manager._dynamic_capture_state = gpu_cudagraph_utils.DynamicGraphCaptureState()
         managers.append(manager)
 
     stream = object()
@@ -2632,9 +2438,7 @@ def test_working_set_reuses_one_lazy_capture_stream_across_owners(monkeypatch):
     )
 
     gpu_cudagraph_utils.DynamicGraphWorkingSet(tuple(managers))
-    contexts = [
-        manager._get_dynamic_graph_capture_context() for manager in managers
-    ]
+    contexts = [manager._get_dynamic_graph_capture_context() for manager in managers]
 
     assert stream_calls == [torch.device("cuda:2")]
     assert len({id(manager._dynamic_capture_state) for manager in managers}) == 1
@@ -2703,6 +2507,71 @@ def test_working_set_x0_retires_only_ledger_with_pinned_graph_active():
 
     assert working_set.active_graph_bytes == 7_340_032
     assert working_set.resident_bytes == 7_340_032
+
+
+def test_residency_receipt_exposes_reclaim_proof_only_for_evictable_entries():
+    pinned_desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL,
+        num_tokens=1,
+        num_reqs=1,
+        uniform_token_count=1,
+        runtime_generation="receipt-generation",
+    )
+    leased_desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.PIECEWISE,
+        num_tokens=4,
+        num_reqs=1,
+        uniform_token_count=4,
+        runtime_generation="receipt-generation",
+    )
+    evictable_desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.PIECEWISE,
+        num_tokens=8,
+        num_reqs=2,
+        uniform_token_count=4,
+        runtime_generation="receipt-generation",
+    )
+    entries = {
+        pinned_desc: gpu_cudagraph_utils.DynamicGraphEntry(
+            descriptor=pinned_desc,
+            pinned=True,
+            state=gpu_cudagraph_utils.DynamicGraphResidency.HOT,
+            charged_bytes=64,
+            local_pool_bytes=48,
+            reclaimable_bytes=32,
+        ),
+        leased_desc: gpu_cudagraph_utils.DynamicGraphEntry(
+            descriptor=leased_desc,
+            state=gpu_cudagraph_utils.DynamicGraphResidency.HOT,
+            charged_bytes=64,
+            local_pool_bytes=48,
+            reclaimable_bytes=32,
+            leases={"txn"},
+        ),
+        evictable_desc: gpu_cudagraph_utils.DynamicGraphEntry(
+            descriptor=evictable_desc,
+            state=gpu_cudagraph_utils.DynamicGraphResidency.HOT,
+            charged_bytes=64,
+            local_pool_bytes=48,
+            reclaimable_bytes=32,
+        ),
+    }
+    manager = SimpleNamespace(
+        dynamic_graph_owner="target",
+        runtime_generation="receipt-generation",
+        _dynamic_graph_entries=entries,
+    )
+
+    receipt = gpu_cudagraph_utils.DynamicGraphWorkingSet((manager,)).residency_receipt(
+        transaction_id=None,
+        resident_bytes=192,
+        floor_bytes=0,
+        transition_floor_bytes=0,
+        peak_bytes=192,
+        cublas_workspace_bytes=0,
+    )
+
+    assert sorted(entry.reclaimable_bytes for entry in receipt.entries) == [0, 0, 32]
 
 
 def test_working_set_administrative_x0_evicts_only_unpinned_hot_entries():

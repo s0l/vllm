@@ -3,8 +3,8 @@
 
 The callbacks keep model-specific KV initialization and EngineCore lifecycle
 setup at their natural owners, while this module makes the order between KV,
-policy, scheduler generation, workers, and pre-READY calibration executable
-rather than documentary.
+policy, scheduler generation, workers, and pre-READY executable restore
+explicit rather than documentary.
 """
 
 from __future__ import annotations
@@ -12,8 +12,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
-
-import torch
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -85,9 +83,10 @@ def synchronize_elastic_runtime_generation(
 ) -> dict[str, Any] | None:
     if not getattr(scheduler, "elastic_on_demand_graphs", False):
         return None
-    generation = getattr(scheduler, "_elastic_runtime_generation", None)
-    if generation is None:
+    controller = getattr(scheduler, "_elastic_admission_controller", None)
+    if controller is None:
         return None
+    generation = controller.generation
     worker_generations = collective_rpc(
         "set_elastic_runtime_generation", args=(generation.value,)
     )
@@ -158,44 +157,10 @@ def prepare_elastic_runtime(
 
 
 def complete_elastic_startup(owner: Any) -> str:
-    """Calibrate or restore an elastic runtime and publish worker residency."""
+    """Restore an exact sealed elastic runtime and publish its residency."""
     scheduler = owner.scheduler
     outcome = "not_elastic"
-    if getattr(scheduler, "_elastic_calibration_mode", False):
-        try:
-            owner._run_elastic_startup_calibration()
-        except torch.OutOfMemoryError:
-            logger.critical(
-                "CALIBRATION_OOM: pre-READY elastic CUDA Graph calibration "
-                "exhausted the exact prospective KV tail; startup is fail-stop "
-                "and must not retry in this process"
-            )
-            owner._shutdown_failed_elastic_calibration()
-            raise
-        except RuntimeError as error:
-            receipt = (
-                "CALIBRATION_OOM"
-                if "out of memory" in str(error).lower()
-                else "CALIBRATION_FAILED"
-            )
-            logger.critical(
-                "%s: pre-READY elastic CUDA Graph calibration did not seal; "
-                "startup is fail-stop and serving remains unavailable",
-                receipt,
-                exc_info=True,
-            )
-            owner._shutdown_failed_elastic_calibration()
-            raise
-        except Exception:
-            logger.critical(
-                "CALIBRATION_FAILED: pre-READY elastic CUDA Graph calibration "
-                "did not seal; serving remains unavailable",
-                exc_info=True,
-            )
-            owner._shutdown_failed_elastic_calibration()
-            raise
-        outcome = "calibrated"
-    elif (
+    if (
         getattr(scheduler, "elastic_on_demand_graphs", False)
         and getattr(scheduler, "_elastic_require_catalog", False)
     ):
@@ -213,7 +178,7 @@ def complete_elastic_startup(owner: Any) -> str:
                 "restore the complete FULL family before READY",
                 exc_info=True,
             )
-            owner._shutdown_failed_elastic_calibration()
+            owner._shutdown_failed_elastic_startup()
             raise
         outcome = "restored"
 

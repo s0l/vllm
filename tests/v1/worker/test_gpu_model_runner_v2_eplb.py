@@ -4,7 +4,7 @@
 
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -19,20 +19,15 @@ from vllm.v1.worker.gpu import model_runner as mrv2
 def test_request_free_maintenance_preserves_published_graph_owner_set():
     output = SimpleNamespace(
         elastic_step_plan=SimpleNamespace(kind=ElasticPlanKind.MAINTENANCE),
-        elastic_abort_staged_hotset=False,
     )
 
     assert mrv2._release_idle_graph_cache(output) is False
 
 
 def test_request_free_idle_and_reclaim_release_graph_owner_set():
-    idle = SimpleNamespace(
-        elastic_step_plan=None,
-        elastic_abort_staged_hotset=False,
-    )
+    idle = SimpleNamespace(elastic_step_plan=None)
     reclaim = SimpleNamespace(
         elastic_step_plan=SimpleNamespace(kind=ElasticPlanKind.RECLAIM),
-        elastic_abort_staged_hotset=False,
     )
 
     assert mrv2._release_idle_graph_cache(idle) is True
@@ -78,68 +73,6 @@ def test_dynamic_graph_working_set_includes_target_and_draft_owners():
         manager.finish_dynamic_step.assert_called_once_with()
 
 
-def test_dynamic_graph_working_set_persists_staged_retirement_until_successor(
-    monkeypatch,
-):
-    runner = object.__new__(mrv2.GPUModelRunner)
-    runner.device = torch.device("cpu")
-    target = MagicMock()
-    target.dynamic_graph_owner = "target"
-    prefill = MagicMock()
-    prefill.dynamic_graph_owner = "mtp_prefill"
-    decode = MagicMock()
-    decode.dynamic_graph_owner = "mtp_decode"
-    runner.cudagraph_manager = target
-    runner.speculator = SimpleNamespace(
-        dynamic_cudagraph_managers=lambda: (prefill, decode)
-    )
-
-    capture_boundary = runner._dynamic_graph_working_set()
-    target_victim = SimpleNamespace(
-        logical=SimpleNamespace(owner="target"), identity="old-target"
-    )
-    prefill_victim = SimpleNamespace(
-        logical=SimpleNamespace(owner="mtp_prefill"), identity="old-prefill"
-    )
-    plan = SimpleNamespace(
-        staged_hotset_replace=True,
-        transaction_id="q1-to-q4",
-        victim_keys=(target_victim, prefill_victim),
-        physical_keys=(MagicMock(),),
-    )
-    capture_boundary.stage_hotset_victim_commit(plan)
-
-    settlement_boundary = runner._dynamic_graph_working_set()
-    assert settlement_boundary is capture_boundary
-    assert settlement_boundary.has_pending_staged_hotset_retirement
-
-    # Request-free maintenance publishes but does not consume the successor.
-    # Its settlement must retain the physical victims.
-    runner._elastic_step_measurement_active = False
-    runner._elastic_cached_graph_receipt = (101, 7, 3)
-    monkeypatch.setattr(mrv2.torch.cuda, "synchronize", lambda _device: None)
-    assert runner._finish_dynamic_graph_step(transaction_id="q1-to-q4") == (101, 7, 3)
-    target.evict_physical_key.assert_not_called()
-    prefill.evict_physical_key.assert_not_called()
-    assert settlement_boundary.has_pending_staged_hotset_retirement
-
-    # The first distinct USER settlement clears the fence, but the predecessor
-    # graph objects remain HOT through the active workload epoch. Idle teardown
-    # is the first safe physical destruction point for their shared pool state.
-    assert runner._finish_dynamic_graph_step(
-        transaction_id="q4-first-user",
-        step_plan=SimpleNamespace(
-            transaction_id="q4-first-user",
-            kind=mrv2.ElasticPlanKind.USER,
-            physical_keys=plan.physical_keys,
-        ),
-    ) == (101, 7, 3)
-    target.is_physical_key_hot.assert_called_once_with(target_victim)
-    prefill.is_physical_key_hot.assert_called_once_with(prefill_victim)
-    target.evict_physical_key.assert_not_called()
-    prefill.evict_physical_key.assert_not_called()
-    decode.evict_physical_key.assert_not_called()
-    assert not settlement_boundary.has_pending_staged_hotset_retirement
 
 
 def test_dynamic_graph_working_set_rejects_runtime_manager_replacement():
@@ -170,7 +103,6 @@ def test_idle_dynamic_graph_step_reports_physical_memory_floor(monkeypatch, capl
     working_set = MagicMock()
     working_set.resident_bytes = 31
     working_set.active_graph_bytes = 20
-    working_set.has_pending_staged_hotset_retirement = False
     runner._dynamic_graph_working_set = lambda: working_set
     runner.elastic_kv_controller = MagicMock()
     runner.elastic_kv_controller.reconcile_external_memory.return_value = 37
@@ -204,7 +136,6 @@ def test_idle_dynamic_graph_step_reports_zero_floor_after_graph_eviction(
         resident_bytes = 31
         active_graph_bytes = 20
         idle_retention_cleared = False
-        has_pending_staged_hotset_retirement = False
 
         def finish_idle_step(self):
             self.resident_bytes = 0
@@ -239,7 +170,6 @@ def test_idle_x0_settles_graphs_and_keeps_pinned_floor_before_kv_return():
     working_set = MagicMock()
     working_set.resident_bytes = 29
     working_set.active_graph_bytes = 0
-    working_set.has_pending_staged_hotset_retirement = False
     runner._trim_dynamic_attention_cudagraph_state = MagicMock(return_value=(3, 41))
     runner._clear_elastic_cublas_workspaces = MagicMock(return_value=17)
     runner._measure_elastic_cublas_workspace_bytes = MagicMock(return_value=13)
@@ -258,7 +188,6 @@ def test_idle_x0_preserves_global_workspace_while_pinned_graph_is_hot():
     working_set = MagicMock()
     working_set.resident_bytes = 29
     working_set.active_graph_bytes = 7
-    working_set.has_pending_staged_hotset_retirement = False
     runner._trim_dynamic_attention_cudagraph_state = MagicMock(return_value=(3, 41))
     runner._clear_elastic_cublas_workspaces = MagicMock(return_value=17)
     runner._measure_elastic_cublas_workspace_bytes = MagicMock(return_value=13)
@@ -286,9 +215,7 @@ def test_live_step_settles_dynamic_graph_lifecycle_after_sampling():
     runner._elastic_last_step_peak_external_bytes = 41
     runner._finish_dynamic_graph_step = MagicMock(return_value=(31, 7, 13))
     runner._set_elastic_cublas_workspace_unit = MagicMock()
-    working_set = MagicMock()
-    working_set.hot_snapshot.return_value = (("target",),)
-    runner._dynamic_graph_working_set = lambda: working_set
+    runner._publish_elastic_residency_receipt = MagicMock()
     output = SimpleNamespace(
         elastic_external_memory_bytes=0,
         elastic_external_memory_floor_bytes=0,
@@ -302,67 +229,17 @@ def test_live_step_settles_dynamic_graph_lifecycle_after_sampling():
     assert output.elastic_external_memory_floor_bytes == 7
     assert output.elastic_external_memory_transition_floor_bytes == 13
     assert output.elastic_external_memory_peak_bytes == 41
-    assert output.elastic_hot_graphs == (("target",),)
     runner._finish_dynamic_graph_step.assert_called_once_with(
         transaction_id="txn-16",
         step_plan=None,
-        staged_hotset_consumed=True,
+    )
+    runner._publish_elastic_residency_receipt.assert_called_once_with(
+        output, "txn-16"
     )
 
 
-def test_post_sampling_settlement_retains_same_transaction_consumed_hotset(
-    monkeypatch,
-):
-    runner = object.__new__(mrv2.GPUModelRunner)
-    runner.device = torch.device("cpu")
-    runner._elastic_step_measurement_active = False
-    runner._elastic_cached_graph_receipt = (31, 7, 13)
-    working_set = MagicMock()
-    working_set.resident_bytes = 31
-    working_set.has_pending_staged_hotset_retirement = True
-    working_set.pending_staged_hotset_transaction_id = "maintenance-16"
-    runner._dynamic_graph_working_set = lambda: working_set
-    synchronize = MagicMock()
-    monkeypatch.setattr(mrv2.torch.cuda, "synchronize", synchronize)
-
-    assert runner._finish_dynamic_graph_step(
-        transaction_id="maintenance-16",
-        staged_hotset_consumed=True,
-    ) == (31, 7, 13)
-
-    assert working_set.method_calls[:3] == [
-        call.finish_step(),
-        call.release_leases("maintenance-16"),
-        call.finish_staged_hotset_after_consumers("maintenance-16"),
-    ]
-    synchronize.assert_called_once_with(runner.device)
 
 
-def test_post_sampling_settlement_retains_staged_hotset_after_successor(
-    monkeypatch,
-):
-    runner = object.__new__(mrv2.GPUModelRunner)
-    runner.device = torch.device("cpu")
-    runner._elastic_step_measurement_active = False
-    runner._elastic_cached_graph_receipt = (31, 7, 13)
-    working_set = MagicMock()
-    working_set.resident_bytes = 31
-    working_set.has_pending_staged_hotset_retirement = True
-    working_set.pending_staged_hotset_transaction_id = "maintenance-16"
-    runner._dynamic_graph_working_set = lambda: working_set
-    synchronize = MagicMock()
-    monkeypatch.setattr(mrv2.torch.cuda, "synchronize", synchronize)
-
-    successor = SimpleNamespace(transaction_id="txn-17")
-    assert runner._finish_dynamic_graph_step(
-        transaction_id="txn-17", step_plan=successor
-    ) == (31, 7, 13)
-    assert working_set.method_calls[:3] == [
-        call.finish_step(),
-        call.release_leases("txn-17"),
-        call.finish_staged_hotset_after_successor(successor),
-    ]
-    synchronize.assert_called_once_with(runner.device)
 
 
 def test_idle_preserve_receipt_keeps_hot_graph_without_finishing_step():

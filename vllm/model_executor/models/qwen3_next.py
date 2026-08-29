@@ -60,7 +60,6 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
-from vllm.model_executor.layers.projection_capture import projection_capture_copy
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Dynamic
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -163,6 +162,14 @@ def _ag2_tp3_owner_prequant_enabled(
             + ", ".join(incompatible)
         )
     return True
+
+
+def _reject_removed_projection_calibration() -> None:
+    if os.environ.get("AG2_VLLM_PROJECTION_CALIBRATION_OUTPUT", ""):
+        raise RuntimeError(
+            "AG2 projection calibration capture was removed because its "
+            "Graph-visible observer is not neutral"
+        )
 
 
 def _ag2_tp3_mtp_block5_enabled(
@@ -826,18 +833,6 @@ class Qwen3NextAttention(nn.Module):
                 "AG2_VLLM_AUX_HIDDEN_TRACE_DCP_REQUEST_TAIL_ROWS"
             )
 
-    def ag2_enable_projection_calibration_capture(
-        self, capacity: int, dtype: torch.dtype
-    ) -> None:
-        if capacity < 1:
-            raise ValueError("projection capture capacity must be positive")
-        self._ag2_projection_capture_enabled = True
-        self.register_buffer(
-            "_ag2_projection_capture_gated",
-            torch.full((capacity, self.q_size), torch.nan, dtype=dtype),
-            persistent=False,
-        )
-
     def ag2_enable_sequence_full_trace(self) -> None:
         """Enable fixed, sequence-wide full-attention fingerprint producers."""
         self._ag2_aux_compact_full_stages = (
@@ -1018,15 +1013,6 @@ class Qwen3NextAttention(nn.Module):
             self._ag2_trace_core[: trace.shape[0]].copy_(trace)
         if gate is not None:
             attn_output = attn_output * torch.sigmoid(gate)
-        if getattr(self, "_ag2_projection_capture_enabled", False):
-            selected = _ag2_compact_select(
-                attn_output,
-                self._ag2_projection_capture_row_indices,
-            )
-            projection_capture_copy(
-                selected,
-                self._ag2_projection_capture_gated,
-            )
         if return_ag2_mtp_trace:
             mtp_trace["gated"] = attn_output
         if (
@@ -1571,7 +1557,7 @@ class Qwen3NextDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self._ag2_enable_projection_calibration_capture(vllm_config.model_config.dtype)
+        _reject_removed_projection_calibration()
 
         self.layer_scale = getattr(config, "layer_scale", False)
         if self.layer_scale:
@@ -1589,79 +1575,6 @@ class Qwen3NextDecoderLayer(nn.Module):
                     config.hidden_size,
                 ),
             )
-
-    def _ag2_enable_projection_calibration_capture(self, dtype: torch.dtype) -> None:
-        output = os.environ.get("AG2_VLLM_PROJECTION_CALIBRATION_OUTPUT", "")
-        self._ag2_projection_capture_enabled = bool(output)
-        if not self._ag2_projection_capture_enabled:
-            return
-        positions_raw = os.environ.get("AG2_VLLM_PROJECTION_CALIBRATION_POSITIONS", "")
-        positions = tuple(
-            dict.fromkeys(int(value) for value in positions_raw.split(",") if value)
-        )
-        capacity = int(os.environ.get("AG2_VLLM_PROJECTION_CALIBRATION_CAPACITY", "4"))
-        if not positions or any(position < 0 for position in positions):
-            raise ValueError("projection calibration requires nonnegative positions")
-        if capacity < len(positions):
-            raise ValueError(
-                "projection calibration capacity is smaller than positions"
-            )
-        self._ag2_projection_capture_positions = positions
-        self._ag2_projection_capture_capacity = capacity
-        self.register_buffer(
-            "_ag2_projection_capture_rows",
-            torch.full((capacity,), -1, dtype=torch.int64),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_ag2_projection_capture_attention_input",
-            torch.full(
-                (capacity, self.input_layernorm.weight.shape[0]),
-                torch.nan,
-                dtype=dtype,
-            ),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_ag2_projection_capture_mlp_input",
-            torch.full(
-                (capacity, self.post_attention_layernorm.weight.shape[0]),
-                torch.nan,
-                dtype=dtype,
-            ),
-            persistent=False,
-        )
-        if self._ag2_tp3_owner_prequant:
-            self.register_buffer(
-                "_ag2_projection_capture_attention_residual",
-                torch.full(
-                    (capacity, self.input_layernorm.weight.shape[0]),
-                    torch.nan,
-                    dtype=dtype,
-                ),
-                persistent=False,
-            )
-            self.register_buffer(
-                "_ag2_projection_capture_mlp_residual",
-                torch.full(
-                    (capacity, self.post_attention_layernorm.weight.shape[0]),
-                    torch.nan,
-                    dtype=dtype,
-                ),
-                persistent=False,
-            )
-        if self.layer_type == "full_attention":
-            self.self_attn.ag2_enable_projection_calibration_capture(capacity, dtype)
-        else:
-            self.linear_attn.ag2_enable_projection_calibration_capture(capacity, dtype)
-        enable_mlp_capture = getattr(
-            self.mlp, "ag2_enable_projection_calibration_capture", None
-        )
-        if enable_mlp_capture is None:
-            raise NotImplementedError(
-                "projection calibration currently requires the dense Qwen MLP"
-            )
-        enable_mlp_capture(capacity, dtype)
 
     def _ag2_owner_prequantize(
         self,
@@ -1778,28 +1691,6 @@ class Qwen3NextDecoderLayer(nn.Module):
             self._ag2_trace_input[: trace.shape[0]].copy_(trace)
         if return_ag2_mtp_trace:
             mtp_trace["layer_input"] = hidden_states
-        if self._ag2_projection_capture_enabled:
-            capture_rows = _ag2_compact_row_indices(
-                positions,
-                self._ag2_projection_capture_positions,
-                self._ag2_projection_capture_capacity,
-            )
-            projection_capture_copy(
-                capture_rows,
-                self._ag2_projection_capture_rows,
-            )
-            if self._ag2_tp3_owner_prequant:
-                projection_capture_copy(
-                    _ag2_compact_select(hidden_states, capture_rows),
-                    self._ag2_projection_capture_attention_input,
-                )
-                projection_capture_copy(
-                    _ag2_compact_select(
-                        hidden_states if residual is None else residual,
-                        capture_rows,
-                    ),
-                    self._ag2_projection_capture_attention_residual,
-                )
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -1821,17 +1712,6 @@ class Qwen3NextDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         if return_ag2_mtp_trace:
             mtp_trace["input_norm"] = hidden_states
-        if self._ag2_projection_capture_enabled:
-            if not self._ag2_tp3_owner_prequant:
-                projection_capture_copy(
-                    _ag2_compact_select(hidden_states, capture_rows),
-                    self._ag2_projection_capture_attention_input,
-                )
-            self.mlp._ag2_projection_capture_row_indices = capture_rows
-            if self.layer_type == "full_attention":
-                self.self_attn._ag2_projection_capture_row_indices = capture_rows
-            else:
-                self.linear_attn._ag2_projection_capture_row_indices = capture_rows
         if self._ag2_aux_compact_boundary_enabled:
             configured_positions = tuple(
                 int(value)
@@ -1999,21 +1879,6 @@ class Qwen3NextDecoderLayer(nn.Module):
                 residual = sequence_parallel_chunk(residual)
 
         # Fully Connected
-        if self._ag2_projection_capture_enabled and self._ag2_tp3_owner_prequant:
-            projection_capture_copy(
-                _ag2_compact_select(
-                    hidden_states,
-                    self._ag2_projection_capture_rows,
-                ),
-                self._ag2_projection_capture_mlp_input,
-            )
-            projection_capture_copy(
-                _ag2_compact_select(
-                    residual,
-                    self._ag2_projection_capture_rows,
-                ),
-                self._ag2_projection_capture_mlp_residual,
-            )
         if self._ag2_tp3_owner_prequant:
             hidden_states, residual = self._ag2_owner_prequantize(
                 hidden_states,
@@ -2033,14 +1898,6 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
-            )
-        if self._ag2_projection_capture_enabled and not self._ag2_tp3_owner_prequant:
-            projection_capture_copy(
-                _ag2_compact_select(
-                    hidden_states,
-                    self._ag2_projection_capture_rows,
-                ),
-                self._ag2_projection_capture_mlp_input,
             )
         if return_ag2_mtp_trace:
             mtp_trace["post_attention_norm"] = hidden_states
@@ -2573,7 +2430,8 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                     )
                 if not hasattr(consumer, "_ag2_nvfp4_arc_selected_all"):
                     raise RuntimeError(
-                        f"layer {layer.layer_idx} consumer is missing ARC owner metadata"
+                        f"layer {layer.layer_idx} consumer is missing "
+                        "ARC owner metadata"
                     )
         logger.warning(
             "Validated target-only TP3 owner residual + ARC prequant ABI for %d layers",

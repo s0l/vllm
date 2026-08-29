@@ -23,19 +23,41 @@ class ElasticGraphError(RuntimeError):
     """An elastic graph state transition violated the admission contract."""
 
 
+@dataclass(frozen=True)
+class ElasticRuntimeConfig:
+    """Single activation authority shared by scheduler and Graph workers."""
+
+    enabled: bool
+
+    @classmethod
+    def from_vllm_config(cls, vllm_config: Any) -> ElasticRuntimeConfig:
+        additional = getattr(vllm_config, "additional_config", None)
+        model_config = getattr(vllm_config, "model_config", None)
+        compilation_config = getattr(vllm_config, "compilation_config", None)
+        mode = getattr(compilation_config, "cudagraph_mode", None)
+        mode_name = getattr(mode, "name", str(mode))
+        return cls(
+            enabled=bool(
+                isinstance(additional, dict)
+                and additional.get("elastic_gdn_backing", False)
+                and not getattr(model_config, "enforce_eager", False)
+                and mode_name != "NONE"
+            )
+        )
+
+
 class GraphResidency(str, Enum):
     COLD = "cold"
-    ADMISSION_PENDING = "admission_pending"
     CAPTURING = "capturing"
     HOT_EVICTABLE = "hot_evictable"
     HOT_PINNED = "hot_pinned"
-    COOLDOWN = "cooldown"
 
 
 class ElasticPlanKind(str, Enum):
     USER = "user"
     MAINTENANCE = "maintenance"
     RECLAIM = "reclaim"
+    PRESSURE_RECLAIM = "pressure_reclaim"
     DEFER = "defer"
 
 
@@ -139,30 +161,24 @@ class OwnerGraphExecutionPolicy:
             or self.execution_order < 0
         ):
             raise ValueError("Graph owner execution order must be non-negative")
-        if (
-            self.piecewise_query_len_min_tokens is not None
-            and (
-                isinstance(self.piecewise_query_len_min_tokens, bool)
-                or not isinstance(self.piecewise_query_len_min_tokens, int)
-                or self.piecewise_query_len_min_tokens <= 0
-            )
+        if self.piecewise_query_len_min_tokens is not None and (
+            isinstance(self.piecewise_query_len_min_tokens, bool)
+            or not isinstance(self.piecewise_query_len_min_tokens, int)
+            or self.piecewise_query_len_min_tokens <= 0
         ):
             raise ValueError(
                 "PIECEWISE query-length threshold must be a positive integer"
             )
-        if (
-            tuple(sorted(set(self.full_query_lens))) != self.full_query_lens
-            or any(query_len <= 0 for query_len in self.full_query_lens)
+        if tuple(sorted(set(self.full_query_lens))) != self.full_query_lens or any(
+            query_len <= 0 for query_len in self.full_query_lens
         ):
             raise ValueError("FULL query lengths must be sorted unique positives")
-        if (
-            tuple(sorted(set(self.compiled_piecewise_sizes)))
-            != self.compiled_piecewise_sizes
-            or any(size <= 0 for size in self.compiled_piecewise_sizes)
+        if tuple(
+            sorted(set(self.compiled_piecewise_sizes))
+        ) != self.compiled_piecewise_sizes or any(
+            size <= 0 for size in self.compiled_piecewise_sizes
         ):
-            raise ValueError(
-                "compiled PIECEWISE sizes must be sorted unique positives"
-            )
+            raise ValueError("compiled PIECEWISE sizes must be sorted unique positives")
 
     def mode_for(self, uniform_query_len: int | None) -> str:
         if uniform_query_len in self.full_query_lens:
@@ -242,9 +258,7 @@ class GraphExecutionPolicy:
             if any(order is None for order in orders) or len(set(orders)) != len(
                 orders
             ):
-                raise ValueError(
-                    "runtime Graph owners require unique execution order"
-                )
+                raise ValueError("runtime Graph owners require unique execution order")
 
     @cached_property
     def fingerprint(self) -> str:
@@ -295,9 +309,7 @@ class GraphExecutionPolicy:
         if isinstance(schema, bool) or not isinstance(schema, int):
             raise ValueError("graph execution policy schema must be an integer")
         raw_owners = payload.get("owners")
-        if not isinstance(raw_owners, Sequence) or isinstance(
-            raw_owners, (str, bytes)
-        ):
+        if not isinstance(raw_owners, Sequence) or isinstance(raw_owners, (str, bytes)):
             raise ValueError("graph execution policy owners must be a sequence")
         owners = []
         for raw in raw_owners:
@@ -309,12 +321,9 @@ class GraphExecutionPolicy:
                     "graph execution policy full_exact_x must be a boolean"
                 )
             query_len_min_tokens = raw.get("piecewise_query_len_min_tokens")
-            if (
-                query_len_min_tokens is not None
-                and (
-                    isinstance(query_len_min_tokens, bool)
-                    or not isinstance(query_len_min_tokens, int)
-                )
+            if query_len_min_tokens is not None and (
+                isinstance(query_len_min_tokens, bool)
+                or not isinstance(query_len_min_tokens, int)
             ):
                 raise ValueError(
                     "graph execution policy piecewise_query_len_min_tokens "
@@ -328,9 +337,7 @@ class GraphExecutionPolicy:
                     compiled_piecewise_sizes=integer_sequence(
                         raw, "compiled_piecewise_sizes"
                     ),
-                    capability_contract=required_string(
-                        raw, "capability_contract"
-                    ),
+                    capability_contract=required_string(raw, "capability_contract"),
                     full_exact_x=full_exact_x,
                     piecewise_padding_contract=required_string(
                         raw, "piecewise_padding_contract"
@@ -347,9 +354,7 @@ class GraphExecutionPolicy:
             verifier_contract=required_string(payload, "verifier_contract"),
             math_contract=required_string(payload, "math_contract"),
             owners=tuple(owners),
-            verifier_configuration=required_string(
-                payload, "verifier_configuration"
-            ),
+            verifier_configuration=required_string(payload, "verifier_configuration"),
         )
         claimed = payload.get("fingerprint")
         if claimed is not None and not isinstance(claimed, str):
@@ -373,6 +378,13 @@ def bind_runtime_generation_to_policy(
             "graph_execution_policy": policy.fingerprint,
         }
     )
+
+
+def compute_elastic_runtime_generation_from_factors(
+    factors: Mapping[str, Any],
+) -> str:
+    """Canonical generation computation shared by all runtime participants."""
+    return hashlib.sha256(json.dumps(factors, sort_keys=True).encode()).hexdigest()
 
 
 @dataclass(frozen=True, order=True)
@@ -428,6 +440,150 @@ class GraphPrice:
             raise ValueError("capture peak cannot be below resident bytes")
         if not self.reclaim_group:
             raise ValueError("a graph price requires a reclaim group")
+
+
+ELASTIC_RESIDENCY_RECEIPT_SCHEMA = 1
+ELASTIC_RESIDENCY_RECEIPT_SCHEMA_FINGERPRINT = hashlib.sha256(
+    json.dumps(
+        {
+            "schema": ELASTIC_RESIDENCY_RECEIPT_SCHEMA,
+            "receipt": (
+                "generation",
+                "transaction_id",
+                "resident_bytes",
+                "floor_bytes",
+                "transition_floor_bytes",
+                "peak_bytes",
+                "cublas_workspace_bytes",
+                "entries",
+                "complete",
+            ),
+            "entry": (
+                "key",
+                "pinned",
+                "resident_bytes",
+                "local_pool_bytes",
+                "reclaimable_bytes",
+                "lease_ids",
+            ),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+).hexdigest()
+
+
+@dataclass(frozen=True)
+class ElasticResidencyEntry:
+    """One physical executable in a worker residency publication."""
+
+    key: PhysicalReplayKey
+    pinned: bool
+    resident_bytes: int
+    local_pool_bytes: int
+    reclaimable_bytes: int
+    lease_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for name in ("resident_bytes", "local_pool_bytes", "reclaimable_bytes"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.reclaimable_bytes > self.resident_bytes:
+            raise ValueError("reclaim proof exceeds resident bytes")
+        if self.pinned and self.reclaimable_bytes:
+            raise ValueError("a pinned Graph entry cannot be reclaimable")
+        if tuple(sorted(set(self.lease_ids))) != self.lease_ids:
+            raise ValueError("lease ids must be sorted and unique")
+        if self.lease_ids and self.reclaimable_bytes:
+            raise ValueError("a leased Graph entry cannot be reclaimable")
+
+
+@dataclass(frozen=True)
+class ElasticResidencyReceipt:
+    """Complete generation-bound worker publication; never a positional ABI."""
+
+    generation: RuntimeGeneration
+    transaction_id: str | None
+    resident_bytes: int
+    floor_bytes: int
+    transition_floor_bytes: int
+    peak_bytes: int
+    cublas_workspace_bytes: int
+    entries: tuple[ElasticResidencyEntry, ...]
+    complete: bool = True
+    schema: int = ELASTIC_RESIDENCY_RECEIPT_SCHEMA
+    schema_fingerprint: str = ELASTIC_RESIDENCY_RECEIPT_SCHEMA_FINGERPRINT
+
+    def __post_init__(self) -> None:
+        if self.schema != ELASTIC_RESIDENCY_RECEIPT_SCHEMA:
+            raise ValueError("unsupported elastic residency receipt schema")
+        if self.schema_fingerprint != ELASTIC_RESIDENCY_RECEIPT_SCHEMA_FINGERPRINT:
+            raise ValueError("elastic residency receipt schema fingerprint mismatch")
+        if not self.complete:
+            raise ValueError("partial elastic residency receipts are forbidden")
+        for name in (
+            "resident_bytes",
+            "floor_bytes",
+            "transition_floor_bytes",
+            "peak_bytes",
+            "cublas_workspace_bytes",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.floor_bytes > self.resident_bytes:
+            raise ValueError("physical floor exceeds aggregate resident bytes")
+        if self.transition_floor_bytes > self.peak_bytes:
+            raise ValueError("transition floor exceeds measured peak")
+        if self.peak_bytes < self.resident_bytes:
+            raise ValueError("measured peak is below aggregate resident bytes")
+        keys = tuple(entry.key for entry in self.entries)
+        if len(set(keys)) != len(keys):
+            raise ValueError("elastic residency receipt contains duplicate keys")
+        if any(entry.key.generation != self.generation for entry in self.entries):
+            raise ValueError("elastic residency receipt mixes runtime generations")
+        if tuple(sorted(keys, key=lambda key: key.identity)) != keys:
+            raise ValueError("elastic residency entries must be identity-sorted")
+
+    @cached_property
+    def fingerprint(self) -> str:
+        return _fingerprint(asdict(self))
+
+
+@dataclass(frozen=True)
+class ElasticAdmissionLoan:
+    """One FIFO scheduler-to-worker external-memory reservation."""
+
+    step_key: tuple[int, ...] | None
+    grant_bytes: int
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.grant_bytes, bool)
+            or not isinstance(self.grant_bytes, int)
+            or self.grant_bytes < 0
+        ):
+            raise ValueError("elastic admission loan must be non-negative")
+
+
+@dataclass(frozen=True)
+class ElasticAdmissionSnapshot:
+    """Stable controller state used by differential trace replay."""
+
+    generation: RuntimeGeneration
+    pending_loans: tuple[ElasticAdmissionLoan, ...]
+    pending_maintenance: tuple[str, str, tuple[int, ...] | None] | None
+    step_key: tuple[int, ...] | None
+    recapture_pending_key: tuple[int, ...] | None
+    resident_bytes: int
+    pinned_resident_bytes: int
+    evictable_resident_bytes: int
+    floor_bytes: int
+    transition_floor_bytes: int
+    cublas_workspace_bytes: int
+    entry_states: tuple[tuple[str, str, tuple[str, ...]], ...]
+    stats: ElasticGraphStats
 
 
 @dataclass(frozen=True)
@@ -502,8 +658,6 @@ class ElasticStepPlan:
     capture_loan_bytes: int
     reclaim_bytes: int
     defer_reason: str | None = None
-    staged_hotset_replace: bool = False
-    residency_cap_bytes: int = 0
 
     def __post_init__(self) -> None:
         if not self.transaction_id:
@@ -516,7 +670,6 @@ class ElasticStepPlan:
             "available_bytes",
             "capture_loan_bytes",
             "reclaim_bytes",
-            "residency_cap_bytes",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} cannot be negative")
@@ -524,9 +677,10 @@ class ElasticStepPlan:
             raise ValueError("a user plan cannot contain cold graph misses")
         if self.kind == ElasticPlanKind.MAINTENANCE and not self.cold_misses:
             raise ValueError("maintenance requires at least one cold miss")
-        if self.kind == ElasticPlanKind.RECLAIM and (
-            self.cold_misses or not self.victim_keys
-        ):
+        if self.kind in {
+            ElasticPlanKind.RECLAIM,
+            ElasticPlanKind.PRESSURE_RECLAIM,
+        } and (self.cold_misses or not self.victim_keys):
             raise ValueError("reclaim requires victims and cannot capture")
         if self.kind == ElasticPlanKind.DEFER and not self.defer_reason:
             raise ValueError("a deferred plan requires an explicit reason")
@@ -538,10 +692,6 @@ class ElasticStepPlan:
             raise ValueError("plan hit/miss keys are outside its owner set")
         if set(self.victim_keys).intersection(self.protected_keys):
             raise ValueError("a protected key cannot be selected as a victim")
-        if self.staged_hotset_replace and self.kind != ElasticPlanKind.MAINTENANCE:
-            raise ValueError("staged hotset publication requires maintenance")
-        if self.residency_cap_bytes and self.kind == ElasticPlanKind.DEFER:
-            raise ValueError("deferred plans cannot claim an active residency cap")
 
     @cached_property
     def fingerprint(self) -> str:
@@ -676,14 +826,10 @@ def resolve_step_physical_keys(
         keys: list[PhysicalReplayKey] = []
         semantic_uniform = uniform_query_len or None
         uniform_step = bool(
-            semantic_uniform is not None
-            and num_tokens == num_reqs * semantic_uniform
+            semantic_uniform is not None and num_tokens == num_reqs * semantic_uniform
         )
         for owner_policy in ordered_owners:
-            if (
-                owner_policy.activation == "speculative"
-                and num_spec_tokens <= 0
-            ):
+            if owner_policy.activation == "speculative" and num_spec_tokens <= 0:
                 continue
             if owner_policy.token_source == "step":
                 owner_tokens = num_tokens
@@ -725,9 +871,7 @@ def resolve_step_physical_keys(
                     if preserve_exact_m
                     else piecewise_boundary(owner_tokens)
                 )
-                owner_compiled_sizes = frozenset(
-                    owner_policy.compiled_piecewise_sizes
-                )
+                owner_compiled_sizes = frozenset(owner_policy.compiled_piecewise_sizes)
                 if not preserve_exact_m and physical_tokens in owner_compiled_sizes:
                     continue
                 minimum = owner_policy.piecewise_query_len_min_tokens
@@ -905,11 +1049,11 @@ def select_short_decode_physical_x(
     )
 
 
-class ElasticGraphCache:
-    """Deterministic multi-entry cache and admission planner.
+class ElasticAdmissionController:
+    """Scheduler-owned admission, loan and residency state machine.
 
     CUDA teardown/publication is performed by the caller.  This object owns
-    only policy state and therefore can be replayed in scheduler tests.
+    policy and FIFO loan state and can therefore be replayed without Scheduler.
     """
 
     def __init__(self, generation: RuntimeGeneration):
@@ -925,6 +1069,29 @@ class ElasticGraphCache:
         self._deferrals = 0
         self._defer_reasons: Counter[str] = Counter()
         self._trace: deque[tuple[str, str, str]] = deque(maxlen=128)
+        self._pending_loans: deque[ElasticAdmissionLoan] = deque()
+        self._pending_maintenance_plan: ElasticStepPlan | None = None
+        self._pending_maintenance_step_key: tuple[int, ...] | None = None
+        self._transaction_seq = 0
+        self._last_receipt: ElasticResidencyReceipt | None = None
+        # Settled execution shape and the one cold shape awaiting its first
+        # authoritative worker measurement.
+        self.step_key: tuple[int, ...] | None = None
+        self.recapture_pending_key: tuple[int, ...] | None = None
+        # Runtime measurements replace provisional discovery loans; they are
+        # evidence, never a fixed reserve.
+        self.measured_bytes: dict[tuple[int, ...], int] = {}
+        self.capture_envelopes: dict[tuple[int, ...], tuple[int, int, int]] = {}
+        self.resident_bytes = 0
+        self.pinned_resident_bytes = 0
+        self.evictable_resident_bytes = 0
+        # Actual and prospective non-reclaimable allocator floors.
+        self.floor_bytes = 0
+        self.transition_floor_bytes = 0
+        self.cublas_workspace_bytes = 0
+        self.last_maintenance_step_key: tuple[int, ...] | None = None
+        self.idle_cleanup_started_at: float | None = None
+        self.last_capacity_receipt: tuple[object, ...] | None = None
 
     @property
     def entries(self) -> Mapping[PhysicalReplayKey, ElasticGraphEntry]:
@@ -945,6 +1112,273 @@ class ElasticGraphCache:
     @property
     def trace(self) -> tuple[tuple[str, str, str], ...]:
         return tuple(self._trace)
+
+    @property
+    def pending_loans(self) -> tuple[ElasticAdmissionLoan, ...]:
+        return tuple(self._pending_loans)
+
+    @property
+    def latest_loan(self) -> ElasticAdmissionLoan | None:
+        return self._pending_loans[-1] if self._pending_loans else None
+
+    @property
+    def pending_maintenance_plan(self) -> ElasticStepPlan | None:
+        return self._pending_maintenance_plan
+
+    @property
+    def pending_maintenance_step_key(self) -> tuple[int, ...] | None:
+        return self._pending_maintenance_step_key
+
+    @property
+    def last_receipt(self) -> ElasticResidencyReceipt | None:
+        return self._last_receipt
+
+    @property
+    def snapshot(self) -> ElasticAdmissionSnapshot:
+        return ElasticAdmissionSnapshot(
+            generation=self.generation,
+            pending_loans=tuple(self._pending_loans),
+            pending_maintenance=(
+                None
+                if self._pending_maintenance_plan is None
+                else (
+                    self._pending_maintenance_plan.kind.value,
+                    self._pending_maintenance_plan.transaction_id,
+                    self._pending_maintenance_step_key,
+                )
+            ),
+            step_key=self.step_key,
+            recapture_pending_key=self.recapture_pending_key,
+            resident_bytes=self.resident_bytes,
+            pinned_resident_bytes=self.pinned_resident_bytes,
+            evictable_resident_bytes=self.evictable_resident_bytes,
+            floor_bytes=self.floor_bytes,
+            transition_floor_bytes=self.transition_floor_bytes,
+            cublas_workspace_bytes=self.cublas_workspace_bytes,
+            entry_states=tuple(
+                sorted(
+                    (
+                        key.identity,
+                        entry.state.value,
+                        tuple(sorted(entry.leases)),
+                    )
+                    for key, entry in self._entries.items()
+                )
+            ),
+            stats=self.stats,
+        )
+
+    def next_transaction_id(self) -> str:
+        self._transaction_seq += 1
+        return f"elastic-{self._transaction_seq:020d}"
+
+    def reserve_loan(
+        self,
+        step_key: tuple[int, ...] | None,
+        grant_bytes: int,
+    ) -> ElasticAdmissionLoan:
+        loan = ElasticAdmissionLoan(step_key, grant_bytes)
+        self._pending_loans.append(loan)
+        return loan
+
+    def replace_latest_loan(
+        self,
+        step_key: tuple[int, ...] | None,
+        grant_bytes: int,
+    ) -> ElasticAdmissionLoan:
+        if not self._pending_loans:
+            raise ElasticGraphError("cannot replace a missing elastic loan")
+        loan = ElasticAdmissionLoan(step_key, grant_bytes)
+        self._pending_loans[-1] = loan
+        return loan
+
+    def settle_next_loan(self) -> ElasticAdmissionLoan:
+        if not self._pending_loans:
+            raise ElasticGraphError("cannot settle a missing elastic loan")
+        return self._pending_loans.popleft()
+
+    def cancel_latest_loan(self) -> ElasticAdmissionLoan:
+        if not self._pending_loans:
+            raise ElasticGraphError("cannot cancel a missing elastic loan")
+        return self._pending_loans.pop()
+
+    def clear_loans(self) -> None:
+        self._pending_loans.clear()
+
+    def arm_maintenance(
+        self,
+        plan: ElasticStepPlan,
+        step_key: tuple[int, ...] | None,
+    ) -> None:
+        if plan.generation != self.generation:
+            raise ElasticGraphError("pending maintenance has a stale generation")
+        if plan.kind == ElasticPlanKind.MAINTENANCE and step_key is None:
+            raise ElasticGraphError("capture maintenance requires a step key")
+        if (
+            plan.kind
+            in {
+                ElasticPlanKind.RECLAIM,
+                ElasticPlanKind.PRESSURE_RECLAIM,
+            }
+            and step_key is not None
+        ):
+            raise ElasticGraphError("pressure reclaim cannot carry a step key")
+        if plan.kind not in {
+            ElasticPlanKind.MAINTENANCE,
+            ElasticPlanKind.RECLAIM,
+            ElasticPlanKind.PRESSURE_RECLAIM,
+        }:
+            raise ElasticGraphError("only physical maintenance can be pending")
+        self._pending_maintenance_plan = plan
+        self._pending_maintenance_step_key = step_key
+
+    def clear_maintenance(self) -> None:
+        self._pending_maintenance_plan = None
+        self._pending_maintenance_step_key = None
+
+    def max_pending_grant(self) -> int:
+        return max((loan.grant_bytes for loan in self._pending_loans), default=0)
+
+    def record_measurement(
+        self,
+        step_key: tuple[int, ...],
+        measured_bytes: int,
+        *,
+        keep_max: bool = False,
+    ) -> None:
+        if measured_bytes < 0:
+            raise ElasticGraphError("elastic measurement cannot be negative")
+        if keep_max:
+            measured_bytes = max(
+                measured_bytes,
+                self.measured_bytes.get(step_key, 0),
+            )
+        self.measured_bytes[step_key] = measured_bytes
+
+    def record_capture_envelope(
+        self,
+        owner_key: tuple[int, ...],
+        envelope: tuple[int, int, int],
+        *,
+        merge_max: bool = False,
+    ) -> None:
+        if any(value < 0 for value in envelope):
+            raise ElasticGraphError("elastic capture envelope cannot be negative")
+        if merge_max:
+            prior = self.capture_envelopes.get(owner_key, (0, 0, 0))
+            envelope = tuple(max(prior[index], envelope[index]) for index in range(3))
+        self.capture_envelopes[owner_key] = envelope
+
+    def mark_recapture(self, step_key: tuple[int, ...]) -> None:
+        self.recapture_pending_key = step_key
+
+    def finish_recapture(self, step_key: tuple[int, ...]) -> None:
+        if self.recapture_pending_key != step_key:
+            raise ElasticGraphError("settled recapture key differs from pending key")
+        self.recapture_pending_key = None
+
+    def publish_step_key(self, step_key: tuple[int, ...] | None) -> None:
+        self.step_key = step_key
+
+    def capacity_receipt_changed(self, receipt: tuple[object, ...]) -> bool:
+        return receipt != self.last_capacity_receipt
+
+    def remember_capacity_receipt(self, receipt: tuple[object, ...]) -> None:
+        self.last_capacity_receipt = receipt
+
+    def publish_physical_accounting(
+        self,
+        *,
+        resident_bytes: int,
+        floor_bytes: int,
+        transition_floor_bytes: int,
+        cublas_workspace_bytes: int,
+        maintenance_step_key: tuple[int, ...] | None,
+    ) -> None:
+        if not 0 <= floor_bytes <= transition_floor_bytes <= resident_bytes:
+            raise ElasticGraphError("elastic physical accounting is inconsistent")
+        if cublas_workspace_bytes < 0:
+            raise ElasticGraphError("elastic workspace cannot be negative")
+        self.resident_bytes = resident_bytes
+        self.floor_bytes = floor_bytes
+        self.transition_floor_bytes = transition_floor_bytes
+        if cublas_workspace_bytes:
+            self.cublas_workspace_bytes = cublas_workspace_bytes
+        self.last_maintenance_step_key = maintenance_step_key
+
+    def idle_cleanup_expired(
+        self,
+        *,
+        required: bool,
+        now: float,
+        timeout_s: float,
+    ) -> bool:
+        if not required:
+            self.idle_cleanup_started_at = None
+            return False
+        if self.idle_cleanup_started_at is None:
+            self.idle_cleanup_started_at = now
+            return False
+        return now - self.idle_cleanup_started_at >= timeout_s
+
+    def accept_residency_receipt(
+        self,
+        receipt: ElasticResidencyReceipt,
+        *,
+        expected_transaction_id: str | None = None,
+    ) -> tuple[int, int]:
+        """Validate and atomically publish one complete physical receipt.
+
+        Returns pinned and evictable resident bytes.  The complete receipt is
+        retained as controller authority only after Graph state synchronization
+        succeeds.
+        """
+        if receipt.generation != self.generation:
+            raise ElasticGraphError(
+                "worker residency generation differs from controller"
+            )
+        if (
+            expected_transaction_id is not None
+            and receipt.transaction_id != expected_transaction_id
+        ):
+            raise ElasticGraphError(
+                "worker residency transaction differs from controller"
+            )
+        parsed: list[tuple[PhysicalReplayKey, GraphPrice, bool, int]] = []
+        for entry in receipt.entries:
+            if entry.lease_ids:
+                raise ElasticGraphError(
+                    "worker published a HOT receipt before releasing leases"
+                )
+            resident = entry.resident_bytes
+            parsed.append(
+                (
+                    entry.key,
+                    GraphPrice(
+                        resident_bytes=resident,
+                        capture_peak_bytes=resident,
+                        reclaim_group=f"private-pool:{entry.key.identity}",
+                    ),
+                    entry.pinned,
+                    entry.reclaimable_bytes,
+                )
+            )
+        self.synchronize_hot(parsed)
+        self._last_receipt = receipt
+        pinned_bytes = sum(
+            price.resident_bytes for _key, price, pinned, _proof in parsed if pinned
+        )
+        evictable_bytes = sum(
+            price.resident_bytes for _key, price, pinned, _proof in parsed if not pinned
+        )
+        self.resident_bytes = receipt.resident_bytes
+        self.pinned_resident_bytes = pinned_bytes
+        self.evictable_resident_bytes = evictable_bytes
+        self.floor_bytes = receipt.floor_bytes
+        self.transition_floor_bytes = receipt.transition_floor_bytes
+        if receipt.cublas_workspace_bytes:
+            self.cublas_workspace_bytes = receipt.cublas_workspace_bytes
+        return pinned_bytes, evictable_bytes
 
     def register(
         self,
@@ -1072,18 +1506,31 @@ class ElasticGraphCache:
             if reclaimable_bytes < 0:
                 raise ElasticGraphError("worker reclaim proof cannot be negative")
             observed[key] = (price, pinned, reclaimable_bytes)
+        # Validate the complete publication before changing any cache entry.
+        # A rejected physical read-back must leave the last accepted scheduler
+        # view intact; otherwise a later retry starts from a partially COLD
+        # state that no worker ever published.
+        observed_ids = tuple(sorted(item.identity for item in observed))
+        for key, entry in self._entries.items():
+            if entry.hot and key not in observed and entry.leases:
+                raise ElasticGraphError(
+                    "worker receipt dropped a scheduler-leased graph: "
+                    f"missing={key.identity!r} "
+                    f"leases={tuple(sorted(entry.leases))!r} "
+                    f"observed={observed_ids!r}"
+                )
+        for key, (price, _pinned, _reclaimable_bytes) in observed.items():
+            entry = self._entries.get(key)
+            if (
+                entry is not None
+                and entry.price is not None
+                and entry.price.reclaim_group != price.reclaim_group
+            ):
+                raise ElasticGraphError(
+                    "graph reclaim identity changed inside one generation"
+                )
         for key, entry in tuple(self._entries.items()):
             if entry.hot and key not in observed:
-                if entry.leases:
-                    observed_ids = tuple(
-                        sorted(item.identity for item in observed)
-                    )
-                    raise ElasticGraphError(
-                        "worker receipt dropped a scheduler-leased graph: "
-                        f"missing={key.identity!r} "
-                        f"leases={tuple(sorted(entry.leases))!r} "
-                        f"observed={observed_ids!r}"
-                    )
                 self._entries[key] = replace(
                     entry,
                     state=GraphResidency.COLD,
@@ -1169,21 +1616,15 @@ class ElasticGraphCache:
         owner_set_capture_envelope_bytes: int | None = None,
         retained_transition_overlap_bytes: int = 0,
         shared_resident_bytes: int = 0,
-        replace_unleased_on_miss: bool = False,
-        residency_cap_bytes: int = 0,
     ) -> ElasticStepPlan:
         if request_bytes < 0 or available_bytes < 0:
             raise ValueError("admission byte counts cannot be negative")
-        if residency_cap_bytes < 0:
-            raise ValueError("residency cap cannot be negative")
         if retained_transition_overlap_bytes < 0:
             raise ValueError("retained transition overlap cannot be negative")
         if shared_resident_bytes < 0 or shared_resident_bytes > request_bytes:
             raise ValueError(
                 "shared resident bytes must lie inside current request bytes"
             )
-        if replace_unleased_on_miss and residency_cap_bytes <= 0:
-            raise ValueError("bounded hotset replacement requires a positive cap")
         keys = tuple(dict.fromkeys(physical_keys))
         protected = tuple(dict.fromkeys(protected_keys))
         for key in (*keys, *protected):
@@ -1219,194 +1660,18 @@ class ElasticGraphCache:
         if owner_set_capture_envelope_bytes is not None:
             if owner_set_capture_envelope_bytes < 0:
                 raise ValueError("owner-set capture envelope cannot be negative")
-            capture_loan = owner_set_capture_envelope_bytes if misses else 0
+            capture_loan = (
+                owner_set_capture_envelope_bytes + retained_transition_overlap_bytes
+                if misses
+                else 0
+            )
             required_bytes = max(request_bytes, capture_loan)
         else:
-            capture_loan = sum(price.capture_peak_bytes for price in prices.values())
+            capture_loan = (
+                sum(price.capture_peak_bytes for price in prices.values())
+                + retained_transition_overlap_bytes
+            )
             required_bytes = request_bytes + capture_loan
-        if replace_unleased_on_miss:
-            if not misses:
-                if request_bytes > residency_cap_bytes:
-                    return self._defer(
-                        transaction_id,
-                        keys,
-                        tuple(hits),
-                        tuple(misses),
-                        protected,
-                        request_bytes,
-                        available_bytes,
-                        kv_transition,
-                        "hotset_residency_over_cap",
-                    )
-            else:
-                if owner_set_capture_envelope_bytes is None:
-                    return self._defer(
-                        transaction_id,
-                        keys,
-                        tuple(hits),
-                        tuple(misses),
-                        protected,
-                        request_bytes,
-                        available_bytes,
-                        kv_transition,
-                        "hotset_owner_set_envelope_required",
-                    )
-                # Keep a multi-entry working set while its predicted settled
-                # residency remains under the declared cap.
-                # The previous implementation replaced every unleased entry
-                # on every miss, so a repeated product wave recaptured the
-                # same small set indefinitely even with hundreds of MiB of
-                # unused hotset capacity. For an unknown exact key the
-                # synchronized owner-set envelope is a conservative upper
-                # bound for the entire new set, so current+envelope below the
-                # cap also proves that eviction is unnecessary. Worker
-                # read-back remains the final cap oracle after capture.
-                priced_retention = (
-                    len(prices) == len(misses)
-                    and request_bytes
-                    + sum(price.resident_bytes for price in prices.values())
-                    <= residency_cap_bytes
-                )
-                conservative_unknown_retention = (
-                    len(prices) != len(misses)
-                    and request_bytes
-                    + max(
-                        0,
-                        owner_set_capture_envelope_bytes - shared_resident_bytes,
-                    )
-                    <= residency_cap_bytes
-                )
-                retain_existing = (
-                    priced_retention or conservative_unknown_retention
-                )
-                destination_increment = (
-                    sum(price.resident_bytes for price in prices.values())
-                    if len(prices) == len(misses)
-                    else max(
-                        0,
-                        owner_set_capture_envelope_bytes - shared_resident_bytes,
-                    )
-                )
-                settled_deficit = max(
-                    0,
-                    request_bytes
-                    + destination_increment
-                    - residency_cap_bytes,
-                )
-                replacement: tuple[
-                    tuple[PhysicalReplayKey, ...], tuple[str, ...], int
-                ] | None
-                if retain_existing:
-                    replacement = ((), (), 0)
-                elif len(prices) == len(misses):
-                    replacement = self._select_victims(
-                        settled_deficit,
-                        set(keys).union(protected),
-                    )
-                else:
-                    # An unpriced owner-set envelope is an aggregate endpoint,
-                    # not a marginal resident price. It can prove all-old -> B
-                    # replacement, but cannot rank a partial subset by settled
-                    # bytes. Keep the older fail-closed whole-set fallback only
-                    # for this UNKNOWN case; measured classes use the minimal
-                    # deficit selector above.
-                    replacement = self._select_complete_hotset_victims(
-                        set(keys).union(protected)
-                    )
-                if replacement is None:
-                    return self._defer(
-                        transaction_id,
-                        keys,
-                        tuple(hits),
-                        tuple(misses),
-                        protected,
-                        request_bytes,
-                        available_bytes,
-                        kv_transition,
-                        "hotset_victim_not_reclaimable",
-                    )
-                victims, groups, reclaimed = replacement
-                if (
-                    len(prices) == len(misses)
-                    and reclaimed < settled_deficit
-                ):
-                    return self._defer(
-                        transaction_id,
-                        keys,
-                        tuple(hits),
-                        tuple(misses),
-                        protected,
-                        request_bytes,
-                        available_bytes,
-                        kv_transition,
-                        "hotset_victim_not_reclaimable",
-                    )
-                # A replacement endpoint was calibrated while the prior set
-                # remained alive until post-consumer publication, so max(old,
-                # destination) is its proven atomic bound. Retention is a
-                # different physical DAG: unrelated entries intentionally stay
-                # resident after publication. Their current endpoint and each
-                # exact miss capture peak must coexist. Treating the destination
-                # envelope as if it already contained those retained entries
-                # underfunded a K0 B64 -> FULL/q1 transition by 1.4 MiB.
-                capture_loan = (
-                    max(
-                        owner_set_capture_envelope_bytes,
-                        request_bytes
-                        + retained_transition_overlap_bytes
-                        + (
-                            sum(
-                                price.capture_peak_bytes
-                                for price in prices.values()
-                            )
-                            if len(prices) == len(misses)
-                            else max(
-                                0,
-                                owner_set_capture_envelope_bytes
-                                - shared_resident_bytes,
-                            )
-                        ),
-                    )
-                    if retain_existing
-                    else max(
-                        request_bytes,
-                        owner_set_capture_envelope_bytes,
-                    )
-                )
-                if capture_loan > available_bytes:
-                    return self._defer(
-                        transaction_id,
-                        keys,
-                        tuple(hits),
-                        tuple(misses),
-                        protected,
-                        request_bytes,
-                        available_bytes,
-                        kv_transition,
-                        "insufficient_atomic_hotset_transition_bytes",
-                        capture_loan=capture_loan,
-                    )
-                return ElasticStepPlan(
-                    transaction_id=transaction_id,
-                    generation=self.generation,
-                    kind=ElasticPlanKind.MAINTENANCE,
-                    physical_keys=keys,
-                    hot_hits=tuple(hits),
-                    cold_misses=tuple(misses),
-                    protected_keys=protected,
-                    victim_keys=victims,
-                    reclaim_groups=groups,
-                    capture_order=self._ordered_capture_misses(misses),
-                    kv_transition=kv_transition,
-                    request_bytes=request_bytes,
-                    available_bytes=available_bytes,
-                    capture_loan_bytes=capture_loan,
-                    reclaim_bytes=reclaimed,
-                    # Empty->first-set also needs worker actual-charge cap
-                    # validation before it becomes scheduler authority.
-                    staged_hotset_replace=True,
-                    residency_cap_bytes=residency_cap_bytes,
-                )
         deficit = max(0, required_bytes - available_bytes)
         victims, groups, reclaimed = self._select_victims(
             deficit, set(keys).union(protected)
@@ -1510,12 +1775,97 @@ class ElasticGraphCache:
             reclaim_bytes=reclaimed,
         )
 
+    def plan_pressure_reclaim_all(
+        self,
+        transaction_id: str,
+        *,
+        request_bytes: int,
+        available_bytes: int,
+        protected_keys: Iterable[PhysicalReplayKey] = (),
+    ) -> ElasticStepPlan:
+        """Plan all-or-nothing teardown at a physical-quiescent boundary."""
+        protected = tuple(dict.fromkeys(protected_keys))
+        for key in protected:
+            self._require_generation(key)
+        protected_set = set(protected)
+        candidates = tuple(
+            sorted(
+                (
+                    entry
+                    for key, entry in self._entries.items()
+                    if entry.hot and key not in protected_set
+                ),
+                key=lambda entry: entry.key.identity,
+            )
+        )
+        if not candidates:
+            return self._defer(
+                transaction_id,
+                (),
+                (),
+                (),
+                protected,
+                request_bytes,
+                available_bytes,
+                None,
+                "no_graphs_to_pressure_reclaim",
+            )
+        if any(entry.leases or entry.deferred_free for entry in candidates):
+            return self._defer(
+                transaction_id,
+                (),
+                (),
+                (),
+                protected,
+                request_bytes,
+                available_bytes,
+                None,
+                "pressure_reclaim_has_active_graph_lease",
+            )
+        return ElasticStepPlan(
+            transaction_id=transaction_id,
+            generation=self.generation,
+            kind=ElasticPlanKind.PRESSURE_RECLAIM,
+            physical_keys=(),
+            hot_hits=(),
+            cold_misses=(),
+            protected_keys=protected,
+            victim_keys=tuple(entry.key for entry in candidates),
+            # Administrative destruction is proved by the complete worker
+            # receipt, not by ordinary unpinned reclaim-group accounting.
+            reclaim_groups=(),
+            capture_order=(),
+            kv_transition=None,
+            request_bytes=request_bytes,
+            available_bytes=available_bytes,
+            capture_loan_bytes=self.floor_bytes,
+            reclaim_bytes=max(0, request_bytes - self.floor_bytes),
+        )
+
     def begin_reclaim(self, plan: ElasticStepPlan) -> None:
-        self._validate_plan(plan, ElasticPlanKind.RECLAIM)
+        if plan.kind not in {
+            ElasticPlanKind.RECLAIM,
+            ElasticPlanKind.PRESSURE_RECLAIM,
+        }:
+            raise ElasticGraphError("unexpected elastic plan kind")
+        self._validate_plan(plan, plan.kind)
         for key in plan.victim_keys:
             entry = self._entries.get(key)
-            if entry is None or not entry.reclaimable:
+            admissible = bool(
+                entry is not None
+                and (
+                    entry.reclaimable
+                    or (
+                        plan.kind == ElasticPlanKind.PRESSURE_RECLAIM
+                        and entry.hot
+                        and not entry.leases
+                        and not entry.deferred_free
+                    )
+                )
+            )
+            if not admissible:
                 raise ElasticGraphError("reclaim victim is no longer reclaimable")
+            assert entry is not None
             self._entries[key] = replace(entry, state=GraphResidency.COLD)
         self._evictions += len(plan.victim_keys)
         self._evicted_bytes += plan.reclaim_bytes
@@ -1527,22 +1877,15 @@ class ElasticGraphCache:
             entry = self._entries.get(key)
             if entry is None or not entry.reclaimable:
                 raise ElasticGraphError("maintenance victim is no longer reclaimable")
-            if plan.staged_hotset_replace:
-                self._entries[key] = replace(
-                    entry,
-                    leases=entry.leases.union((plan.transaction_id,)),
-                )
-            else:
-                self._entries[key] = replace(entry, state=GraphResidency.COLD)
+            self._entries[key] = replace(entry, state=GraphResidency.COLD)
         for key in plan.cold_misses:
             entry = self._entries.get(key) or ElasticGraphEntry(key=key)
             if entry.hot or entry.leases:
                 raise ElasticGraphError("maintenance miss changed before capture")
             self._entries[key] = replace(entry, state=GraphResidency.CAPTURING)
         self._cold_misses += len(plan.cold_misses)
-        if not plan.staged_hotset_replace:
-            self._evictions += len(plan.victim_keys)
-            self._evicted_bytes += plan.reclaim_bytes
+        self._evictions += len(plan.victim_keys)
+        self._evicted_bytes += plan.reclaim_bytes
         self._trace.append((plan.transaction_id, "maintenance", plan.fingerprint))
 
     def finish_maintenance(
@@ -1562,57 +1905,7 @@ class ElasticGraphCache:
             if price is None:
                 raise ElasticGraphError("publication omitted a measured graph price")
             self.publish_hot(key, price, pinned=key in pinned)
-        self.commit_staged_hotset_replace(plan)
         self._promotions += len(plan.cold_misses)
-
-    def commit_staged_hotset_replace(self, plan: ElasticStepPlan) -> None:
-        """Commit victim retirement only after every new owner published."""
-        self._validate_plan(plan, ElasticPlanKind.MAINTENANCE)
-        if not plan.staged_hotset_replace:
-            return
-        for key in plan.cold_misses:
-            entry = self._entries.get(key)
-            if entry is None or not entry.hot:
-                raise ElasticGraphError(
-                    "staged hotset commit requires every new owner HOT"
-                )
-        for key in plan.victim_keys:
-            entry = self._entries.get(key)
-            if entry is None or entry.leases != frozenset((plan.transaction_id,)):
-                raise ElasticGraphError("staged victim lease changed before commit")
-            self._entries[key] = replace(
-                entry,
-                state=GraphResidency.COLD,
-                leases=frozenset(),
-            )
-        self._evictions += len(plan.victim_keys)
-        self._evicted_bytes += plan.reclaim_bytes
-
-    def abort_staged_hotset_replace(self, plan: ElasticStepPlan) -> None:
-        """Roll back an unused published candidate to the preceding HOT set."""
-        self._validate_plan(plan, ElasticPlanKind.MAINTENANCE)
-        if not plan.staged_hotset_replace:
-            raise ElasticGraphError("only a staged hotset replacement can be aborted")
-        for key in plan.cold_misses:
-            entry = self._entries.get(key)
-            if entry is None or not entry.hot or entry.leases:
-                raise ElasticGraphError(
-                    "staged hotset abort requires an unleased published candidate"
-                )
-            self._entries[key] = replace(entry, state=GraphResidency.COLD)
-        for key in plan.victim_keys:
-            entry = self._entries.get(key)
-            if entry is None or entry.hot or entry.leases:
-                raise ElasticGraphError(
-                    "staged hotset abort requires an unleased retired victim"
-                )
-            self._entries[key] = replace(entry, state=GraphResidency.HOT_EVICTABLE)
-        self._promotions -= len(plan.cold_misses)
-        self._evictions -= len(plan.victim_keys)
-        self._evicted_bytes -= plan.reclaim_bytes
-        if self._promotions < 0 or self._evictions < 0 or self._evicted_bytes < 0:
-            raise ElasticGraphError("staged hotset abort underflowed cache counters")
-        self._trace.append((plan.transaction_id, "abort_staged", plan.fingerprint))
 
     def fail_maintenance(self, plan: ElasticStepPlan) -> None:
         self._validate_plan(plan, ElasticPlanKind.MAINTENANCE)
@@ -1620,16 +1913,8 @@ class ElasticGraphCache:
             entry = self._entries.get(key)
             if entry is not None and entry.state == GraphResidency.CAPTURING:
                 self._entries[key] = replace(
-                    entry, state=GraphResidency.COOLDOWN, leases=frozenset()
+                    entry, state=GraphResidency.COLD, leases=frozenset()
                 )
-        if plan.staged_hotset_replace:
-            for key in plan.victim_keys:
-                entry = self._entries.get(key)
-                if entry is not None and plan.transaction_id in entry.leases:
-                    self._entries[key] = replace(
-                        entry,
-                        leases=entry.leases.difference((plan.transaction_id,)),
-                    )
 
     def release(self, transaction_id: str) -> None:
         for key, entry in tuple(self._entries.items()):
@@ -1646,6 +1931,29 @@ class ElasticGraphCache:
         self._deferrals += 1
         self._defer_reasons[plan.defer_reason] += 1
         self._trace.append((plan.transaction_id, "defer", plan.fingerprint))
+
+    def defer_admission(
+        self,
+        transaction_id: str,
+        *,
+        request_bytes: int,
+        available_bytes: int,
+        reason: str,
+    ) -> ElasticStepPlan:
+        """Publish a typed no-mutation scheduler admission deferral."""
+        plan = self._defer(
+            transaction_id,
+            (),
+            (),
+            (),
+            (),
+            request_bytes,
+            available_bytes,
+            None,
+            reason,
+        )
+        self.observe_defer(plan)
+        return plan
 
     def _select_victims(
         self,
@@ -1679,9 +1987,7 @@ class ElasticGraphCache:
     def _select_complete_hotset_victims(
         self,
         protected: set[PhysicalReplayKey],
-    ) -> tuple[
-        tuple[PhysicalReplayKey, ...], tuple[str, ...], int
-    ] | None:
+    ) -> tuple[tuple[PhysicalReplayKey, ...], tuple[str, ...], int] | None:
         """Return every old HOT reclaim group, or fail if any cannot retire."""
         outside = {
             key

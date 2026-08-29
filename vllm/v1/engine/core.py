@@ -7,7 +7,7 @@ import signal
 import threading
 import time
 from collections import defaultdict, deque
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
 from enum import IntEnum
@@ -101,10 +101,10 @@ from vllm.version import __version__ as VLLM_VERSION
 logger = init_logger(__name__)
 
 
-class _ElasticCalibrationPartialWave(RuntimeError):
+class _ElasticRestorePartialWave(RuntimeError):
     def __init__(self, admitted_x: int, requested_x: int) -> None:
         super().__init__(
-            "elastic calibration refused a partial active cohort before model "
+            "elastic restore refused a partial active cohort before model "
             f"execution: requested_x={requested_x} admitted_x={admitted_x}"
         )
         self.admitted_x = admitted_x
@@ -161,13 +161,9 @@ class EngineCore:
             include_finished_set=include_finished_set,
             log_stats=self.log_stats,
         )
-        self.structured_output_manager = (
-            prepared_runtime.structured_output_manager
-        )
+        self.structured_output_manager = prepared_runtime.structured_output_manager
         self.scheduler = prepared_runtime.scheduler
-        self.elastic_runtime_generation_receipt = (
-            prepared_runtime.generation_receipt
-        )
+        self.elastic_runtime_generation_receipt = prepared_runtime.generation_receipt
         hash_block_size = prepared_runtime.hash_block_size
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
@@ -288,9 +284,7 @@ class EngineCore:
 
     def _synchronize_elastic_runtime_generation(self) -> None:
         """Make the post-KV scheduler generation authoritative on workers."""
-        synchronize_elastic_runtime_generation(
-            self.scheduler, self.collective_rpc
-        )
+        synchronize_elastic_runtime_generation(self.scheduler, self.collective_rpc)
 
     def _restore_elastic_pinned_full_family(self) -> None:
         """Recapture the sealed FULL family before serving becomes healthy.
@@ -322,9 +316,7 @@ class EngineCore:
             )
 
         started = time.monotonic()
-        previous_calibration_mode = scheduler._elastic_calibration_mode
         previous_restore_mode = getattr(scheduler, "_elastic_restore_mode", False)
-        scheduler._elastic_calibration_mode = True
         scheduler._elastic_restore_mode = True
         scheduler.max_num_running_reqs = max_x
         serial = 0
@@ -335,13 +327,11 @@ class EngineCore:
             for x in range(1, max_x + 1):
                 for query_len in reversed(query_lens):
                     serial += 1
-                    measured_key, admitted_x = (
-                        self._run_elastic_full_calibration_wave(
-                            k=configured_k,
-                            x=x,
-                            query_len=query_len,
-                            serial=serial,
-                        )
+                    measured_key, admitted_x = self._run_elastic_full_restore_wave(
+                        k=configured_k,
+                        x=x,
+                        query_len=query_len,
+                        serial=serial,
                     )
                     wanted = (1, configured_k, x, x * query_len, query_len)
                     if measured_key != wanted or admitted_x != x:
@@ -357,7 +347,6 @@ class EngineCore:
                             f"completed={serial}/{len(expected)} elapsed={elapsed:.3f}"
                         )
         finally:
-            scheduler._elastic_calibration_mode = previous_calibration_mode
             scheduler._elastic_restore_mode = previous_restore_mode
         logger.warning(
             "Elastic sealed pinned FULL family restored before READY: "
@@ -416,18 +405,14 @@ class EngineCore:
             )
 
         started = time.monotonic()
-        previous_calibration_mode = scheduler._elastic_calibration_mode
         previous_restore_mode = getattr(scheduler, "_elastic_restore_mode", False)
-        scheduler._elastic_calibration_mode = True
         scheduler._elastic_restore_mode = True
         try:
-            measured_key, admitted_x = (
-                self._run_elastic_full_calibration_wave_in_epoch(
+            measured_key, admitted_x = self._run_elastic_full_restore_wave_in_epoch(
                 k=full_key[1],
                 x=full_key[2],
                 query_len=full_key[4],
                 serial=1,
-            )
             )
             if measured_key != full_key or admitted_x != full_key[2]:
                 raise RuntimeError(
@@ -436,11 +421,8 @@ class EngineCore:
                     f"admitted_x={admitted_x}"
                 )
             if time.monotonic() - started > 120:
-                raise RuntimeError(
-                    "bounded elastic hotset restore exceeded 120 s"
-                )
+                raise RuntimeError("bounded elastic hotset restore exceeded 120 s")
         finally:
-            scheduler._elastic_calibration_mode = previous_calibration_mode
             scheduler._elastic_restore_mode = previous_restore_mode
             scheduler.max_num_running_reqs = int(coverage["mixed_max_x"])
         logger.warning(
@@ -453,54 +435,55 @@ class EngineCore:
 
     def _synchronize_elastic_startup_residency(self) -> None:
         """Publish restored HOT state and its replay workspace before READY."""
-        snapshots = self.collective_rpc("get_elastic_graph_hot_snapshot")
-        if not snapshots:
+        receipts = self.collective_rpc("get_elastic_graph_residency_receipt")
+        if not receipts:
             raise RuntimeError("elastic startup returned no worker residency receipt")
 
-        workspace_receipts = self.collective_rpc(
-            "get_elastic_graph_workspace_receipt"
-        )
-        if not workspace_receipts:
-            raise RuntimeError("elastic startup returned no workspace receipt")
-
         scheduler = cast(Any, self.scheduler)
-        expected_generation = scheduler._elastic_runtime_generation.value
-        try:
-            receipt_generations = [
-                str(receipt[0]) for receipt in workspace_receipts
-            ]
-            workspace_units = [int(receipt[1]) for receipt in workspace_receipts]
-        except (IndexError, TypeError, ValueError) as error:
-            raise RuntimeError(
-                "elastic startup returned malformed workspace receipts: "
-                f"{workspace_receipts!r}"
-            ) from error
-        if any(
-            generation != expected_generation
-            for generation in receipt_generations
-        ):
+        expected_generation = scheduler._elastic_admission_controller.generation.value
+        receipt_generations = [receipt.generation.value for receipt in receipts]
+        workspace_units = [receipt.cublas_workspace_bytes for receipt in receipts]
+        if any(generation != expected_generation for generation in receipt_generations):
             raise RuntimeError(
                 "elastic startup workspace generation differs from scheduler: "
                 f"expected={expected_generation!r} "
-                f"receipts={workspace_receipts!r}"
+                f"receipts={receipts!r}"
             )
         if any(unit <= 0 for unit in workspace_units):
             raise RuntimeError(
                 "elastic startup workspace unit must be positive on every rank: "
-                f"receipts={workspace_receipts!r}"
+                f"receipts={receipts!r}"
             )
         rank_safe_workspace_unit = max(workspace_units)
 
-        def rank_safe_projection(
-            rows: tuple[tuple[object, ...], ...],
-        ) -> tuple[tuple[object, ...], ...]:
-            # local_pool_bytes is intentionally rank-local; charged and
-            # reclaimable bytes in the adjacent columns are already reduced.
-            return tuple(row[:10] + row[11:] for row in rows)
+        def rank_safe_projection(receipt: Any) -> tuple[object, ...]:
+            # local_pool_bytes is rank-local; all other fields are consensus.
+            entries = tuple(
+                (
+                    entry.key,
+                    entry.pinned,
+                    entry.resident_bytes,
+                    entry.reclaimable_bytes,
+                    entry.lease_ids,
+                )
+                for entry in receipt.entries
+            )
+            return (
+                receipt.generation,
+                receipt.transaction_id,
+                receipt.resident_bytes,
+                receipt.floor_bytes,
+                receipt.transition_floor_bytes,
+                receipt.peak_bytes,
+                receipt.complete,
+                receipt.schema,
+                receipt.schema_fingerprint,
+                entries,
+            )
 
-        reference = snapshots[0]
+        reference = receipts[0]
         projected = rank_safe_projection(reference)
-        if any(rank_safe_projection(snapshot) != projected for snapshot in snapshots):
+        if any(rank_safe_projection(receipt) != projected for receipt in receipts):
             raise RuntimeError(
                 "elastic startup HOT residency differs across worker ranks"
             )
@@ -508,7 +491,7 @@ class EngineCore:
         # Mutate scheduler state only after both receipts validate. A stale or
         # malformed workspace epoch must preserve the previously accepted HOT
         # snapshot and unit rather than partially publishing startup state.
-        scheduler._sync_elastic_hot_graphs(reference)
+        scheduler._sync_elastic_residency_receipt(reference)
         scheduler._elastic_cublas_workspace_unit_bytes = rank_safe_workspace_unit
         # The scheduler constructor can only publish the catalog projection;
         # this second receipt is the first authoritative post-restore physical
@@ -518,83 +501,15 @@ class EngineCore:
             "Elastic startup HOT residency synchronized: entries=%d pinned=%d "
             "resident_bytes=%d reclaimable_bytes=%d workspace_unit_bytes=%d "
             "generation=%s",
-            len(reference),
-            sum(bool(row[8]) for row in reference),
-            sum(int(row[9]) for row in reference),
-            sum(int(row[11]) for row in reference),
+            len(reference.entries),
+            sum(entry.pinned for entry in reference.entries),
+            sum(entry.resident_bytes for entry in reference.entries),
+            sum(entry.reclaimable_bytes for entry in reference.entries),
             rank_safe_workspace_unit,
-            scheduler._elastic_runtime_generation.value,
+            scheduler._elastic_admission_controller.generation.value,
         )
 
-    def _prune_elastic_calibration_full_superset(self, max_x: int) -> None:
-        """Drop unreachable pinned probes and synchronize the smaller ledger."""
-        scheduler = cast(Any, self.scheduler)
-        # Pure planning unit fixtures have no physical worker cache.
-        if not hasattr(scheduler, "_elastic_graph_cache"):
-            return
-        if not scheduler._elastic_calibration_mode or scheduler.has_requests():
-            raise RuntimeError(
-                "pinned FULL calibration pruning requires a pre-READY idle epoch"
-            )
-        transaction_id = f"calibration-full-prune-x{max_x}"
-        receipts = self.collective_rpc(
-            "prune_elastic_pinned_full_above",
-            args=(max_x, transaction_id),
-        )
-        if not receipts:
-            raise RuntimeError("pinned FULL pruning returned no rank receipts")
-        victim_counts = {int(receipt[0]) for receipt in receipts}
-        charged_bytes = {int(receipt[1]) for receipt in receipts}
-        resident_bytes = {int(receipt[2]) for receipt in receipts}
-        if len(victim_counts) != 1 or len(charged_bytes) != 1:
-            raise RuntimeError(
-                "pinned FULL pruning diverged across ranks: "
-                f"receipts={receipts!r}"
-            )
-        snapshots = self.collective_rpc("get_elastic_graph_hot_snapshot")
-        projected = [
-            tuple(row[:10] + row[11:] for row in snapshot)
-            for snapshot in snapshots
-        ]
-        if not snapshots or any(snapshot != projected[0] for snapshot in projected[1:]):
-            raise RuntimeError("pinned FULL pruning produced divergent HOT snapshots")
-        scheduler._sync_elastic_hot_graphs(snapshots[0])
-        rank_safe_resident = max(resident_bytes)
-        if not scheduler.kv_cache_manager.coordinator.set_elastic_external_memory(
-            rank_safe_resident,
-            minimum_free_primary_blocks=1,
-        ):
-            raise RuntimeError(
-                "pruned pinned FULL residency could not be returned to KV: "
-                f"resident_bytes={rank_safe_resident}"
-            )
-        scheduler._elastic_graph_resident_bytes = rank_safe_resident
-        logger.warning(
-            "Elastic calibration pruned unreachable pinned FULL probes: "
-            "max_x=%d victims=%d charged_bytes=%d resident_bytes=%d",
-            max_x,
-            next(iter(victim_counts)),
-            next(iter(charged_bytes)),
-            rank_safe_resident,
-        )
-
-    def _shutdown_failed_elastic_calibration(self) -> None:
-        """Release worker processes when construction fails before assignment.
-
-        ``run_engine_core`` cannot call ``EngineCore.shutdown`` when
-        ``EngineCoreProc(...)`` raises inside its constructor because its local
-        ``engine_core`` variable is still ``None``. Calibration runs at exactly
-        that boundary, so it must explicitly tear down the executor here.
-        """
-        try:
-            self.shutdown()
-        except Exception:
-            logger.exception(
-                "CALIBRATION_SHUTDOWN_FAILED: explicit pre-READY worker "
-                "teardown raised; process exit remains mandatory"
-            )
-
-    def _add_elastic_calibration_request(
+    def _add_elastic_restore_request(
         self,
         *,
         request_id: str,
@@ -603,12 +518,10 @@ class EngineCore:
         max_tokens: int,
     ) -> None:
         if prompt_len <= 0:
-            raise ValueError("elastic calibration prompt length must be positive")
+            raise ValueError("elastic restore prompt length must be positive")
         configured_k = int(getattr(self.scheduler, "num_spec_tokens", 0))
         if k not in {0, configured_k}:
-            raise ValueError(
-                f"elastic calibration K must be 0 or {configured_k}, got {k}"
-            )
+            raise ValueError(f"elastic restore K must be 0 or {configured_k}, got {k}")
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
             temperature=0.6,
@@ -633,15 +546,15 @@ class EngineCore:
         request, request_wave = self.preprocess_add_request(core_request)
         self.add_request(request, request_wave)
 
-    def _run_elastic_calibration_step(self) -> SchedulerOutput:
+    def _run_elastic_restore_step(self) -> SchedulerOutput:
         outputs, model_executed = self.step()
         self.post_step(model_executed)
         scheduler_output = getattr(self, "_last_scheduler_output", None)
         if scheduler_output is None:
-            raise RuntimeError("elastic calibration step produced no scheduler output")
+            raise RuntimeError("elastic restore step produced no scheduler output")
         return scheduler_output
 
-    def _prepare_elastic_calibration_admission(
+    def _prepare_elastic_restore_admission(
         self,
         request_ids: list[str],
         *,
@@ -649,23 +562,21 @@ class EngineCore:
     ) -> int:
         scheduler = cast(Any, self.scheduler)
         return int(
-            scheduler.prepare_elastic_calibration_admission(
+            scheduler.prepare_elastic_restore_admission(
                 request_ids,
                 retain_hot_graphs=retain_hot_graphs,
             )
         )
 
-    def _prepare_elastic_calibration_capture(
+    def _prepare_elastic_restore_capture(
         self,
         step_key: tuple[int, ...],
     ) -> None:
         scheduler = cast(Any, self.scheduler)
-        if not scheduler.prepare_elastic_calibration_capture(step_key):
+        if not scheduler.prepare_elastic_restore_capture(step_key):
             return
-        maintenance = self._run_elastic_calibration_step()
-        residency_step_key = scheduler._elastic_graph_carrier_closure_step_key(
-            step_key
-        )
+        maintenance = self._run_elastic_restore_step()
+        residency_step_key = scheduler._elastic_graph_carrier_closure_step_key(step_key)
         expected_physical_keys = scheduler._resolve_elastic_step_physical_keys(
             residency_step_key
         )
@@ -681,45 +592,39 @@ class EngineCore:
             or actual_physical_keys != expected_physical_keys
         ):
             raise RuntimeError(
-                "elastic calibration COLD capture crossed a request commit "
+                "elastic restore COLD capture crossed a request commit "
                 "boundary or changed physical owner identity: "
                 f"step_key={step_key!r} expected={expected_physical_keys!r} "
                 f"actual={actual_physical_keys!r}"
             )
 
-    def _reclaim_elastic_calibration_hotset_before_wave(
+    def _reclaim_elastic_restore_hotset_before_wave(
         self,
         rebuild_step_keys: tuple[tuple[int, ...], ...] = (),
     ) -> None:
         scheduler = cast(Any, self.scheduler)
-        if not scheduler.prepare_elastic_calibration_idle_reclaim(
-            rebuild_step_keys
-        ):
+        if not scheduler.prepare_elastic_restore_idle_reclaim(rebuild_step_keys):
             return
-        reclaim_output = self._run_elastic_calibration_step()
+        reclaim_output = self._run_elastic_restore_step()
         if (
             reclaim_output.total_num_scheduled_tokens
             or reclaim_output.elastic_step_plan is None
             or reclaim_output.elastic_step_plan.kind != ElasticPlanKind.RECLAIM
         ):
-            raise RuntimeError(
-                "idle elastic reclaim crossed a request commit boundary"
-            )
+            raise RuntimeError("idle elastic reclaim crossed a request commit boundary")
 
-    def _begin_elastic_calibration_physical_epoch(
+    def _begin_elastic_restore_physical_epoch(
         self,
         step_keys: tuple[tuple[int, ...], ...],
     ) -> None:
         declared_step_keys = tuple(dict.fromkeys(step_keys))
-        self._reclaim_elastic_calibration_hotset_before_wave(
-            declared_step_keys
-        )
+        self._reclaim_elastic_restore_hotset_before_wave(declared_step_keys)
         for step_key in declared_step_keys:
-            self._prepare_elastic_calibration_capture(step_key)
+            self._prepare_elastic_restore_capture(step_key)
         scheduler = cast(Any, self.scheduler)
-        scheduler.assert_elastic_calibration_captures_hot(declared_step_keys)
+        scheduler.assert_elastic_restore_captures_hot(declared_step_keys)
 
-    def _rollback_elastic_calibration_physical_epoch(
+    def _rollback_elastic_restore_physical_epoch(
         self,
         *,
         request_ids: list[str],
@@ -736,16 +641,25 @@ class EngineCore:
         self.abort_requests(request_ids)
         if finish_unexecuted_step:
             scheduler = cast(Any, self.scheduler)
-            scheduler.finish_unexecuted_elastic_calibration_step()
-        self._drain_elastic_calibration()
-        self._reclaim_elastic_calibration_hotset_before_wave(
+            scheduler.finish_unexecuted_elastic_restore_step()
+        self._drain_elastic_restore()
+        self._reclaim_elastic_restore_hotset_before_wave(
             tuple(dict.fromkeys(step_keys))
         )
 
-    def _drain_elastic_calibration(self, *, max_steps: int = 32) -> None:
+    def _drain_elastic_restore(self, *, max_steps: int = 32) -> None:
         steps = 0
         while self.scheduler.has_requests():
-            self._run_elastic_calibration_step()
+            scheduler = cast(Any, self.scheduler)
+            reclaim_ready = bool(
+                scheduler._needs_elastic_idle_reclaim()
+                and not scheduler.has_unfinished_requests()
+                and not scheduler.has_finished_requests()
+            )
+            if reclaim_ready:
+                self._reclaim_elastic_restore_hotset_before_wave()
+            else:
+                self._run_elastic_restore_step()
             steps += 1
             if steps > max_steps:
                 raise RuntimeError(
@@ -753,25 +667,7 @@ class EngineCore:
                     f"{max_steps} steps"
                 )
 
-    @contextmanager
-    def _elastic_calibration_cold_epoch(self):
-        """Explicitly reclaim evictable graphs after one calibration wave.
-
-        Ordinary idle preserves the HOT cache. Cold-envelope stability needs
-        distinct physical captures, so calibration alone requests an
-        administrative X0 tail before the next epoch. Before READY, idle FULL
-        pins are temporarily made reclaimable so repeated cold observations
-        correspond to real captures rather than relabelled HOT replays.
-        """
-        scheduler = cast(Any, self.scheduler)
-        previous = getattr(scheduler, "_elastic_force_idle_cleanup", False)
-        scheduler._elastic_force_idle_cleanup = True
-        try:
-            yield
-        finally:
-            scheduler._elastic_force_idle_cleanup = previous
-
-    def _assert_elastic_calibration_key(
+    def _assert_elastic_restore_key(
         self,
         scheduler_output: SchedulerOutput,
         expected: tuple[int, ...],
@@ -789,7 +685,7 @@ class EngineCore:
                 f"tokens={scheduler_output.num_scheduled_tokens!r}"
             )
 
-    def _elastic_calibration_decode_key(
+    def _elastic_restore_decode_key(
         self, *, k: int, x: int, query_len: int
     ) -> tuple[int, int, int, int, int]:
         """Name a calibration wave by the active verifier representation."""
@@ -798,8 +694,7 @@ class EngineCore:
         batched_piecewise = bool(
             k > 0
             and query_len == k + 1
-            and getattr(policy, "verifier_contract", None)
-            == "batched-causal-q1-v1"
+            and getattr(policy, "verifier_contract", None) == "batched-causal-q1-v1"
         )
         return (
             0 if batched_piecewise else 1,
@@ -809,40 +704,35 @@ class EngineCore:
             query_len,
         )
 
-    def _run_elastic_full_calibration_wave(
+    def _run_elastic_full_restore_wave(
         self,
         *,
         k: int,
         x: int,
         query_len: int,
         serial: int,
-        discover_max_x: bool = False,
     ) -> tuple[tuple[int, ...] | None, int]:
         # The prefill used to construct a decode cohort is an administrative
-        # witness, not part of the pinned FULL family. Give every complete
-        # probe one explicit cold epoch so its evictable PIECEWISE setup cannot
-        # accumulate across a descending MaxX search. FULL publications remain
-        # pinned and survive the cleanup.
-        with self._elastic_calibration_cold_epoch():
-            return self._run_elastic_full_calibration_wave_in_epoch(
-                k=k,
-                x=x,
-                query_len=query_len,
-                serial=serial,
-                discover_max_x=discover_max_x,
-            )
+        # witness, not part of the pinned FULL family. The restore helper
+        # explicitly reclaims incompatible evictable carriers before capture;
+        # pinned FULL publications survive that cleanup.
+        return self._run_elastic_full_restore_wave_in_epoch(
+            k=k,
+            x=x,
+            query_len=query_len,
+            serial=serial,
+        )
 
-    def _run_elastic_full_calibration_wave_in_epoch(
+    def _run_elastic_full_restore_wave_in_epoch(
         self,
         *,
         k: int,
         x: int,
         query_len: int,
         serial: int,
-        discover_max_x: bool = False,
     ) -> tuple[tuple[int, ...] | None, int]:
         req_ids = [
-            f"_elastic_cal_full_{serial}_{k}_{query_len}_{x}_{index}"
+            f"_elastic_restore_full_{serial}_{k}_{query_len}_{x}_{index}"
             for index in range(x)
         ]
         scheduler = cast(Any, self.scheduler)
@@ -853,16 +743,16 @@ class EngineCore:
             False,
         )
         if prefill_key is None:
-            raise RuntimeError("elastic calibration prefill has no graph identity")
-        decode_key = self._elastic_calibration_decode_key(
+            raise RuntimeError("elastic restore prefill has no graph identity")
+        decode_key = self._elastic_restore_decode_key(
             k=k,
             x=x,
             query_len=query_len,
         )
         declared_step_keys = (prefill_key, decode_key)
-        self._begin_elastic_calibration_physical_epoch(declared_step_keys)
+        self._begin_elastic_restore_physical_epoch(declared_step_keys)
         for req_id in req_ids:
-            self._add_elastic_calibration_request(
+            self._add_elastic_restore_request(
                 request_id=req_id,
                 prompt_len=2,
                 k=k,
@@ -872,35 +762,33 @@ class EngineCore:
         # Both known physical owner sets are now settled.  Apply request/KV
         # admission against their aggregate residency before executing either
         # shape; a smaller prefix retries in a new untouched epoch.
-        retain_hot_graphs = bool(
-            getattr(scheduler, "_elastic_graph_resident_bytes", 0)
-        )
-        prepared_x = self._prepare_elastic_calibration_admission(
+        retain_hot_graphs = bool(scheduler._elastic_admission_controller.resident_bytes)
+        prepared_x = self._prepare_elastic_restore_admission(
             req_ids,
             retain_hot_graphs=retain_hot_graphs,
         )
         if prepared_x == 0:
-            self._rollback_elastic_calibration_physical_epoch(
+            self._rollback_elastic_restore_physical_epoch(
                 request_ids=req_ids,
                 step_keys=declared_step_keys,
             )
             raise RuntimeError("elastic wave preflight admitted no requests")
         if prepared_x != x:
             if not 0 < prepared_x < x:
-                self._rollback_elastic_calibration_physical_epoch(
+                self._rollback_elastic_restore_physical_epoch(
                     request_ids=req_ids,
                     step_keys=declared_step_keys,
                 )
                 raise RuntimeError(
-                    "elastic calibration admission returned an invalid prefix: "
+                    "elastic restore admission returned an invalid prefix: "
                     f"requested_x={x} prepared_x={prepared_x}"
                 )
-            self._rollback_elastic_calibration_physical_epoch(
+            self._rollback_elastic_restore_physical_epoch(
                 request_ids=req_ids,
                 step_keys=declared_step_keys,
             )
             logger.warning(
-                "Elastic pre-READY calibration wave downshifted before model "
+                "Elastic pre-READY restore wave downshifted before model "
                 "execution: requested_x=%d prepared_x=%d K=%d query_len=%d",
                 x,
                 prepared_x,
@@ -911,10 +799,10 @@ class EngineCore:
 
         # Real prefill establishes request and sampler/MTP state only after
         # every declared COLD owner set and the complete KV wave are committed.
-        prefill = self._run_elastic_calibration_step()
+        prefill = self._run_elastic_restore_step()
         admitted_x = len(prefill.num_scheduled_tokens)
         if admitted_x > prepared_x:
-            self._rollback_elastic_calibration_physical_epoch(
+            self._rollback_elastic_restore_physical_epoch(
                 request_ids=req_ids,
                 step_keys=declared_step_keys,
             )
@@ -925,7 +813,7 @@ class EngineCore:
             )
         if admitted_x != x:
             if not 0 < admitted_x < x:
-                self._rollback_elastic_calibration_physical_epoch(
+                self._rollback_elastic_restore_physical_epoch(
                     request_ids=req_ids,
                     step_keys=declared_step_keys,
                 )
@@ -933,7 +821,7 @@ class EngineCore:
                     "elastic MaxX probe made no monotone admission progress: "
                     f"requested_x={x} admitted_x={admitted_x}"
                 )
-            self._rollback_elastic_calibration_physical_epoch(
+            self._rollback_elastic_restore_physical_epoch(
                 request_ids=req_ids,
                 step_keys=declared_step_keys,
             )
@@ -949,12 +837,12 @@ class EngineCore:
         if k > 0 and query_len == 1:
             for req_id in req_ids:
                 scheduler.requests[req_id].spec_token_ids.clear()
-        self._elastic_calibration_expected_decode_ids = frozenset(req_ids)
+        self._elastic_restore_expected_decode_ids = frozenset(req_ids)
         try:
-            cold = self._run_elastic_calibration_step()
-        except _ElasticCalibrationPartialWave as contraction:
-            self._elastic_calibration_expected_decode_ids = frozenset()
-            self._rollback_elastic_calibration_physical_epoch(
+            cold = self._run_elastic_restore_step()
+        except _ElasticRestorePartialWave as contraction:
+            self._elastic_restore_expected_decode_ids = frozenset()
+            self._rollback_elastic_restore_physical_epoch(
                 request_ids=req_ids,
                 step_keys=declared_step_keys,
                 finish_unexecuted_step=True,
@@ -969,11 +857,11 @@ class EngineCore:
             )
             return None, contraction.admitted_x
         finally:
-            self._elastic_calibration_expected_decode_ids = frozenset()
+            self._elastic_restore_expected_decode_ids = frozenset()
         cold_admitted_x = len(cold.num_scheduled_tokens)
         if cold_admitted_x != x:
             if not 0 < cold_admitted_x < x:
-                self._rollback_elastic_calibration_physical_epoch(
+                self._rollback_elastic_restore_physical_epoch(
                     request_ids=req_ids,
                     step_keys=declared_step_keys,
                 )
@@ -981,7 +869,7 @@ class EngineCore:
                     "elastic FULL probe made no monotone decode admission "
                     f"progress: requested_x={x} admitted_x={cold_admitted_x}"
                 )
-            self._rollback_elastic_calibration_physical_epoch(
+            self._rollback_elastic_restore_physical_epoch(
                 request_ids=req_ids,
                 step_keys=declared_step_keys,
             )
@@ -994,1542 +882,40 @@ class EngineCore:
                 query_len,
             )
             return None, cold_admitted_x
-        expected = self._elastic_calibration_decode_key(
-            k=k, x=x, query_len=query_len
-        )
-        self._assert_elastic_calibration_key(cold, expected)
-        if discover_max_x:
-            feasible_x = self._elastic_calibration_decode_capacity(
-                x=x,
-                step_key=expected,
-            )
-            if feasible_x < x:
-                self._rollback_elastic_calibration_physical_epoch(
-                    request_ids=req_ids,
-                    step_keys=declared_step_keys,
-                )
-                logger.warning(
-                    "Elastic pre-READY MaxX probe downshifted by measured "
-                    "cold envelope: requested_x=%d feasible_x=%d K=%d "
-                    "query_len=%d",
-                    x,
-                    feasible_x,
-                    k,
-                    query_len,
-                )
-                return None, feasible_x
+        expected = self._elastic_restore_decode_key(k=k, x=x, query_len=query_len)
+        self._assert_elastic_restore_key(cold, expected)
         if k > 0 and query_len == 1:
             for req_id in req_ids:
                 request = scheduler.requests.get(req_id)
                 if request is not None:
                     request.spec_token_ids.clear()
-        self._elastic_calibration_expected_decode_ids = frozenset(req_ids)
+        self._elastic_restore_expected_decode_ids = frozenset(req_ids)
         try:
-            hot = self._run_elastic_calibration_step()
-        except _ElasticCalibrationPartialWave as contraction:
-            self._elastic_calibration_expected_decode_ids = frozenset()
-            self._rollback_elastic_calibration_physical_epoch(
+            hot = self._run_elastic_restore_step()
+        except _ElasticRestorePartialWave as contraction:
+            self._elastic_restore_expected_decode_ids = frozenset()
+            self._rollback_elastic_restore_physical_epoch(
                 request_ids=req_ids,
                 step_keys=declared_step_keys,
                 finish_unexecuted_step=True,
             )
             return None, contraction.admitted_x
         finally:
-            self._elastic_calibration_expected_decode_ids = frozenset()
-        self._assert_elastic_calibration_key(hot, expected)
+            self._elastic_restore_expected_decode_ids = frozenset()
+        self._assert_elastic_restore_key(hot, expected)
         self.abort_requests(req_ids)
-        self._drain_elastic_calibration()
+        self._drain_elastic_restore()
         return expected, x
 
-    def _elastic_calibration_decode_capacity(
-        self,
-        *,
-        x: int,
-        step_key: tuple[int, ...],
-    ) -> int:
-        """Resolve a cold decode wave's exact next-step resident capacity."""
-        scheduler = cast(Any, self.scheduler)
-        row = scheduler._elastic_graph_catalog.get(step_key)
-        cold_peak = 0 if row is None else int(row.get("cold_peak_bytes", 0))
-        if cold_peak <= 0:
-            raise RuntimeError(
-                "elastic MaxX probe has no settled cold envelope: "
-                f"step_key={step_key!r}"
+    def _shutdown_failed_elastic_startup(self) -> None:
+        """Release workers when construction fails before assignment."""
+        try:
+            self.shutdown()
+        except Exception:
+            logger.exception(
+                "ELASTIC_STARTUP_SHUTDOWN_FAILED: explicit pre-READY worker "
+                "teardown raised; process exit remains mandatory"
             )
-        coordinator = scheduler.kv_cache_manager.coordinator
-        block_pool = coordinator.block_pool
-        used_primary = (
-            block_pool.active_num_gpu_blocks - block_pool.get_num_free_blocks()
-        )
-        # Block zero is the permanent null block. Calibration salts prevent
-        # prefix sharing, so the remainder must divide exactly across the X
-        # identical requests.  The current per-request block is writable: the
-        # two-token calibration prompt leaves 2494 slots in a 2496-token block.
-        # Adding a second block here priced a hypothetical boundary crossing
-        # and falsely contracted the short-decode X40 workload to X26.
-        per_request, remainder = divmod(max(0, used_primary - 1), x)
-        if per_request <= 0 or remainder:
-            raise RuntimeError(
-                "elastic MaxX probe cannot resolve exact primary ownership: "
-                f"X={x} used_primary={used_primary} remainder={remainder}"
-            )
-        required_primary_per_request = per_request
-        feasible_x = coordinator.max_elastic_full_context_requests(
-            required_primary_per_request,
-            cold_peak,
-            x,
-        )
-        if feasible_x < 1:
-            raise RuntimeError(
-                "measured cold decode envelope cannot preserve executable X1: "
-                f"step_key={step_key!r} cold_peak_bytes={cold_peak} "
-                f"primary_blocks_per_request={required_primary_per_request}"
-            )
-        logger.info(
-            "Elastic measured MaxX decode capacity: requested_x=%d "
-            "feasible_x=%d cold_peak_bytes=%d used_primary_blocks=%d "
-            "required_primary_blocks_per_request=%d step_key=%s",
-            x,
-            feasible_x,
-            cold_peak,
-            used_primary,
-            required_primary_per_request,
-            step_key,
-        )
-        return feasible_x
-
-    @staticmethod
-    def _elastic_piecewise_boundaries(max_tokens: int) -> tuple[int, ...]:
-        boundaries: list[int] = []
-        value = 1
-        while value < max_tokens:
-            boundaries.append(value)
-            value <<= 1
-        boundaries.append(max_tokens)
-        return tuple(boundaries)
-
-    @staticmethod
-    def _elastic_calibration_physical_form_plan(
-        inventory: Mapping[int, tuple[Any, ...]], boundary_x: int
-    ) -> tuple[tuple[int, tuple[Any, ...]], ...]:
-        """Validate the runtime-derived short-decode physical form order."""
-        plan = tuple(inventory.items())
-        xs = tuple(x for x, _physical_keys in plan)
-        if (
-            boundary_x <= 0
-            or not xs
-            or xs[-1] != boundary_x
-            or tuple(sorted(set(xs))) != xs
-        ):
-            raise RuntimeError(
-                "elastic calibration inventory is not an ascending terminal "
-                f"physical-form plan: boundary_x={boundary_x} xs={xs}"
-            )
-        for x, physical_keys in plan:
-            if any(key.physical_num_reqs != x for key in physical_keys):
-                raise RuntimeError(
-                    "elastic calibration physical owner lost cohort identity: "
-                    f"X={x} keys={physical_keys}"
-                )
-        return plan
-
-    @staticmethod
-    def _elastic_calibration_catalog_row_stable(
-        key: tuple[int, ...],
-        row: dict[str, int] | None,
-        *,
-        bounded_exact_hotset: bool,
-    ) -> bool:
-        """Apply the sealed representation's exact row-completeness contract."""
-        if row is None:
-            return False
-        from vllm.v1.worker.startup_plan import (
-            elastic_graph_catalog_row_complete,
-        )
-
-        return elastic_graph_catalog_row_complete(
-            key,
-            row,
-            representation=(
-                "bounded_exact_hotset"
-                if bounded_exact_hotset
-                else "pinned_full_family"
-            ),
-        )
-
-    @staticmethod
-    def _elastic_mixed_prefill_reachable(x: int, m: int, query_len: int) -> bool:
-        """Whether X-1 decode rows plus one prefill row fit in packed M."""
-        return x >= 2 and query_len >= 1 and m > (x - 1) * query_len
-
-    def _run_elastic_balanced_prefill_pair(
-        self,
-        *,
-        k: int,
-        x: int,
-        m: int,
-        serial: int,
-    ) -> tuple[tuple[int, ...] | None, int]:
-        if not 1 <= x <= m:
-            raise ValueError(f"balanced prefill requires 1 <= X <= M, got {x}/{m}")
-        lengths = [m // x + int(index < m % x) for index in range(x)]
-        scheduler = cast(Any, self.scheduler)
-        expected = scheduler._canonical_elastic_graph_step_key(
-            {f"prefill-{index}": length for index, length in enumerate(lengths)},
-            k,
-            False,
-        )
-        assert expected is not None
-        declared_step_keys = (expected,)
-        self._begin_elastic_calibration_physical_epoch(declared_step_keys)
-        outputs: list[SchedulerOutput] = []
-        for repeat in range(2):
-            if repeat:
-                # The first product witness is allowed to change worker-side
-                # physical residency while settling its exact runtime state.
-                # Revalidate the declared owner set before committing the
-                # second request cohort; if the worker receipt retired it,
-                # restore it through request-free MAINTENANCE while scheduler
-                # and KV state are still idle.  Assuming that USER replay kept
-                # the carrier HOT lets a COLD plan cross the commit boundary at
-                # large compiled-only prefill shapes (for example K3/B4096).
-                self._prepare_elastic_calibration_capture(expected)
-                scheduler.assert_elastic_calibration_captures_hot(
-                    declared_step_keys
-                )
-            req_ids = []
-            for index, prompt_len in enumerate(lengths):
-                req_id = f"_elastic_cal_prefill_{serial}_{k}_{m}_{x}_{repeat}_{index}"
-                req_ids.append(req_id)
-                self._add_elastic_calibration_request(
-                    request_id=req_id,
-                    prompt_len=prompt_len,
-                    k=k,
-                    max_tokens=1,
-                )
-            prepared_x = self._prepare_elastic_calibration_admission(
-                req_ids,
-                retain_hot_graphs=bool(
-                    getattr(scheduler, "_elastic_graph_resident_bytes", 0)
-                ),
-            )
-            if prepared_x != x:
-                if not 0 < prepared_x < x:
-                    self._rollback_elastic_calibration_physical_epoch(
-                        request_ids=req_ids,
-                        step_keys=declared_step_keys,
-                    )
-                    raise RuntimeError(
-                        "elastic balanced-prefill admission returned an invalid "
-                        f"prefix: requested_x={x} prepared_x={prepared_x}"
-                    )
-                self._rollback_elastic_calibration_physical_epoch(
-                    request_ids=req_ids,
-                    step_keys=declared_step_keys,
-                )
-                return None, prepared_x
-            outputs.append(self._run_elastic_calibration_step())
-            admitted_x = len(outputs[-1].num_scheduled_tokens)
-            if admitted_x > prepared_x:
-                self._rollback_elastic_calibration_physical_epoch(
-                    request_ids=req_ids,
-                    step_keys=declared_step_keys,
-                )
-                raise RuntimeError(
-                    "elastic balanced-prefill scheduler exceeded its "
-                    f"wave preflight: requested_x={x} prepared_x={prepared_x} "
-                    f"admitted_x={admitted_x}"
-                )
-            if admitted_x != x:
-                if not 0 < admitted_x < x:
-                    self._rollback_elastic_calibration_physical_epoch(
-                        request_ids=req_ids,
-                        step_keys=declared_step_keys,
-                    )
-                    raise RuntimeError(
-                        "elastic balanced-prefill probe made no monotone "
-                        f"admission progress: requested_x={x} admitted_x={admitted_x}"
-                    )
-                self._rollback_elastic_calibration_physical_epoch(
-                    request_ids=req_ids,
-                    step_keys=declared_step_keys,
-                )
-                logger.warning(
-                    "Elastic max-B pure-prefill probe downshifted by admission: "
-                    "requested_x=%d admitted_x=%d M=%d",
-                    x,
-                    admitted_x,
-                    m,
-                )
-                return None, admitted_x
-            # A prefill request would otherwise contribute a decode row to the
-            # second witness. Remove it synchronously while leaving the HOT
-            # graph resident, then submit a fresh identical prefill batch.
-            self.abort_requests(req_ids)
-        for output in outputs:
-            self._assert_elastic_calibration_key(output, expected)
-        self._drain_elastic_calibration()
-        return expected, x
-
-    def _run_elastic_mixed_prefill_pair(
-        self,
-        *,
-        k: int,
-        x: int,
-        m: int,
-        query_len: int,
-        serial: int,
-    ) -> tuple[tuple[int, ...] | None, int]:
-        decode_reqs = x - 1
-        prefill_len = m - decode_reqs * query_len
-        if decode_reqs <= 0 or prefill_len <= 0:
-            return None, min(x, 1)
-        base_ids = [
-            f"_elastic_cal_mixed_base_{serial}_{k}_{query_len}_{m}_{x}_{index}"
-            for index in range(decode_reqs)
-        ]
-        scheduler = cast(Any, self.scheduler)
-        base_key = scheduler._canonical_elastic_graph_step_key(
-            dict.fromkeys(base_ids, 2),
-            k,
-            False,
-        )
-        expected = scheduler._canonical_elastic_graph_step_key(
-            {
-                **{f"decode-{index}": query_len for index in range(decode_reqs)},
-                "prefill": prefill_len,
-            },
-            k,
-            False,
-        )
-        if base_key is None or expected is None:
-            raise RuntimeError("elastic mixed calibration has no graph identity")
-        declared_step_keys = (base_key, expected)
-        self._begin_elastic_calibration_physical_epoch(declared_step_keys)
-        retention_id = scheduler.retain_elastic_calibration_captures(
-            declared_step_keys
-        )
-        retention_released = False
-
-        def release_retention() -> None:
-            nonlocal retention_released
-            if not retention_released:
-                scheduler.release_elastic_calibration_retention(retention_id)
-                retention_released = True
-
-        for req_id in base_ids:
-            self._add_elastic_calibration_request(
-                request_id=req_id,
-                prompt_len=2,
-                k=k,
-                max_tokens=16,
-            )
-        prepared_base_x = self._prepare_elastic_calibration_admission(
-            base_ids,
-            retain_hot_graphs=bool(
-                getattr(scheduler, "_elastic_graph_resident_bytes", 0)
-            ),
-        )
-        if prepared_base_x != decode_reqs:
-            release_retention()
-            self._rollback_elastic_calibration_physical_epoch(
-                request_ids=base_ids,
-                step_keys=declared_step_keys,
-            )
-            if not 0 < prepared_base_x < decode_reqs:
-                raise RuntimeError(
-                    "elastic mixed-prefill base admission returned an invalid "
-                    f"prefix: requested_x={decode_reqs} "
-                    f"prepared_x={prepared_base_x}"
-                )
-            return None, prepared_base_x
-        base_output = self._run_elastic_calibration_step()
-        admitted_base_x = len(base_output.num_scheduled_tokens)
-        if admitted_base_x > prepared_base_x:
-            release_retention()
-            self._rollback_elastic_calibration_physical_epoch(
-                request_ids=base_ids,
-                step_keys=declared_step_keys,
-            )
-            raise RuntimeError(
-                "elastic mixed-prefill decode cohort exceeded wave "
-                f"preflight: requested_x={decode_reqs} "
-                f"prepared_x={prepared_base_x} admitted_x={admitted_base_x}"
-            )
-        if admitted_base_x != decode_reqs:
-            if not 0 < admitted_base_x < decode_reqs:
-                release_retention()
-                self._rollback_elastic_calibration_physical_epoch(
-                    request_ids=base_ids,
-                    step_keys=declared_step_keys,
-                )
-                raise RuntimeError(
-                    "elastic mixed-prefill base cohort made no monotone "
-                    f"admission progress: requested_x={decode_reqs} "
-                    f"admitted_x={admitted_base_x}"
-                )
-            release_retention()
-            self._rollback_elastic_calibration_physical_epoch(
-                request_ids=base_ids,
-                step_keys=declared_step_keys,
-            )
-            logger.warning(
-                "Elastic mixed-prefill base cohort downshifted by admission: "
-                "requested_x=%d admitted_x=%d K=%d query_len=%d M=%d",
-                decode_reqs,
-                admitted_base_x,
-                k,
-                query_len,
-                m,
-            )
-            return None, admitted_base_x
-        outputs: list[SchedulerOutput] = []
-        for repeat in range(2):
-            if k > 0 and query_len == 1:
-                for req_id in base_ids:
-                    scheduler.requests[req_id].spec_token_ids.clear()
-            prefill_id = (
-                f"_elastic_cal_mixed_prefill_{serial}_{k}_{query_len}_{m}_{x}_{repeat}"
-            )
-            self._add_elastic_calibration_request(
-                request_id=prefill_id,
-                prompt_len=prefill_len,
-                k=k,
-                max_tokens=1,
-            )
-            user_output = None
-            for administrative_attempt in range(4):
-                scheduler.prepare_elastic_calibration_execution(expected)
-                candidate_output = self._run_elastic_calibration_step()
-                admitted_x = len(candidate_output.num_scheduled_tokens)
-                if admitted_x:
-                    user_output = candidate_output
-                    break
-                plan = candidate_output.elastic_step_plan
-                pending = scheduler._elastic_pending_maintenance_plan
-                defer_reason = getattr(
-                    scheduler, "_elastic_last_defer_reason", None
-                )
-                if (
-                    plan is None
-                    and pending is None
-                    and defer_reason
-                    not in {
-                        "final_shape_maintenance_required",
-                        "cold_promotion_pending",
-                    }
-                ):
-                    raise RuntimeError(
-                        "elastic mixed-prefill produced an unexplained "
-                        "administrative step: "
-                        f"attempt={administrative_attempt} "
-                        f"reason={defer_reason!r}"
-                    )
-            if user_output is None:
-                admitted_x = 0
-            else:
-                outputs.append(user_output)
-            if admitted_x != x:
-                if not 0 < admitted_x < x:
-                    retained_state = tuple(
-                        (
-                            physical_key.identity,
-                            None if entry is None else entry.state.value,
-                            () if entry is None else tuple(sorted(entry.leases)),
-                        )
-                        for step_key in declared_step_keys
-                        for physical_key in (
-                            scheduler._resolve_elastic_step_physical_keys(
-                                scheduler._elastic_graph_carrier_closure_step_key(
-                                    step_key
-                                )
-                            )
-                        )
-                        for entry in (
-                            scheduler._elastic_graph_cache.entries.get(physical_key),
-                        )
-                    )
-                    retention_identity = getattr(
-                        scheduler, "_elastic_calibration_retention_id", None
-                    )
-                    last_defer_step_key = getattr(
-                        scheduler, "_elastic_last_defer_step_key", None
-                    )
-                    last_defer_physical_keys = getattr(
-                        scheduler, "_elastic_last_defer_physical_keys", None
-                    )
-                    release_retention()
-                    self._rollback_elastic_calibration_physical_epoch(
-                        request_ids=[prefill_id, *base_ids],
-                        step_keys=declared_step_keys,
-                    )
-                    raise RuntimeError(
-                        "elastic mixed-prefill probe made no monotone admission "
-                        f"progress: requested_x={x} admitted_x={admitted_x} "
-                        f"repeat={repeat} K={k} query_len={query_len} M={m} "
-                        f"step_plan={candidate_output.elastic_step_plan!r} "
-                        "pending_maintenance="
-                        f"{scheduler._elastic_pending_maintenance_plan!r} "
-                        "pending_step_key="
-                        f"{scheduler._elastic_pending_maintenance_step_key!r} "
-                        "last_defer_reason="
-                        f"{getattr(scheduler, '_elastic_last_defer_reason', None)!r} "
-                        "last_defer_step_key="
-                        f"{last_defer_step_key!r} "
-                        "last_defer_physical_keys="
-                        f"{last_defer_physical_keys!r} "
-                        f"graph_step_key={scheduler._elastic_graph_step_key!r} "
-                        f"retention_id={retention_identity!r} "
-                        f"retained_state={retained_state!r} "
-                        f"running={len(scheduler.running)} "
-                        f"waiting={len(scheduler.waiting)} "
-                        f"skipped_waiting={len(scheduler.skipped_waiting)}"
-                    )
-                release_retention()
-                self._rollback_elastic_calibration_physical_epoch(
-                    request_ids=[prefill_id, *base_ids],
-                    step_keys=declared_step_keys,
-                )
-                logger.warning(
-                    "Elastic max-B mixed-prefill probe downshifted by admission: "
-                    "requested_x=%d admitted_x=%d K=%d query_len=%d M=%d",
-                    x,
-                    admitted_x,
-                    k,
-                    query_len,
-                    m,
-                )
-                return None, admitted_x
-            # Preserve only the decode cohort between cold/hot witnesses.
-            self.abort_requests([prefill_id])
-        for output in outputs:
-            self._assert_elastic_calibration_key(output, expected)
-        release_retention()
-        self.abort_requests(base_ids)
-        self._drain_elastic_calibration()
-        return expected, x
-
-    def _try_fast_reseal_policy_migration(self, *, started: float) -> bool:
-        """Publish completed policy migration and restore its bounded carrier."""
-        scheduler = cast(Any, self.scheduler)
-        from vllm.v1.worker.startup_plan import (
-            try_reseal_policy_migrated_elastic_graph_catalog,
-        )
-
-        coverage = try_reseal_policy_migrated_elastic_graph_catalog(
-            self.vllm_config,
-            scheduler.kv_cache_config,
-            scheduler._elastic_graph_catalog,
-            calibration_wall_seconds=time.monotonic() - started,
-        )
-        if coverage is None:
-            return False
-        scheduler._elastic_graph_catalog_coverage = coverage
-        scheduler.max_num_running_reqs = min(
-            scheduler.max_num_running_reqs, int(coverage["mixed_max_x"])
-        )
-        scheduler._elastic_calibration_mode = False
-        scheduler._elastic_require_catalog = True
-        self._restore_elastic_bounded_hotset()
-        scheduler._publish_elastic_startup_capacity()
-        logger.warning(
-            "Elastic graph-policy migration fast resealed: required_shapes=%d "
-            "decode_max_x=%d mixed_max_x=%d full_context_max_x=%d "
-            "wall_seconds=%.3f",
-            len(coverage["required_step_keys"]),
-            coverage["decode_max_x"],
-            coverage["mixed_max_x"],
-            coverage["full_context_max_x"],
-            time.monotonic() - started,
-        )
-        return True
-
-    def _run_elastic_startup_calibration(self) -> None:
-        """Measure and seal every runtime-derived FULL/PIECEWISE class."""
-        scheduler = cast(Any, self.scheduler)
-        if self.is_pooling_model:
-            raise RuntimeError("elastic CUDA Graph calibration requires generation")
-        if self.async_scheduling or self.batch_queue is not None:
-            raise RuntimeError(
-                "elastic startup calibration requires one synchronous batch"
-            )
-        configured_k = int(scheduler.num_spec_tokens)
-        if configured_k < 0:
-            raise RuntimeError(
-                "elastic startup calibration requires non-negative K: "
-                f"configured K={configured_k}"
-            )
-        resident_ceiling = int(scheduler.max_num_running_reqs)
-        if resident_ceiling < 1:
-            raise RuntimeError(
-                "elastic startup calibration has no full-context resident X1"
-            )
-        if scheduler.dynamic_sd_lookup is not None:
-            reachable_k = set(scheduler.dynamic_sd_lookup[1 : resident_ceiling + 1])
-            if reachable_k != {configured_k}:
-                raise RuntimeError(
-                    "elastic startup calibration requires a fixed K contract "
-                    "over the reachable resident range; "
-                    f"X=1..{resident_ceiling} resolves K={sorted(reachable_k)}"
-                )
-        max_m = int(self.vllm_config.scheduler_config.max_num_batched_tokens)
-        speculative_config = self.vllm_config.speculative_config
-        nondecode_k = (
-            0
-            if speculative_config is not None
-            and speculative_config.disable_speculation_on_non_decode
-            else configured_k
-        )
-        # Start with the configured product lane. Its K>0 wave captures all
-        # mandatory target/MTP owners and is the conservative first physical
-        # boundary. K0 follows as a distinct target-only contract.
-        product_query_len = 1 + configured_k
-        # Speculative verification starts at 1 + K tokens per request, but an
-        # acceptance contraction can leave the same K lane with one token per
-        # request on the next step. Both are reachable product FULL contracts.
-        # K0 pure prefill remains a target-only PIECEWISE witness below; it is
-        # not a reason to pin a diagnostic FULL family for the lifetime of the
-        # product process.
-        k_values = (configured_k,)
-        product_full_query_lens = (
-            (1, product_query_len) if configured_k else (product_query_len,)
-        )
-        coordinator = scheduler.kv_cache_manager.coordinator
-        primary_blocks = int(scheduler._elastic_primary_blocks_per_max_request)
-        raw_full_x = coordinator.max_elastic_full_context_requests(
-            primary_blocks,
-            0,
-            resident_ceiling,
-        )
-        if raw_full_x < 1:
-            raise RuntimeError(
-                "raw elastic KV geometry cannot preserve one full-context request"
-            )
-
-        required: set[tuple[int, ...]] = set()
-        started = time.monotonic()
-        serial = 0
-        max_stabilization_attempts = 4
-
-        if self._try_fast_reseal_policy_migration(started=started):
-            return
-
-        def bind_decode_boundary(boundary_x: int) -> None:
-            """Keep scheduler admission and q4 physical inventory atomic."""
-            scheduler.max_num_running_reqs = boundary_x
-            scheduler._rebuild_elastic_short_decode_inventory(boundary_x)
-
-        def calibration_decode_xs(
-            query_len: int, boundary_x: int
-        ) -> tuple[int, ...]:
-            """Enumerate executable identities, not every padded semantic X."""
-            key = self._elastic_calibration_decode_key(
-                k=configured_k,
-                x=1,
-                query_len=query_len,
-            )
-            if key[0] == 1:
-                return tuple(range(1, boundary_x + 1))
-            buckets: list[int] = []
-            physical_x = 1
-            while physical_x <= boundary_x:
-                buckets.append(physical_x)
-                physical_x <<= 1
-            if buckets[-1] != boundary_x:
-                buckets.append(boundary_x)
-            return tuple(buckets)
-
-        def catalog_row_stable(key: tuple[int, ...]) -> bool:
-            row = scheduler._elastic_graph_catalog.get(key)
-            return self._elastic_calibration_catalog_row_stable(
-                key,
-                row,
-                bounded_exact_hotset=bool(
-                    getattr(
-                        scheduler, "_elastic_calibration_boundary", {}
-                    ).get(
-                        "bounded_exact_hotset", 0
-                    )
-                ),
-            )
-
-        def full_family_hot(key: tuple[int, ...]) -> bool:
-            if key[0] == 0:
-                # PIECEWISE verifier witnesses are deliberately evictable;
-                # sealed cold stability, not startup pinning, is their
-                # residency contract.
-                return True
-            graph_cache = getattr(scheduler, "_elastic_graph_cache", None)
-            runtime_generation = getattr(
-                scheduler, "_elastic_runtime_generation", None
-            )
-            # Lightweight unit fixtures without the physical cache exercise
-            # catalog planning only. A real elastic runtime always owns both.
-            if graph_cache is None or runtime_generation is None:
-                return True
-            return all(
-                (entry := graph_cache.entries.get(physical_key)) is not None
-                and entry.pinned
-                for physical_key in scheduler._resolve_elastic_step_physical_keys(
-                    key
-                )
-            )
-
-        # KISS item 1: C0 is full-context capacity, not the much larger short
-        # decode residency ceiling. Measure the product owners at floor(C0)
-        # before making any executable KV/concurrency claim.
-        bind_decode_boundary(raw_full_x)
-        bootstrap_key = None
-        for _attempt in range(max_stabilization_attempts):
-            serial += 1
-            bootstrap_key, admitted_x = self._run_elastic_full_calibration_wave(
-                k=configured_k,
-                x=raw_full_x,
-                query_len=product_query_len,
-                serial=serial,
-            )
-            if bootstrap_key is None or admitted_x != raw_full_x:
-                raise RuntimeError(
-                    "floor(C0) product calibration was not fully admitted: "
-                    f"raw_full_x={raw_full_x} admitted_x={admitted_x}"
-                )
-            if catalog_row_stable(bootstrap_key):
-                break
-        else:
-            raise RuntimeError(
-                "floor(C0) product calibration did not stabilize within "
-                f"{max_stabilization_attempts} cold epochs"
-            )
-        assert bootstrap_key is not None
-        required.add(bootstrap_key)
-        bootstrap_row = scheduler._elastic_graph_catalog[bootstrap_key]
-        bootstrap_cold = int(bootstrap_row["cold_peak_bytes"])
-        guaranteed_full_x = coordinator.max_elastic_full_context_requests(
-            primary_blocks,
-            bootstrap_cold,
-            resident_ceiling,
-        )
-        if guaranteed_full_x < 1:
-            raise RuntimeError(
-                "product CUDA Graph owners leave no executable full-context X1"
-            )
-        full_receipt = coordinator.elastic_full_context_capacity_receipt(
-            primary_blocks,
-            bootstrap_cold,
-            guaranteed_full_x,
-        )
-        logger.warning(
-            "Elastic KISS full-context calibration complete: floor_C0=%d "
-            "GuaranteedFullContextX[K%d]=%d max_model_len=%d "
-            "measured_cold_envelope_bytes=%d attention_blocks=%d "
-            "required_attention_blocks=%d residual_attention_blocks=%d "
-            "gdn_blocks=%d",
-            raw_full_x,
-            configured_k,
-            guaranteed_full_x,
-            self.vllm_config.model_config.max_model_len,
-            bootstrap_cold,
-            full_receipt["attention_blocks"],
-            full_receipt["required_attention_blocks"],
-            full_receipt["residual_attention_blocks"],
-            full_receipt["gdn_blocks"],
-        )
-
-        # KISS item 2: start at the exact no-Graph short-residency ceiling,
-        # then descend only when real admission or a synchronized cold capture
-        # proves the candidate impossible. Every transition is strictly
-        # decreasing, so this cannot become an unbounded shape sweep.
-        prior_decode_max_x = int(
-            getattr(scheduler, "_elastic_calibration_boundary", {}).get(
-                "decode_max_x", resident_ceiling
-            )
-        )
-        max_x = min(resident_ceiling, prior_decode_max_x)
-        if max_x < resident_ceiling:
-            logger.warning(
-                "Elastic calibration resume preserves the sealed source "
-                "DecodeMaxX upper bound: resident_ceiling=%d prior_decode_max_x=%d",
-                resident_ceiling,
-                prior_decode_max_x,
-            )
-        max_x_attempts = 0
-        visited_x: set[int] = set()
-
-        def stabilize_decode_form(x: int, *, terminal: bool) -> int:
-            nonlocal max_x_attempts, serial
-            expected_key = self._elastic_calibration_decode_key(
-                k=configured_k,
-                x=x,
-                query_len=product_query_len,
-            )
-            if catalog_row_stable(expected_key):
-                required.add(expected_key)
-                return x
-            measured_key = None
-            feasible_x = x
-            for _attempt in range(max_stabilization_attempts):
-                serial += 1
-                max_x_attempts += 1
-                measured_key, feasible_x = self._run_elastic_full_calibration_wave(
-                    k=configured_k,
-                    x=x,
-                    query_len=product_query_len,
-                    serial=serial,
-                    discover_max_x=terminal,
-                )
-                if measured_key is None or catalog_row_stable(expected_key):
-                    break
-            if measured_key is not None and catalog_row_stable(expected_key):
-                required.add(measured_key)
-                return x
-            if measured_key is not None:
-                raise RuntimeError(
-                    "elastic decode physical form cold/hot envelopes did not "
-                    "stabilize within "
-                    f"{max_stabilization_attempts} epochs at X={x}"
-                )
-            if not 0 < feasible_x < x:
-                raise RuntimeError(
-                    "elastic decode physical form probe did not produce a "
-                    f"strict downshift: candidate={x} feasible={feasible_x}"
-                )
-            return feasible_x
-
-        while True:
-            if max_x in visited_x:
-                raise RuntimeError(f"elastic MaxX calibration cycled at X={max_x}")
-            visited_x.add(max_x)
-            bind_decode_boundary(max_x)
-            form_plan = self._elastic_calibration_physical_form_plan(
-                scheduler._elastic_short_decode_inventory,
-                max_x,
-            )
-            logger.warning(
-                "Elastic pre-READY physical-form probe plan: K=%d terminal_x=%d "
-                "forms=%s",
-                configured_k,
-                max_x,
-                tuple(
-                    (
-                        x,
-                        tuple(
-                            (
-                                key.logical.owner,
-                                key.logical.mode,
-                                key.logical.token_bucket,
-                                key.physical_num_reqs,
-                                key.logical.uniform_query_len,
-                            )
-                            for key in physical_keys
-                        ),
-                    )
-                    for x, physical_keys in form_plan
-                ),
-            )
-            contracted = False
-            for sentinel_x, _physical_keys in form_plan[:-1]:
-                feasible_x = stabilize_decode_form(sentinel_x, terminal=False)
-                if feasible_x != sentinel_x:
-                    max_x = feasible_x
-                    contracted = True
-                    break
-            if contracted:
-                continue
-            feasible_x = stabilize_decode_form(max_x, terminal=True)
-            if feasible_x == max_x:
-                break
-            max_x = feasible_x
-        bind_decode_boundary(max_x)
-        logger.warning(
-            "Elastic pre-READY DecodeMaxX fixed point: resident_ceiling=%d "
-            "measured_decode_max_x=%d attempts=%d path=%s wall_seconds=%.3f",
-            resident_ceiling,
-            max_x,
-            max_x_attempts,
-            tuple(visited_x),
-            time.monotonic() - started,
-        )
-        if self._try_fast_reseal_policy_migration(started=started):
-            return
-
-        # KISS item 3: decode MaxX is only an upper bound.  Establish the real
-        # price of every max-B physical lane at a safe exact-X anchor, then try
-        # that upper bound.  Admission returns the largest prefix that can
-        # coexist with the already proven graph floor; retrying with B
-        # redistributed over that smaller X yields an exact fixed point rather
-        # than a bytes-per-shape estimate.
-        decode_max_x = max_x
-        max_b_anchor_x = min(7, max_x, max_m)
-        # Non-decode execution follows the effective phase policy.  A runtime
-        # with disable_speculation_on_non_decode=True has no K3 PIECEWISE
-        # product path: pre-capturing it would prepare one owner set and let
-        # the scheduler commit the real K0 wave behind that transaction.
-        max_b_paths: list[tuple[str, int, int]] = [("pure", 0, 0)]
-        if nondecode_k:
-            max_b_paths.append(("pure", nondecode_k, 0))
-        if max_x >= 2 and max_m >= 2:
-            max_b_paths.extend(
-                ("mixed", k, query_len)
-                for k in (nondecode_k,)
-                for query_len in ((1,) if k == 0 else (1, 1 + k))
-                if self._elastic_mixed_prefill_reachable(2, max_m, query_len)
-            )
-
-        def stabilize_max_b_path(
-            kind: str,
-            k: int,
-            query_len: int,
-            x: int,
-        ) -> tuple[tuple[int, ...] | None, int]:
-            nonlocal serial
-            # Mixed PIECEWISE execution is a packed X/M physical DAG.  The
-            # per-request query-length distribution changes runtime metadata,
-            # not the graph descriptor, and canonicalization deliberately
-            # stores query_class=0 for every non-uniform step.
-            expected = (0, k, x, max_m, 0)
-            compiled_only = not scheduler._resolve_elastic_step_physical_keys(
-                expected
-            )
-            if catalog_row_stable(expected):
-                # A migrated row reached this checkpoint only after exact
-                # physical-owner/ABI compatibility against a sealed source.
-                # Replaying unchanged M4096 prefill under CUDA_LAUNCH_BLOCKING
-                # adds no Graph evidence and can serialize the whole model for
-                # minutes. The strictly validated sealed-source checkpoint is
-                # the calibration proof; product admission remains a later
-                # acceptance gate under normal asynchronous execution.
-                required.add(expected)
-                return expected, x
-            measured_key = None
-            admitted_x = x
-            for _attempt in range(max_stabilization_attempts):
-                serial += 1
-                with self._elastic_calibration_cold_epoch():
-                    if kind == "pure":
-                        measured_key, admitted_x = (
-                            self._run_elastic_balanced_prefill_pair(
-                                k=k,
-                                x=x,
-                                m=max_m,
-                                serial=serial,
-                            )
-                        )
-                    else:
-                        measured_key, admitted_x = (
-                            self._run_elastic_mixed_prefill_pair(
-                                k=k,
-                                x=x,
-                                m=max_m,
-                                query_len=query_len,
-                                serial=serial,
-                            )
-                        )
-                if compiled_only and measured_key is not None:
-                    # This carrier executed through torch.compile but owns no
-                    # CUDA Graph. Admission is the product proof; demanding a
-                    # cold/HOT catalog row would retry an impossible capture.
-                    return expected, x
-                if measured_key is None or catalog_row_stable(expected):
-                    break
-            if measured_key is None:
-                return None, admitted_x
-            if not catalog_row_stable(expected):
-                raise RuntimeError(
-                    "max-B calibration path did not stabilize within "
-                    f"{max_stabilization_attempts} epochs: kind={kind} K={k} "
-                    f"X={x} M={max_m} query_len={query_len}"
-                )
-            required.add(expected)
-            return expected, x
-
-        # X<=7 is an exact scheduler/catalog class and provides the physical
-        # descriptor floor used to reject an impossible larger X before the
-        # worker starts capture.
-        for kind, k, query_len in max_b_paths:
-            anchor_x = max_b_anchor_x
-            if kind == "mixed":
-                anchor_x = min(
-                    anchor_x,
-                    1 + (max_m - 1) // query_len,
-                )
-            _key, admitted_x = stabilize_max_b_path(kind, k, query_len, anchor_x)
-            if _key is None or admitted_x != anchor_x:
-                raise RuntimeError(
-                    "safe max-B physical anchor was not fully admitted: "
-                    f"kind={kind} K={k} X={anchor_x} M={max_m} "
-                    f"query_len={query_len} admitted_x={admitted_x}"
-                )
-
-        max_b_path_keys: dict[tuple[str, int, int], tuple[int, ...]] = {}
-        for kind, k, query_len in max_b_paths:
-            if kind == "mixed" and max_x < 2:
-                continue
-            path_x = max_x
-            if kind == "mixed":
-                path_x = min(path_x, 1 + (max_m - 1) // query_len)
-            path_visited: set[int] = set()
-            while True:
-                if path_x in path_visited:
-                    raise RuntimeError(
-                        "max-B calibration cycled: "
-                        f"kind={kind} K={k} query_len={query_len} X={path_x}"
-                    )
-                path_visited.add(path_x)
-                bind_decode_boundary(path_x)
-                measured_key, admitted_x = stabilize_max_b_path(
-                    kind,
-                    k,
-                    query_len,
-                    path_x,
-                )
-                if measured_key is not None:
-                    max_b_path_keys[(kind, k, query_len)] = measured_key
-                    max_x = min(max_x, path_x)
-                    break
-                if not 0 < admitted_x < path_x:
-                    raise RuntimeError(
-                        "max-B probe did not produce a strict downshift: "
-                        f"kind={kind} K={k} query_len={query_len} "
-                        f"candidate={path_x} admitted={admitted_x}"
-                    )
-                path_x = admitted_x
-                if kind == "mixed" and path_x < 2:
-                    max_x = 1
-                    break
-            bind_decode_boundary(max_x)
-
-        # ``required_step_keys`` is Graph-catalog coverage, not a ledger of
-        # every logical execution witness.  A compiled-only PIECEWISE carrier
-        # has already executed successfully above but resolves to no physical
-        # Graph owner and therefore can never publish a Graph price row.
-        # Retaining it here makes a truthful bounded catalog impossible to
-        # seal.  Real FULL/PIECEWISE Graph keys remain fail-closed.
-        required = {
-            key
-            for key in required
-            if key[2] <= max_x
-            and scheduler._resolve_elastic_step_physical_keys(key)
-        }
-        bind_decode_boundary(max_x)
-        logger.warning(
-            "Elastic pre-READY GuaranteedMaxX fixed point: DecodeMaxX=%d "
-            "GuaranteedMaxX[B%d]=%d anchor_x=%d paths=%s wall_seconds=%.3f",
-            decode_max_x,
-            max_m,
-            max_x,
-            max_b_anchor_x,
-            max_b_path_keys,
-            time.monotonic() - started,
-        )
-
-        # The old calibration enumerated every power-of-two M crossed with
-        # X1..X7 and MaxX, producing 217 logical shapes. Executable identity is
-        # exact physical X, but first-capture safety needs a conservative
-        # owner-set envelope, not an exact price for every future key. Measure
-        # max-B worst forms plus three runtime-derived holdouts. Unknown exact
-        # keys then use the maximum class envelope and are captured by a
-        # maintenance transaction; they never borrow an optimistic KV tail.
-        boundaries = self._elastic_piecewise_boundaries(max_m)
-        interior = boundaries[:-1]
-        holdout_indices = (
-            min(6, len(interior) - 1),
-            len(interior) // 2,
-            max(0, len(interior) - 2),
-        )
-        holdout_boundaries = tuple(
-            sorted({interior[index] for index in holdout_indices})
-        ) if interior else ()
-        holdout_witnesses: list[tuple[str, int, int, int]] = []
-        for m in holdout_boundaries:
-            x = min(max_x, m)
-            holdout_witnesses.append(("pure", 0, m, x))
-            mixed_query_lens = (
-                (1, 1 + nondecode_k) if nondecode_k else (1,)
-            )
-            for query_len in mixed_query_lens:
-                if self._elastic_mixed_prefill_reachable(x, m, query_len):
-                    holdout_witnesses.append(
-                        ("mixed", nondecode_k, m, query_len)
-                    )
-        logical_full = sum(
-            len(calibration_decode_xs(query_len, max_x))
-            for query_len in product_full_query_lens
-        )
-        logical_piecewise = len(max_b_paths) + len(holdout_witnesses)
-        logger.warning(
-            "Elastic pre-READY compact calibration plan: max_x=%d B=%d K=%s "
-            "full_classes=%d piecewise_worst_form_classes=%d holdouts=%s "
-            "catalog_cache_hits=%d",
-            max_x,
-            max_m,
-            k_values,
-            logical_full,
-            logical_piecewise,
-            holdout_boundaries,
-            sum(catalog_row_stable(key) for key in scheduler._elastic_graph_catalog),
-        )
-        completed = 0
-        total = logical_full + len(holdout_witnesses)
-        inventory_started = time.monotonic()
-
-        def progress() -> None:
-            nonlocal completed
-            completed += 1
-            if completed in {1, 2}:
-                elapsed = time.monotonic() - inventory_started
-                eta = elapsed / completed * (total - completed)
-                logger.warning(
-                    "Elastic pre-READY calibration progress: completed=%d/%d "
-                    "mean_seconds=%.3f remaining_eta_seconds=%.1f",
-                    completed,
-                    total,
-                    elapsed / completed,
-                    eta,
-                )
-
-        def stabilize_full_shape(x: int, query_len: int) -> int:
-            nonlocal serial
-            expected_key = self._elastic_calibration_decode_key(
-                k=configured_k, x=x, query_len=query_len
-            )
-            if catalog_row_stable(expected_key) and full_family_hot(expected_key):
-                required.add(expected_key)
-                progress()
-                return x
-            measured_key = None
-            admitted_x = x
-            for _attempt in range(max_stabilization_attempts):
-                serial += 1
-                measured_key, admitted_x = self._run_elastic_full_calibration_wave(
-                    k=configured_k,
-                    x=x,
-                    query_len=query_len,
-                    serial=serial,
-                )
-                if measured_key is None or admitted_x != x:
-                    return admitted_x
-                if catalog_row_stable(expected_key):
-                    break
-            else:
-                raise RuntimeError(
-                    "reachable FULL calibration class did not stabilize "
-                    f"within {max_stabilization_attempts} epochs: "
-                    f"K={configured_k} X={x} query_len={query_len}"
-                )
-            assert measured_key is not None
-            required.add(measured_key)
-            progress()
-            return x
-
-        for kind, k, m, shape in holdout_witnesses:
-            if kind == "pure":
-                x = shape
-                runner = self._run_elastic_balanced_prefill_pair
-                runner_kwargs = {"k": 0, "x": x, "m": m}
-            else:
-                query_len = shape
-                x = min(max_x, 1 + (m - 1) // query_len)
-                runner = self._run_elastic_mixed_prefill_pair
-                runner_kwargs = {
-                    "k": k,
-                    "x": x,
-                    "m": m,
-                    "query_len": query_len,
-                }
-            measured_key = None
-            visited_x: set[int] = set()
-            while True:
-                if x in visited_x:
-                    raise RuntimeError(
-                        "PIECEWISE holdout admission cycled: "
-                        f"kind={kind} K={k} X={x} M={m}"
-                    )
-                visited_x.add(x)
-                expected_holdout = (0, k, x, m, 0)
-                compiled_only = not scheduler._resolve_elastic_step_physical_keys(
-                    expected_holdout
-                )
-                contracted_x = None
-                for _attempt in range(max_stabilization_attempts):
-                    serial += 1
-                    with self._elastic_calibration_cold_epoch():
-                        measured_key, admitted_x = runner(
-                            serial=serial,
-                            **runner_kwargs,
-                        )
-                    if measured_key is None or admitted_x != x:
-                        if 0 < admitted_x < x:
-                            contracted_x = admitted_x
-                            break
-                        raise RuntimeError(
-                            "PIECEWISE holdout made no monotone admission "
-                            f"progress: kind={kind} K={k} X={x} M={m} "
-                            f"admitted_x={admitted_x}"
-                        )
-                    if compiled_only:
-                        # Some pure K0 PIECEWISE carriers (observed at M64)
-                        # execute through torch.compile and intentionally own
-                        # no persistent CUDA Graph descriptor.  Requiring a
-                        # catalog row retried the same successful two-witness
-                        # execution four times and could never stabilize an
-                        # owner that does not exist.  The max-B path applies
-                        # the same consumed-contract rule.
-                        break
-                    if catalog_row_stable(measured_key):
-                        break
-                else:
-                    raise RuntimeError(
-                        "PIECEWISE holdout did not stabilize: "
-                        f"kind={kind} K={k} X={x} M={m}"
-                    )
-                if contracted_x is None:
-                    break
-                max_x = min(max_x, contracted_x)
-                bind_decode_boundary(max_x)
-                x = min(contracted_x, m)
-                runner_kwargs["x"] = x
-                logger.warning(
-                    "Elastic PIECEWISE holdout contracted product boundary: "
-                    "kind=%s K=%d M=%d max_x=%d",
-                    kind,
-                    k,
-                    m,
-                    max_x,
-                )
-            assert measured_key is not None
-            required.add(measured_key)
-            progress()
-
-        required_piecewise_k = {0}
-        required_piecewise_k.update(path[1] for path in max_b_path_keys)
-        for k in required_piecewise_k:
-            required_k_keys = {
-                key
-                for key in (*required, *max_b_path_keys.values())
-                if not key[0] and key[1] == k
-            }
-            physical_k_keys = {
-                key
-                for key in required_k_keys
-                if scheduler._resolve_elastic_step_physical_keys(key)
-            }
-            if required_k_keys and not physical_k_keys:
-                # A compiled-only family executes through torch.compile and
-                # has no persistent CUDA Graph owner to price. Its individual
-                # witnesses already passed above. Requiring a non-zero Graph
-                # envelope here contradicts that consumed contract and makes
-                # every valid K0-only family impossible to seal.
-                continue
-            global_key = (0, k, 0, 0, 0)
-            envelopes = getattr(scheduler, "_elastic_graph_capture_envelopes", {})
-            envelope = envelopes.get(global_key)
-            witnessed_peak = max(
-                (
-                    int(row.get("cold_peak_bytes", 0))
-                    for key, row in scheduler._elastic_graph_catalog.items()
-                    if not key[0] and key[1] == k
-                ),
-                default=0,
-            )
-            if (envelope is None or envelope[0] <= 0) and witnessed_peak <= 0:
-                raise RuntimeError(
-                    "compact calibration did not publish a PIECEWISE worst-form "
-                    f"envelope for K={k}"
-                )
-
-        # Probe searches above left a context-dependent FULL superset. Remove
-        # it, then construct the accepted family in X layers so no query family
-        # can tax another with shapes beyond the common boundary.
-        full_candidate_x = max_x
-        self._prune_elastic_calibration_full_superset(0)
-        required = {key for key in required if not key[0]}
-        max_x = 0
-        full_query_lens = tuple(
-            query_len
-            for query_len in (
-                (product_query_len, 1) if configured_k else (product_query_len,)
-            )
-            if self._elastic_calibration_decode_key(
-                k=configured_k, x=1, query_len=query_len
-            )[0]
-            == 1
-        )
-        for x in range(1, full_candidate_x + 1):
-            bind_decode_boundary(x)
-            layer_complete = True
-            for query_len in full_query_lens:
-                admitted_x = stabilize_full_shape(x, query_len)
-                if admitted_x != x:
-                    layer_complete = False
-                    break
-            if not layer_complete:
-                if x == 1:
-                    raise RuntimeError(
-                        "layered pinned FULL family cannot preserve executable X1"
-                    )
-                max_x = x - 1
-                bind_decode_boundary(max_x)
-                self._prune_elastic_calibration_full_superset(max_x)
-                logger.warning(
-                    "Elastic layered pinned FULL fixed point reached: "
-                    "candidate_x=%d max_x=%d admitted_x=%d",
-                    x,
-                    max_x,
-                    admitted_x,
-                )
-                break
-            max_x = x
-        if max_x < 1:
-            raise RuntimeError("layered pinned FULL family produced no boundary")
-        bind_decode_boundary(max_x)
-
-        # The batched-q1 verifier uses evictable PIECEWISE executables.  Its
-        # semantic cohorts are padded onto the bounded physical inventory, so
-        # calibrating X3 and then demanding an exact X3/M12 row is a category
-        # error: the consumed executable is X4/M16.  Prove every physical
-        # endpoint, and rebuild/retry if admission contracts the terminal X.
-        piecewise_query_lens = tuple(
-            query_len
-            for query_len in product_full_query_lens
-            if self._elastic_calibration_decode_key(
-                k=configured_k, x=1, query_len=query_len
-            )[0]
-            == 0
-        )
-        while piecewise_query_lens:
-            bind_decode_boundary(max_x)
-            contracted = False
-            for query_len in piecewise_query_lens:
-                for x in calibration_decode_xs(query_len, max_x):
-                    admitted_x = stabilize_full_shape(x, query_len)
-                    if admitted_x != x:
-                        if not 0 < admitted_x < x:
-                            raise RuntimeError(
-                                "PIECEWISE decode inventory made no monotone "
-                                f"progress: X={x} admitted={admitted_x}"
-                            )
-                        max_x = min(max_x, admitted_x)
-                        self._prune_elastic_calibration_full_superset(max_x)
-                        bind_decode_boundary(max_x)
-                        contracted = True
-                        break
-                if contracted:
-                    break
-            if not contracted:
-                break
-
-        # The acceptance-contraction FULL family is pinned last and can lower
-        # the product boundary after the original max-B witnesses were taken.
-        # Re-prove every B lane at one common final X; a larger historical row
-        # or a class envelope is safe for capture but is not an exact advertised
-        # boundary receipt.
-        while True:
-            final_max_b_x = max_x
-            for kind, k, query_len in max_b_paths:
-                if kind == "mixed" and max_x < 2:
-                    continue
-                path_x = max_x
-                if kind == "mixed":
-                    path_x = min(path_x, 1 + (max_m - 1) // query_len)
-                measured_key, admitted_x = stabilize_max_b_path(
-                    kind, k, query_len, path_x
-                )
-                if measured_key is None:
-                    if not 0 < admitted_x < path_x:
-                        raise RuntimeError(
-                            "final max-B boundary made no monotone progress: "
-                            f"kind={kind} K={k} X={path_x} admitted={admitted_x}"
-                        )
-                    max_x = min(max_x, admitted_x)
-                    bind_decode_boundary(max_x)
-                    break
-                max_b_path_keys[(kind, k, query_len)] = measured_key
-            if max_x == final_max_b_x:
-                break
-            logger.warning(
-                "Elastic final max-B witnesses contracted product boundary: "
-                "previous_x=%d max_x=%d",
-                final_max_b_x,
-                max_x,
-            )
-
-        # Descending probes may have pinned classes above the final common
-        # boundary. They are calibration artifacts, not serving work, and
-        # retaining them would make the advertised prefix pay a permanent
-        # self-tax. This is the sole administrative FULL eviction before seal.
-        self._prune_elastic_calibration_full_superset(max_x)
-
-        bounded_hotset = bool(
-            getattr(scheduler, "_elastic_graph_hotset_cap_bytes", 0)
-        )
-        restore_step_keys: set[tuple[int, ...]] = set()
-        if bounded_hotset:
-            restore_piecewise_key = scheduler._canonical_elastic_graph_step_key(
-                {f"restore-{index}": 2 for index in range(max_x)},
-                configured_k,
-                False,
-            )
-            restore_full_key = self._elastic_calibration_decode_key(
-                k=configured_k,
-                x=max_x,
-                query_len=1,
-            )
-            if restore_piecewise_key is None or restore_full_key[0] != 1:
-                raise RuntimeError("bounded calibration has no restore carrier pair")
-            restore_step_keys = {restore_piecewise_key, restore_full_key}
-            required.update(restore_step_keys)
-
-        # The final product boundary is a fixed point of the whole
-        # simultaneously resident pinned FULL family, never an alternative
-        # per-shape cold envelope. Extra probes above the fixed point may stay
-        # pinned in this calibration process; counting their real bytes is
-        # conservative and cannot inflate advertised concurrency.
-        pinned_full_bytes = int(
-            getattr(scheduler, "_elastic_pinned_graph_resident_bytes", 0)
-        )
-        capacity_graph_bytes = pinned_full_bytes
-        if bounded_hotset:
-            pinned_full_bytes = 0
-            capacity_graph_bytes = max(
-                max(
-                    int(scheduler._elastic_graph_catalog[key]["cold_peak_bytes"]),
-                    int(scheduler._elastic_graph_catalog[key]["hot_peak_bytes"]),
-                )
-                for key in restore_step_keys
-            )
-        guaranteed_full_context_x = coordinator.max_elastic_full_context_requests(
-            primary_blocks,
-            capacity_graph_bytes,
-            max_x,
-        )
-        if guaranteed_full_context_x < 1:
-            raise RuntimeError(
-                "aggregate pinned FULL family leaves no executable X1"
-            )
-        # Full-context concurrency and short-step physical concurrency are
-        # separate guarantees.  The former uses primary_blocks for the entire
-        # max_model_len and is normally much smaller; applying it as the global
-        # scheduler cap silently turns an accepted X14 short/mixed boundary
-        # into X1.
-        bind_decode_boundary(max_x)
-        inventory_xs = tuple(scheduler._elastic_short_decode_inventory)
-        if not inventory_xs or inventory_xs[-1] != max_x:
-            raise RuntimeError(
-                "final short-decode inventory does not match DecodeMaxX: "
-                f"inventory={inventory_xs} decode_max_x={max_x}"
-            )
-        # Final publication boundary: max-B reproof above may have added
-        # compiled-only witnesses after the earlier inventory filter.
-        required = {
-            key
-            for key in required
-            if key[2] <= max_x
-            and scheduler._resolve_elastic_step_physical_keys(key)
-        }
-        graph_cache = getattr(scheduler, "_elastic_graph_cache", None)
-        runtime_generation = getattr(
-            scheduler, "_elastic_runtime_generation", None
-        )
-        if graph_cache is not None and runtime_generation is not None:
-            for query_len in product_full_query_lens:
-                for x in calibration_decode_xs(query_len, max_x):
-                    full_key = self._elastic_calibration_decode_key(
-                        k=configured_k,
-                        x=x,
-                        query_len=query_len,
-                    )
-                    for physical_key in scheduler._resolve_elastic_step_physical_keys(
-                        full_key
-                    ):
-                        entry = graph_cache.entries.get(physical_key)
-                        if not bounded_hotset and (
-                            entry is None or (full_key[0] == 1 and not entry.pinned)
-                        ):
-                            raise RuntimeError(
-                                "advertised decode family lacks physical "
-                                f"residency: X={x} query_len={query_len} "
-                                f"owner={physical_key.logical.owner}"
-                            )
-                    row = scheduler._elastic_graph_catalog.get(full_key)
-                    if row is None:
-                        raise RuntimeError(
-                            "advertised FULL family has no synchronized price "
-                            f"row: X={x} query_len={query_len}"
-                        )
-                    # A serving FULL executable is immutable/pinned and is
-                    # never cold-captured again in this process.  Its final
-                    # proof is therefore the conservative synchronized price
-                    # envelope plus this aggregate owner-set HOT/pinned
-                    # snapshot, not an impossible second post-pinning cold
-                    # replay.  Evictable PIECEWISE rows retain the stricter
-                    # cold-stability requirement at catalog seal.
-                    if not bounded_hotset:
-                        row["finalized_pinned_owner_set"] = 1
-        pinned_full_entries = sum(
-            1
-            for entry in getattr(graph_cache, "entries", {}).values()
-            if entry.pinned
-        )
-        if bounded_hotset:
-            pinned_full_entries = 0
-        logger.warning(
-            "Elastic aggregate pinned FULL fixed point: pinned_entries=%d "
-            "pinned_bytes=%d DecodeMaxX=%d MixedMaxX=%d "
-            "GuaranteedFullContextX=%d",
-            pinned_full_entries,
-            pinned_full_bytes,
-            max_x,
-            max_x,
-            guaranteed_full_context_x,
-        )
-
-        wall = time.monotonic() - started
-        from vllm.v1.worker.startup_plan import seal_elastic_graph_catalog
-
-        seal_elastic_graph_catalog(
-            self.vllm_config,
-            scheduler.kv_cache_config,
-            scheduler._elastic_graph_catalog,
-            required_step_keys=required,
-            calibration_wall_seconds=wall,
-            decode_max_x=max_x,
-            mixed_max_x=max_x,
-            full_context_max_x=guaranteed_full_context_x,
-            pinned_full_entries=pinned_full_entries,
-            pinned_full_bytes=pinned_full_bytes,
-            representation=(
-                "bounded_exact_hotset"
-                if bounded_hotset
-                else "pinned_full_family"
-            ),
-            restore_step_keys=restore_step_keys,
-        )
-        scheduler._elastic_graph_catalog_coverage = {
-            "decode_max_x": max_x,
-            "mixed_max_x": max_x,
-            "full_context_max_x": guaranteed_full_context_x,
-            "pinned_full_entries": pinned_full_entries,
-            "pinned_full_bytes": pinned_full_bytes,
-            "required_step_keys": [list(key) for key in sorted(required)],
-        }
-        if bounded_hotset:
-            scheduler._elastic_graph_catalog_coverage.update(
-                representation="bounded_exact_hotset",
-                restore_step_keys=[
-                    list(key) for key in sorted(restore_step_keys)
-                ],
-            )
-        scheduler._elastic_calibration_mode = False
-        scheduler._elastic_require_catalog = True
-        if bounded_hotset:
-            self._restore_elastic_bounded_hotset()
-        scheduler._publish_elastic_startup_capacity()
-        logger.warning(
-            "Elastic pre-READY calibration complete and serving gate sealed: "
-            "required_shapes=%d wall_seconds=%.3f",
-            len(required),
-            wall,
-        )
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
@@ -2889,18 +1275,18 @@ class EngineCore:
             self._ag2_step_trace_path and not self._ag2_step_trace_complete
         )
         step_start_ns = time.perf_counter_ns() if trace_enabled else 0
-        scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        scheduler_output = self.scheduler.schedule(
+            self._should_throttle_prefills(), physical_quiescent=True
+        )
         self._last_scheduler_output = scheduler_output
         expected_calibration_ids = getattr(
-            self, "_elastic_calibration_expected_decode_ids", frozenset()
+            self, "_elastic_restore_expected_decode_ids", frozenset()
         )
         if expected_calibration_ids and scheduler_output.is_pure_decode_step:
             scheduled_ids = frozenset(scheduler_output.num_scheduled_tokens)
             if scheduled_ids != expected_calibration_ids:
-                self.scheduler.cancel_unexecuted_elastic_calibration_step(
-                    scheduler_output
-                )
-                raise _ElasticCalibrationPartialWave(
+                self.scheduler.cancel_unexecuted_elastic_restore_step(scheduler_output)
+                raise _ElasticRestorePartialWave(
                     len(scheduled_ids), len(expected_calibration_ids)
                 )
         schedule_end_ns = time.perf_counter_ns() if trace_enabled else 0
@@ -3013,7 +1399,10 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
-            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            scheduler_output = self.scheduler.schedule(
+                self._should_throttle_prefills(),
+                physical_quiescent=not batch_queue,
+            )
             schedule_end_ns = time.perf_counter_ns() if trace_enabled else 0
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(

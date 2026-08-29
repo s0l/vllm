@@ -40,6 +40,9 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up
 from vllm.v1.core.elastic_graph import (
     ElasticPlanKind,
+    ElasticResidencyEntry,
+    ElasticResidencyReceipt,
+    ElasticRuntimeConfig,
     ElasticStepPlan,
     GraphExecutionPolicy,
     LogicalDispatchKey,
@@ -99,13 +102,9 @@ def _effective_mtp_verifier_contract(
             f"sources={sorted(token_sources)!r}"
         )
     enabled = {
-        "pseudo-prefill-v1": os.environ.get(
-            "AG2_VLLM_MTP_DCP_PSEUDO_DECODE", "0"
-        )
+        "pseudo-prefill-v1": os.environ.get("AG2_VLLM_MTP_DCP_PSEUDO_DECODE", "0")
         == "1",
-        "batched-causal-q1-v1": os.environ.get(
-            "AG2_VLLM_MTP_DCP_BATCHED_DECODE", "0"
-        )
+        "batched-causal-q1-v1": os.environ.get("AG2_VLLM_MTP_DCP_BATCHED_DECODE", "0")
         == "1",
         "sequential-causal-q1-v1": os.environ.get(
             "AG2_VLLM_MTP_DCP_SEQUENTIAL_DECODE", "0"
@@ -117,10 +116,7 @@ def _effective_mtp_verifier_contract(
         raise RuntimeError(
             "multiple MTP verifier implementations are simultaneously enabled"
         )
-    if selected:
-        verifier = selected[0]
-    else:
-        verifier = "native-backend-v1"
+    verifier = selected[0] if selected else "native-backend-v1"
     verifier_configuration = verifier
     math_contract = {
         "pseudo-prefill-v1": "rejected-pseudo-prefill-common-history-v1",
@@ -129,23 +125,15 @@ def _effective_mtp_verifier_contract(
         "native-backend-v1": "native-target-baseline-v1",
     }[verifier]
     if verifier == "batched-causal-q1-v1":
-        fixed_split = os.environ.get(
-            "AG2_VLLM_MTP_DCP_BATCHED_FIXED_SPLIT_SIZE", ""
-        )
-        disable_split = os.environ.get(
-            "AG2_VLLM_MTP_DCP_BATCHED_DISABLE_SPLIT_KV", "0"
-        )
-        workspace_mib = os.environ.get(
-            "AG2_VLLM_MTP_DCP_BATCHED_WORKSPACE_MIB", ""
-        )
+        fixed_split = os.environ.get("AG2_VLLM_MTP_DCP_BATCHED_FIXED_SPLIT_SIZE", "")
+        disable_split = os.environ.get("AG2_VLLM_MTP_DCP_BATCHED_DISABLE_SPLIT_KV", "0")
+        workspace_mib = os.environ.get("AG2_VLLM_MTP_DCP_BATCHED_WORKSPACE_MIB", "")
         verifier_configuration = (
             f"{verifier}:fixed_split={fixed_split}:"
             f"disable_split={disable_split}:workspace_mib={workspace_mib}"
         )
         if (fixed_split, disable_split, workspace_mib) == ("2048", "1", "96"):
-            math_contract = (
-                "accepted-batched-q1-split2048-nosplit-forced-prefix-v1"
-            )
+            math_contract = "accepted-batched-q1-split2048-nosplit-forced-prefix-v1"
     return verifier, verifier_configuration, math_contract
 
 
@@ -208,13 +196,7 @@ def graph_execution_policy_from_managers(
 
 
 def uses_elastic_on_demand_graphs(vllm_config: VllmConfig) -> bool:
-    additional_config = vllm_config.additional_config
-    return bool(
-        isinstance(additional_config, dict)
-        and additional_config.get("elastic_gdn_backing", False)
-        and getattr(vllm_config.compilation_config, "cudagraph_mode", None)
-        != CUDAGraphMode.NONE
-    )
+    return ElasticRuntimeConfig.from_vllm_config(vllm_config).enabled
 
 
 def copy_aux_hidden_state(
@@ -426,7 +408,6 @@ class DynamicGraphWorkingSet:
 
     def __init__(self, managers: tuple["CudaGraphManager", ...]):
         self.managers = managers
-        self._pending_staged_hotset_plan: ElasticStepPlan | None = None
         self._planned_capture_order: tuple[PhysicalReplayKey, ...] = ()
         if managers and all(
             isinstance(manager, CudaGraphManager) for manager in managers
@@ -611,14 +592,7 @@ class DynamicGraphWorkingSet:
         """
         if plan.kind == ElasticPlanKind.DEFER:
             raise RuntimeError("a deferred elastic plan cannot reach a worker")
-        if (
-            self._pending_staged_hotset_plan is not None
-            and plan.kind == ElasticPlanKind.USER
-        ):
-            self.validate_staged_hotset_successor(plan)
-        managers = {
-            manager.dynamic_graph_owner: manager for manager in self.managers
-        }
+        managers = {manager.dynamic_graph_owner: manager for manager in self.managers}
         # Protected keys belong to a scheduler-owned multi-step physical epoch.
         # Lease them without making them dispatch candidates for this shape.
         for key in plan.protected_keys:
@@ -629,19 +603,19 @@ class DynamicGraphWorkingSet:
                     f"{key.logical.owner!r}"
                 )
             manager.acquire_physical_key_lease(key, plan.transaction_id)
-        if not plan.staged_hotset_replace:
-            for key in plan.victim_keys:
-                manager = managers.get(key.logical.owner)
-                if manager is None:
-                    raise RuntimeError(
-                        "elastic plan references unknown victim owner "
-                        f"{key.logical.owner!r}"
-                    )
-                manager.evict_physical_key(
-                    key,
-                    transaction_id=plan.transaction_id,
-                    reason="elastic_admission_plan",
+        for key in plan.victim_keys:
+            manager = managers.get(key.logical.owner)
+            if manager is None:
+                raise RuntimeError(
+                    "elastic plan references unknown victim owner "
+                    f"{key.logical.owner!r}"
                 )
+            manager.evict_physical_key(
+                key,
+                transaction_id=plan.transaction_id,
+                reason="elastic_admission_plan",
+                administrative=plan.kind == ElasticPlanKind.PRESSURE_RECLAIM,
+            )
         for key in plan.physical_keys:
             manager = managers.get(key.logical.owner)
             if manager is None:
@@ -663,9 +637,7 @@ class DynamicGraphWorkingSet:
                 raise RuntimeError("USER elastic plan cannot trigger capture")
             manager.queue_physical_key(key)
         pending_keys = tuple(
-            manager._dynamic_pending.physical_replay_key(
-                manager.dynamic_graph_owner
-            )
+            manager._dynamic_pending.physical_replay_key(manager.dynamic_graph_owner)
             for manager in self.managers
             if manager._dynamic_pending is not None
         )
@@ -676,211 +648,7 @@ class DynamicGraphWorkingSet:
             )
         self._planned_capture_order = plan.capture_order
 
-    def validate_staged_hotset_candidate(
-        self,
-        plan: ElasticStepPlan,
-        *,
-        external_overhead_bytes: int = 0,
-    ) -> int:
-        """Validate the new exact owner set before destroying the old set."""
-        if external_overhead_bytes < 0:
-            raise ValueError("staged hotset external overhead cannot be negative")
-        if not plan.staged_hotset_replace:
-            return self.resident_bytes + external_overhead_bytes
-        desired = set(plan.physical_keys)
-        victims = set(plan.victim_keys)
-        charged = 0
-        seen: set[PhysicalReplayKey] = set()
-        for manager in self.managers:
-            for entry in manager._dynamic_graph_entries.values():
-                if entry.state != DynamicGraphResidency.HOT:
-                    continue
-                key = entry.descriptor.physical_replay_key(
-                    manager.dynamic_graph_owner
-                )
-                if key in victims:
-                    continue
-                seen.add(key)
-                charged += entry.charged_bytes
-        if not desired.issubset(seen):
-            missing = sorted(key.identity for key in desired.difference(seen))
-            raise RuntimeError(
-                f"staged hotset publication omitted physical keys: {missing}"
-            )
-        if self.managers:
-            charged += self.managers[0]._dynamic_retention_ledger.rank_safe_bytes
-        charged += external_overhead_bytes
-        if not plan.residency_cap_bytes or charged > plan.residency_cap_bytes:
-            raise RuntimeError(
-                "staged hotset exceeds rank-safe residency cap: "
-                f"charged_bytes={charged} cap_bytes={plan.residency_cap_bytes}"
-            )
-        return charged
-
-    def commit_staged_hotset_victims(self, plan: ElasticStepPlan) -> int:
-        """Retain old executables through the active workload epoch.
-
-        A captured successor can keep address-stable closure state backed by
-        allocations whose lifetime is extended by predecessor graph objects.
-        Destroying those objects after one synchronized replay is therefore
-        not a valid pool boundary. Keep victims HOT and charged in physical
-        read-back; the request-free idle path destroys all unpinned entries.
-        """
-        if not plan.staged_hotset_replace:
-            return 0
-        for key in plan.victim_keys:
-            manager = next(
-                (
-                    item
-                    for item in self.managers
-                    if item.dynamic_graph_owner == key.logical.owner
-                ),
-                None,
-            )
-            if manager is None or not manager.is_physical_key_hot(key):
-                raise RuntimeError(
-                    "staged hotset retained victim is absent or not HOT: "
-                    f"owner={key.logical.owner!r} key={key.identity!r}"
-                )
-        return len(plan.victim_keys)
-
-    def stage_hotset_victim_commit(self, plan: ElasticStepPlan) -> None:
-        """Defer old-set retirement until every step consumer has finished."""
-        # Atomic publication is also used for empty->first-set and additive
-        # catalog restoration.  With no victims there is no physical lifetime
-        # fence to carry into a successor; arming probation would incorrectly
-        # block the next independent MAINTENANCE transaction at startup.
-        if not plan.staged_hotset_replace or not plan.victim_keys:
-            return
-        if self._pending_staged_hotset_plan is not None:
-            raise RuntimeError("a staged hotset retirement is already pending")
-        self._pending_staged_hotset_plan = plan
-
-    @property
-    def has_pending_staged_hotset_retirement(self) -> bool:
-        return self._pending_staged_hotset_plan is not None
-
-    @property
-    def pending_staged_hotset_transaction_id(self) -> str | None:
-        plan = self._pending_staged_hotset_plan
-        return None if plan is None else plan.transaction_id
-
-    def finish_staged_hotset_after_consumers(
-        self, transaction_id: str | None
-    ) -> int:
-        """Publish retained predecessors after the first consumer boundary."""
-        plan = self._pending_staged_hotset_plan
-        if plan is None:
-            return 0
-        if transaction_id is None:
-            raise RuntimeError(
-                "staged hotset retirement requires a transaction id"
-            )
-        if plan.transaction_id != transaction_id:
-            raise RuntimeError(
-                "staged hotset retirement transaction mismatch: "
-                f"pending={plan.transaction_id!r} finish={transaction_id!r}"
-            )
-        retired = self.commit_staged_hotset_victims(plan)
-        self._pending_staged_hotset_plan = None
-        return retired
-
-    def finish_staged_hotset_after_successor(
-        self, successor_plan: ElasticStepPlan | None
-    ) -> int:
-        """Publish retained predecessors after a distinct real consumer.
-
-        A distinct USER proves the candidate is executable, but not that its
-        address-stable closure is independent from predecessor graph objects.
-        Keep both sets HOT and charged until request-free idle.
-        """
-        plan = self._pending_staged_hotset_plan
-        if plan is None:
-            return 0
-        self.validate_staged_hotset_successor(successor_plan)
-        retired = self.commit_staged_hotset_victims(plan)
-        self._pending_staged_hotset_plan = None
-        return retired
-
-    def validate_staged_hotset_successor(
-        self, successor_plan: ElasticStepPlan | None
-    ) -> None:
-        """Fail before replay unless USER consumes the published owner set."""
-        plan = self._pending_staged_hotset_plan
-        if plan is None:
-            return
-        if successor_plan is None:
-            raise RuntimeError(
-                "staged hotset successor retirement requires an elastic plan"
-            )
-        if successor_plan.transaction_id == plan.transaction_id:
-            raise RuntimeError(
-                "staged hotset successor must differ from maintenance transaction"
-            )
-        if successor_plan.kind != ElasticPlanKind.USER:
-            raise RuntimeError("staged hotset successor must be a USER plan")
-        candidate_keys = set(plan.physical_keys)
-        successor_keys = set(successor_plan.physical_keys)
-        if not candidate_keys or candidate_keys != successor_keys:
-            raise RuntimeError(
-                "staged hotset successor owner set differs from published candidate: "
-                f"candidate={sorted(key.identity for key in candidate_keys)} "
-                f"successor={sorted(key.identity for key in successor_keys)}"
-            )
-
-    def finish_staged_hotset_at_idle(self, transaction_id: str | None) -> int:
-        """Retire probationary pools at a proven request-free boundary."""
-        plan = self._pending_staged_hotset_plan
-        if plan is None:
-            return 0
-        if not transaction_id or transaction_id == plan.transaction_id:
-            raise RuntimeError(
-                "staged hotset idle retirement requires a successor transaction"
-            )
-        retired = self.commit_staged_hotset_victims(plan)
-        self._pending_staged_hotset_plan = None
-        return retired
-
-    def abort_staged_hotset_candidate(self, plan: ElasticStepPlan) -> None:
-        """Discard only newly captured entries; preserve the old HOT set."""
-        if not plan.staged_hotset_replace:
-            return
-        if self._pending_staged_hotset_plan is plan:
-            self._pending_staged_hotset_plan = None
-        managers = {
-            manager.dynamic_graph_owner: manager for manager in self.managers
-        }
-        for key in reversed(plan.cold_misses):
-            manager = managers.get(key.logical.owner)
-            if manager is not None:
-                manager.discard_staged_physical_key(
-                    key,
-                    transaction_id=plan.transaction_id,
-                )
-
-    def abort_pending_staged_hotset(
-        self,
-        origin_transaction_id: str | None,
-        abort_transaction_id: str | None,
-    ) -> int:
-        """Discard an unused successor while preserving its predecessor pools."""
-        plan = self._pending_staged_hotset_plan
-        if plan is None:
-            raise RuntimeError("staged hotset abort has no pending candidate")
-        if not origin_transaction_id or plan.transaction_id != origin_transaction_id:
-            raise RuntimeError(
-                "staged hotset abort transaction mismatch: "
-                f"pending={plan.transaction_id!r} origin={origin_transaction_id!r}"
-            )
-        if not abort_transaction_id or abort_transaction_id == origin_transaction_id:
-            raise RuntimeError("staged hotset abort requires a distinct transaction")
-        discarded = len(plan.cold_misses)
-        self.abort_staged_hotset_candidate(plan)
-        return discarded
-
-    def require_rank_consensus(
-        self, plan: ElasticStepPlan, *, collective: bool
-    ) -> str:
+    def require_rank_consensus(self, plan: ElasticStepPlan, *, collective: bool) -> str:
         """Reject a stale or rank-divergent plan before any CUDA/KV mutation."""
         if self.managers:
             generations = {
@@ -891,11 +659,7 @@ class DynamicGraphWorkingSet:
                 raise RuntimeError(
                     "elastic plan generation differs from worker runtime"
                 )
-        if (
-            not collective
-            or not self.managers
-            or self.managers[0].tp_size == 1
-        ):
+        if not collective or not self.managers or self.managers[0].tp_size == 1:
             return require_plan_consensus((plan,))
         gathered: list[ElasticStepPlan | None] = [
             None for _ in range(self.managers[0].tp_size)
@@ -910,6 +674,16 @@ class DynamicGraphWorkingSet:
         return require_plan_consensus(
             tuple(item for item in gathered if item is not None)
         )
+
+    def discard_failed_capture(self, plan: ElasticStepPlan) -> None:
+        """Remove only destinations created by a failed capture transaction."""
+        managers = {manager.dynamic_graph_owner: manager for manager in self.managers}
+        for key in reversed(plan.cold_misses):
+            manager = managers.get(key.logical.owner)
+            if manager is not None:
+                manager.discard_failed_physical_key(
+                    key, transaction_id=plan.transaction_id
+                )
 
     def prepare_manager_capture(
         self,
@@ -936,41 +710,56 @@ class DynamicGraphWorkingSet:
         for manager in self.managers:
             manager.release_transaction_leases(transaction_id)
 
-    def hot_snapshot(self) -> tuple[tuple[object, ...], ...]:
-        rows = []
-        pending_victims = set()
-        if self._pending_staged_hotset_plan is not None:
-            pending_victims.update(self._pending_staged_hotset_plan.victim_keys)
+    def residency_receipt(
+        self,
+        *,
+        transaction_id: str | None,
+        resident_bytes: int,
+        floor_bytes: int,
+        transition_floor_bytes: int,
+        peak_bytes: int,
+        cublas_workspace_bytes: int,
+    ) -> ElasticResidencyReceipt:
+        entries = []
         for manager in self.managers:
             for entry in manager._dynamic_graph_entries.values():
                 if entry.state != DynamicGraphResidency.HOT:
                     continue
-                key = entry.descriptor.physical_replay_key(
-                    manager.dynamic_graph_owner
-                )
+                key = entry.descriptor.physical_replay_key(manager.dynamic_graph_owner)
                 # Victims remain physically resident only as a transition
                 # lifetime fence.  Publishing them as selectable HOT would
                 # let scheduler policy reuse a logically retired carrier.
-                if key in pending_victims:
-                    continue
-                rows.append(
-                    (
-                        key.identity,
-                        manager.dynamic_graph_owner,
-                        entry.descriptor.cg_mode.name,
-                        entry.descriptor.num_tokens,
-                        key.physical_num_reqs,
-                        entry.descriptor.uniform_token_count,
-                        entry.descriptor.num_active_loras,
-                        key.generation.value,
-                        entry.pinned,
-                        entry.charged_bytes,
-                        entry.local_pool_bytes,
-                        entry.reclaimable_bytes,
-                        len(entry.leases),
+                entries.append(
+                    ElasticResidencyEntry(
+                        key=key,
+                        pinned=entry.pinned,
+                        resident_bytes=entry.charged_bytes,
+                        local_pool_bytes=entry.local_pool_bytes,
+                        # Physical pool proof remains manager-owned for a
+                        # later administrative teardown. Scheduler policy may
+                        # consume it only while the executable is unpinned and
+                        # unleased in this exact receipt.
+                        reclaimable_bytes=(
+                            0
+                            if entry.pinned or entry.leases
+                            else entry.reclaimable_bytes
+                        ),
+                        lease_ids=tuple(sorted(entry.leases)),
                     )
                 )
-        return tuple(sorted(rows))
+        generations = {manager.runtime_generation for manager in self.managers}
+        if len(generations) != 1:
+            raise RuntimeError("elastic residency publication mixed generations")
+        return ElasticResidencyReceipt(
+            generation=RuntimeGeneration(next(iter(generations))),
+            transaction_id=transaction_id,
+            resident_bytes=resident_bytes,
+            floor_bytes=floor_bytes,
+            transition_floor_bytes=transition_floor_bytes,
+            peak_bytes=max(peak_bytes, resident_bytes, transition_floor_bytes),
+            cublas_workspace_bytes=cublas_workspace_bytes,
+            entries=tuple(sorted(entries, key=lambda item: item.key.identity)),
+        )
 
     def rebind_runtime_generation(self, generation: RuntimeGeneration) -> None:
         """Bind deferred graph metadata to the scheduler's post-KV epoch.
@@ -1021,9 +810,9 @@ class DynamicGraphWorkingSet:
             )
         victims.sort(
             key=lambda item: repr(
-                item[1].descriptor.physical_replay_key(
-                    item[0].dynamic_graph_owner
-                ).identity
+                item[1]
+                .descriptor.physical_replay_key(item[0].dynamic_graph_owner)
+                .identity
             )
         )
         charged = sum(entry.charged_bytes for _manager, entry in victims)
@@ -1053,9 +842,9 @@ class DynamicGraphWorkingSet:
             )
         victims.sort(
             key=lambda item: repr(
-                item[1].descriptor.physical_replay_key(
-                    item[0].dynamic_graph_owner
-                ).identity
+                item[1]
+                .descriptor.physical_replay_key(item[0].dynamic_graph_owner)
+                .identity
             )
         )
         charged = sum(entry.charged_bytes for _manager, entry in victims)
@@ -1165,10 +954,43 @@ class CudaGraphManager:
         self.elastic_graph_activation = elastic_graph_activation
         self.elastic_graph_token_source = elastic_graph_token_source
         self.elastic_graph_fixed_query_len = elastic_graph_fixed_query_len
-        self.compiled_piecewise_sizes = configured_compiled_piecewise_sizes(
-            vllm_config
-        )
+        self.compiled_piecewise_sizes = configured_compiled_piecewise_sizes(vllm_config)
         self._compiled_piecewise_dispatch_logged: set[int] = set()
+        self.defer_startup_graphs = uses_elastic_on_demand_graphs(vllm_config)
+        if self.defer_startup_graphs:
+            from vllm.v1.core.elastic_runtime import (
+                compute_elastic_runtime_generation,
+            )
+
+            self.runtime_generation = compute_elastic_runtime_generation(vllm_config)
+        else:
+            self.runtime_generation = "static"
+        legacy_elastic_graph_keys = {
+            "dynamic_cudagraph_capture_sizes",
+            "dynamic_cudagraph_full_capture_sizes",
+            "dynamic_cudagraph_piecewise_capture_range",
+            "dynamic_cudagraph_piecewise_coverage_sizes",
+            "dynamic_cudagraph_piecewise_safety_sizes",
+            "dynamic_cudagraph_budget_mb",
+            "dynamic_cudagraph_max_entry_mb",
+            "dynamic_cudagraph_guard_mb",
+            "dynamic_cudagraph_min_hits",
+            "dynamic_cudagraph_full_min_hits",
+            "dynamic_cudagraph_piecewise_min_hits",
+            "dynamic_cudagraph_piecewise_min_padding_pct",
+            "dynamic_cudagraph_cooldown_steps",
+            "dynamic_cudagraph_pinned_sizes",
+        }
+        if self.defer_startup_graphs:
+            configured_legacy_keys = sorted(
+                legacy_elastic_graph_keys.intersection(additional_config)
+            )
+            if configured_legacy_keys:
+                raise ValueError(
+                    "elastic CUDA Graph shapes and memory are runtime-derived; "
+                    "remove legacy additional-config keys: "
+                    f"{configured_legacy_keys}"
+                )
         dynamic_sizes = (
             additional_config.get("dynamic_cudagraph_capture_sizes", [])
             if isinstance(additional_config, dict)
@@ -1232,41 +1054,6 @@ class CudaGraphManager:
         # on-demand candidates when a dynamic graph ceiling is configured.
         # Their memory is borrowed only after scheduler admission and is
         # physically returned by the normal dynamic eviction path.
-        self.defer_startup_graphs = uses_elastic_on_demand_graphs(vllm_config)
-        if self.defer_startup_graphs:
-            from vllm.v1.worker.startup_plan import (
-                compute_elastic_runtime_generation,
-            )
-
-            self.runtime_generation = compute_elastic_runtime_generation(vllm_config)
-        else:
-            self.runtime_generation = "static"
-        legacy_elastic_graph_keys = {
-            "dynamic_cudagraph_capture_sizes",
-            "dynamic_cudagraph_full_capture_sizes",
-            "dynamic_cudagraph_piecewise_capture_range",
-            "dynamic_cudagraph_piecewise_coverage_sizes",
-            "dynamic_cudagraph_piecewise_safety_sizes",
-            "dynamic_cudagraph_budget_mb",
-            "dynamic_cudagraph_max_entry_mb",
-            "dynamic_cudagraph_guard_mb",
-            "dynamic_cudagraph_min_hits",
-            "dynamic_cudagraph_full_min_hits",
-            "dynamic_cudagraph_piecewise_min_hits",
-            "dynamic_cudagraph_piecewise_min_padding_pct",
-            "dynamic_cudagraph_cooldown_steps",
-            "dynamic_cudagraph_pinned_sizes",
-        }
-        if self.defer_startup_graphs:
-            configured_legacy_keys = sorted(
-                legacy_elastic_graph_keys.intersection(additional_config)
-            )
-            if configured_legacy_keys:
-                raise ValueError(
-                    "elastic CUDA Graph shapes and memory are runtime-derived; "
-                    "remove legacy additional-config keys: "
-                    f"{configured_legacy_keys}"
-                )
         dynamic_piecewise_sizes = set(dynamic_sizes)
         dynamic_full_capture_sizes = set(dynamic_full_sizes)
         if self.defer_startup_graphs:
@@ -1310,164 +1097,119 @@ class CudaGraphManager:
         self.has_dynamic_capture_candidates = self.defer_startup_graphs or bool(
             self.dynamic_capture_sizes or self.dynamic_piecewise_capture_range
         )
-        dynamic_budget_mb = (
-            additional_config.get(
-                "dynamic_cudagraph_budget_mb",
-                0,
+        if not self.defer_startup_graphs:
+            dynamic_budget_mb = (
+                additional_config.get("dynamic_cudagraph_budget_mb", 0)
+                if isinstance(additional_config, dict)
+                else 0
             )
-            if isinstance(additional_config, dict)
-            else 0
-        )
-        if self.defer_startup_graphs:
-            dynamic_budget_mb = 0
-        if isinstance(dynamic_budget_mb, bool) or not isinstance(
-            dynamic_budget_mb, int
-        ):
-            raise ValueError("dynamic_cudagraph_budget_mb must be an integer")
-        if not self.defer_startup_graphs and self.has_dynamic_capture_candidates != (
-            dynamic_budget_mb > 0
-        ):
-            raise ValueError(
-                "dynamic CUDA graphs require both capture sizes and a positive "
-                "dynamic_cudagraph_budget_mb"
-            )
-        self.dynamic_graph_budget_bytes = dynamic_budget_mb * 1024 * 1024
-        config_hotset_cap_mb = (
-            additional_config.get("elastic_graph_hotset_cap_mb", 0)
-            if isinstance(additional_config, dict)
-            else 0
-        )
-        env_hotset_cap = os.environ.get(
-            "AG2_VLLM_ELASTIC_GRAPH_HOTSET_CAP_MB", ""
-        )
-        try:
-            env_hotset_cap_mb = int(env_hotset_cap) if env_hotset_cap else 0
-        except ValueError as error:
-            raise ValueError(
-                "AG2_VLLM_ELASTIC_GRAPH_HOTSET_CAP_MB must be an integer"
-            ) from error
-        if config_hotset_cap_mb and env_hotset_cap and (
-            config_hotset_cap_mb != env_hotset_cap_mb
-        ):
-            raise ValueError("elastic graph hotset cap config/env disagree")
-        hotset_cap_mb = env_hotset_cap_mb or config_hotset_cap_mb
-        if (
-            isinstance(hotset_cap_mb, bool)
-            or not isinstance(hotset_cap_mb, int)
-            or hotset_cap_mb < 0
-        ):
-            raise ValueError("elastic_graph_hotset_cap_mb must be an integer >= 0")
-        if hotset_cap_mb and not self.defer_startup_graphs:
-            raise ValueError(
-                "elastic_graph_hotset_cap_mb requires elastic on-demand graphs"
-            )
-        self.dynamic_graph_hotset_cap_bytes = hotset_cap_mb * 1024 * 1024
-        max_entry_mb = (
-            additional_config.get("dynamic_cudagraph_max_entry_mb", dynamic_budget_mb)
-            if isinstance(additional_config, dict)
-            else 0
-        )
-        guard_mb = (
-            additional_config.get("dynamic_cudagraph_guard_mb", 150)
-            if isinstance(additional_config, dict)
-            else 150
-        )
-        if self.defer_startup_graphs:
-            max_entry_mb = 0
-            guard_mb = 0
-        self.dynamic_graph_min_hits = (
-            additional_config.get("dynamic_cudagraph_min_hits", 2)
-            if isinstance(additional_config, dict)
-            else 2
-        )
-        self.dynamic_graph_full_min_hits = (
-            additional_config.get(
-                "dynamic_cudagraph_full_min_hits", self.dynamic_graph_min_hits
-            )
-            if isinstance(additional_config, dict)
-            else self.dynamic_graph_min_hits
-        )
-        self.dynamic_graph_piecewise_min_hits = (
-            additional_config.get(
-                "dynamic_cudagraph_piecewise_min_hits", self.dynamic_graph_min_hits
-            )
-            if isinstance(additional_config, dict)
-            else self.dynamic_graph_min_hits
-        )
-        self.dynamic_graph_piecewise_min_padding_pct = (
-            additional_config.get("dynamic_cudagraph_piecewise_min_padding_pct", 25)
-            if isinstance(additional_config, dict)
-            else 25
-        )
-        self.dynamic_graph_cooldown_steps = (
-            additional_config.get("dynamic_cudagraph_cooldown_steps", 128)
-            if isinstance(additional_config, dict)
-            else 128
-        )
-        for name, value, minimum in (
-            ("dynamic_cudagraph_max_entry_mb", max_entry_mb, 1),
-            ("dynamic_cudagraph_guard_mb", guard_mb, 0),
-            ("dynamic_cudagraph_min_hits", self.dynamic_graph_min_hits, 1),
-            (
-                "dynamic_cudagraph_full_min_hits",
-                self.dynamic_graph_full_min_hits,
-                1,
-            ),
-            (
-                "dynamic_cudagraph_piecewise_min_hits",
-                self.dynamic_graph_piecewise_min_hits,
-                1,
-            ),
-            (
-                "dynamic_cudagraph_piecewise_min_padding_pct",
-                self.dynamic_graph_piecewise_min_padding_pct,
-                0,
-            ),
-            (
-                "dynamic_cudagraph_cooldown_steps",
-                self.dynamic_graph_cooldown_steps,
-                1,
-            ),
-        ):
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or (
-                    self.dynamic_capture_sizes
-                    and not self.defer_startup_graphs
-                    and value < minimum
-                )
+            if isinstance(dynamic_budget_mb, bool) or not isinstance(
+                dynamic_budget_mb, int
             ):
-                raise ValueError(f"{name} must be an integer >= {minimum}")
-        self.dynamic_graph_max_entry_bytes = max_entry_mb * 1024 * 1024
-        self.dynamic_graph_guard_bytes = guard_mb * 1024 * 1024
-        if self.dynamic_graph_max_entry_bytes > self.dynamic_graph_budget_bytes:
-            raise ValueError(
-                "dynamic_cudagraph_max_entry_mb cannot exceed the dynamic "
-                "CUDA Graph budget"
+                raise ValueError("dynamic_cudagraph_budget_mb must be an integer")
+            if self.has_dynamic_capture_candidates != (dynamic_budget_mb > 0):
+                raise ValueError(
+                    "dynamic CUDA graphs require both capture sizes and a positive "
+                    "dynamic_cudagraph_budget_mb"
+                )
+            self.dynamic_graph_budget_bytes = dynamic_budget_mb * 1024 * 1024
+            max_entry_mb = (
+                additional_config.get(
+                    "dynamic_cudagraph_max_entry_mb", dynamic_budget_mb
+                )
+                if isinstance(additional_config, dict)
+                else 0
             )
-        pinned_sizes = (
-            additional_config.get("dynamic_cudagraph_pinned_sizes", [])
-            if isinstance(additional_config, dict)
-            else []
-        )
-        if not isinstance(pinned_sizes, list) or any(
-            isinstance(size, bool) or not isinstance(size, int) or size <= 0
-            for size in pinned_sizes
-        ):
-            raise ValueError(
-                "dynamic_cudagraph_pinned_sizes must be a list of positive integers"
+            guard_mb = (
+                additional_config.get("dynamic_cudagraph_guard_mb", 150)
+                if isinstance(additional_config, dict)
+                else 150
             )
-        if not set(pinned_sizes).issubset(self.dynamic_capture_sizes):
-            raise ValueError(
-                "dynamic_cudagraph_pinned_sizes must be dynamic capture sizes"
+            self.dynamic_graph_min_hits = (
+                additional_config.get("dynamic_cudagraph_min_hits", 2)
+                if isinstance(additional_config, dict)
+                else 2
             )
-        self.dynamic_graph_pinned_sizes = frozenset(pinned_sizes)
-        if self.dynamic_graph_pinned_sizes:
-            raise ValueError(
-                "dynamic_cudagraph_pinned_sizes is incompatible with elastic "
-                "step-scoped graph residency"
+            self.dynamic_graph_full_min_hits = (
+                additional_config.get(
+                    "dynamic_cudagraph_full_min_hits", self.dynamic_graph_min_hits
+                )
+                if isinstance(additional_config, dict)
+                else self.dynamic_graph_min_hits
             )
+            self.dynamic_graph_piecewise_min_hits = (
+                additional_config.get(
+                    "dynamic_cudagraph_piecewise_min_hits",
+                    self.dynamic_graph_min_hits,
+                )
+                if isinstance(additional_config, dict)
+                else self.dynamic_graph_min_hits
+            )
+            self.dynamic_graph_piecewise_min_padding_pct = (
+                additional_config.get("dynamic_cudagraph_piecewise_min_padding_pct", 25)
+                if isinstance(additional_config, dict)
+                else 25
+            )
+            self.dynamic_graph_cooldown_steps = (
+                additional_config.get("dynamic_cudagraph_cooldown_steps", 128)
+                if isinstance(additional_config, dict)
+                else 128
+            )
+            for name, value, minimum in (
+                ("dynamic_cudagraph_max_entry_mb", max_entry_mb, 1),
+                ("dynamic_cudagraph_guard_mb", guard_mb, 0),
+                ("dynamic_cudagraph_min_hits", self.dynamic_graph_min_hits, 1),
+                (
+                    "dynamic_cudagraph_full_min_hits",
+                    self.dynamic_graph_full_min_hits,
+                    1,
+                ),
+                (
+                    "dynamic_cudagraph_piecewise_min_hits",
+                    self.dynamic_graph_piecewise_min_hits,
+                    1,
+                ),
+                (
+                    "dynamic_cudagraph_piecewise_min_padding_pct",
+                    self.dynamic_graph_piecewise_min_padding_pct,
+                    0,
+                ),
+                (
+                    "dynamic_cudagraph_cooldown_steps",
+                    self.dynamic_graph_cooldown_steps,
+                    1,
+                ),
+            ):
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or (self.dynamic_capture_sizes and value < minimum)
+                ):
+                    raise ValueError(f"{name} must be an integer >= {minimum}")
+            self.dynamic_graph_max_entry_bytes = max_entry_mb * 1024 * 1024
+            self.dynamic_graph_guard_bytes = guard_mb * 1024 * 1024
+            if self.dynamic_graph_max_entry_bytes > self.dynamic_graph_budget_bytes:
+                raise ValueError(
+                    "dynamic_cudagraph_max_entry_mb cannot exceed the dynamic "
+                    "CUDA Graph budget"
+                )
+            pinned_sizes = (
+                additional_config.get("dynamic_cudagraph_pinned_sizes", [])
+                if isinstance(additional_config, dict)
+                else []
+            )
+            if not isinstance(pinned_sizes, list) or any(
+                isinstance(size, bool) or not isinstance(size, int) or size <= 0
+                for size in pinned_sizes
+            ):
+                raise ValueError(
+                    "dynamic_cudagraph_pinned_sizes must be a list of positive integers"
+                )
+            if not set(pinned_sizes).issubset(self.dynamic_capture_sizes):
+                raise ValueError(
+                    "dynamic_cudagraph_pinned_sizes must be dynamic capture sizes"
+                )
+            self.dynamic_graph_pinned_sizes = frozenset(pinned_sizes)
         self._dynamic_graph_entries: dict[
             BatchExecutionDescriptor, DynamicGraphEntry
         ] = {}
@@ -1599,8 +1341,7 @@ class CudaGraphManager:
                 allow_full=allow_full,
                 semantic_decode=bool(
                     runtime_num_reqs > 0
-                    and row["num_tokens"]
-                    == runtime_num_reqs * self.decode_query_len
+                    and row["num_tokens"] == runtime_num_reqs * self.decode_query_len
                     and self.dynamic_graph_owner
                     in {"target", "mtp_prefill", "mtp_decode"}
                 ),
@@ -2001,8 +1742,7 @@ class CudaGraphManager:
             self.vllm_config.scheduler_config.max_num_batched_tokens,
         )
         return (
-            num_tokens != token_bucket
-            or token_bucket in self.compiled_piecewise_sizes
+            num_tokens != token_bucket or token_bucket in self.compiled_piecewise_sizes
         )
 
     def _runtime_decode_query_lens(self) -> set[int]:
@@ -2077,8 +1817,7 @@ class CudaGraphManager:
             num_reqs=num_reqs if mixed_mode == CUDAGraphMode.FULL else None,
             uniform_token_count=(
                 uniform_token_count
-                if exact_batched_decode
-                and uniform_token_count == self.decode_query_len
+                if exact_batched_decode and uniform_token_count == self.decode_query_len
                 else None
             ),
             num_active_loras=effective_loras,
@@ -2166,10 +1905,7 @@ class CudaGraphManager:
         if entry is None:
             entry = DynamicGraphEntry(
                 descriptor=desc,
-                pinned=(
-                    desc.cg_mode == CUDAGraphMode.FULL
-                    and not self.dynamic_graph_hotset_cap_bytes
-                ),
+                pinned=desc.cg_mode == CUDAGraphMode.FULL,
             )
             self._dynamic_graph_entries[desc] = entry
             from vllm.v1.worker.startup_plan import maybe_save_cudagraph_recipe
@@ -2202,9 +1938,7 @@ class CudaGraphManager:
         )
         return desc
 
-    def queue_physical_key(
-        self, key: PhysicalReplayKey
-    ) -> BatchExecutionDescriptor:
+    def queue_physical_key(self, key: PhysicalReplayKey) -> BatchExecutionDescriptor:
         """Queue exactly the physical key resolved by the scheduler plan."""
         if key.logical.owner != self.dynamic_graph_owner:
             raise RuntimeError(
@@ -2223,9 +1957,7 @@ class CudaGraphManager:
                 f"unknown elastic CUDA Graph mode {key.logical.mode!r}"
             ) from exc
         decode_mode = self.cudagraph_mode.decode_mode()
-        elastic_token_source = getattr(
-            self, "elastic_graph_token_source", "legacy-v1"
-        )
+        elastic_token_source = getattr(self, "elastic_graph_token_source", "legacy-v1")
         owner_policy = OwnerGraphExecutionPolicy(
             owner=self.dynamic_graph_owner,
             full_query_lens=(
@@ -2283,10 +2015,7 @@ class CudaGraphManager:
             entry = DynamicGraphEntry(
                 descriptor=desc,
                 runtime_num_reqs=key.physical_num_reqs,
-                pinned=(
-                    mode == CUDAGraphMode.FULL
-                    and not self.dynamic_graph_hotset_cap_bytes
-                ),
+                pinned=mode == CUDAGraphMode.FULL,
             )
             self._dynamic_graph_entries[desc] = entry
         entry.last_used_epoch = self._dynamic_epoch
@@ -2322,6 +2051,7 @@ class CudaGraphManager:
         *,
         transaction_id: str,
         reason: str,
+        administrative: bool = False,
     ) -> None:
         """Destroy one scheduler-selected executable, with exact provenance."""
         if key.logical.owner != self.dynamic_graph_owner:
@@ -2337,37 +2067,38 @@ class CudaGraphManager:
                 f"owner={self.dynamic_graph_owner} key={key.identity}"
             )
         self._evict_dynamic_entry(
-            matching[0], transaction_id=transaction_id, reason=reason
+            matching[0],
+            transaction_id=transaction_id,
+            reason=reason,
+            administrative=administrative,
         )
 
-    def discard_staged_physical_key(
+    def discard_failed_physical_key(
         self,
         key: PhysicalReplayKey,
         *,
         transaction_id: str,
     ) -> None:
-        """Remove a staged candidate without touching the preceding HOT set."""
+        """Remove a failed destination without touching unrelated HOT entries."""
         matching = [
             entry
             for desc, entry in self._dynamic_graph_entries.items()
             if desc.physical_replay_key(self.dynamic_graph_owner) == key
         ]
         if len(matching) != 1:
-            raise RuntimeError("staged hotset candidate is absent or ambiguous")
+            raise RuntimeError("failed capture destination is absent or ambiguous")
         entry = matching[0]
         if entry.state == DynamicGraphResidency.HOT:
             self._evict_dynamic_entry(
                 entry,
                 transaction_id=transaction_id,
-                reason="staged_hotset_abort",
+                reason="failed_capture_rollback",
                 administrative=True,
             )
         elif self._dynamic_pending == entry.descriptor:
             self.cancel_pending_dynamic_capture()
         elif entry.graph_segments:
-            raise RuntimeError(
-                "non-HOT staged candidate retained executable segments"
-            )
+            raise RuntimeError("non-HOT failed capture retained executable segments")
         entry.state = DynamicGraphResidency.WARM
         entry.hits = 0
         entry.runtime_num_reqs = None
@@ -2411,14 +2142,15 @@ class CudaGraphManager:
             return desc.num_tokens == num_tokens and desc.num_reqs == num_reqs
         if (
             self.dynamic_graph_owner in {"target", "mtp_prefill"}
-            and uniform_token_count == self.decode_query_len
-            and num_tokens == num_reqs * self.decode_query_len
+            and uniform_token_count is not None
+            and uniform_token_count > 0
+            and num_tokens == num_reqs * uniform_token_count
         ):
             physical_x = desc.physical_num_reqs
             return bool(
                 physical_x is not None
                 and physical_x >= num_reqs
-                and desc.num_tokens == physical_x * self.decode_query_len
+                and desc.num_tokens == physical_x * uniform_token_count
             )
         if desc.num_tokens not in self.dynamic_piecewise_safety_sizes:
             return desc.num_tokens == num_tokens
@@ -2599,13 +2331,16 @@ class CudaGraphManager:
             runtime_generation=desc.runtime_generation,
         )
 
-    def uses_tp3_owner_prequant_decode(
-        self, _desc: BatchExecutionDescriptor
-    ) -> bool:
+    def uses_tp3_owner_prequant_decode(self, _desc: BatchExecutionDescriptor) -> bool:
         """Base Graph owners do not consume the target owner-prequant lane."""
         return False
 
     def _cooldown_dynamic_entry(self, entry: DynamicGraphEntry) -> None:
+        if self.defer_startup_graphs:
+            entry.state = DynamicGraphResidency.WARM
+            entry.hits = 0
+            entry.cooldown_until_epoch = 0
+            return
         entry.state = DynamicGraphResidency.COOLDOWN
         entry.hits = 0
         entry.cooldown_until_epoch = (
@@ -3423,8 +3158,7 @@ class CudaGraphManager:
                 desc.semantic_decode
                 and desc.physical_num_reqs is not None
                 and desc.physical_num_reqs >= num_reqs
-                and desc.num_tokens
-                == desc.physical_num_reqs * self.decode_query_len
+                and desc.num_tokens == desc.physical_num_reqs * self.decode_query_len
                 and uniform_token_count == self.decode_query_len
                 and num_tokens == num_reqs * self.decode_query_len
                 for desc in self._dynamic_step_candidates
@@ -3730,9 +3464,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.tp3_owner_prequant = tp3_owner_prequant
         self._tp3_owner_replay_receipts: set[tuple[int, int | None, int | None]] = set()
 
-    def uses_tp3_owner_prequant_decode(
-        self, desc: BatchExecutionDescriptor
-    ) -> bool:
+    def uses_tp3_owner_prequant_decode(self, desc: BatchExecutionDescriptor) -> bool:
         """Resolve the graph-captured owner-prequant lane.
 
         The compiled-only carrier restores the previously accepted reducer
@@ -3987,9 +3719,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                     intermediate_tensors = model_output
                     if capture_outputs.intermediate_tensors is None:
                         capture_outputs.intermediate_tensors = (
-                            IntermediateTensors.empty_like(
-                                intermediate_tensors
-                            )
+                            IntermediateTensors.empty_like(intermediate_tensors)
                         )
                     for k, v in intermediate_tensors.tensors.items():
                         capture_outputs.intermediate_tensors[k][:num_tokens] = v

@@ -1,5 +1,6 @@
 import json
 
+import pytest
 import torch
 from torch import nn
 
@@ -7,8 +8,16 @@ from vllm.model_executor.models.qwen3_next import (
     _ag2_packetize_and_clear_trace_attrs,
     _ag2_release_layer_trace_refs,
     _ag2_trace_packet,
+    _reject_removed_projection_calibration,
 )
 from vllm.v1.worker.gpu.aux_hidden_trace import AuxHiddenTrace
+
+
+def test_removed_projection_calibration_fails_closed(monkeypatch) -> None:
+    monkeypatch.setenv("AG2_VLLM_PROJECTION_CALIBRATION_OUTPUT", "/tmp/rejected")
+
+    with pytest.raises(RuntimeError, match="observer is not neutral"):
+        _reject_removed_projection_calibration()
 
 
 def test_request_chunk_manifest_reports_saved_invocations(

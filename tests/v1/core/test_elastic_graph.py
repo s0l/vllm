@@ -5,9 +5,13 @@ from types import SimpleNamespace
 import pytest
 
 from vllm.v1.core.elastic_graph import (
-    ElasticGraphCache,
+    ElasticAdmissionController,
+    ElasticAdmissionLoan,
     ElasticGraphError,
     ElasticPlanKind,
+    ElasticResidencyEntry,
+    ElasticResidencyReceipt,
+    ElasticRuntimeConfig,
     GraphExecutionPolicy,
     GraphPrice,
     GraphResidency,
@@ -23,6 +27,85 @@ from vllm.v1.core.elastic_graph import (
 )
 
 GENERATION = RuntimeGeneration("test-generation")
+
+
+def test_controller_fifo_loans_and_transaction_ids_are_public_and_replayable() -> None:
+    controller = ElasticAdmissionController(GENERATION)
+
+    assert controller.next_transaction_id() == "elastic-00000000000000000001"
+    assert controller.next_transaction_id() == "elastic-00000000000000000002"
+    controller.reserve_loan((1, 3, 8, 32, 1), 128)
+    controller.reserve_loan(None, 0)
+    controller.replace_latest_loan((0, 3, 16, 64, 0), 96)
+
+    assert controller.snapshot.pending_loans == (
+        ElasticAdmissionLoan((1, 3, 8, 32, 1), 128),
+        ElasticAdmissionLoan((0, 3, 16, 64, 0), 96),
+    )
+    assert controller.max_pending_grant() == 128
+    assert controller.settle_next_loan() == ElasticAdmissionLoan((1, 3, 8, 32, 1), 128)
+    assert controller.cancel_latest_loan() == ElasticAdmissionLoan(
+        (0, 3, 16, 64, 0), 96
+    )
+    assert controller.pending_loans == ()
+
+    with pytest.raises(ValueError, match="non-negative"):
+        controller.reserve_loan(None, True)
+    with pytest.raises(ValueError, match="non-negative"):
+        controller.reserve_loan(None, "128")  # type: ignore[arg-type]
+    with pytest.raises(ElasticGraphError, match="missing elastic loan"):
+        controller.settle_next_loan()
+
+
+def test_controller_receipt_acceptance_is_atomic_and_transaction_bound() -> None:
+    controller = ElasticAdmissionController(GENERATION)
+    physical = key("target", "PIECEWISE", 32, 8)
+    receipt = ElasticResidencyReceipt(
+        generation=GENERATION,
+        transaction_id="elastic-00000000000000000001",
+        resident_bytes=88,
+        floor_bytes=8,
+        transition_floor_bytes=16,
+        peak_bytes=96,
+        cublas_workspace_bytes=4,
+        entries=(
+            ElasticResidencyEntry(
+                key=physical,
+                pinned=False,
+                resident_bytes=80,
+                local_pool_bytes=80,
+                reclaimable_bytes=80,
+            ),
+        ),
+    )
+
+    assert controller.accept_residency_receipt(
+        receipt,
+        expected_transaction_id=receipt.transaction_id,
+    ) == (0, 80)
+    accepted = controller.snapshot
+    assert controller.last_receipt == receipt
+
+    stale = replace(
+        receipt,
+        generation=RuntimeGeneration("stale-generation"),
+        entries=(
+            replace(
+                receipt.entries[0],
+                key=replace(physical, generation=RuntimeGeneration("stale-generation")),
+            ),
+        ),
+    )
+    with pytest.raises(ElasticGraphError, match="generation differs"):
+        controller.accept_residency_receipt(stale)
+    with pytest.raises(ElasticGraphError, match="transaction differs"):
+        controller.accept_residency_receipt(
+            replace(receipt, transaction_id="out-of-order"),
+            expected_transaction_id=receipt.transaction_id,
+        )
+
+    assert controller.snapshot == accepted
+    assert controller.last_receipt == receipt
 
 
 def current_q4_piecewise_policy() -> GraphExecutionPolicy:
@@ -84,7 +167,9 @@ def price(name: str, resident: int = 10, peak: int = 12) -> GraphPrice:
     return GraphPrice(resident, peak, name)
 
 
-def publish(cache: ElasticGraphCache, graph_key: PhysicalReplayKey, *, pinned=False):
+def publish(
+    cache: ElasticAdmissionController, graph_key: PhysicalReplayKey, *, pinned=False
+):
     graph_price = price(graph_key.identity)
     cache.publish_hot(graph_key, graph_price, pinned=pinned)
     cache.install_reclaim_group(
@@ -102,7 +187,7 @@ def test_same_piecewise_bucket_keeps_distinct_physical_x_variants() -> None:
     assert x8.logical == x32.logical
     assert x8 != x32
 
-    cache = ElasticGraphCache(GENERATION)
+    cache = ElasticAdmissionController(GENERATION)
     publish(cache, x8)
     publish(cache, x32)
     assert cache.entries[x8].hot
@@ -111,7 +196,7 @@ def test_same_piecewise_bucket_keeps_distinct_physical_x_variants() -> None:
 
 def test_recapture_price_keeps_conservative_cold_envelope() -> None:
     graph_key = key("target", "PIECEWISE", 4096, 8)
-    cache = ElasticGraphCache(GENERATION)
+    cache = ElasticAdmissionController(GENERATION)
     cache.publish_hot(
         graph_key,
         price("private-pool", resident=44, peak=52),
@@ -129,9 +214,7 @@ def test_recapture_price_keeps_conservative_cold_envelope() -> None:
         )
     )
 
-    assert cache.entries[graph_key].price == price(
-        "private-pool", resident=44, peak=52
-    )
+    assert cache.entries[graph_key].price == price("private-pool", resident=44, peak=52)
     assert cache._groups["private-pool"] == ReclaimGroup(
         "private-pool", (graph_key,), reclaimable_bytes=1, retained_bytes=1
     )
@@ -139,7 +222,7 @@ def test_recapture_price_keeps_conservative_cold_envelope() -> None:
 
 def test_recapture_rejects_changed_reclaim_identity() -> None:
     graph_key = key("target", "PIECEWISE", 4096, 8)
-    cache = ElasticGraphCache(GENERATION)
+    cache = ElasticAdmissionController(GENERATION)
     cache.publish_hot(graph_key, price("first"), pinned=False)
 
     with pytest.raises(ElasticGraphError, match="reclaim identity changed"):
@@ -176,9 +259,7 @@ def test_exact_piecewise_target_preserves_semantic_uniform_query_len() -> None:
 
 def test_piecewise_query_len_identity_starts_only_at_consumed_math_threshold() -> None:
     policy = current_q4_piecewise_policy()
-    below = resolve_step_physical_keys(
-        (0, 3, 1, 4, 4), GENERATION, 4096, policy=policy
-    )
+    below = resolve_step_physical_keys((0, 3, 1, 4, 4), GENERATION, 4096, policy=policy)
     below_mixed = resolve_step_physical_keys(
         (0, 3, 1, 4, 0), GENERATION, 4096, policy=policy
     )
@@ -194,7 +275,7 @@ def test_piecewise_query_len_identity_starts_only_at_consumed_math_threshold() -
     assert boundary[0].logical.uniform_query_len == 4
     assert boundary != boundary_mixed
 
-    cache = ElasticGraphCache(GENERATION)
+    cache = ElasticAdmissionController(GENERATION)
     for graph_key in below_mixed:
         publish(cache, graph_key)
     plan = cache.plan(
@@ -211,24 +292,20 @@ def test_piecewise_query_len_identity_starts_only_at_consumed_math_threshold() -
 
 def test_current_policy_accepts_q1_full_and_rejects_q4_full() -> None:
     policy = current_q4_piecewise_policy()
-    q1 = resolve_step_physical_keys(
-        (1, 0, 32, 32, 1), GENERATION, 4096, policy=policy
-    )
+    q1 = resolve_step_physical_keys((1, 0, 32, 32, 1), GENERATION, 4096, policy=policy)
     assert [(item.logical.owner, item.logical.mode) for item in q1] == [
         ("target", "FULL")
     ]
 
     with pytest.raises(ElasticGraphError, match="FULL key violates"):
-        resolve_step_physical_keys(
-            (1, 3, 40, 160, 4), GENERATION, 4096, policy=policy
-        )
+        resolve_step_physical_keys((1, 3, 40, 160, 4), GENERATION, 4096, policy=policy)
 
 
 def test_policy_payload_is_content_addressed_and_corruption_fails_closed() -> None:
     payload = current_q4_piecewise_policy().to_payload()
-    assert GraphExecutionPolicy.from_payload(payload).fingerprint == payload[
-        "fingerprint"
-    ]
+    assert (
+        GraphExecutionPolicy.from_payload(payload).fingerprint == payload["fingerprint"]
+    )
     payload["math_contract"] = "silently-mutated"
     with pytest.raises(ValueError, match="fingerprint mismatch"):
         GraphExecutionPolicy.from_payload(payload)
@@ -299,9 +376,7 @@ def test_production_none_policy_cannot_resolve_short_decode() -> None:
         owners=(OwnerGraphExecutionPolicy("target", (1,), "NONE"),),
     )
     with pytest.raises(ElasticGraphError, match="representation policy"):
-        resolve_step_physical_keys(
-            (0, 0, 1, 4, 0), GENERATION, 4096, policy=policy
-        )
+        resolve_step_physical_keys((0, 0, 1, 4, 0), GENERATION, 4096, policy=policy)
 
 
 def test_full_target_exact_mtp_wave_is_not_rounded_into_compiled_class() -> None:
@@ -366,12 +441,12 @@ def test_runtime_policy_resolves_k0_without_draft_owners() -> None:
         ),
     )
 
-    keys = resolve_step_physical_keys(
-        (1, 0, 7, 7, 1), GENERATION, 4096, policy=policy
-    )
+    keys = resolve_step_physical_keys((1, 0, 7, 7, 1), GENERATION, 4096, policy=policy)
 
-    assert [(item.logical.owner, item.logical.mode, item.logical.token_bucket)
-            for item in keys] == [("target", "FULL", 7)]
+    assert [
+        (item.logical.owner, item.logical.mode, item.logical.token_bucket)
+        for item in keys
+    ] == [("target", "FULL", 7)]
 
 
 def test_runtime_policy_resolves_arbitrary_k_from_owner_formulas() -> None:
@@ -404,9 +479,7 @@ def test_runtime_policy_resolves_arbitrary_k_from_owner_formulas() -> None:
         ),
     )
 
-    keys = resolve_step_physical_keys(
-        (0, 7, 5, 40, 8), GENERATION, 4096, policy=policy
-    )
+    keys = resolve_step_physical_keys((0, 7, 5, 40, 8), GENERATION, 4096, policy=policy)
 
     assert [
         (item.logical.owner, item.logical.mode, item.logical.token_bucket)
@@ -440,9 +513,7 @@ def test_runtime_policy_resolves_dflash_query_geometry_without_mtp_names() -> No
         ),
     )
 
-    keys = resolve_step_physical_keys(
-        (0, 7, 5, 40, 8), GENERATION, 4096, policy=policy
-    )
+    keys = resolve_step_physical_keys((0, 7, 5, 40, 8), GENERATION, 4096, policy=policy)
 
     assert [
         (item.logical.owner, item.logical.mode, item.logical.token_bucket)
@@ -462,9 +533,7 @@ def test_short_decode_inventory_supports_k0_and_terminal_max_x() -> None:
     )
 
     assert tuple(inventory) == (1, 2, 4, 5)
-    assert [
-        keys[0].logical.token_bucket for keys in inventory.values()
-    ] == [1, 2, 4, 5]
+    assert [keys[0].logical.token_bucket for keys in inventory.values()] == [1, 2, 4, 5]
 
 
 def test_short_decode_inventory_keeps_exact_graph_owners() -> None:
@@ -522,12 +591,15 @@ def test_scheduler_resolver_caps_mtp_prefill_piecewise_boundary() -> None:
 
 
 def test_compiled_k0_piecewise_carrier_has_no_physical_graph_key() -> None:
-    assert resolve_step_physical_keys(
-        (0, 0, 40, 4096, 0),
-        GENERATION,
-        max_num_batched_tokens=4096,
-        compiled_piecewise_sizes=(4096,),
-    ) == ()
+    assert (
+        resolve_step_physical_keys(
+            (0, 0, 40, 4096, 0),
+            GENERATION,
+            max_num_batched_tokens=4096,
+            compiled_piecewise_sizes=(4096,),
+        )
+        == ()
+    )
 
     adjacent = resolve_step_physical_keys(
         (0, 0, 40, 2048, 0),
@@ -560,12 +632,15 @@ def test_compiled_piecewise_exemption_drops_speculative_piecewise_graphs_only() 
 def test_compiled_piecewise_exemption_covers_bounded_unpriced_prefill_sizes() -> None:
     compiled = (2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
     for tokens in compiled:
-        assert resolve_step_physical_keys(
-            (0, 0, 1, tokens, 0),
-            GENERATION,
-            max_num_batched_tokens=4096,
-            compiled_piecewise_sizes=compiled,
-        ) == ()
+        assert (
+            resolve_step_physical_keys(
+                (0, 0, 1, tokens, 0),
+                GENERATION,
+                max_num_batched_tokens=4096,
+                compiled_piecewise_sizes=compiled,
+            )
+            == ()
+        )
     assert resolve_step_physical_keys(
         (0, 0, 1, 1, 0),
         GENERATION,
@@ -598,9 +673,7 @@ def test_compiled_mixed_carriers_do_not_remove_exact_k3_decode_graphs() -> None:
             max_num_batched_tokens=4096,
             compiled_piecewise_sizes=compiled,
         )
-        assert [item.logical.owner for item in mixed_same_geometry] == [
-            "mtp_decode"
-        ]
+        assert [item.logical.owner for item in mixed_same_geometry] == ["mtp_decode"]
 
     # An undeclared exact carrier is Graph-backed for the same reason.
     exact_x3 = resolve_step_physical_keys(
@@ -640,7 +713,7 @@ def test_full_family_and_piecewise_survive_arbitrary_hot_transitions() -> None:
     full_x1 = key("target", "FULL", 4, 1, uniform=4)
     full_x2 = key("target", "FULL", 8, 2, uniform=4)
     mixed = key("target", "PIECEWISE", 4096, 12)
-    cache = ElasticGraphCache(GENERATION)
+    cache = ElasticAdmissionController(GENERATION)
     publish(cache, full_x1, pinned=True)
     publish(cache, full_x2, pinned=True)
     publish(cache, mixed)
@@ -660,12 +733,139 @@ def test_full_family_and_piecewise_survive_arbitrary_hot_transitions() -> None:
     assert all(cache.entries[item].hot for item in (full_x1, full_x2, mixed))
 
 
+def test_step5_cold_a_b_a_alternation_defers_until_true_idle() -> None:
+    """A leased A cannot fund B; idle reclaim then permits B and A again."""
+    a = key("target", "PIECEWISE", 4096, 8)
+    b = key("target", "PIECEWISE", 8192, 16)
+    controller = ElasticAdmissionController(GENERATION)
+    publish(controller, a)
+    controller.register(b, price=price("b"))
+
+    active_a = controller.plan("active-a", (a,), request_bytes=0, available_bytes=0)
+    controller.commit_user(active_a)
+    blocked_b = controller.plan("blocked-b", (b,), request_bytes=8, available_bytes=0)
+    assert blocked_b.kind == ElasticPlanKind.DEFER
+    assert not blocked_b.victim_keys
+    assert controller.entries[a].leases == frozenset({"active-a"})
+
+    controller.cancel("active-a")
+    reclaim_a = controller.plan_reclaim_all(
+        "idle-a", request_bytes=0, available_bytes=0
+    )
+    assert reclaim_a.kind == ElasticPlanKind.RECLAIM
+    assert reclaim_a.victim_keys == (a,)
+    controller.begin_reclaim(reclaim_a)
+
+    capture_b = controller.plan("capture-b", (b,), request_bytes=0, available_bytes=12)
+    assert capture_b.kind == ElasticPlanKind.MAINTENANCE
+    assert not capture_b.victim_keys
+    controller.begin_maintenance(capture_b)
+    controller.finish_maintenance(capture_b, {b: price("b")})
+
+    capture_a = controller.plan(
+        "capture-a-again", (a,), request_bytes=0, available_bytes=12
+    )
+    assert capture_a.kind == ElasticPlanKind.MAINTENANCE
+    assert not capture_a.victim_keys
+    controller.begin_maintenance(capture_a)
+    controller.finish_maintenance(capture_a, {a: price(a.identity)})
+
+    assert controller.entries[a].hot
+    assert controller.entries[b].hot
+
+
+def test_step5_x_sequence_idle_and_cold_x16_recovery() -> None:
+    """Independent holdout for the exact KV6 lifecycle shape sequence."""
+    xs = (32, 16, 17, 39)
+    keys = {x: key("target", "PIECEWISE", 4096, x) for x in xs}
+    controller = ElasticAdmissionController(GENERATION)
+
+    for x in xs:
+        graph_key = keys[x]
+        plan = controller.plan(
+            f"capture-x{x}",
+            (graph_key,),
+            request_bytes=0,
+            available_bytes=12,
+            owner_set_capture_envelope_bytes=12,
+        )
+        assert plan.kind == ElasticPlanKind.MAINTENANCE
+        assert not plan.victim_keys
+        controller.begin_maintenance(plan)
+        controller.finish_maintenance(
+            plan,
+            {graph_key: price(graph_key.identity)},
+        )
+        controller.install_reclaim_group(
+            ReclaimGroup(
+                graph_key.identity,
+                (graph_key,),
+                reclaimable_bytes=10,
+            )
+        )
+        controller.retain_hot(plan.transaction_id, (graph_key,))
+        controller.cancel(plan.transaction_id)
+
+    reclaim = controller.plan_reclaim_all(
+        "true-idle", request_bytes=0, available_bytes=0
+    )
+    assert reclaim.kind == ElasticPlanKind.RECLAIM
+    assert set(reclaim.victim_keys) == set(keys.values())
+    controller.begin_reclaim(reclaim)
+    assert all(not controller.entries[item].hot for item in keys.values())
+
+    x16 = keys[16]
+    recovery = controller.plan(
+        "cold-x16-recovery",
+        (x16,),
+        request_bytes=0,
+        available_bytes=12,
+        owner_set_capture_envelope_bytes=12,
+    )
+    assert recovery.kind == ElasticPlanKind.MAINTENANCE
+    assert not recovery.victim_keys
+    controller.begin_maintenance(recovery)
+    controller.finish_maintenance(recovery, {x16: price(x16.identity)})
+    assert controller.entries[x16].hot
+
+
+def test_step5_capture_cancellation_boundaries_preserve_physical_truth() -> None:
+    """Cancellation before, during and after publication never invents HOT."""
+    graph_key = key("target", "PIECEWISE", 4096, 16)
+    controller = ElasticAdmissionController(GENERATION)
+    controller.register(graph_key, price=price("capture-cancel"))
+
+    before = controller.plan(
+        "cancel-before", (graph_key,), request_bytes=0, available_bytes=12
+    )
+    controller.fail_maintenance(before)
+    assert controller.entries[graph_key].state == GraphResidency.COLD
+
+    during = controller.plan(
+        "cancel-during", (graph_key,), request_bytes=0, available_bytes=12
+    )
+    controller.begin_maintenance(during)
+    assert controller.entries[graph_key].state == GraphResidency.CAPTURING
+    controller.fail_maintenance(during)
+    assert controller.entries[graph_key].state == GraphResidency.COLD
+
+    after = controller.plan(
+        "cancel-after", (graph_key,), request_bytes=0, available_bytes=12
+    )
+    controller.begin_maintenance(after)
+    controller.finish_maintenance(after, {graph_key: price("capture-cancel")})
+    controller.retain_hot(after.transaction_id, (graph_key,))
+    controller.cancel(after.transaction_id)
+    assert controller.entries[graph_key].hot
+    assert not controller.entries[graph_key].leases
+
+
 def test_lru_pressure_evicts_only_oldest_unleased_piecewise_group() -> None:
     older = key("target", "PIECEWISE", 2048, 8)
     newer = key("target", "PIECEWISE", 4096, 8)
     pinned = key("target", "FULL", 4, 1, uniform=4)
     cold = key("mtp_prefill", "PIECEWISE", 4096, 8)
-    cache = ElasticGraphCache(GENERATION)
+    cache = ElasticAdmissionController(GENERATION)
     publish(cache, older)
     publish(cache, newer)
     publish(cache, pinned, pinned=True)
@@ -688,7 +888,7 @@ def test_lru_pressure_evicts_only_oldest_unleased_piecewise_group() -> None:
 
 def test_two_outstanding_leases_and_cancellation_are_independent() -> None:
     graph_key = key("target", "PIECEWISE", 4096, 8)
-    cache = ElasticGraphCache(GENERATION)
+    cache = ElasticAdmissionController(GENERATION)
     publish(cache, graph_key)
     first = cache.plan("first", (graph_key,), request_bytes=0, available_bytes=0)
     second = cache.plan("second", (graph_key,), request_bytes=0, available_bytes=0)
@@ -703,9 +903,9 @@ def test_two_outstanding_leases_and_cancellation_are_independent() -> None:
     assert cache.entries[graph_key].reclaimable
 
 
-def test_maintenance_is_separate_from_user_commit_and_failure_is_cold() -> None:
+def test_capture_execute_is_separate_from_hot_hit_and_failure_is_cold() -> None:
     cold = key("target", "PIECEWISE", 4096, 8)
-    cache = ElasticGraphCache(GENERATION)
+    cache = ElasticAdmissionController(GENERATION)
     cold_price = price("cold", resident=9, peak=12)
     cache.register(cold, price=cold_price)
     plan = cache.plan("capture", (cold,), request_bytes=0, available_bytes=12)
@@ -716,13 +916,13 @@ def test_maintenance_is_separate_from_user_commit_and_failure_is_cold() -> None:
     cache.begin_maintenance(plan)
     assert cache.entries[cold].state == GraphResidency.CAPTURING
     cache.fail_maintenance(plan)
-    assert cache.entries[cold].state == GraphResidency.COOLDOWN
+    assert cache.entries[cold].state == GraphResidency.COLD
     assert not cache.entries[cold].leases
 
 
 def test_unknown_price_defers_without_mutation_or_eternal_implicit_loan() -> None:
     unknown = key("target", "PIECEWISE", 8192, 9)
-    cache = ElasticGraphCache(GENERATION)
+    cache = ElasticAdmissionController(GENERATION)
     before = dict(cache.entries)
     plan = cache.plan("unknown", (unknown,), request_bytes=0, available_bytes=1 << 40)
     assert plan.kind == ElasticPlanKind.DEFER
@@ -732,7 +932,7 @@ def test_unknown_price_defers_without_mutation_or_eternal_implicit_loan() -> Non
 
 def test_class_envelope_funds_first_capture_and_returns_to_exact_price() -> None:
     unknown = key("target", "PIECEWISE", 8192, 9)
-    cache = ElasticGraphCache(GENERATION)
+    cache = ElasticAdmissionController(GENERATION)
     envelope = price("class-envelope", resident=20, peak=30)
     plan = cache.plan(
         "enveloped",
@@ -754,7 +954,7 @@ def test_capture_with_sufficient_budget_retains_unrelated_hot_graphs() -> None:
     old_a = key("target", "PIECEWISE", 2048, 8)
     old_b = key("target", "PIECEWISE", 4096, 8)
     cold = key("target", "PIECEWISE", 8192, 8)
-    cache = ElasticGraphCache(GENERATION)
+    cache = ElasticAdmissionController(GENERATION)
     publish(cache, full, pinned=True)
     publish(cache, old_a)
     publish(cache, old_b)
@@ -773,7 +973,7 @@ def test_capture_with_sufficient_budget_retains_unrelated_hot_graphs() -> None:
 def test_owner_set_endpoint_subtracts_only_proven_reclaim_before_capture() -> None:
     old = key("target", "PIECEWISE", 4096, 8)
     cold = key("target", "PIECEWISE", 8192, 8)
-    cache = ElasticGraphCache(GENERATION)
+    cache = ElasticAdmissionController(GENERATION)
     publish(cache, old)
 
     # The 130-byte endpoint includes the old resident set.  Only the physical
@@ -792,104 +992,26 @@ def test_owner_set_endpoint_subtracts_only_proven_reclaim_before_capture() -> No
     assert plan.capture_loan_bytes == 120
 
 
-def test_bounded_hotset_stages_old_set_until_new_publication() -> None:
-    old = key("target", "FULL", 1, 1, uniform=1)
-    new = key("target", "FULL", 16, 16, uniform=1)
-    cache = ElasticGraphCache(GENERATION)
-    publish(cache, old)
-    cache.register(new, price=price("new", resident=20, peak=24))
+def test_capture_loan_includes_retained_transition_overlap() -> None:
+    cold = key("target", "PIECEWISE", 8192, 8)
+    cache = ElasticAdmissionController(GENERATION)
 
     plan = cache.plan(
-        "replace",
-        (new,),
-        request_bytes=10,
-        available_bytes=64,
-        owner_set_capture_envelope_bytes=24,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=24,
+        "retained-overlap",
+        (cold,),
+        request_bytes=100,
+        available_bytes=160,
+        owner_set_capture_envelope_bytes=130,
+        retained_transition_overlap_bytes=20,
     )
+
     assert plan.kind == ElasticPlanKind.MAINTENANCE
-    assert plan.staged_hotset_replace
-    assert plan.victim_keys == (old,)
-    assert plan.capture_loan_bytes == 24
-
-    cache.begin_maintenance(plan)
-    assert cache.entries[old].hot
-    assert cache.entries[old].leases == frozenset({"replace"})
-    assert cache.entries[new].state == GraphResidency.CAPTURING
-
-    cache.finish_maintenance(
-        plan,
-        {new: price("new", resident=20, peak=24)},
-    )
-    assert cache.entries[old].state == GraphResidency.COLD
-    assert not cache.entries[old].leases
-    assert cache.entries[new].hot
-    assert cache.stats.evictions == 1
-
-
-def test_bounded_hotset_capture_failure_preserves_old_set() -> None:
-    old = key("target", "FULL", 1, 1, uniform=1)
-    new = key("target", "FULL", 16, 16, uniform=1)
-    cache = ElasticGraphCache(GENERATION)
-    publish(cache, old)
-    cache.register(new, price=price("new", resident=20, peak=24))
-    plan = cache.plan(
-        "replace-fail",
-        (new,),
-        request_bytes=10,
-        available_bytes=64,
-        owner_set_capture_envelope_bytes=24,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=24,
-    )
-    cache.begin_maintenance(plan)
-    cache.fail_maintenance(plan)
-
-    assert cache.entries[old].hot
-    assert cache.entries[old].reclaimable
-    assert cache.entries[new].state == GraphResidency.COOLDOWN
-    assert cache.stats.evictions == 0
-
-
-def test_bounded_hotset_rejects_unreclaimable_but_separates_capture_peak() -> None:
-    old = key("target", "FULL", 1, 1, uniform=1)
-    new = key("target", "FULL", 16, 16, uniform=1)
-    cache = ElasticGraphCache(GENERATION)
-    publish(cache, old, pinned=True)
-    cache.register(new, price=price("new", resident=20, peak=24))
-
-    pinned = cache.plan(
-        "pinned",
-        (new,),
-        request_bytes=10,
-        available_bytes=64,
-        owner_set_capture_envelope_bytes=24,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=24,
-    )
-    assert pinned.kind == ElasticPlanKind.DEFER
-    assert pinned.defer_reason == "hotset_victim_not_reclaimable"
-    assert cache.entries[old].hot
-
-    empty = ElasticGraphCache(GENERATION)
-    conservative_capture = empty.plan(
-        "oversized",
-        (new,),
-        request_bytes=0,
-        available_bytes=128,
-        owner_set_capture_envelope_bytes=40,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=32,
-    )
-    assert conservative_capture.kind == ElasticPlanKind.MAINTENANCE
-    assert conservative_capture.staged_hotset_replace
-    assert conservative_capture.capture_loan_bytes == 40
+    assert plan.capture_loan_bytes == 150
 
 
 def test_idle_unpin_makes_pinned_graph_reclaimable() -> None:
     pinned_key = key("target", "FULL", 7, 7, uniform=1)
-    cache = ElasticGraphCache(GENERATION)
+    cache = ElasticAdmissionController(GENERATION)
     publish(cache, pinned_key, pinned=True)
 
     assert cache.unpin_idle((pinned_key,)) == (pinned_key,)
@@ -905,396 +1027,221 @@ def test_idle_unpin_makes_pinned_graph_reclaimable() -> None:
 
 def test_idle_unpin_rejects_leased_graph() -> None:
     pinned_key = key("target", "FULL", 9, 9, uniform=1)
-    cache = ElasticGraphCache(GENERATION)
+    cache = ElasticAdmissionController(GENERATION)
     publish(cache, pinned_key, pinned=True)
     plan = cache.plan("user", (pinned_key,), request_bytes=10, available_bytes=20)
     cache.commit_user(plan)
 
     with pytest.raises(ElasticGraphError, match="cannot unpin an active"):
         cache.unpin_idle((pinned_key,))
-
     assert cache.entries[pinned_key].pinned
     assert cache.entries[pinned_key].leases == frozenset({"user"})
 
 
-def test_bounded_hotset_retains_priced_entries_below_cap() -> None:
-    old = key("target", "FULL", 1, 1, uniform=1)
-    new = key("target", "FULL", 16, 16, uniform=1)
-    cache = ElasticGraphCache(GENERATION)
-    publish(cache, old)
-    cache.register(new, price=price("new", resident=20, peak=24))
+def test_pressure_reclaim_plans_pinned_and_evictable_without_early_mutation() -> None:
+    pinned_key = key("target", "FULL", 39, 39, uniform=1)
+    evictable_key = key("target", "PIECEWISE", 156, 39)
+    controller = ElasticAdmissionController(GENERATION)
+    publish(controller, pinned_key, pinned=True)
+    publish(controller, evictable_key)
+    controller.resident_bytes = 100
+    controller.floor_bytes = 12
 
-    plan = cache.plan(
-        "retain-below-cap",
-        (new,),
-        request_bytes=10,
-        available_bytes=64,
-        owner_set_capture_envelope_bytes=24,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=32,
+    plan = controller.plan_pressure_reclaim_all(
+        "pressure-x39", request_bytes=100, available_bytes=0
     )
 
-    assert plan.kind == ElasticPlanKind.MAINTENANCE
-    assert plan.staged_hotset_replace
-    assert not plan.victim_keys
-    assert plan.capture_loan_bytes == 34
-    cache.begin_maintenance(plan)
-    cache.finish_maintenance(plan, {new: price("new", resident=20, peak=24)})
-    assert cache.entries[old].hot
-    assert cache.entries[new].hot
-    assert cache.stats.evictions == 0
+    assert plan.kind == ElasticPlanKind.PRESSURE_RECLAIM
+    assert plan.victim_keys == (evictable_key, pinned_key)
+    assert plan.reclaim_groups == ()
+    assert plan.capture_loan_bytes == 12
+    assert plan.reclaim_bytes == 88
+    assert controller.entries[pinned_key].pinned
+    assert controller.entries[evictable_key].reclaimable
+
+    controller.begin_reclaim(plan)
+    assert not controller.entries[pinned_key].hot
+    assert not controller.entries[evictable_key].hot
 
 
-def test_bounded_hotset_retains_unknown_exact_set_when_envelope_fits() -> None:
-    """A miss is not an eviction trigger when conservative bytes fit."""
-    old = key("target", "FULL", 1, 1, uniform=1)
-    new = key("target", "PIECEWISE", 12, 3)
-    cache = ElasticGraphCache(GENERATION)
-    publish(cache, old)
+def test_pressure_reclaim_rejects_leased_pinned_set_without_mutation() -> None:
+    pinned_key = key("target", "FULL", 39, 39, uniform=1)
+    controller = ElasticAdmissionController(GENERATION)
+    publish(controller, pinned_key, pinned=True)
+    controller.retain_hot("active", (pinned_key,))
 
-    plan = cache.plan(
-        "retain-unknown-below-cap",
-        (new,),
-        request_bytes=100,
-        available_bytes=512,
-        owner_set_capture_envelope_bytes=180,
-        retained_transition_overlap_bytes=20,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=320,
+    plan = controller.plan_pressure_reclaim_all(
+        "leased", request_bytes=10, available_bytes=0
     )
 
-    assert plan.kind == ElasticPlanKind.MAINTENANCE
-    assert plan.staged_hotset_replace
-    assert plan.victim_keys == ()
-    assert plan.capture_loan_bytes == 300
-    assert cache.entries[old].hot
-
-
-def test_bounded_hotset_unknown_set_replaces_only_on_proven_cap_deficit() -> None:
-    old = key("target", "FULL", 1, 1, uniform=1)
-    new = key("target", "PIECEWISE", 12, 3)
-    cache = ElasticGraphCache(GENERATION)
-    publish(cache, old)
-
-    plan = cache.plan(
-        "replace-unknown-over-cap",
-        (new,),
-        request_bytes=180,
-        available_bytes=512,
-        owner_set_capture_envelope_bytes=180,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=320,
-    )
-
-    assert plan.kind == ElasticPlanKind.MAINTENANCE
-    assert plan.victim_keys == (old,)
-
-
-def test_unknown_set_does_not_double_count_shared_resident_floor() -> None:
-    """Destination envelope and current endpoint share retained CUDA state."""
-    old = key("target", "FULL", 1, 1, uniform=1)
-    new = key("target", "PIECEWISE", 8, 2)
-    cache = ElasticGraphCache(GENERATION)
-    publish(cache, old)
-
-    plan = cache.plan(
-        "retain-shared-floor",
-        (new,),
-        request_bytes=650,
-        available_bytes=700,
-        owner_set_capture_envelope_bytes=526,
-        shared_resident_bytes=520,
-        retained_transition_overlap_bytes=20,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=671,
-    )
-
-    assert plan.kind == ElasticPlanKind.MAINTENANCE
-    assert plan.victim_keys == ()
-    assert plan.capture_loan_bytes == 676
-
-
-def test_bounded_hotset_retained_transition_composes_workspace_overlap() -> None:
-    """The retained-endpoint max must not mask measured workspace overlap."""
-    old = key("target", "FULL", 1, 1, uniform=1)
-    new = key("target", "FULL", 16, 16, uniform=1)
-    cache = ElasticGraphCache(GENERATION)
-    publish(cache, old)
-    cache.register(new, price=price("new", resident=20, peak=24))
-
-    plan = cache.plan(
-        "retain-with-overlap",
-        (new,),
-        request_bytes=10,
-        available_bytes=96,
-        owner_set_capture_envelope_bytes=30,
-        retained_transition_overlap_bytes=32,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=64,
-    )
-
-    assert plan.kind == ElasticPlanKind.MAINTENANCE
-    assert plan.victim_keys == ()
-    # Without the explicit atomic term, request + peak (=34) masks the
-    # overlap carried only by a smaller owner-set envelope (=30).
-    assert plan.capture_loan_bytes == 66
-
-
-def test_live_retained_transition_receipt_funds_observed_residency() -> None:
-    """Replay the exact byte boundary from the failed short12 transaction."""
-    current_endpoint = 185_335_808
-    old_grant = 297_795_584
-    workspace_unit = 33_554_432
-    observed_residency = 309_067_776
-    miss_peaks = (23_855_104, 44_040_192, 44_564_480)
-    assert current_endpoint + sum(miss_peaks) == old_grant
-
-    cache = ElasticGraphCache(GENERATION)
-    old = key("old", "FULL", 2, 2, uniform=1)
-    publish(cache, old)
-    misses = (
-        key("target", "PIECEWISE", 4, 1),
-        key("mtp_prefill", "PIECEWISE", 4, 1),
-        key("mtp_decode", "FULL", 1, 1, uniform=1),
-    )
-    for graph_key, peak in zip(misses, miss_peaks, strict=True):
-        cache.register(
-            graph_key,
-            price=price(graph_key.logical.owner, resident=peak, peak=peak),
-        )
-
-    plan = cache.plan(
-        "live-receipt-replay",
-        misses,
-        request_bytes=current_endpoint,
-        available_bytes=1 << 30,
-        owner_set_capture_envelope_bytes=old_grant,
-        retained_transition_overlap_bytes=workspace_unit,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=640 << 20,
-    )
-
-    assert plan.victim_keys == ()
-    assert plan.capture_loan_bytes == 331_350_016
-    assert plan.capture_loan_bytes >= observed_residency
-
-
-def test_bounded_hotset_over_cap_replaces_old_endpoint() -> None:
-    old = key("target", "FULL", 1, 1, uniform=1)
-    new = key("target", "FULL", 16, 16, uniform=1)
-    cache = ElasticGraphCache(GENERATION)
-    publish(cache, old)
-    cache.register(new, price=price("new", resident=20, peak=24))
-    plan = cache.plan(
-        "absolute-endpoint",
-        (new,),
-        request_bytes=20,
-        available_bytes=44,
-        owner_set_capture_envelope_bytes=39,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=32,
-    )
-    assert plan.kind == ElasticPlanKind.MAINTENANCE
-    # The settled old+new residency would be 30 bytes, but request_bytes is
-    # the authoritative current endpoint for cap admission.  20+20 exceeds
-    # the declared 32-byte hotset, so this is replacement, not retention.
-    assert plan.capture_loan_bytes == 39
-    assert plan.staged_hotset_replace
-    assert cache.entries[old].hot
-    assert plan.victim_keys == (old,)
-
-
-def test_bounded_hotset_reclaims_only_minimum_lru_groups_for_deficit() -> None:
-    oldest = key("target", "FULL", 1, 1, uniform=1)
-    newer = key("target", "FULL", 2, 2, uniform=1)
-    newest = key("target", "FULL", 4, 4, uniform=1)
-    cold = key("target", "FULL", 8, 8, uniform=1)
-    cache = ElasticGraphCache(GENERATION)
-    for graph_key, resident in ((oldest, 10), (newer, 11), (newest, 12)):
-        graph_price = price(graph_key.identity, resident=resident, peak=resident)
-        cache.publish_hot(graph_key, graph_price, pinned=False)
-        cache.install_reclaim_group(
-            ReclaimGroup(
-                graph_price.reclaim_group,
-                (graph_key,),
-                reclaimable_bytes=resident,
-            )
-        )
-    cache.register(cold, price=price("cold", resident=8, peak=8))
-
-    # Current 33 + new 8 exceeds cap 25 by 16. The two oldest groups reclaim
-    # 21; the newest remains HOT. Whole-hotset replacement would reclaim 33.
-    plan = cache.plan(
-        "minimal-deficit",
-        (cold,),
-        request_bytes=33,
-        available_bytes=64,
-        owner_set_capture_envelope_bytes=8,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=25,
-    )
-
-    assert plan.kind == ElasticPlanKind.MAINTENANCE
-    assert plan.victim_keys == (oldest, newer)
-    assert plan.reclaim_bytes == 21
-    assert newest not in plan.victim_keys
-
-
-def test_bounded_hotset_rejects_absolute_endpoint_above_capacity() -> None:
-    old = key("target", "FULL", 1, 1, uniform=1)
-    new = key("target", "FULL", 16, 16, uniform=1)
-    cache = ElasticGraphCache(GENERATION)
-    publish(cache, old)
-    cache.register(new, price=price("new", resident=20, peak=24))
-    plan = cache.plan(
-        "endpoint-too-large",
-        (new,),
-        request_bytes=20,
-        available_bytes=39,
-        owner_set_capture_envelope_bytes=40,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=32,
-    )
     assert plan.kind == ElasticPlanKind.DEFER
-    assert plan.defer_reason == "insufficient_atomic_hotset_transition_bytes"
-    assert cache.entries[old].hot
+    assert plan.defer_reason == "pressure_reclaim_has_active_graph_lease"
+    assert not plan.victim_keys
+    assert controller.entries[pinned_key].pinned
+    assert controller.entries[pinned_key].leases == frozenset({"active"})
 
 
-def test_bounded_hotset_first_publication_is_staged_for_cap_validation() -> None:
-    desired = resolve_step_physical_keys((1, 3, 40, 40, 1), GENERATION, 4096)
-    cache = ElasticGraphCache(GENERATION)
+def test_pressure_reclaim_rejects_stale_protected_key_without_mutation() -> None:
+    pinned_key = key("target", "FULL", 39, 39, uniform=1)
+    controller = ElasticAdmissionController(GENERATION)
+    publish(controller, pinned_key, pinned=True)
+    stale = replace(
+        pinned_key,
+        generation=RuntimeGeneration("stale-idle-reclaim-generation"),
+    )
+    before = controller.snapshot
+
+    with pytest.raises(ElasticGraphError, match="stale generation"):
+        controller.plan_pressure_reclaim_all(
+            "pressure-reclaim-stale-protected",
+            request_bytes=1,
+            available_bytes=0,
+            protected_keys=(stale,),
+        )
+
+    assert controller.snapshot == before
+
+
+def test_no_deficit_miss_never_selects_a_victim() -> None:
+    old = key("target", "PIECEWISE", 8, 8)
+    new = key("target", "PIECEWISE", 16, 16)
+    cache = ElasticAdmissionController(GENERATION)
+    publish(cache, old)
+    cache.register(new, price=price("new", resident=20, peak=24))
 
     plan = cache.plan(
-        "first-publication",
-        desired,
-        request_bytes=0,
-        available_bytes=512,
-        owner_set_capture_envelope_bytes=200,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=256,
+        "capture-with-tail",
+        (new,),
+        request_bytes=10,
+        available_bytes=40,
+        owner_set_capture_envelope_bytes=24,
     )
 
     assert plan.kind == ElasticPlanKind.MAINTENANCE
-    assert plan.staged_hotset_replace
-    assert not plan.victim_keys
-    assert plan.physical_keys == desired
-    assert [item.logical.owner for item in plan.capture_order] == [
-        "mtp_prefill",
-        "target",
-        "mtp_decode",
-    ]
-    assert [item.logical.mode for item in plan.capture_order] == [
-        "PIECEWISE",
-        "FULL",
-        "FULL",
-    ]
+    assert plan.victim_keys == ()
+    assert plan.capture_order == (new,)
+    assert cache.entries[old].hot
 
 
-def test_m160_owner_set_preserves_dispatch_identity_but_captures_piecewise_first(
-) -> None:
-    desired = resolve_step_physical_keys(
-        (1, 3, 40, 160, 4),
-        GENERATION,
-        max_num_batched_tokens=4096,
-        compiled_piecewise_sizes=(256, 512, 1024, 2048, 4096),
+def test_residency_receipt_rejects_stale_generation_and_active_reclaim() -> None:
+    graph_key = key("target", "PIECEWISE", 8, 8)
+    with pytest.raises(ValueError, match="pinned Graph entry"):
+        ElasticResidencyEntry(
+            key=graph_key,
+            pinned=True,
+            resident_bytes=16,
+            local_pool_bytes=16,
+            reclaimable_bytes=16,
+        )
+    with pytest.raises(ValueError, match="leased Graph entry"):
+        ElasticResidencyEntry(
+            key=graph_key,
+            pinned=False,
+            resident_bytes=16,
+            local_pool_bytes=16,
+            reclaimable_bytes=16,
+            lease_ids=("active",),
+        )
+
+    stale = replace(graph_key, generation=RuntimeGeneration("stale"))
+    entry = ElasticResidencyEntry(
+        key=stale,
+        pinned=False,
+        resident_bytes=16,
+        local_pool_bytes=16,
+        reclaimable_bytes=16,
     )
-    cache = ElasticGraphCache(GENERATION)
+    with pytest.raises(ValueError, match="mixes runtime generations"):
+        ElasticResidencyReceipt(
+            generation=GENERATION,
+            transaction_id=None,
+            resident_bytes=16,
+            floor_bytes=0,
+            transition_floor_bytes=0,
+            peak_bytes=16,
+            cublas_workspace_bytes=0,
+            entries=(entry,),
+        )
 
-    plan = cache.plan(
-        "m160-first-publication",
-        desired,
-        request_bytes=0,
-        available_bytes=512,
-        owner_set_capture_envelope_bytes=200,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=256,
+    with pytest.raises(ValueError, match="partial.*forbidden"):
+        ElasticResidencyReceipt(
+            generation=GENERATION,
+            transaction_id=None,
+            resident_bytes=0,
+            floor_bytes=0,
+            transition_floor_bytes=0,
+            peak_bytes=0,
+            cublas_workspace_bytes=0,
+            entries=(),
+            complete=False,
+        )
+
+
+def test_runtime_config_is_single_fail_closed_activation_authority() -> None:
+    config = SimpleNamespace(
+        additional_config={"elastic_gdn_backing": True},
+        model_config=SimpleNamespace(enforce_eager=False),
+        compilation_config=SimpleNamespace(cudagraph_mode=SimpleNamespace(name="FULL")),
+    )
+    assert ElasticRuntimeConfig.from_vllm_config(config).enabled
+    config.model_config.enforce_eager = True
+    assert not ElasticRuntimeConfig.from_vllm_config(config).enabled
+
+
+def test_measured_deficit_defers_while_only_victim_is_leased() -> None:
+    active = key("target", "PIECEWISE", 8, 8)
+    cold = key("target", "PIECEWISE", 16, 16)
+    cache = ElasticAdmissionController(GENERATION)
+    publish(cache, active)
+    cache.register(cold, price=price("cold", resident=20, peak=24))
+    active_plan = cache.plan(
+        "active-a", (active,), request_bytes=10, available_bytes=40
+    )
+    cache.commit_user(active_plan)
+
+    deferred = cache.plan(
+        "defer-b",
+        (cold,),
+        request_bytes=10,
+        available_bytes=20,
+        owner_set_capture_envelope_bytes=30,
     )
 
-    assert [item.logical.owner for item in plan.physical_keys] == [
-        "target",
-        "mtp_prefill",
-        "mtp_decode",
-    ]
-    assert [item.logical.owner for item in plan.capture_order] == [
-        "mtp_prefill",
-        "target",
-        "mtp_decode",
-    ]
-    assert [item.logical.mode for item in plan.capture_order] == [
-        "PIECEWISE",
-        "FULL",
-        "FULL",
-    ]
+    assert deferred.kind == ElasticPlanKind.DEFER
+    assert deferred.defer_reason == "insufficient_reclaimable_graph_and_kv_bytes"
+    assert cache.entries[active].hot
+    assert cache.entries[active].leases == frozenset({"active-a"})
 
 
-def test_bounded_hotset_a_b_a_retains_both_owner_sets_with_shared_floor() -> None:
-    """A and B capture once each; the return to A is a pure HOT hit.
+def test_true_idle_reclaim_then_capture_preserves_progress() -> None:
+    old = key("target", "PIECEWISE", 8, 8)
+    new = key("target", "PIECEWISE", 16, 16)
+    cache = ElasticAdmissionController(GENERATION)
+    publish(cache, old)
+    cache.release("absent")
 
-    The worker aggregate includes a large shared CUDA/runtime floor.  It must
-    be counted once when predicting the settled A+B endpoint, otherwise the
-    first B miss spuriously replaces A and turns A->B->A into recapture churn.
-    """
-    cache = ElasticGraphCache(GENERATION)
-    a = key("target", "FULL", 4, 1, uniform=4)
-    b = key("target", "FULL", 8, 2, uniform=4)
-    shared_floor = 520
-    cap = 671
-
-    first_a = cache.plan(
-        "capture-a",
-        (a,),
-        request_bytes=0,
-        available_bytes=cap,
-        owner_set_capture_envelope_bytes=650,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=cap,
+    reclaim = cache.plan_reclaim_all(
+        "idle-reclaim", request_bytes=10, available_bytes=0
     )
-    assert first_a.kind == ElasticPlanKind.MAINTENANCE
-    cache.begin_maintenance(first_a)
-    cache.finish_maintenance(
-        first_a,
-        {a: price("a", resident=130, peak=130)},
-    )
+    assert reclaim.kind == ElasticPlanKind.RECLAIM
+    cache.begin_reclaim(reclaim)
+    cache.synchronize_hot(())
 
-    first_b = cache.plan(
+    cache.register(new, price=price("new", resident=20, peak=24))
+    capture = cache.plan(
         "capture-b",
-        (b,),
-        request_bytes=650,
-        available_bytes=700,
-        owner_set_capture_envelope_bytes=526,
-        shared_resident_bytes=shared_floor,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=cap,
+        (new,),
+        request_bytes=0,
+        available_bytes=24,
+        owner_set_capture_envelope_bytes=24,
     )
-    assert first_b.kind == ElasticPlanKind.MAINTENANCE
-    assert first_b.victim_keys == ()
-    cache.begin_maintenance(first_b)
-    cache.finish_maintenance(
-        first_b,
-        {b: price("b", resident=6, peak=6)},
-    )
-
-    return_a = cache.plan(
-        "return-a",
-        (a,),
-        request_bytes=656,
-        available_bytes=700,
-        owner_set_capture_envelope_bytes=650,
-        shared_resident_bytes=shared_floor,
-        replace_unleased_on_miss=True,
-        residency_cap_bytes=cap,
-    )
-    assert return_a.kind == ElasticPlanKind.USER
-    assert return_a.hot_hits == (a,)
-    assert return_a.cold_misses == ()
-    assert cache.stats.cold_misses == 2
-    assert cache.stats.promotions == 2
-    assert cache.stats.evictions == 0
+    assert capture.kind == ElasticPlanKind.MAINTENANCE
+    assert capture.victim_keys == ()
 
 
 def test_observability_is_aggregate_and_trace_is_bounded() -> None:
     graph_key = key("target", "PIECEWISE", 4096, 8)
-    cache = ElasticGraphCache(GENERATION)
+    cache = ElasticAdmissionController(GENERATION)
     publish(cache, graph_key)
     for index in range(140):
         plan = cache.plan(
@@ -1317,7 +1264,7 @@ def test_observability_is_aggregate_and_trace_is_bounded() -> None:
 def test_kv_pressure_builds_explicit_reclaim_transaction() -> None:
     full = key("target", "FULL", 4, 1, uniform=4)
     piecewise = key("target", "PIECEWISE", 4096, 8)
-    cache = ElasticGraphCache(GENERATION)
+    cache = ElasticAdmissionController(GENERATION)
     publish(cache, full, pinned=True)
     publish(cache, piecewise)
     plan = cache.plan_reclaim_all("kv-pressure", request_bytes=20, available_bytes=0)
@@ -1332,7 +1279,7 @@ def test_insufficient_capacity_defers_without_evicting_pinned_or_leased() -> Non
     pinned = key("target", "FULL", 4, 1, uniform=4)
     leased = key("target", "PIECEWISE", 2048, 8)
     cold = key("target", "PIECEWISE", 4096, 8)
-    cache = ElasticGraphCache(GENERATION)
+    cache = ElasticAdmissionController(GENERATION)
     publish(cache, pinned, pinned=True)
     publish(cache, leased)
     active = cache.plan("active", (leased,), request_bytes=0, available_bytes=0)
@@ -1348,7 +1295,7 @@ def test_insufficient_capacity_defers_without_evicting_pinned_or_leased() -> Non
 
 def test_rank_consensus_rejects_stale_or_divergent_plan_before_mutation() -> None:
     graph_key = key("target", "FULL", 4, 1, uniform=4)
-    cache = ElasticGraphCache(GENERATION)
+    cache = ElasticAdmissionController(GENERATION)
     publish(cache, graph_key, pinned=True)
     plan = cache.plan("same", (graph_key,), request_bytes=0, available_bytes=0)
     assert require_plan_consensus((plan, plan)) == plan.fingerprint
@@ -1363,7 +1310,7 @@ def test_rank_consensus_rejects_stale_or_divergent_plan_before_mutation() -> Non
 
 def test_last_item_release_does_not_clear_idle_residency() -> None:
     graph_key = key("target", "PIECEWISE", 4096, 8)
-    cache = ElasticGraphCache(GENERATION)
+    cache = ElasticAdmissionController(GENERATION)
     publish(cache, graph_key)
     plan = cache.plan("tail", (graph_key,), request_bytes=0, available_bytes=0)
     cache.commit_user(plan)
@@ -1375,7 +1322,7 @@ def test_last_item_release_does_not_clear_idle_residency() -> None:
 def test_deferred_free_blocks_reclaim_until_physical_completion() -> None:
     graph_key = key("target", "PIECEWISE", 4096, 8)
     cold = key("mtp_prefill", "PIECEWISE", 4096, 8)
-    cache = ElasticGraphCache(GENERATION)
+    cache = ElasticAdmissionController(GENERATION)
     publish(cache, graph_key)
     cache._entries[graph_key] = replace(cache.entries[graph_key], deferred_free=True)
     cache.register(cold, price=price("cold", resident=9, peak=12))
@@ -1388,7 +1335,7 @@ def test_reclaim_group_is_atomic_not_sum_of_marginal_entry_prices() -> None:
     first = key("target", "PIECEWISE", 2048, 8)
     second = key("mtp_prefill", "PIECEWISE", 2048, 8)
     cold = key("target", "PIECEWISE", 4096, 8)
-    cache = ElasticGraphCache(GENERATION)
+    cache = ElasticAdmissionController(GENERATION)
     shared = price("shared-pool", resident=10, peak=12)
     cache.publish_hot(first, shared, pinned=False)
     cache.publish_hot(second, shared, pinned=False)
