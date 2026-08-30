@@ -491,8 +491,9 @@ class ElasticResidencyEntry:
                 raise ValueError(f"{name} must be a non-negative integer")
         if self.reclaimable_bytes > self.resident_bytes:
             raise ValueError("reclaim proof exceeds resident bytes")
-        if self.pinned and self.reclaimable_bytes:
-            raise ValueError("a pinned Graph entry cannot be reclaimable")
+        # Pinning is current policy; reclaimable_bytes is the physical proof
+        # available after a future explicit idle unpin. A lease, unlike a pin,
+        # crosses an active ownership boundary and must still suppress proof.
         if tuple(sorted(set(self.lease_ids))) != self.lease_ids:
             raise ValueError("lease ids must be sorted and unique")
         if self.lease_ids and self.reclaimable_bytes:
@@ -1359,7 +1360,7 @@ class ElasticAdmissionController:
                         capture_peak_bytes=resident,
                         reclaim_group=f"private-pool:{entry.key.identity}",
                     ),
-                    entry.pinned,
+                    entry.pinned or entry.reclaimable_bytes == 0,
                     entry.reclaimable_bytes,
                 )
             )
@@ -1458,16 +1459,15 @@ class ElasticAdmissionController:
                 entry, leases=entry.leases.union((transaction_id,))
             )
 
-    def unpin_idle(
-        self,
-        keys: Iterable[PhysicalReplayKey],
-    ) -> tuple[PhysicalReplayKey, ...]:
-        """Make selected idle pinned entries reclaimable for a rebuild."""
-        selected = set(keys)
+    def unpin_idle(self) -> tuple[PhysicalReplayKey, ...]:
+        """Make every proof-backed idle pin reclaimable for calibration."""
+        reclaimable_keys = {
+            key for group in self._groups.values() for key in group.keys
+        }
         pinned = tuple(
             entry
             for entry in self._entries.values()
-            if entry.pinned and entry.key in selected
+            if entry.pinned and entry.key in reclaimable_keys
         )
         if any(entry.leases or entry.deferred_free for entry in pinned):
             raise ElasticGraphError("cannot unpin an active graph executable")
@@ -1538,6 +1538,11 @@ class ElasticAdmissionController:
                 )
         self._groups.clear()
         for key, (price, pinned, reclaimable_bytes) in observed.items():
+            # An executable without a physical reclaim proof may be reusable,
+            # but deleting it cannot fund another capture. Represent that
+            # retained pool residency as pinned instead of creating the
+            # impossible HOT_EVICTABLE-without-a-group state.
+            pinned = pinned or reclaimable_bytes == 0
             prior = self._entries.get(key)
             was_capturing = (
                 prior is not None and prior.state == GraphResidency.CAPTURING
@@ -1563,7 +1568,7 @@ class ElasticAdmissionController:
                 self.publish_hot(key, price, pinned=pinned)
             if was_capturing:
                 self._promotions += 1
-            if not pinned and reclaimable_bytes:
+            if reclaimable_bytes:
                 self.install_reclaim_group(
                     ReclaimGroup(
                         group_id=price.reclaim_group,

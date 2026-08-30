@@ -144,12 +144,13 @@ def _arc_quantize_impl(
     if (
         k <= 0
         or k % 64 != 0
-        or selected_count not in (64, 256, 512)
+        or selected_count not in (0, 64, 256, 512)
         or selected.dtype != torch.int32
+        or x.dtype not in (torch.bfloat16, torch.float16)
     ):
         raise ValueError(
             "ARC requires BF16/FP16 [...,K] with K divisible by 64 and "
-            "int32 selected[64|256|512]"
+            "int32 selected[0|64|256|512]"
         )
     original_shape = x.shape
     x = x.reshape(-1, x.shape[-1])
@@ -160,6 +161,8 @@ def _arc_quantize_impl(
         backend="b12x",
         padded_n=x.shape[1] + selected_count,
     )
+    if selected_count == 0:
+        return packed.view(-1, original_shape[-1] // 2), scales
     _write_residual_tail_kernel[(x.shape[0], selected_count // 16)](
         x,
         selected,

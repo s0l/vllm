@@ -31,6 +31,10 @@ _OWNER_WIDTHS = (2048, 2048, 1024)
 _OWNER_OFFSETS = (0, 2048, 4096)
 
 
+def _owner_runtime_active() -> bool:
+    return os.environ.get("AG2_VLLM_TP3_OWNER_PREQUANT", "0") == "1"
+
+
 def _record_applied_prefix(sidecar: _Sidecar, prefix: str, rank: int) -> None:
     """Record exact manifest coverage without emitting one INFO line per layer."""
     if prefix in sidecar.applied_prefixes:
@@ -199,7 +203,7 @@ def maybe_apply_ag2_nvfp4_arc_sidecar(
     layer.register_buffer(
         "_ag2_nvfp4_arc_selected", selected.contiguous(), persistent=False
     )
-    if os.environ.get("AG2_VLLM_TP3_OWNER_PREQUANT", "0") == "1":
+    if _owner_runtime_active():
         selected_cpu: list[torch.Tensor] = []
         for peer_rank in range(3):
             peer_manifest_path = Path(directory_text) / f"rank{peer_rank}.manifest.json"
@@ -280,6 +284,7 @@ def maybe_apply_ag2_nvfp4_arc_sidecar(
         )
     layer._ag2_nvfp4_arc_runtime_suffix = suffix
     layer._ag2_nvfp4_arc_sidecar_sha256 = sidecar.manifest["sidecar_sha256"]
+    layer._ag2_nvfp4_owner_metadata_mode = "model-bound-arc"
     _record_applied_prefix(sidecar, prefix, rank)
     logger.debug(
         "AG2 ARC appended prefix=%s rank=%d K=%d->%d",
@@ -288,4 +293,40 @@ def maybe_apply_ag2_nvfp4_arc_sidecar(
         record["base_k"],
         record["augmented_k"],
     )
+    return True
+
+
+def ensure_ag2_nvfp4_base_owner_metadata(layer: torch.nn.Module) -> bool:
+    """Install the model-independent zero-tail owner ABI when ARC is absent."""
+    if not _owner_runtime_active():
+        return False
+    if hasattr(layer, "_ag2_nvfp4_arc_selected_all"):
+        return False
+    if not hasattr(layer, "weight") or layer.weight.ndim != 2:
+        raise RuntimeError("base owner metadata requires a loaded matrix weight")
+    device = layer.weight.device
+    world = len(_OWNER_WIDTHS)
+    layer.register_buffer(
+        "_ag2_nvfp4_arc_selected",
+        torch.empty(0, dtype=torch.int32, device=device),
+        persistent=False,
+    )
+    layer.register_buffer(
+        "_ag2_nvfp4_arc_selected_all",
+        torch.empty((world, 0), dtype=torch.int32, device=device),
+        persistent=False,
+    )
+    for destination in range(world):
+        layer.register_buffer(
+            f"_ag2_nvfp4_arc_route_to_{destination}",
+            torch.empty(0, dtype=torch.int64, device=device),
+            persistent=False,
+        )
+    layer.register_buffer(
+        "_ag2_nvfp4_arc_inverse_order",
+        torch.empty(0, dtype=torch.int64, device=device),
+        persistent=False,
+    )
+    layer._ag2_nvfp4_arc_route_counts = (0,) * (world * world)
+    layer._ag2_nvfp4_owner_metadata_mode = "native-base-only"
     return True

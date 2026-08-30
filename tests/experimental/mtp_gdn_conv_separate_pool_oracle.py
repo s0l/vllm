@@ -61,9 +61,35 @@ def main() -> None:
         dtype=dtype,
     )
     multi_state[block_ids[:, 0].long()] = initial
+    dirty_scratch_state = multi_state.clone()
+    dirty_scratch_state[block_ids[:, 1:].long().flatten()] = (
+        torch.randn_like(dirty_scratch_state[block_ids[:, 1:].long().flatten()])
+        * 7
+    )
     multi_out = causal_conv1d_update(
         inputs.reshape(num_reqs * query_len, dim).clone(),
         multi_state,
+        weight,
+        bias,
+        "silu",
+        conv_state_indices=block_ids,
+        num_accepted_tokens=torch.ones(
+            num_reqs, device=device, dtype=torch.int32
+        ),
+        query_start_loc=torch.arange(
+            0,
+            (num_reqs + 1) * query_len,
+            query_len,
+            device=device,
+            dtype=torch.int32,
+        ),
+        max_query_len=query_len,
+        separate_pool=True,
+        validate_data=False,
+    )
+    dirty_scratch_out = causal_conv1d_update(
+        inputs.reshape(num_reqs * query_len, dim).clone(),
+        dirty_scratch_state,
         weight,
         bias,
         "silu",
@@ -109,6 +135,9 @@ def main() -> None:
     multi_state_history = multi_state[
         block_ids.long().flatten()
     ].reshape(num_reqs, query_len, dim, width - 1)
+    dirty_scratch_history = dirty_scratch_state[
+        block_ids.long().flatten()
+    ].reshape(num_reqs, query_len, dim, width - 1)
 
     result = {
         "shape": {
@@ -130,11 +159,19 @@ def main() -> None:
         "bit_exact_state_history": torch.equal(
             multi_state_history, sequential_state_history
         ),
+        "dirty_scratch_output_exact": torch.equal(
+            dirty_scratch_out, sequential_out
+        ),
+        "dirty_scratch_state_history_exact": torch.equal(
+            dirty_scratch_history, sequential_state_history
+        ),
     }
     print(json.dumps(result, indent=2))
     if (
         not result["bit_exact_output"]
         or not result["bit_exact_state_history"]
+        or not result["dirty_scratch_output_exact"]
+        or not result["dirty_scratch_state_history_exact"]
         or result["scratch_zero_blocks"] != 0
     ):
         raise SystemExit(1)

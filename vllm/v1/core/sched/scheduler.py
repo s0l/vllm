@@ -325,12 +325,17 @@ class Scheduler(SchedulerInterface):
         self._elastic_graph_carrier_step_key: tuple[int, ...] | None = None
         if os.environ.get("AG2_VLLM_ELASTIC_CALIBRATION", "0") == "1":
             raise RuntimeError(
-                "AG2_VLLM_ELASTIC_CALIBRATION was removed from serving; "
-                "use the explicit offline catalog tool"
+                "AG2_VLLM_ELASTIC_CALIBRATION is obsolete; normal startup "
+                "calibrates a catalog miss when "
+                "AG2_VLLM_ELASTIC_AUTO_CALIBRATE=1 and "
+                "AG2_VLLM_ELASTIC_CALIBRATION_SURFACE is set"
             )
         self._elastic_restore_mode = False
         self._elastic_require_catalog = (
             os.environ.get("AG2_VLLM_ELASTIC_REQUIRE_CATALOG", "0") == "1"
+        )
+        self._elastic_auto_calibrate = (
+            os.environ.get("AG2_VLLM_ELASTIC_AUTO_CALIBRATE", "0") == "1"
         )
         self._elastic_graph_catalog: dict[tuple[int, ...], dict[str, int]] = {}
         self._elastic_graph_catalog_coverage: dict[str, Any] = {}
@@ -340,57 +345,22 @@ class Scheduler(SchedulerInterface):
                 load_elastic_graph_catalog_coverage,
             )
 
-            self._elastic_graph_catalog = load_elastic_graph_catalog(
-                self.vllm_config, kv_cache_config
-            )
-            if self._elastic_graph_catalog:
-                self._elastic_graph_catalog_coverage = (
+            catalog = load_elastic_graph_catalog(self.vllm_config, kv_cache_config)
+            if catalog:
+                self.activate_elastic_graph_catalog(
+                    catalog,
                     load_elastic_graph_catalog_coverage(
                         self.vllm_config, kv_cache_config
-                    )
-                )
-                self.max_num_running_reqs = min(
-                    self.max_num_running_reqs,
-                    self._elastic_graph_catalog_coverage["mixed_max_x"],
-                )
-                logger.info(
-                    "Elastic sealed product boundary enabled: decode_max_x=%d "
-                    "mixed_max_x=%d full_context_max_x=%d scheduler_cap=%d",
-                    self._elastic_graph_catalog_coverage["decode_max_x"],
-                    self._elastic_graph_catalog_coverage["mixed_max_x"],
-                    self._elastic_graph_catalog_coverage["full_context_max_x"],
-                    self.max_num_running_reqs,
-                )
-            for catalog_key, row in self._elastic_graph_catalog.items():
-                self._record_elastic_capture_envelope(
-                    catalog_key,
-                    (
-                        _elastic_catalog_cold_residency_envelope(row),
-                        row["floor_bytes"],
-                        0,
                     ),
                 )
-                # A bounded short PIECEWISE request has one prefill step and
-                # must reclaim before a fresh cohort crosses admission.  Its
-                # repeated cold-capture envelope is therefore the conservative
-                # same-key replay price; a synthetic inter-cohort HOT counter
-                # is neither reachable nor required.
-                self._elastic_admission_controller.record_measurement(
-                    catalog_key,
-                    (
-                        max(row["cold_peak_bytes"], row["hot_peak_bytes"])
-                        if (
-                            self._elastic_graph_catalog_coverage.get("representation")
-                            == "bounded_exact_hotset"
-                            and catalog_key[0] == 0
-                        )
-                        else row["hot_peak_bytes"]
-                    ),
-                )
-            if self._elastic_require_catalog and not self._elastic_graph_catalog:
+            if (
+                self._elastic_require_catalog
+                and not self._elastic_graph_catalog
+                and not self._elastic_auto_calibrate
+            ):
                 raise RuntimeError(
-                    "elastic CUDA Graph catalog is empty; use the explicit "
-                    "offline catalog tool before serving"
+                    "elastic CUDA Graph catalog is empty; enable automatic "
+                    "pre-READY calibration and provide an accepted surface"
                 )
         self._elastic_graph_idle_cleanup_timeout_s = 5.0
         self._elastic_last_graph_admission_rejection: tuple[object, ...] | None = None
@@ -747,6 +717,68 @@ class Scheduler(SchedulerInterface):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
+
+    def activate_elastic_graph_catalog(
+        self,
+        catalog: dict[tuple[int, ...], dict[str, int]],
+        coverage: dict[str, Any],
+    ) -> None:
+        """Activate one sealed catalog before any user request is admitted."""
+        lifecycle_initialized = hasattr(self, "requests")
+        active_lifecycle = lifecycle_initialized and (
+            self.has_unfinished_requests()
+            or self.has_finished_requests()
+            or bool(self.num_waiting_for_streaming_input)
+            or self._elastic_admission_controller.pending_maintenance_plan is not None
+            or getattr(self, "_elastic_restore_retention_id", None) is not None
+        )
+        if not catalog:
+            raise RuntimeError("elastic catalog activation requires a sealed catalog")
+        if self._elastic_graph_catalog:
+            raise RuntimeError(
+                "elastic catalog activation requires no previously active catalog"
+            )
+        if active_lifecycle:
+            raise RuntimeError(
+                "elastic catalog activation requires a quiescent pre-READY lifecycle"
+            )
+        self._elastic_graph_catalog = catalog
+        self._elastic_graph_catalog_coverage = coverage
+        self.max_num_running_reqs = min(
+            self.max_num_running_reqs,
+            coverage["mixed_max_x"],
+        )
+        logger.info(
+            "Elastic sealed product boundary enabled: decode_max_x=%d "
+            "mixed_max_x=%d full_context_max_x=%d scheduler_cap=%d",
+            coverage["decode_max_x"],
+            coverage["mixed_max_x"],
+            coverage["full_context_max_x"],
+            self.max_num_running_reqs,
+        )
+        for catalog_key, row in catalog.items():
+            self._record_elastic_capture_envelope(
+                catalog_key,
+                (
+                    _elastic_catalog_cold_residency_envelope(row),
+                    row["floor_bytes"],
+                    0,
+                ),
+            )
+            # A bounded short PIECEWISE request has one prefill step and must
+            # reclaim before a fresh cohort crosses admission. Its repeated
+            # cold envelope is the conservative same-key replay price.
+            self._elastic_admission_controller.record_measurement(
+                catalog_key,
+                (
+                    max(row["cold_peak_bytes"], row["hot_peak_bytes"])
+                    if (
+                        coverage.get("representation") == "bounded_exact_hotset"
+                        and catalog_key[0] == 0
+                    )
+                    else row["hot_peak_bytes"]
+                ),
+            )
 
     @property
     def _gdn_checkpoint_coordinator(self) -> HybridKVCacheCoordinator | None:
@@ -6714,10 +6746,7 @@ class Scheduler(SchedulerInterface):
                 self._elastic_admission_controller.observe_defer(reclaim)
         return admitted
 
-    def prepare_elastic_restore_idle_reclaim(
-        self,
-        rebuild_step_keys: Sequence[tuple[int, ...]] = (),
-    ) -> bool:
+    def prepare_elastic_restore_idle_reclaim(self) -> bool:
         """Prepare a shape-less reclaim before a calibration wave exists.
 
         Reclaim must precede ``add_request``.  Merely requiring an empty
@@ -6737,16 +6766,11 @@ class Scheduler(SchedulerInterface):
             raise RuntimeError("elastic idle reclaim found pending maintenance")
         if not self._elastic_admission_controller.resident_bytes:
             return False
-        rebuild_physical_keys = tuple(
-            dict.fromkeys(
-                physical_key
-                for step_key in rebuild_step_keys
-                for physical_key in self._resolve_elastic_step_physical_keys(
-                    self._elastic_graph_carrier_closure_step_key(step_key)
-                )
-            )
-        )
-        self._elastic_admission_controller.unpin_idle(rebuild_physical_keys)
+        # Calibration rows are independent measurements, not a cumulative
+        # serving hotset. Retaining earlier pinned FULL forms makes admission
+        # depend on sweep order and can falsely contract a later product X.
+        # The controller keeps zero-proof entries pinned fail-closed.
+        self._elastic_admission_controller.unpin_idle()
         reclaim = self._elastic_admission_controller.plan_reclaim_all(
             self._next_elastic_transaction_id(),
             request_bytes=self._elastic_admission_controller.resident_bytes,

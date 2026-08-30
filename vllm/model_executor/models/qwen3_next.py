@@ -125,8 +125,6 @@ def _ag2_tp3_owner_prequant_enabled(
         raise RuntimeError(
             "TP3 owner prequant requires CE (compressed all-reduce) enabled"
         )
-    if not os.environ.get("AG2_VLLM_NVFP4_ARC_SIDECAR_DIR", "").strip():
-        raise RuntimeError("TP3 owner prequant requires the ARC sidecar")
     boolean_trace_switches = (
         "AG2_VLLM_AUX_HIDDEN_TRACE_ALL_INTERNAL_BOUNDARIES",
         "AG2_VLLM_AUX_HIDDEN_TRACE_COMPACT_ALL_BOUNDARIES",
@@ -2430,11 +2428,17 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                     )
                 if not hasattr(consumer, "_ag2_nvfp4_arc_selected_all"):
                     raise RuntimeError(
-                        f"layer {layer.layer_idx} consumer is missing "
-                        "ARC owner metadata"
+                        f"layer {layer.layer_idx} consumer is missing owner metadata"
+                    )
+                mode = getattr(consumer, "_ag2_nvfp4_owner_metadata_mode", None)
+                if mode not in ("native-base-only", "model-bound-arc"):
+                    raise RuntimeError(
+                        f"layer {layer.layer_idx} owner metadata mode is "
+                        f"invalid: {mode}"
                     )
         logger.warning(
-            "Validated target-only TP3 owner residual + ARC prequant ABI for %d layers",
+            "Validated target-only TP3 owner residual/RMS/prequant ABI for %d "
+            "layers (ARC is capability-bound, not required)",
             sum(
                 getattr(layer, "_ag2_tp3_owner_prequant", False)
                 for layer in self.layers

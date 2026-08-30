@@ -9,8 +9,11 @@ explicit rather than documentary.
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from vllm.config import VllmConfig
@@ -23,6 +26,90 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.structured_output import StructuredOutputManager
 
 logger = init_logger(__name__)
+
+
+def _write_calibration_receipt(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(f"{path.suffix}.tmp.{os.getpid()}")
+    try:
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _auto_calibrate_missing_catalog(owner: Any) -> None:
+    from vllm import envs
+    from vllm.v1.core.elastic_catalog import load_sealed_catalog
+    from vllm.v1.engine.elastic_calibrator import calibrate_and_publish_catalog
+    from vllm.v1.worker.startup_plan import (
+        compute_elastic_graph_catalog_fingerprint,
+        load_elastic_graph_catalog,
+        load_elastic_graph_catalog_coverage,
+    )
+
+    surface_value = os.environ.get("AG2_VLLM_ELASTIC_CALIBRATION_SURFACE", "")
+    if not surface_value:
+        raise RuntimeError(
+            "automatic elastic calibration requires "
+            "AG2_VLLM_ELASTIC_CALIBRATION_SURFACE"
+        )
+    surface_path = Path(surface_value)
+    surface_payload = load_sealed_catalog(surface_path, require_migration=False)
+    scheduler = owner.scheduler
+    fingerprint = compute_elastic_graph_catalog_fingerprint(
+        owner.vllm_config, scheduler.kv_cache_config
+    )
+    receipt_path = Path(
+        os.environ.get("AG2_VLLM_ELASTIC_CALIBRATION_RECEIPT")
+        or Path(envs.VLLM_CACHE_ROOT)
+        / "elastic_graph_catalog"
+        / f"auto_calibration_{fingerprint}.json"
+    )
+    receipt: dict[str, Any] = {
+        "schema": "ag2-elastic-auto-calibration-v1",
+        "stage": "calibrating",
+        "fingerprint": fingerprint,
+        "surface": str(surface_path.resolve()),
+    }
+    _write_calibration_receipt(receipt_path, receipt)
+    try:
+        result = calibrate_and_publish_catalog(
+            owner,
+            surface_payload,
+            output_root=Path(envs.VLLM_CACHE_ROOT),
+            expected_fingerprint=fingerprint,
+        )
+        catalog = load_elastic_graph_catalog(
+            owner.vllm_config, scheduler.kv_cache_config
+        )
+        coverage = load_elastic_graph_catalog_coverage(
+            owner.vllm_config, scheduler.kv_cache_config
+        )
+        scheduler.activate_elastic_graph_catalog(catalog, coverage)
+        receipt.update(
+            stage="complete",
+            destination=str(result.destination),
+            measured_shapes=result.measured_shapes,
+            wall_seconds=result.wall_seconds,
+        )
+        _write_calibration_receipt(receipt_path, receipt)
+        logger.warning(
+            "Elastic catalog calibrated automatically before READY: "
+            "fingerprint=%s shapes=%d destination=%s",
+            result.fingerprint,
+            result.measured_shapes,
+            result.destination,
+        )
+    except BaseException as error:
+        receipt.update(
+            stage="failed",
+            error={"type": type(error).__name__, "message": str(error)},
+        )
+        _write_calibration_receipt(receipt_path, receipt)
+        raise
 
 
 @dataclass(frozen=True)
@@ -115,9 +202,7 @@ def prepare_elastic_runtime(
 ) -> ElasticRuntimePreparation:
     """Prepare the post-KV scheduler epoch in the production order."""
     kv_cache_config = initialize_kv_cache()
-    resolve_elastic_graph_execution_policy(
-        vllm_config, kv_cache_config, collective_rpc
-    )
+    resolve_elastic_graph_execution_policy(vllm_config, kv_cache_config, collective_rpc)
     manager = (
         StructuredOutputManager(vllm_config)
         if structured_output_manager_factory is None
@@ -160,11 +245,14 @@ def complete_elastic_startup(owner: Any) -> str:
     """Restore an exact sealed elastic runtime and publish its residency."""
     scheduler = owner.scheduler
     outcome = "not_elastic"
-    if (
-        getattr(scheduler, "elastic_on_demand_graphs", False)
-        and getattr(scheduler, "_elastic_require_catalog", False)
+    if getattr(scheduler, "elastic_on_demand_graphs", False) and getattr(
+        scheduler, "_elastic_require_catalog", False
     ):
         try:
+            if not scheduler._elastic_graph_catalog:
+                if not getattr(scheduler, "_elastic_auto_calibrate", False):
+                    raise RuntimeError("required elastic Graph catalog is absent")
+                _auto_calibrate_missing_catalog(owner)
             representation = scheduler._elastic_graph_catalog_coverage.get(
                 "representation", "pinned_full_family"
             )

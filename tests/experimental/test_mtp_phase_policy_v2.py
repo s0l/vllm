@@ -881,6 +881,113 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
         manager.update_request_blocks(_scheduler_output(finished=["req"]))
         self.assertNotIn("req", manager._block_ids)
 
+    def test_v2_gdn_cold_reuse_zeroes_new_owner_after_finish(self):
+        manager = V2GDNCheckpointManager()
+        store = _Store()
+        manager.store = store
+
+        old = SimpleNamespace(req_id="old", block_ids=([3], [9]))
+        old_output = _scheduler_output(new=[old], scheduled={"old": 1})
+        manager.update_request_blocks(old_output)
+        manager.prepare(old_output, object(), {"old": 0}, {})
+        self.assertEqual(store.calls, [("zero", ([3], [9]))])
+
+        # The scheduler may return a finished request's physical block and
+        # allocate it to a newcomer in the same output. The old owner must be
+        # forgotten before the new mapping is installed, and the recycled
+        # recurrent bytes must be cleared before the newcomer's first forward.
+        store.calls.clear()
+        new = SimpleNamespace(req_id="new", block_ids=([3], [9]))
+        reused_output = _scheduler_output(
+            new=[new], finished=["old"], scheduled={"new": 1}
+        )
+        manager.update_request_blocks(reused_output)
+        manager.prepare(reused_output, object(), {"new": 0}, {})
+
+        self.assertEqual(manager._block_ids, {"new": ([3], [9])})
+        self.assertEqual(store.calls, [("zero", ([3], [9]))])
+
+    def test_v2_gdn_cold_reuse_clears_base_and_speculative_bytes(self):
+        spec = MambaSpec(
+            block_size=4,
+            shapes=((2,),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+            num_speculative_blocks=2,
+            separate_pool=True,
+            separate_pool_num_blocks=7,
+        )
+        state = torch.arange(14, dtype=torch.float32).view(7, 2)
+        config = SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec, layer_names=["gdn"])]
+        )
+        forward_context = {"gdn": SimpleNamespace(kv_cache=[state])}
+        manager = V2GDNCheckpointManager()
+
+        old = SimpleNamespace(req_id="old", block_ids=([3, 4, 5],))
+        manager.update_request_blocks(_scheduler_output(new=[old]))
+        state[3:6].fill_(99)
+
+        new = SimpleNamespace(req_id="new", block_ids=([3, 4, 5],))
+        output = _scheduler_output(
+            new=[new], finished=["old"], scheduled={"new": 1}
+        )
+        manager.update_request_blocks(output)
+        manager.prepare(output, config, {"new": 0}, forward_context)
+
+        torch.testing.assert_close(state[3:6], torch.zeros((3, 2)))
+
+    def test_v2_gdn_resume_replaces_blocks_and_restores_or_zeroes(self):
+        manager = V2GDNCheckpointManager()
+        store = _Store()
+        manager.store = store
+
+        initial = SimpleNamespace(req_id="req", block_ids=([1], [7]))
+        manager.update_request_blocks(_scheduler_output(new=[initial]))
+
+        resumed = CachedRequestData(
+            req_ids=["req"],
+            resumed_req_ids={"req"},
+            new_token_ids=[],
+            all_token_ids={},
+            new_block_ids=[([4], [8])],
+            num_computed_tokens=[0],
+            num_output_tokens=[0],
+        )
+        cold_output = _scheduler_output(
+            cached=resumed,
+            scheduled={"req": 1},
+        )
+        manager.update_request_blocks(cold_output)
+        manager.prepare(cold_output, object(), {"req": 0}, {})
+        self.assertEqual(manager._block_ids["req"], ([4], [8]))
+        self.assertEqual(store.calls, [("zero", ([4], [8]))])
+
+        store.calls.clear()
+        restored_output = _scheduler_output(
+            cached=resumed,
+            scheduled={"req": 1},
+            restores={"req": b"checkpoint"},
+        )
+        manager.update_request_blocks(restored_output)
+        manager.prepare(restored_output, object(), {"req": 0}, {})
+        self.assertEqual(
+            store.calls,
+            [("restore", b"checkpoint", ([4], [8]))],
+        )
+
+    def test_v2_gdn_continuation_preserves_live_state(self):
+        manager = V2GDNCheckpointManager()
+        store = _Store()
+        manager.store = store
+
+        new = SimpleNamespace(req_id="req", block_ids=([2], [6]))
+        manager.update_request_blocks(_scheduler_output(new=[new]))
+        continuing = _scheduler_output(scheduled={"req": 1})
+        manager.prepare(continuing, object(), {"req": 17}, {})
+
+        self.assertEqual(store.calls, [])
+
     def test_v2_gdn_ignores_kernel_warmup_requests(self):
         manager = V2GDNCheckpointManager()
         store = _Store()

@@ -1125,7 +1125,8 @@ def test_dynamic_working_set_executes_immutable_piecewise_first_capture_order():
 @pytest.mark.parametrize(
     ("kind", "administrative"),
     [
-        (ElasticPlanKind.RECLAIM, False),
+        (ElasticPlanKind.MAINTENANCE, False),
+        (ElasticPlanKind.RECLAIM, True),
         (ElasticPlanKind.PRESSURE_RECLAIM, True),
     ],
 )
@@ -2509,7 +2510,7 @@ def test_working_set_x0_retires_only_ledger_with_pinned_graph_active():
     assert working_set.resident_bytes == 7_340_032
 
 
-def test_residency_receipt_exposes_reclaim_proof_only_for_evictable_entries():
+def test_residency_receipt_preserves_pinned_proof_but_not_leased_proof():
     pinned_desc = BatchExecutionDescriptor(
         cg_mode=CUDAGraphMode.FULL,
         num_tokens=1,
@@ -2571,7 +2572,10 @@ def test_residency_receipt_exposes_reclaim_proof_only_for_evictable_entries():
         cublas_workspace_bytes=0,
     )
 
-    assert sorted(entry.reclaimable_bytes for entry in receipt.entries) == [0, 0, 32]
+    by_key = {entry.key: entry for entry in receipt.entries}
+    assert by_key[pinned_desc.physical_replay_key("target")].reclaimable_bytes == 32
+    assert by_key[leased_desc.physical_replay_key("target")].reclaimable_bytes == 0
+    assert by_key[evictable_desc.physical_replay_key("target")].reclaimable_bytes == 32
 
 
 def test_working_set_administrative_x0_evicts_only_unpinned_hot_entries():

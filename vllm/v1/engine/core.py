@@ -598,12 +598,9 @@ class EngineCore:
                 f"actual={actual_physical_keys!r}"
             )
 
-    def _reclaim_elastic_restore_hotset_before_wave(
-        self,
-        rebuild_step_keys: tuple[tuple[int, ...], ...] = (),
-    ) -> None:
+    def _reclaim_elastic_restore_hotset_before_wave(self) -> None:
         scheduler = cast(Any, self.scheduler)
-        if not scheduler.prepare_elastic_restore_idle_reclaim(rebuild_step_keys):
+        if not scheduler.prepare_elastic_restore_idle_reclaim():
             return
         reclaim_output = self._run_elastic_restore_step()
         if (
@@ -618,7 +615,7 @@ class EngineCore:
         step_keys: tuple[tuple[int, ...], ...],
     ) -> None:
         declared_step_keys = tuple(dict.fromkeys(step_keys))
-        self._reclaim_elastic_restore_hotset_before_wave(declared_step_keys)
+        self._reclaim_elastic_restore_hotset_before_wave()
         for step_key in declared_step_keys:
             self._prepare_elastic_restore_capture(step_key)
         scheduler = cast(Any, self.scheduler)
@@ -643,9 +640,7 @@ class EngineCore:
             scheduler = cast(Any, self.scheduler)
             scheduler.finish_unexecuted_elastic_restore_step()
         self._drain_elastic_restore()
-        self._reclaim_elastic_restore_hotset_before_wave(
-            tuple(dict.fromkeys(step_keys))
-        )
+        self._reclaim_elastic_restore_hotset_before_wave()
 
     def _drain_elastic_restore(self, *, max_steps: int = 32) -> None:
         steps = 0

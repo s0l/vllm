@@ -220,6 +220,72 @@ def test_recapture_price_keeps_conservative_cold_envelope() -> None:
     )
 
 
+def test_zero_reclaim_proof_is_retained_not_falsely_evictable() -> None:
+    graph_key = key("target", "PIECEWISE", 4096, 8)
+    cache = ElasticAdmissionController(GENERATION)
+    receipt = ElasticResidencyReceipt(
+        generation=GENERATION,
+        transaction_id="zero-proof-receipt",
+        resident_bytes=94,
+        floor_bytes=0,
+        transition_floor_bytes=0,
+        peak_bytes=94,
+        cublas_workspace_bytes=0,
+        entries=(
+            ElasticResidencyEntry(
+                key=graph_key,
+                pinned=False,
+                resident_bytes=94,
+                local_pool_bytes=0,
+                reclaimable_bytes=0,
+            ),
+        ),
+    )
+
+    assert cache.accept_residency_receipt(receipt) == (94, 0)
+    assert cache.entries[graph_key].pinned
+    assert cache._groups == {}
+    reclaim = cache.plan_reclaim_all(
+        "zero-proof-tail",
+        request_bytes=cache.resident_bytes,
+        available_bytes=0,
+    )
+    assert reclaim.kind == ElasticPlanKind.DEFER
+    assert reclaim.defer_reason == "no_reclaimable_piecewise_graphs"
+
+
+def test_pinned_receipt_preserves_proof_for_explicit_idle_unpin() -> None:
+    graph_key = key("target", "FULL", 8, 8, uniform=1)
+    cache = ElasticAdmissionController(GENERATION)
+    receipt = ElasticResidencyReceipt(
+        generation=GENERATION,
+        transaction_id="pinned-proof-receipt",
+        resident_bytes=80,
+        floor_bytes=0,
+        transition_floor_bytes=0,
+        peak_bytes=80,
+        cublas_workspace_bytes=0,
+        entries=(
+            ElasticResidencyEntry(
+                key=graph_key,
+                pinned=True,
+                resident_bytes=80,
+                local_pool_bytes=80,
+                reclaimable_bytes=79,
+            ),
+        ),
+    )
+
+    assert cache.accept_residency_receipt(receipt) == (80, 0)
+    assert cache.entries[graph_key].pinned
+    assert cache.unpin_idle() == (graph_key,)
+    reclaim = cache.plan_reclaim_all(
+        "pinned-proof-rebuild", request_bytes=80, available_bytes=0
+    )
+    assert reclaim.kind == ElasticPlanKind.RECLAIM
+    assert reclaim.victim_keys == (graph_key,)
+
+
 def test_recapture_rejects_changed_reclaim_identity() -> None:
     graph_key = key("target", "PIECEWISE", 4096, 8)
     cache = ElasticAdmissionController(GENERATION)
@@ -1014,7 +1080,7 @@ def test_idle_unpin_makes_pinned_graph_reclaimable() -> None:
     cache = ElasticAdmissionController(GENERATION)
     publish(cache, pinned_key, pinned=True)
 
-    assert cache.unpin_idle((pinned_key,)) == (pinned_key,)
+    assert cache.unpin_idle() == (pinned_key,)
     assert cache.entries[pinned_key].reclaimable
     reclaim = cache.plan_reclaim_all(
         "cold-epoch",
@@ -1025,6 +1091,15 @@ def test_idle_unpin_makes_pinned_graph_reclaimable() -> None:
     assert reclaim.victim_keys == (pinned_key,)
 
 
+def test_idle_unpin_preserves_pinned_graph_without_physical_proof() -> None:
+    pinned_key = key("target", "FULL", 7, 7, uniform=1)
+    cache = ElasticAdmissionController(GENERATION)
+    cache.publish_hot(pinned_key, price("retained-pool"), pinned=True)
+
+    assert cache.unpin_idle() == ()
+    assert cache.entries[pinned_key].pinned
+
+
 def test_idle_unpin_rejects_leased_graph() -> None:
     pinned_key = key("target", "FULL", 9, 9, uniform=1)
     cache = ElasticAdmissionController(GENERATION)
@@ -1033,7 +1108,7 @@ def test_idle_unpin_rejects_leased_graph() -> None:
     cache.commit_user(plan)
 
     with pytest.raises(ElasticGraphError, match="cannot unpin an active"):
-        cache.unpin_idle((pinned_key,))
+        cache.unpin_idle()
     assert cache.entries[pinned_key].pinned
     assert cache.entries[pinned_key].leases == frozenset({"user"})
 
@@ -1123,16 +1198,16 @@ def test_no_deficit_miss_never_selects_a_victim() -> None:
     assert cache.entries[old].hot
 
 
-def test_residency_receipt_rejects_stale_generation_and_active_reclaim() -> None:
+def test_residency_receipt_allows_pinned_proof_but_rejects_active_lease() -> None:
     graph_key = key("target", "PIECEWISE", 8, 8)
-    with pytest.raises(ValueError, match="pinned Graph entry"):
-        ElasticResidencyEntry(
-            key=graph_key,
-            pinned=True,
-            resident_bytes=16,
-            local_pool_bytes=16,
-            reclaimable_bytes=16,
-        )
+    pinned = ElasticResidencyEntry(
+        key=graph_key,
+        pinned=True,
+        resident_bytes=16,
+        local_pool_bytes=16,
+        reclaimable_bytes=16,
+    )
+    assert pinned.pinned and pinned.reclaimable_bytes == 16
     with pytest.raises(ValueError, match="leased Graph entry"):
         ElasticResidencyEntry(
             key=graph_key,

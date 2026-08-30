@@ -57,6 +57,10 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+from vllm.model_executor.layers.quantization.utils.ag2_nvfp4_arc import (
+    ensure_ag2_nvfp4_base_owner_metadata,
+    maybe_apply_ag2_nvfp4_arc_sidecar,
+)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     process_fp8_input_tensor_strategy_moe,
     process_fp8_weight_channel_strategy,
@@ -69,9 +73,6 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     MXFP8_SCALE_DTYPE,
     MXFP8_VALUE_DTYPE,
-)
-from vllm.model_executor.layers.quantization.utils.ag2_nvfp4_arc import (
-    maybe_apply_ag2_nvfp4_arc_sidecar,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -1293,6 +1294,7 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         )
 
         maybe_apply_ag2_nvfp4_arc_sidecar(layer, self.layer_prefix)
+        ensure_ag2_nvfp4_base_owner_metadata(layer)
 
         # Convert layer to NVFP4 linear kernel format
         self.kernel.process_weights_after_loading(layer)

@@ -78,7 +78,25 @@ def test_real_elastic_scheduler_constructor_fails_closed_without_catalog(
     monkeypatch.setattr(startup_plan, "load_elastic_graph_catalog", lambda *_: {})
     monkeypatch.setenv("AG2_VLLM_ELASTIC_REQUIRE_CATALOG", "1")
 
-    with pytest.raises(RuntimeError, match="explicit offline catalog tool"):
+    with pytest.raises(RuntimeError, match="enable automatic pre-READY calibration"):
+        create_scheduler(
+            max_num_seqs=16,
+            additional_config={"elastic_gdn_backing": True},
+            elastic_graph_execution_policy=_execution_policy().to_payload(),
+        )
+
+
+def test_real_elastic_scheduler_rejects_obsolete_calibration_switch(monkeypatch):
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    monkeypatch.setattr(
+        ElasticRuntimeConfig,
+        "from_vllm_config",
+        classmethod(lambda cls, _config: cls(enabled=True)),
+    )
+    monkeypatch.setattr(startup_plan, "load_elastic_graph_catalog", lambda *_: {})
+    monkeypatch.setenv("AG2_VLLM_ELASTIC_CALIBRATION", "1")
+
+    with pytest.raises(RuntimeError, match="normal startup calibrates a catalog miss"):
         create_scheduler(
             max_num_seqs=16,
             additional_config={"elastic_gdn_backing": True},

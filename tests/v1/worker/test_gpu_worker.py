@@ -137,9 +137,7 @@ def test_elastic_identities_include_profile_config(plan_env):
             SimpleNamespace(
                 **{
                     **vars(kv),
-                    "elastic_graph_execution_policy": {
-                        "fingerprint": "policy-a"
-                    },
+                    "elastic_graph_execution_policy": {"fingerprint": "policy-a"},
                 }
             ),
         )
@@ -197,6 +195,46 @@ def test_catalog_identity_ignores_serving_load_policy(plan_env):
         ):
             serving = startup_plan.compute_elastic_graph_catalog_fingerprint(config, kv)
     assert discovery == serving
+
+
+def test_catalog_identity_ignores_unmapped_budget_slack(plan_env):
+    config = _plan_worker().vllm_config
+    kv = SimpleNamespace(
+        num_blocks=64,
+        elastic_attention_stride=86_900_736,
+        elastic_gdn_stride=19_611_648,
+        elastic_mapping_quantum=2 << 20,
+        elastic_gdn_initial_blocks=4,
+        elastic_gdn_blocks_per_request=3,
+        elastic_rank_budget_bytes=(100, 200, 300),
+        elastic_rank_primary_mapped_bytes=(4, 5, 6),
+        elastic_rank_gdn_mapped_bytes=(7, 8, 9),
+        elastic_graph_execution_policy=None,
+    )
+    base = startup_plan.compute_elastic_graph_catalog_fingerprint(config, kv)
+    slack_only = SimpleNamespace(
+        **{
+            **vars(kv),
+            "elastic_rank_budget_bytes": tuple(
+                value + (2 << 20) for value in kv.elastic_rank_budget_bytes
+            ),
+        }
+    )
+    mapped_change = SimpleNamespace(
+        **{
+            **vars(kv),
+            "elastic_rank_primary_mapped_bytes": (4, 5, 7),
+        }
+    )
+
+    assert (
+        startup_plan.compute_elastic_graph_catalog_fingerprint(config, slack_only)
+        == base
+    )
+    assert (
+        startup_plan.compute_elastic_graph_catalog_fingerprint(config, mapped_change)
+        != base
+    )
 
 
 def test_startup_plan_apply_gate(plan_env):

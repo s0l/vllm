@@ -614,7 +614,11 @@ class DynamicGraphWorkingSet:
                 key,
                 transaction_id=plan.transaction_id,
                 reason="elastic_admission_plan",
-                administrative=plan.kind == ElasticPlanKind.PRESSURE_RECLAIM,
+                administrative=plan.kind
+                in {
+                    ElasticPlanKind.RECLAIM,
+                    ElasticPlanKind.PRESSURE_RECLAIM,
+                },
             )
         for key in plan.physical_keys:
             manager = managers.get(key.logical.owner)
@@ -736,13 +740,12 @@ class DynamicGraphWorkingSet:
                         resident_bytes=entry.charged_bytes,
                         local_pool_bytes=entry.local_pool_bytes,
                         # Physical pool proof remains manager-owned for a
-                        # later administrative teardown. Scheduler policy may
-                        # consume it only while the executable is unpinned and
-                        # unleased in this exact receipt.
+                        # later administrative teardown. Pinning prevents the
+                        # scheduler from consuming the proof until an explicit
+                        # idle rebuild; an active lease cannot cross receipt
+                        # publication and therefore suppresses the proof.
                         reclaimable_bytes=(
-                            0
-                            if entry.pinned or entry.leases
-                            else entry.reclaimable_bytes
+                            0 if entry.leases else entry.reclaimable_bytes
                         ),
                         lease_ids=tuple(sorted(entry.leases)),
                     )

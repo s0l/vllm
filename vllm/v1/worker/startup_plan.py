@@ -194,7 +194,11 @@ def compute_elastic_graph_catalog_fingerprint(
         "mapping_quantum": kv_cache_config.elastic_mapping_quantum,
         "gdn_initial_blocks": kv_cache_config.elastic_gdn_initial_blocks,
         "gdn_blocks_per_request": kv_cache_config.elastic_gdn_blocks_per_request,
-        "rank_budgets": kv_cache_config.elastic_rank_budget_bytes,
+        # Profiled free bytes can move by one mapping quantum between otherwise
+        # identical process epochs without changing any mapped KV region.  The
+        # catalog prices Graph executables against the consumed physical pools;
+        # bind those pools below, while startup admission revalidates them
+        # against the current raw budget before READY.
         "rank_primary": kv_cache_config.elastic_rank_primary_mapped_bytes,
         "rank_gdn": kv_cache_config.elastic_rank_gdn_mapped_bytes,
         "graph_execution_policy": getattr(
@@ -202,9 +206,9 @@ def compute_elastic_graph_catalog_fingerprint(
         ),
     }
     component_hashes = {
-        name: hashlib.sha256(
-            json.dumps(value, sort_keys=True).encode()
-        ).hexdigest()[:16]
+        name: hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()[
+            :16
+        ]
         for name, value in factors.items()
     }
     logger.info(
@@ -354,8 +358,7 @@ def load_elastic_graph_catalog(
             compiled_piecewise_sizes=compiled_piecewise_sizes,
         )
         if any(
-            row.get(name) != value
-            for name, value in expected_policy_metadata.items()
+            row.get(name) != value for name, value in expected_policy_metadata.items()
         ):
             raise RuntimeError(
                 "elastic Graph catalog row has stale representation lineage: "
@@ -374,9 +377,7 @@ def load_elastic_graph_catalog(
                 "hot_stable_replays",
             )
         }
-        finalized_pinned_owner_set = row.get(
-            "finalized_pinned_owner_set", 0
-        )
+        finalized_pinned_owner_set = row.get("finalized_pinned_owner_set", 0)
         if any(
             isinstance(value, bool) or not isinstance(value, int) or value < 0
             for value in fields.values()
@@ -387,9 +388,7 @@ def load_elastic_graph_catalog(
             continue
         complete_row = dict(fields)
         if finalized_pinned_owner_set:
-            complete_row["finalized_pinned_owner_set"] = (
-                finalized_pinned_owner_set
-            )
+            complete_row["finalized_pinned_owner_set"] = finalized_pinned_owner_set
         if not elastic_graph_catalog_row_complete(
             key, complete_row, representation=representation
         ) and not (
@@ -449,14 +448,10 @@ def load_elastic_graph_catalog_coverage(
         else None
     )
     restore_step_keys = (
-        coverage.get("restore_step_keys", [])
-        if isinstance(coverage, dict)
-        else None
+        coverage.get("restore_step_keys", []) if isinstance(coverage, dict) else None
     )
     required_step_keys = (
-        coverage.get("required_step_keys", [])
-        if isinstance(coverage, dict)
-        else None
+        coverage.get("required_step_keys", []) if isinstance(coverage, dict) else None
     )
     from vllm.v1.core.elastic_graph import configured_compiled_piecewise_sizes
 
@@ -475,15 +470,11 @@ def load_elastic_graph_catalog_coverage(
         payload.get("schema") != ELASTIC_GRAPH_CATALOG_SCHEMA_VERSION
         or payload.get("fingerprint") != fingerprint
         or payload.get("sealed") is not True
-        or not _catalog_policy_matches(
-            payload.get("graph_execution_policy"), policy
-        )
+        or not _catalog_policy_matches(payload.get("graph_execution_policy"), policy)
         or not isinstance(coverage, dict)
-        or coverage.get("graph_execution_policy_fingerprint")
-        != policy.fingerprint
+        or coverage.get("graph_execution_policy_fingerprint") != policy.fingerprint
         or coverage.get("verifier_contract") != policy.verifier_contract
-        or coverage.get("verifier_configuration")
-        != policy.verifier_configuration
+        or coverage.get("verifier_configuration") != policy.verifier_configuration
         or coverage.get("math_contract") != policy.math_contract
         or coverage.get("capture_state_abi") != ELASTIC_CAPTURE_STATE_ABI
         or any(
@@ -515,8 +506,7 @@ def load_elastic_graph_catalog_coverage(
         or (
             representation == "pinned_full_family"
             and (
-                coverage["pinned_full_entries"] < 1
-                or coverage["pinned_full_bytes"] < 1
+                coverage["pinned_full_entries"] < 1 or coverage["pinned_full_bytes"] < 1
             )
         )
         or (
@@ -575,9 +565,7 @@ def maybe_save_cudagraph_recipe(
             -1 if item["num_reqs"] is None else item["num_reqs"],
             -1 if item["uniform_token_count"] is None else item["uniform_token_count"],
             item["num_active_loras"],
-            -1
-            if item["physical_num_reqs"] is None
-            else item["physical_num_reqs"],
+            -1 if item["physical_num_reqs"] is None else item["physical_num_reqs"],
             item["runtime_generation"],
         ),
     )

@@ -68,6 +68,8 @@ def main() -> None:
         dtype=state_dtype,
     )
     multi_state[1] = initial
+    dirty_scratch_state = multi_state.clone()
+    dirty_scratch_state[2:] = torch.randn_like(dirty_scratch_state[2:]) * 7
     multi_indices = torch.arange(
         1, query_len + 1, device=device, dtype=torch.int32
     ).view(1, query_len)
@@ -82,6 +84,23 @@ def main() -> None:
         initial_state=multi_state,
         inplace_final_state=True,
         cu_seqlens=torch.tensor([0, query_len], device=device, dtype=torch.int32),
+        ssm_state_indices=multi_indices,
+        num_accepted_tokens=torch.ones(1, device=device, dtype=torch.int32),
+        use_qk_l2norm_in_kernel=True,
+    )
+    dirty_scratch_out, _ = fused_sigmoid_gating_delta_rule_update(
+        A_log=a_log,
+        a=a,
+        b=b,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        initial_state=dirty_scratch_state,
+        inplace_final_state=True,
+        cu_seqlens=torch.tensor(
+            [0, query_len], device=device, dtype=torch.int32
+        ),
         ssm_state_indices=multi_indices,
         num_accepted_tokens=torch.ones(1, device=device, dtype=torch.int32),
         use_qk_l2norm_in_kernel=True,
@@ -115,6 +134,9 @@ def main() -> None:
 
     output_error = tensor_error(multi_out, sequential_out)
     state_error = tensor_error(multi_state[1:4], sequential_state_history)
+    dirty_scratch_state_error = tensor_error(
+        dirty_scratch_state[1:4], sequential_state_history
+    )
     result = {
         "shape": {
             "query_len": query_len,
@@ -125,13 +147,28 @@ def main() -> None:
         },
         "output_error": output_error,
         "state_error": state_error,
+        "dirty_scratch_output_error": tensor_error(
+            dirty_scratch_out, sequential_out
+        ),
+        "dirty_scratch_state_error": dirty_scratch_state_error,
         "bit_exact_output": torch.equal(multi_out, sequential_out),
         "bit_exact_state": torch.equal(
             multi_state[1:4], sequential_state_history
         ),
+        "dirty_scratch_bit_exact_output": torch.equal(
+            dirty_scratch_out, sequential_out
+        ),
+        "dirty_scratch_bit_exact_state": torch.equal(
+            dirty_scratch_state[1:4], sequential_state_history
+        ),
     }
     print(json.dumps(result, indent=2))
-    if not result["bit_exact_output"] or not result["bit_exact_state"]:
+    if (
+        not result["bit_exact_output"]
+        or not result["bit_exact_state"]
+        or not result["dirty_scratch_bit_exact_output"]
+        or not result["dirty_scratch_bit_exact_state"]
+    ):
         raise SystemExit(1)
 
 

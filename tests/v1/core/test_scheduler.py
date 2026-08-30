@@ -102,6 +102,65 @@ def _new_elastic_scheduler(
     return scheduler
 
 
+def _catalog_activation_scheduler(
+    *, unfinished: bool = False, finished: bool = False
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        _elastic_graph_catalog={},
+        requests={"completed-calibration-tombstone": object()},
+        has_unfinished_requests=Mock(return_value=unfinished),
+        has_finished_requests=Mock(return_value=finished),
+        num_waiting_for_streaming_input=0,
+        _elastic_restore_retention_id=None,
+        _elastic_admission_controller=SimpleNamespace(
+            pending_maintenance_plan=None,
+            record_measurement=Mock(),
+        ),
+        max_num_running_reqs=64,
+        _record_elastic_capture_envelope=Mock(),
+    )
+
+
+def _activate_catalog(scheduler: SimpleNamespace) -> None:
+    Scheduler.activate_elastic_graph_catalog(
+        scheduler,
+        {
+            (1, 3, 1, 1, 1): {
+                "cold_peak_bytes": 10,
+                "floor_bytes": 0,
+                "hot_peak_bytes": 9,
+            }
+        },
+        {
+            "representation": "bounded_exact_hotset",
+            "decode_max_x": 39,
+            "mixed_max_x": 39,
+            "full_context_max_x": 39,
+        },
+    )
+
+
+def test_catalog_activation_accepts_drained_calibration_tombstones() -> None:
+    scheduler = _catalog_activation_scheduler()
+
+    _activate_catalog(scheduler)
+
+    assert scheduler.max_num_running_reqs == 39
+    assert scheduler._elastic_graph_catalog
+
+
+@pytest.mark.parametrize("unfinished,finished", [(True, False), (False, True)])
+def test_catalog_activation_rejects_live_scheduler_lifecycle(
+    unfinished: bool, finished: bool
+) -> None:
+    scheduler = _catalog_activation_scheduler(
+        unfinished=unfinished, finished=finished
+    )
+
+    with pytest.raises(RuntimeError, match="quiescent pre-READY lifecycle"):
+        _activate_catalog(scheduler)
+
+
 def _reset_elastic_loans(
     scheduler: Scheduler,
     *loans: tuple[tuple[int, ...] | None, int],
@@ -11213,11 +11272,10 @@ def test_elastic_restore_prepares_idle_hotset_reclaim_before_requests():
     kv_cache_manager.estimate_uncached_full_sequence_requirements.assert_not_called()
 
 
-def test_elastic_restore_preserves_unrelated_pinned_family():
-    generation = RuntimeGeneration("calibration-selective-rebuild")
+def test_elastic_restore_reclaims_previous_pinned_family_before_next_shape():
+    generation = RuntimeGeneration("calibration-isolated-rebuild")
     scheduler = _new_elastic_scheduler(generation)
     retained_key = (1, 0, 3, 3, 1)
-    future_key = (1, 0, 5, 5, 1)
     scheduler._elastic_restore_mode = True
     scheduler.scheduler_config = Mock(max_num_batched_tokens=4096)
     scheduler.running = []
@@ -11227,18 +11285,54 @@ def test_elastic_restore_preserves_unrelated_pinned_family():
     scheduler.has_finished_requests = Mock(return_value=False)
     scheduler._elastic_admission_controller.resident_bytes = 128
     scheduler._elastic_admission_controller.floor_bytes = 0
-    for physical_key in scheduler._resolve_elastic_step_physical_keys(retained_key):
-        scheduler._elastic_admission_controller.publish_hot(
+    retained_physical_keys = scheduler._resolve_elastic_step_physical_keys(
+        retained_key
+    )
+    for physical_key in retained_physical_keys:
+        controller = scheduler._elastic_admission_controller
+        controller.publish_hot(
             physical_key,
             GraphPrice(128, 160, physical_key.logical.owner),
             pinned=True,
         )
+        controller.install_reclaim_group(
+            ReclaimGroup(
+                physical_key.logical.owner,
+                (physical_key,),
+                reclaimable_bytes=128,
+            )
+        )
 
-    assert scheduler.prepare_elastic_restore_idle_reclaim((future_key,)) is False
+    assert scheduler.prepare_elastic_restore_idle_reclaim() is True
+    reclaim = scheduler._elastic_admission_controller.pending_maintenance_plan
+    assert reclaim is not None and reclaim.kind == ElasticPlanKind.RECLAIM
+    assert set(reclaim.victim_keys) == set(retained_physical_keys)
     assert all(
-        entry.pinned
+        not entry.pinned
         for entry in scheduler._elastic_admission_controller.entries.values()
     )
+
+
+def test_elastic_restore_accepts_zero_reclaim_proof_as_terminal_tail():
+    generation = RuntimeGeneration("restore-zero-proof-tail")
+    scheduler = _new_elastic_scheduler(generation)
+    graph_key = next(
+        iter(scheduler._resolve_elastic_step_physical_keys((0, 3, 1, 4, 0)))
+    )
+    scheduler._elastic_restore_mode = True
+    scheduler.running = []
+    scheduler.num_waiting_for_streaming_input = 0
+    scheduler.requests = {}
+    scheduler.has_unfinished_requests = Mock(return_value=False)
+    scheduler.has_finished_requests = Mock(return_value=False)
+    controller = _elastic_controller(scheduler)
+    controller.resident_bytes = 94
+    controller.synchronize_hot(
+        ((graph_key, GraphPrice(94, 94, "retained-pool"), False, 0),)
+    )
+
+    assert scheduler.prepare_elastic_restore_idle_reclaim() is False
+    assert controller.entries[graph_key].pinned
 
 
 def test_elastic_restore_idle_reclaim_rejects_waiting_request_boundary():
