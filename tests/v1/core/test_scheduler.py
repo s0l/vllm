@@ -11604,6 +11604,7 @@ def test_elastic_graph_idle_floor_fails_closed_after_deadline(monkeypatch):
     scheduler = _new_elastic_scheduler(RuntimeGeneration("scheduler-unit"))
     scheduler.scheduler_config = Mock(max_num_batched_tokens=4096)
     scheduler.elastic_on_demand_graphs = True
+    scheduler._elastic_restore_mode = True
     stale_zero_token_key = (0, 0, 1, 0, 0)
     _reset_elastic_loans(scheduler, (stale_zero_token_key, 88))
     scheduler._elastic_admission_controller.measured_bytes = {}
@@ -11644,3 +11645,50 @@ def test_elastic_idle_cleanup_stops_when_only_pinned_residency_remains():
     scheduler._elastic_admission_controller.evictable_resident_bytes = 0
     scheduler._elastic_admission_controller.floor_bytes = 13
     assert scheduler._elastic_idle_cleanup_outstanding()
+
+
+def test_elastic_serving_idle_retains_current_hotset_without_engine_spin():
+    scheduler = _new_elastic_scheduler()
+    scheduler.elastic_on_demand_graphs = True
+    scheduler._elastic_restore_mode = False
+    scheduler.running = []
+    scheduler.waiting = []
+    scheduler.skipped_waiting = []
+    scheduler.has_unfinished_requests = Mock(return_value=False)
+    scheduler.has_finished_requests = Mock(return_value=False)
+    scheduler.connector = None
+    scheduler.ec_connector = None
+    controller = scheduler._elastic_admission_controller
+    graph_key = scheduler._resolve_elastic_step_physical_keys((0, 3, 1, 4, 4))[0]
+    group_id = f"idle:{graph_key.identity}"
+    controller.publish_hot(graph_key, GraphPrice(88, 88, group_id), pinned=False)
+    controller.install_reclaim_group(
+        ReclaimGroup(group_id, (graph_key,), reclaimable_bytes=88)
+    )
+    controller.resident_bytes = 88
+    controller.evictable_resident_bytes = 88
+
+    assert scheduler._elastic_idle_cleanup_outstanding()
+    assert not scheduler._needs_elastic_idle_reclaim()
+    assert not scheduler.has_requests()
+    assert controller.entries[graph_key].hot
+    assert controller.pending_maintenance_plan is None
+
+
+def test_elastic_restore_idle_exposes_reclaim_as_scheduler_work():
+    scheduler = _new_elastic_scheduler()
+    scheduler.elastic_on_demand_graphs = True
+    scheduler._elastic_restore_mode = True
+    scheduler.running = []
+    scheduler.waiting = []
+    scheduler.skipped_waiting = []
+    scheduler.has_unfinished_requests = Mock(return_value=False)
+    scheduler.has_finished_requests = Mock(return_value=False)
+    scheduler.connector = None
+    scheduler.ec_connector = None
+    controller = scheduler._elastic_admission_controller
+    controller.resident_bytes = 88
+    controller.evictable_resident_bytes = 88
+
+    assert scheduler._needs_elastic_idle_reclaim()
+    assert scheduler.has_requests()

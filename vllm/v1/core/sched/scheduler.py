@@ -4540,6 +4540,12 @@ class Scheduler(SchedulerInterface):
         """Derive the sole request-free reclaim predicate from physical state."""
         return bool(
             self.elastic_on_demand_graphs
+            # Startup calibration explicitly tears down each independent
+            # measurement epoch. Ordinary serving retains its last HOT set;
+            # replacement and pressure plans already carry explicit victims.
+            # Treating every evictable serving graph as scheduler work keeps
+            # EngineCore and all TP workers in an unbounded empty-step loop.
+            and self._elastic_restore_mode
             and not self.running
             and not len(getattr(self, "waiting", ()))
             and not len(getattr(self, "skipped_waiting", ()))
