@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
+import pickle
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 from vllm.v1.core.elastic_graph import (
+    DispatchRepresentation,
     ElasticAdmissionController,
     ElasticAdmissionLoan,
     ElasticGraphError,
@@ -20,13 +22,37 @@ from vllm.v1.core.elastic_graph import (
     PhysicalReplayKey,
     ReclaimGroup,
     RuntimeGeneration,
+    build_execution_manifest,
+    canonical_execution_request_order,
     configured_compiled_piecewise_sizes,
     derive_short_decode_graph_inventory,
+    execution_manifest_phase_from_step_key,
     require_plan_consensus,
     resolve_step_physical_keys,
 )
 
 GENERATION = RuntimeGeneration("test-generation")
+
+
+def test_canonical_execution_order_matches_decode_then_prefill_input_batch() -> None:
+    scheduled = {"prefill-q1": 1, "decode-q4": 4, "prefill-q3": 3}
+
+    assert canonical_execution_request_order(
+        scheduled,
+        is_prefilling_by_request={
+            "prefill-q1": True,
+            "decode-q4": False,
+            "prefill-q3": True,
+        },
+        decode_query_len=4,
+    ) == ("decode-q4", "prefill-q1", "prefill-q3")
+
+    with pytest.raises(ValueError, match="lifecycle identity differs"):
+        canonical_execution_request_order(
+            scheduled,
+            is_prefilling_by_request={"decode-q4": False},
+            decode_query_len=4,
+        )
 
 
 def test_controller_fifo_loans_and_transaction_ids_are_public_and_replayable() -> None:
@@ -139,6 +165,589 @@ def runtime_shape_policy(*owners: OwnerGraphExecutionPolicy) -> GraphExecutionPo
         verifier_contract="runtime-shape-control-v1",
         math_contract="runtime-shape-math-v1",
         owners=tuple(sorted(owners, key=lambda owner: owner.owner)),
+    )
+
+
+def execution_manifest_policy(
+    *, compiled_target_sizes: tuple[int, ...] = ()
+) -> GraphExecutionPolicy:
+    return runtime_shape_policy(
+        OwnerGraphExecutionPolicy(
+            "mtp_decode",
+            (1,),
+            "PIECEWISE",
+            activation="speculative",
+            token_source="requests",
+            execution_order=2,
+        ),
+        OwnerGraphExecutionPolicy(
+            "mtp_prefill",
+            (),
+            "PIECEWISE",
+            activation="speculative",
+            token_source="step",
+            execution_order=1,
+        ),
+        OwnerGraphExecutionPolicy(
+            "target",
+            (),
+            "PIECEWISE",
+            compiled_piecewise_sizes=compiled_target_sizes,
+            activation="always",
+            token_source="step",
+            execution_order=0,
+        ),
+    )
+
+
+def test_execution_manifest_keeps_q1_current_separate_from_q4_successor() -> None:
+    policy = execution_manifest_policy()
+    manifest, dispatch = build_execution_manifest(
+        step_key=(0, 3, 1, 1, 0),
+        request_ids=("request-0",),
+        per_request_query_lens=(1,),
+        per_request_is_prefilling=(True,),
+        scheduled_draft_rows=(0,),
+        requested_output_k=3,
+        executed_drafter_k=3,
+        phase="mixed",
+        generation=GENERATION,
+        policy=policy,
+        max_num_batched_tokens=4096,
+    )
+
+    assert manifest.per_request_query_lens == (1,)
+    assert manifest.scheduled_draft_rows == (0,)
+    assert [invocation.owner for invocation in manifest.invocations] == [
+        "target",
+        "mtp_prefill",
+        "mtp_decode",
+    ]
+    assert [invocation.live_num_tokens for invocation in manifest.invocations] == [
+        1,
+        1,
+        1,
+    ]
+    assert all(
+        item.representation == DispatchRepresentation.HOT_GRAPH for item in dispatch
+    )
+    assert {item.physical_key.logical.token_bucket for item in dispatch} == {1}
+
+    successor = resolve_step_physical_keys(
+        (0, 3, 1, 4, 4), GENERATION, 4096, policy=policy
+    )
+    assert {key.logical.token_bucket for key in successor} == {1, 4}
+    assert set(successor) != {
+        item.physical_key for item in dispatch if item.physical_key is not None
+    }
+
+
+def test_variable_decode_uses_piecewise_manifest_lane() -> None:
+    step_key = (0, 3, 2, 8, 0)
+    phase = execution_manifest_phase_from_step_key(step_key)
+    manifest, dispatch = build_execution_manifest(
+        step_key=step_key,
+        request_ids=("request-q4", "request-q3"),
+        per_request_query_lens=(4, 3),
+        per_request_is_prefilling=(False, False),
+        scheduled_draft_rows=(3, 2),
+        requested_output_k=3,
+        executed_drafter_k=3,
+        phase=phase,
+        generation=GENERATION,
+        policy=execution_manifest_policy(compiled_target_sizes=(8,)),
+        max_num_batched_tokens=4096,
+    )
+
+    assert phase == "mixed"
+    assert manifest.per_request_is_prefilling == (False, False)
+    assert [item.phase for item in manifest.invocations] == ["mixed"] * 3
+    assert [item.live_num_tokens for item in manifest.invocations] == [7, 7, 2]
+    assert [item.physical_num_tokens for item in manifest.invocations] == [8, 8, 2]
+    assert dispatch[0].representation == DispatchRepresentation.COMPILED_ONLY
+    assert all(
+        item.representation == DispatchRepresentation.HOT_GRAPH for item in dispatch[1:]
+    )
+
+
+def test_execution_manifest_binds_single_final_replay_inside_mixed_rows() -> None:
+    is_prefilling_by_request = {
+        "decode": False,
+        # The semantic prompt ended at position 3, but preemption extended the
+        # execution-prefill boundary to 4. Position 3 is therefore the final
+        # replay row, not ordinary decode.
+        "resumed-final-replay": 3 < 4,
+    }
+    request_ids = canonical_execution_request_order(
+        {"resumed-final-replay": 1, "decode": 1},
+        is_prefilling_by_request=is_prefilling_by_request,
+        decode_query_len=4,
+    )
+    manifest, _dispatch = build_execution_manifest(
+        step_key=(0, 0, 2, 2, 0),
+        request_ids=request_ids,
+        per_request_query_lens=(1, 1),
+        per_request_is_prefilling=tuple(
+            is_prefilling_by_request[request_id] for request_id in request_ids
+        ),
+        scheduled_draft_rows=(0, 0),
+        requested_output_k=0,
+        executed_drafter_k=0,
+        phase="mixed",
+        generation=GENERATION,
+        policy=execution_manifest_policy(),
+        max_num_batched_tokens=4096,
+    )
+
+    assert manifest.request_ids == ("decode", "resumed-final-replay")
+    assert manifest.per_request_is_prefilling == (False, True)
+    assert (
+        replace(
+            manifest,
+            per_request_is_prefilling=(False, False),
+        ).fingerprint
+        != manifest.fingerprint
+    )
+
+
+def test_manifest_phase_comes_from_uniform_marker_not_lifecycle_label() -> None:
+    assert execution_manifest_phase_from_step_key(None) is None
+    assert execution_manifest_phase_from_step_key((0, 3, 12, 32, 0)) == "mixed"
+    assert execution_manifest_phase_from_step_key((0, 3, 12, 48, 4)) == "decode"
+
+
+def test_mixed_q1_does_not_select_uniform_decode_full_graph() -> None:
+    policy = runtime_shape_policy(
+        OwnerGraphExecutionPolicy(
+            "mtp_decode",
+            (1,),
+            "PIECEWISE",
+            activation="speculative",
+            token_source="requests",
+            execution_order=2,
+        ),
+        OwnerGraphExecutionPolicy(
+            "mtp_prefill",
+            (4,),
+            "PIECEWISE",
+            activation="speculative",
+            token_source="step",
+            execution_order=1,
+        ),
+        OwnerGraphExecutionPolicy(
+            "target",
+            (1,),
+            "PIECEWISE",
+            activation="always",
+            token_source="step",
+            execution_order=0,
+        ),
+    )
+
+    _manifest, mixed_dispatch = build_execution_manifest(
+        step_key=(0, 3, 1, 1, 0),
+        request_ids=("request-0",),
+        per_request_query_lens=(1,),
+        per_request_is_prefilling=(True,),
+        scheduled_draft_rows=(0,),
+        requested_output_k=3,
+        executed_drafter_k=3,
+        phase="mixed",
+        generation=GENERATION,
+        policy=policy,
+        max_num_batched_tokens=4096,
+    )
+    _manifest, decode_dispatch = build_execution_manifest(
+        step_key=(1, 3, 1, 1, 1),
+        request_ids=("request-0",),
+        per_request_query_lens=(1,),
+        per_request_is_prefilling=(False,),
+        scheduled_draft_rows=(0,),
+        requested_output_k=3,
+        executed_drafter_k=3,
+        phase="decode",
+        generation=GENERATION,
+        policy=policy,
+        max_num_batched_tokens=4096,
+    )
+
+    assert mixed_dispatch[0].physical_key is not None
+    assert mixed_dispatch[0].physical_key.logical.mode == "PIECEWISE"
+    assert decode_dispatch[0].physical_key is not None
+    assert decode_dispatch[0].physical_key.logical.mode == "FULL"
+
+
+def test_execution_manifest_rejects_successor_as_mixed_current() -> None:
+    with pytest.raises(ElasticGraphError, match="cannot inherit a successor carrier"):
+        build_execution_manifest(
+            step_key=(0, 3, 1, 4, 4),
+            request_ids=("request-0",),
+            per_request_query_lens=(1,),
+            per_request_is_prefilling=(True,),
+            scheduled_draft_rows=(0,),
+            requested_output_k=3,
+            executed_drafter_k=3,
+            phase="mixed",
+            generation=GENERATION,
+            policy=execution_manifest_policy(),
+            max_num_batched_tokens=4096,
+        )
+
+
+def test_execution_manifest_declares_compiled_only_instead_of_graph_miss() -> None:
+    manifest, dispatch = build_execution_manifest(
+        step_key=(0, 0, 1, 4096, 0),
+        request_ids=("request-0",),
+        per_request_query_lens=(4096,),
+        per_request_is_prefilling=(True,),
+        scheduled_draft_rows=(0,),
+        requested_output_k=0,
+        executed_drafter_k=0,
+        phase="mixed",
+        generation=GENERATION,
+        policy=execution_manifest_policy(compiled_target_sizes=(4096,)),
+        max_num_batched_tokens=4096,
+    )
+
+    assert tuple(item.invocation for item in dispatch) == manifest.invocations
+    assert len(dispatch) == 1
+    assert dispatch[0].representation == DispatchRepresentation.COMPILED_ONLY
+    assert dispatch[0].physical_key is None
+
+
+@pytest.mark.parametrize(
+    (
+        "step_key",
+        "query_lens",
+        "draft_rows",
+        "requested_k",
+        "executed_k",
+        "phase",
+        "expected_target_bucket",
+    ),
+    (
+        ((0, 3, 1, 1, 0), (1,), (0,), 3, 3, "mixed", 1),
+        ((0, 3, 1, 2, 0), (2,), (0,), 3, 3, "mixed", 2),
+        ((0, 3, 1, 4, 0), (3,), (1,), 3, 3, "mixed", 4),
+        ((0, 3, 2, 8, 0), (1, 4), (0, 2), 3, 3, "mixed", 8),
+        ((0, 3, 2, 8, 4), (4, 4), (3, 3), 3, 3, "decode", 8),
+        ((0, 0, 1, 2, 0), (2,), (0,), 0, 0, "mixed", 2),
+        # Dynamic scheduling may request one draft while the MTP module still
+        # executes its configured depth of three and slices the publication.
+        ((0, 1, 1, 2, 2), (2,), (1,), 1, 3, "decode", 2),
+    ),
+)
+def test_execution_manifest_state_matrix(
+    step_key,
+    query_lens,
+    draft_rows,
+    requested_k,
+    executed_k,
+    phase,
+    expected_target_bucket,
+) -> None:
+    manifest, dispatch = build_execution_manifest(
+        step_key=step_key,
+        request_ids=tuple(f"request-{index}" for index in range(len(query_lens))),
+        per_request_query_lens=query_lens,
+        per_request_is_prefilling=(False,) * len(query_lens),
+        scheduled_draft_rows=draft_rows,
+        requested_output_k=requested_k,
+        executed_drafter_k=executed_k,
+        phase=phase,
+        generation=GENERATION,
+        policy=execution_manifest_policy(),
+        max_num_batched_tokens=4096,
+    )
+
+    assert manifest.per_request_query_lens == query_lens
+    assert manifest.scheduled_draft_rows == draft_rows
+    assert dispatch[0].invocation.owner == "target"
+    assert dispatch[0].invocation.physical_num_tokens == expected_target_bucket
+    assert len(dispatch) == (3 if requested_k else 1)
+    restored = pickle.loads(pickle.dumps((manifest, dispatch)))
+    assert restored == (manifest, dispatch)
+    assert restored[0].fingerprint == manifest.fingerprint
+
+
+def test_execution_manifest_fingerprint_detects_owner_geometry_mutations() -> None:
+    manifest, _dispatch = build_execution_manifest(
+        step_key=(0, 3, 2, 8, 0),
+        request_ids=("request-0", "request-1"),
+        per_request_query_lens=(1, 4),
+        per_request_is_prefilling=(False, True),
+        scheduled_draft_rows=(0, 2),
+        requested_output_k=3,
+        executed_drafter_k=3,
+        phase="mixed",
+        generation=GENERATION,
+        policy=execution_manifest_policy(),
+        max_num_batched_tokens=4096,
+    )
+
+    assert manifest.per_request_is_prefilling == (False, True)
+    with pytest.raises(ValueError, match="prefill phases must align"):
+        replace(manifest, per_request_is_prefilling=(False,))
+    with pytest.raises(ValueError, match="prefill phases must align"):
+        replace(manifest, per_request_is_prefilling=(False, 1))
+
+    mutations = (
+        replace(manifest, request_ids=("request-1", "request-0")),
+        replace(manifest, per_request_query_lens=(2, 3)),
+        replace(manifest, per_request_is_prefilling=(True, False)),
+        replace(manifest, scheduled_draft_rows=(1, 2)),
+        replace(
+            manifest,
+            scheduled_encoder_inputs=(("request-0", (0,)),),
+        ),
+        replace(
+            manifest,
+            requested_output_k=2,
+            invocations=tuple(
+                replace(invocation, requested_output_k=2)
+                for invocation in manifest.invocations
+            ),
+        ),
+        replace(
+            manifest,
+            executed_drafter_k=4,
+            invocations=tuple(
+                replace(invocation, executed_drafter_k=4)
+                for invocation in manifest.invocations
+            ),
+        ),
+        replace(
+            manifest,
+            active_lora_ids=(7,),
+            invocations=tuple(
+                replace(invocation, active_loras=1)
+                for invocation in manifest.invocations
+            ),
+        ),
+        replace(
+            manifest,
+            generation=RuntimeGeneration("stale"),
+            invocations=tuple(
+                replace(invocation, generation=RuntimeGeneration("stale"))
+                for invocation in manifest.invocations
+            ),
+        ),
+    )
+    assert all(item.fingerprint != manifest.fingerprint for item in mutations)
+
+
+def test_execution_manifest_rejects_underfilled_or_overlimit_identity() -> None:
+    policy = execution_manifest_policy()
+    with pytest.raises(ElasticGraphError, match="max_num_batched_tokens"):
+        build_execution_manifest(
+            step_key=(0, 3, 1, 4, 0),
+            request_ids=("request-0",),
+            per_request_query_lens=(5,),
+            per_request_is_prefilling=(True,),
+            scheduled_draft_rows=(0,),
+            requested_output_k=3,
+            executed_drafter_k=3,
+            phase="mixed",
+            generation=GENERATION,
+            policy=policy,
+            max_num_batched_tokens=4,
+        )
+
+    with pytest.raises(ElasticGraphError, match="scheduled target draft rows"):
+        build_execution_manifest(
+            step_key=(0, 3, 1, 1, 0),
+            request_ids=("request-0",),
+            per_request_query_lens=(1,),
+            per_request_is_prefilling=(True,),
+            scheduled_draft_rows=(4,),
+            requested_output_k=3,
+            executed_drafter_k=3,
+            phase="mixed",
+            generation=GENERATION,
+            policy=policy,
+            max_num_batched_tokens=4,
+        )
+
+
+def test_execution_manifest_binds_encoder_schedule_and_lora_identity() -> None:
+    manifest, _dispatch = build_execution_manifest(
+        step_key=(0, 3, 2, 8, 0),
+        request_ids=("vision", "text"),
+        per_request_query_lens=(5, 3),
+        per_request_is_prefilling=(True, False),
+        scheduled_draft_rows=(0, 1),
+        scheduled_encoder_inputs={"vision": [1, 0, 1]},
+        requested_output_k=3,
+        executed_drafter_k=3,
+        phase="mixed",
+        generation=GENERATION,
+        policy=execution_manifest_policy(),
+        max_num_batched_tokens=4096,
+    )
+
+    assert manifest.scheduled_encoder_inputs == (("vision", (0, 1)),)
+    assert manifest.active_lora_ids == ()
+    with pytest.raises(ElasticGraphError, match="LoRA identity"):
+        build_execution_manifest(
+            step_key=(0, 3, 2, 8, 0),
+            request_ids=("vision", "text"),
+            per_request_query_lens=(5, 3),
+            per_request_is_prefilling=(True, False),
+            scheduled_draft_rows=(0, 1),
+            active_lora_ids=(7,),
+            requested_output_k=3,
+            executed_drafter_k=3,
+            phase="mixed",
+            generation=GENERATION,
+            policy=execution_manifest_policy(),
+            max_num_batched_tokens=4096,
+        )
+
+
+def test_execution_manifest_bounded_geometry_surface() -> None:
+    policy = execution_manifest_policy()
+    for requested_k in range(4):
+        executed_k = 3 if requested_k else 0
+        for x in range(1, 9):
+            for live_per_request in (1, 2, 3, 4, 17, 511):
+                query_lens = tuple(live_per_request + (index % 2) for index in range(x))
+                live_m = sum(query_lens)
+                physical_m = 1 << (live_m - 1).bit_length()
+                if physical_m > 4096:
+                    continue
+                manifest, dispatch = build_execution_manifest(
+                    step_key=(0, requested_k, x, physical_m, 0),
+                    request_ids=tuple(f"r-{index}" for index in range(x)),
+                    per_request_query_lens=query_lens,
+                    per_request_is_prefilling=(False,) * x,
+                    scheduled_draft_rows=tuple(
+                        min(index % 4, executed_k) for index in range(x)
+                    ),
+                    requested_output_k=requested_k,
+                    executed_drafter_k=executed_k,
+                    phase="mixed",
+                    generation=GENERATION,
+                    policy=policy,
+                    max_num_batched_tokens=4096,
+                )
+                assert tuple(item.invocation for item in dispatch) == (
+                    manifest.invocations
+                )
+                assert len(dispatch) == (3 if requested_k else 1)
+
+
+def test_pre_mutation_maintenance_rollback_restores_prior_hot_set() -> None:
+    controller = ElasticAdmissionController(GENERATION)
+    source = key("target", "PIECEWISE", 2, 1)
+    destination = key("target", "PIECEWISE", 4, 1)
+    publish(controller, source)
+    controller.register(destination, price=price("destination"))
+    before_entries = dict(controller.entries)
+    before_stats = controller.stats
+    before_trace = controller.trace
+    plan = controller.plan(
+        "pre-mutation-rollback",
+        (destination,),
+        request_bytes=10,
+        available_bytes=12,
+    )
+    assert plan.kind == ElasticPlanKind.MAINTENANCE
+
+    controller.begin_maintenance(plan)
+    assert not controller.entries[source].hot
+    controller.rollback_pre_mutation(plan)
+
+    assert controller.entries == before_entries
+    assert controller.stats == before_stats
+    assert controller.trace == before_trace
+
+
+def test_pre_mutation_user_rollback_releases_only_transaction_lease() -> None:
+    controller = ElasticAdmissionController(GENERATION)
+    current = key("target", "PIECEWISE", 2, 1)
+    publish(controller, current)
+    plan = controller.plan(
+        "user-rollback",
+        (current,),
+        request_bytes=10,
+        available_bytes=12,
+    )
+    before_stats = controller.stats
+    before_trace = controller.trace
+    controller.commit_user(plan)
+    assert controller.entries[current].leases == frozenset({"user-rollback"})
+
+    controller.rollback_pre_mutation(plan)
+
+    assert controller.entries[current].hot
+    assert not controller.entries[current].leases
+    assert controller.stats == before_stats
+    assert controller.trace == before_trace
+
+
+def test_pre_mutation_reclaim_rollback_restores_evicted_hot_set() -> None:
+    controller = ElasticAdmissionController(GENERATION)
+    victim = key("target", "PIECEWISE", 2, 1)
+    publish(controller, victim)
+    before_entries = dict(controller.entries)
+    before_stats = controller.stats
+    before_trace = controller.trace
+    plan = controller.plan_reclaim_all(
+        "reclaim-rollback",
+        request_bytes=0,
+        available_bytes=0,
+    )
+    assert plan.kind == ElasticPlanKind.RECLAIM
+
+    controller.begin_reclaim(plan)
+    assert not controller.entries[victim].hot
+    controller.rollback_pre_mutation(plan)
+
+    assert controller.entries == before_entries
+    assert controller.stats == before_stats
+    assert controller.trace == before_trace
+
+
+def test_maintenance_receipt_may_publish_captured_and_protected_hot_keys() -> None:
+    controller = ElasticAdmissionController(GENERATION)
+    captured = key("target", "PIECEWISE", 4, 1)
+    protected = key("target", "PIECEWISE", 8, 1)
+    controller.register(captured, price=price("captured"))
+    publish(controller, protected)
+    plan = controller.plan(
+        "maintenance-receipt",
+        (captured,),
+        protected_keys=(protected,),
+        request_bytes=10,
+        available_bytes=32,
+    )
+    assert plan.kind == ElasticPlanKind.MAINTENANCE
+    receipt = ElasticResidencyReceipt(
+        generation=GENERATION,
+        transaction_id=plan.transaction_id,
+        resident_bytes=20,
+        floor_bytes=0,
+        transition_floor_bytes=0,
+        peak_bytes=20,
+        cublas_workspace_bytes=0,
+        entries=tuple(
+            ElasticResidencyEntry(
+                key=physical_key,
+                resident_bytes=10,
+                local_pool_bytes=10,
+                pinned=False,
+                reclaimable_bytes=10,
+            )
+            for physical_key in sorted(
+                (captured, protected), key=lambda item: item.identity
+            )
+        ),
+    )
+
+    controller.validate_residency_receipt(
+        receipt,
+        expected_transaction_id=plan.transaction_id,
+        required_hot_keys=(*plan.physical_keys, *plan.protected_keys),
     )
 
 
@@ -853,7 +1462,7 @@ def test_step5_x_sequence_idle_and_cold_x16_recovery() -> None:
             (graph_key,),
             request_bytes=0,
             available_bytes=12,
-            owner_set_capture_envelope_bytes=12,
+            destination_capture_endpoint_bytes=12,
         )
         assert plan.kind == ElasticPlanKind.MAINTENANCE
         assert not plan.victim_keys
@@ -886,7 +1495,7 @@ def test_step5_x_sequence_idle_and_cold_x16_recovery() -> None:
         (x16,),
         request_bytes=0,
         available_bytes=12,
-        owner_set_capture_envelope_bytes=12,
+        destination_capture_endpoint_bytes=12,
     )
     assert recovery.kind == ElasticPlanKind.MAINTENANCE
     assert not recovery.victim_keys
@@ -1029,7 +1638,8 @@ def test_capture_with_sufficient_budget_retains_unrelated_hot_graphs() -> None:
         (cold,),
         request_bytes=32,
         available_bytes=1 << 20,
-        owner_set_capture_envelope_bytes=1 << 20,
+        destination_capture_endpoint_bytes=1 << 20,
+        shared_resident_bytes=32,
     )
     assert plan.kind == ElasticPlanKind.MAINTENANCE
     assert plan.victim_keys == ()
@@ -1049,13 +1659,50 @@ def test_owner_set_endpoint_subtracts_only_proven_reclaim_before_capture() -> No
         (cold,),
         request_bytes=100,
         available_bytes=120,
-        owner_set_capture_envelope_bytes=130,
+        destination_capture_endpoint_bytes=130,
+        shared_resident_bytes=100,
     )
 
     assert plan.kind == ElasticPlanKind.MAINTENANCE
     assert plan.victim_keys == (old,)
     assert plan.reclaim_bytes == 10
     assert plan.capture_loan_bytes == 120
+
+
+def test_hot_user_endpoint_deficit_defers_without_selecting_victims() -> None:
+    current = key("target", "PIECEWISE", 4096, 8)
+    unrelated = key("target", "PIECEWISE", 2048, 8)
+    cache = ElasticAdmissionController(GENERATION)
+    publish(cache, current)
+    publish(cache, unrelated)
+    before = cache.snapshot
+
+    plan = cache.plan(
+        "hot-one-byte-short",
+        (current,),
+        request_bytes=100,
+        available_bytes=100,
+        destination_capture_endpoint_bytes=101,
+        shared_resident_bytes=100,
+    )
+
+    assert plan.kind == ElasticPlanKind.DEFER
+    assert plan.defer_reason == "hot_endpoint_requires_explicit_reclaim"
+    assert plan.victim_keys == ()
+    assert cache.snapshot == before
+
+
+def test_post_transition_accounting_requires_destination_endpoint() -> None:
+    cache = ElasticAdmissionController(GENERATION)
+
+    with pytest.raises(ValueError, match="requires a destination capture endpoint"):
+        cache.plan(
+            "orphan-post-transition",
+            (),
+            request_bytes=0,
+            available_bytes=1,
+            post_transition_extra_bytes=1,
+        )
 
 
 def test_capture_loan_includes_retained_transition_overlap() -> None:
@@ -1067,12 +1714,169 @@ def test_capture_loan_includes_retained_transition_overlap() -> None:
         (cold,),
         request_bytes=100,
         available_bytes=160,
-        owner_set_capture_envelope_bytes=130,
+        destination_capture_endpoint_bytes=130,
         retained_transition_overlap_bytes=20,
+        shared_resident_bytes=100,
     )
 
     assert plan.kind == ElasticPlanKind.MAINTENANCE
     assert plan.capture_loan_bytes == 150
+
+
+def test_graph_only_plan_reclaims_for_later_hot_consumer_peak() -> None:
+    """Capture and HOT+MM fit separately after one exact victim selection."""
+    old = key("target", "PIECEWISE", 4096, 8)
+    cold = key("target", "PIECEWISE", 8192, 8)
+    cache = ElasticAdmissionController(GENERATION)
+    old_price = price("old", resident=100, peak=100)
+    cache.publish_hot(old, old_price, pinned=False)
+    cache.install_reclaim_group(ReclaimGroup("old", (old,), 100))
+
+    plan = cache.plan(
+        "capture-then-hot-mm",
+        (cold,),
+        request_bytes=100,
+        available_bytes=150,
+        destination_capture_endpoint_bytes=100,
+        post_transition_extra_bytes=50,
+    )
+
+    assert plan.kind == ElasticPlanKind.MAINTENANCE
+    assert plan.victim_keys == (old,)
+    assert plan.reclaim_bytes == 100
+    assert plan.capture_loan_bytes == 100
+
+
+def test_graph_only_plan_distinguishes_cold_and_hot_endpoints() -> None:
+    old = key("target", "PIECEWISE", 4096, 8)
+    cold = key("target", "PIECEWISE", 8192, 8)
+    cache = ElasticAdmissionController(GENERATION)
+    old_price = price("old-asymmetric", resident=60, peak=60)
+    cache.publish_hot(old, old_price, pinned=False)
+    cache.install_reclaim_group(ReclaimGroup("old-asymmetric", (old,), 60))
+
+    plan = cache.plan(
+        "asymmetric-capture-then-hot-mm",
+        (cold,),
+        request_bytes=100,
+        available_bytes=190,
+        destination_capture_endpoint_bytes=140,
+        post_transition_endpoint_bytes=100,
+        post_transition_extra_bytes=50,
+    )
+
+    assert plan.kind == ElasticPlanKind.MAINTENANCE
+    assert plan.victim_keys == (old,)
+    assert plan.reclaim_bytes == 60
+    assert plan.capture_loan_bytes == 180
+
+    insufficient = ElasticAdmissionController(GENERATION)
+    short_price = price("old-asymmetric-short", resident=59, peak=59)
+    insufficient.publish_hot(old, short_price, pinned=False)
+    insufficient.install_reclaim_group(ReclaimGroup("old-asymmetric-short", (old,), 59))
+    entries_before = dict(insufficient.entries)
+    rejected = insufficient.plan(
+        "asymmetric-one-byte-short",
+        (cold,),
+        request_bytes=100,
+        available_bytes=190,
+        destination_capture_endpoint_bytes=140,
+        post_transition_endpoint_bytes=100,
+        post_transition_extra_bytes=50,
+    )
+    assert rejected.kind == ElasticPlanKind.DEFER
+    assert insufficient.entries == entries_before
+
+
+def test_owner_set_endpoint_adds_unshared_live_hotset_before_capture() -> None:
+    cold = key("target", "FULL", 2, 2, uniform=1)
+    cache = ElasticAdmissionController(GENERATION)
+
+    plan = cache.plan(
+        "cumulative-hotset",
+        (cold,),
+        request_bytes=600,
+        available_bytes=800,
+        destination_capture_endpoint_bytes=180,
+        retained_transition_overlap_bytes=32,
+        shared_resident_bytes=12,
+    )
+
+    assert plan.kind == ElasticPlanKind.MAINTENANCE
+    assert plan.capture_loan_bytes == 800
+
+
+def test_destination_intersection_cannot_exceed_either_physical_set() -> None:
+    cold = key("target", "FULL", 2, 2, uniform=1)
+    cache = ElasticAdmissionController(GENERATION)
+
+    with pytest.raises(ValueError, match="current and destination sets"):
+        cache.plan(
+            "invalid-intersection",
+            (cold,),
+            request_bytes=600,
+            available_bytes=800,
+            destination_capture_endpoint_bytes=180,
+            shared_resident_bytes=181,
+        )
+
+
+def test_x2_cold_endpoint_preserves_observed_transition_segment() -> None:
+    cold = key("target", "FULL", 2, 2, uniform=1)
+    cache = ElasticAdmissionController(GENERATION)
+    current = 612_368_384
+    endpoint = 180_355_072
+    transition_segment = 20_971_520
+
+    plan = cache.plan(
+        "x2-underloan-regression",
+        (cold,),
+        request_bytes=current,
+        available_bytes=633_339_904,
+        destination_capture_endpoint_bytes=endpoint,
+        retained_transition_overlap_bytes=transition_segment,
+        shared_resident_bytes=endpoint,
+    )
+
+    assert plan.kind == ElasticPlanKind.MAINTENANCE
+    assert plan.capture_loan_bytes == 633_339_904
+    assert plan.capture_loan_bytes > max(current, endpoint)
+
+
+def test_capture_envelope_merge_keeps_only_common_receipt_byte_proof() -> None:
+    controller = ElasticAdmissionController(GENERATION)
+    owner_key = (0, 3, 0, 0, 0)
+    common = key("target", "PIECEWISE", 32, 8).identity
+    first_only = key("mtp_prefill", "PIECEWISE", 32, 8).identity
+    second_only = key("mtp_decode", "PIECEWISE", 8, 8).identity
+
+    controller.record_capture_envelope(
+        owner_key,
+        (100, 8, 0),
+        merge_max=True,
+        resident_key_bytes=((common, 20), (first_only, 30)),
+    )
+    controller.record_capture_envelope(
+        owner_key,
+        (120, 10, 0),
+        merge_max=True,
+        resident_key_bytes=((common, 12), (second_only, 40)),
+    )
+
+    assert controller.capture_envelopes[owner_key] == (120, 10, 0)
+    assert controller.capture_envelope_resident_key_bytes(owner_key) == ((common, 12),)
+
+    # Direct replacement of the public compatibility view must not reuse stale
+    # sidecar evidence for a different byte endpoint.
+    controller.capture_envelopes[owner_key] = (121, 10, 0)
+    assert controller.capture_envelope_resident_key_bytes(owner_key) is None
+
+    with pytest.raises(ElasticGraphError, match="exceeds the destination endpoint"):
+        controller.record_capture_envelope(
+            (0, 3, 0, 32, 0),
+            (10, 0, 0),
+            resident_key_bytes=((common, 11),),
+        )
 
 
 def test_idle_unpin_makes_pinned_graph_reclaimable() -> None:
@@ -1189,7 +1993,7 @@ def test_no_deficit_miss_never_selects_a_victim() -> None:
         (new,),
         request_bytes=10,
         available_bytes=40,
-        owner_set_capture_envelope_bytes=24,
+        destination_capture_endpoint_bytes=24,
     )
 
     assert plan.kind == ElasticPlanKind.MAINTENANCE
@@ -1251,6 +2055,34 @@ def test_residency_receipt_allows_pinned_proof_but_rejects_active_lease() -> Non
             complete=False,
         )
 
+    with pytest.raises(ValueError, match="local pool exceeds"):
+        ElasticResidencyEntry(
+            key=graph_key,
+            pinned=False,
+            resident_bytes=16,
+            local_pool_bytes=17,
+            reclaimable_bytes=0,
+        )
+    with pytest.raises(ValueError, match="reclaim proof exceeds the local pool"):
+        ElasticResidencyEntry(
+            key=graph_key,
+            pinned=False,
+            resident_bytes=16,
+            local_pool_bytes=8,
+            reclaimable_bytes=9,
+        )
+    with pytest.raises(ValueError, match="entries exceed aggregate"):
+        ElasticResidencyReceipt(
+            generation=GENERATION,
+            transaction_id=None,
+            resident_bytes=15,
+            floor_bytes=0,
+            transition_floor_bytes=0,
+            peak_bytes=16,
+            cublas_workspace_bytes=0,
+            entries=(pinned,),
+        )
+
 
 def test_runtime_config_is_single_fail_closed_activation_authority() -> None:
     config = SimpleNamespace(
@@ -1279,7 +2111,7 @@ def test_measured_deficit_defers_while_only_victim_is_leased() -> None:
         (cold,),
         request_bytes=10,
         available_bytes=20,
-        owner_set_capture_envelope_bytes=30,
+        destination_capture_endpoint_bytes=30,
     )
 
     assert deferred.kind == ElasticPlanKind.DEFER
@@ -1308,7 +2140,7 @@ def test_true_idle_reclaim_then_capture_preserves_progress() -> None:
         (new,),
         request_bytes=0,
         available_bytes=24,
-        owner_set_capture_envelope_bytes=24,
+        destination_capture_endpoint_bytes=24,
     )
     assert capture.kind == ElasticPlanKind.MAINTENANCE
     assert capture.victim_keys == ()

@@ -153,6 +153,124 @@ class ModelState(ABC):
             encoder_outputs = self.encoder_runner.execute_mm_encoder(mm_kwargs)
             self.encoder_cache.encoder_outputs.update(zip(mm_hashes, encoder_outputs))
 
+    def stage_mm_encoder(
+        self,
+        scheduled_encoder_inputs: dict[str, list[int]],
+        req_ids: list[str] | None = None,
+    ) -> tuple[list[str], list[Any]]:
+        """Build rank-local encoder inputs before entering model collectives."""
+        return self.encoder_runner.stage_mm_encoder_batches(scheduled_encoder_inputs)
+
+    def execute_staged_mm_encoder(self, staged: tuple[list[str], list[Any]]) -> None:
+        """Execute an all-rank-converged encoder stage exactly once."""
+        completed = self.execute_staged_mm_encoder_collective(staged)
+        self.commit_staged_mm_encoder(completed)
+
+    def execute_staged_mm_encoder_collective(
+        self, staged: tuple[list[str], list[Any]]
+    ) -> tuple[list[str], list[tuple[int, object]]]:
+        """Run only the common encoder collective/model phase."""
+        mm_hashes, batches = staged
+        grouped_outputs = (
+            self.encoder_runner.execute_staged_mm_encoder_batches(batches)
+            if batches
+            else []
+        )
+        return mm_hashes, grouped_outputs
+
+    def commit_staged_mm_encoder(
+        self, completed: tuple[list[str], list[tuple[int, object]]]
+    ) -> None:
+        """Commit rank-local encoder outputs after the common model phase."""
+        mm_hashes, grouped_outputs = completed
+        encoder_outputs = self.encoder_runner.finalize_staged_mm_encoder_outputs(
+            grouped_outputs
+        )
+        self.encoder_cache.encoder_outputs.update(zip(mm_hashes, encoder_outputs))
+
+    def validate_staged_mm_encoder(
+        self,
+        scheduled_encoder_inputs: dict[str, list[int]],
+        staged: tuple[list[str], list[Any]],
+        req_ids: list[str] | None = None,
+    ) -> None:
+        """Bind rank-local cache state to scheduler-declared encoder work."""
+        staged_hashes, staged_batches = staged
+        expected: list[tuple[str, str]] = []
+        for req_id in req_ids or scheduled_encoder_inputs:
+            input_ids = scheduled_encoder_inputs.get(req_id, [])
+            if not input_ids:
+                continue
+            features = self.encoder_cache.mm_features[req_id]
+            for input_id in input_ids:
+                feature = features[input_id]
+                if feature.data is not None:
+                    expected.append((feature.identifier, feature.modality))
+        staged_modalities = [
+            modality
+            for modality, num_items, _kwargs in staged_batches
+            for _ in range(num_items)
+        ]
+        observed = list(zip(staged_hashes, staged_modalities, strict=True))
+        if observed != expected:
+            raise RuntimeError(
+                "elastic MM encoder staging differs from scheduler-declared "
+                f"work: expected={expected!r} observed={observed!r}"
+            )
+
+    def stage_mm_embeddings(
+        self, input_batch: InputBatch, req_states: RequestState
+    ) -> Any:
+        """Perform local post-encoder gathering before TP token embedding."""
+        return None
+
+    def execute_staged_mm_embeddings(
+        self, staged: Any, input_batch: InputBatch
+    ) -> torch.Tensor | None:
+        """Run the common token-embedding phase for a staged MM batch."""
+        return None
+
+    def commit_staged_mm_embeddings(
+        self, embeddings: Any, input_batch: InputBatch
+    ) -> torch.Tensor | None:
+        """Commit post-collective embeddings to graph-stable input storage."""
+        return embeddings
+
+    def validate_mm_cache_readiness(
+        self,
+        scheduled_encoder_inputs: dict[str, list[int]],
+        input_batch: InputBatch,
+    ) -> None:
+        """Fail locally before any rank enters the MM encoder phase."""
+        self.encoder_runner.validate_cache_readiness(
+            scheduled_encoder_inputs,
+            input_batch.req_ids,
+            input_batch.num_scheduled_tokens,
+            input_batch.prefill_len_np,
+            input_batch.num_computed_tokens_np,
+        )
+
+    def validate_elastic_mm_embedding_split(
+        self, input_batch: InputBatch | None = None
+    ) -> None:
+        """Require an explicit collective/local-tail boundary for elastic MM."""
+        if not callable(
+            getattr(self.model, "embed_text_input_ids_for_elastic", None)
+        ) or not callable(
+            getattr(self.model, "merge_multimodal_embeddings_for_elastic", None)
+        ):
+            raise RuntimeError(
+                "elastic MM execution requires model-specific split text "
+                "embedding and multimodal merge hooks"
+            )
+        if input_batch is not None and (
+            input_batch.num_tokens_after_padding
+            > self.encoder_runner.inputs_embeds.shape[0]
+        ):
+            raise RuntimeError(
+                "elastic MM graph input exceeds the persistent embedding buffer"
+            )
+
     def gather_mm_embeddings(
         self, input_batch: InputBatch, draft_lookahead: int = 0
     ) -> tuple[list[torch.Tensor], torch.Tensor]:

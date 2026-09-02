@@ -42,7 +42,7 @@ def _write_calibration_receipt(path: Path, payload: dict[str, Any]) -> None:
 
 def _auto_calibrate_missing_catalog(owner: Any) -> None:
     from vllm import envs
-    from vllm.v1.core.elastic_catalog import load_sealed_catalog
+    from vllm.v1.core.elastic_catalog import load_sealed_catalog_with_digest
     from vllm.v1.engine.elastic_calibrator import calibrate_and_publish_catalog
     from vllm.v1.worker.startup_plan import (
         compute_elastic_graph_catalog_fingerprint,
@@ -57,22 +57,55 @@ def _auto_calibrate_missing_catalog(owner: Any) -> None:
             "AG2_VLLM_ELASTIC_CALIBRATION_SURFACE"
         )
     surface_path = Path(surface_value)
-    surface_payload = load_sealed_catalog(surface_path, require_migration=False)
+    surface_payload, surface_sha256 = load_sealed_catalog_with_digest(
+        surface_path,
+        require_migration=False,
+        allow_previous_schema=True,
+    )
     scheduler = owner.scheduler
     fingerprint = compute_elastic_graph_catalog_fingerprint(
         owner.vllm_config, scheduler.kv_cache_config
     )
+    canonical_destination = (
+        Path(envs.VLLM_CACHE_ROOT)
+        / "elastic_graph_catalog"
+        / f"elastic_graph_catalog_{fingerprint}.json"
+    )
+    try:
+        canonical_destination.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise RuntimeError(
+            "automatic elastic calibration cannot prove the canonical "
+            f"destination is absent: {canonical_destination}"
+        ) from error
+    else:
+        raise RuntimeError(
+            "automatic elastic calibration refuses an existing canonical "
+            "destination; validate or quarantine it before retrying: "
+            f"{canonical_destination}"
+        )
     receipt_path = Path(
         os.environ.get("AG2_VLLM_ELASTIC_CALIBRATION_RECEIPT")
         or Path(envs.VLLM_CACHE_ROOT)
         / "elastic_graph_catalog"
         / f"auto_calibration_{fingerprint}.json"
     )
+    resolved_surface = surface_path.resolve(strict=False)
+    resolved_canonical = canonical_destination.resolve(strict=False)
+    resolved_receipt = receipt_path.resolve(strict=False)
+    if len({resolved_surface, resolved_canonical, resolved_receipt}) != 3:
+        raise RuntimeError(
+            "elastic calibration surface, canonical catalog and receipt must "
+            "resolve to three distinct paths"
+        )
     receipt: dict[str, Any] = {
         "schema": "ag2-elastic-auto-calibration-v1",
         "stage": "calibrating",
         "fingerprint": fingerprint,
-        "surface": str(surface_path.resolve()),
+        "surface": str(resolved_surface),
+        "surface_sha256": surface_sha256,
     }
     _write_calibration_receipt(receipt_path, receipt)
     try:
@@ -81,6 +114,7 @@ def _auto_calibrate_missing_catalog(owner: Any) -> None:
             surface_payload,
             output_root=Path(envs.VLLM_CACHE_ROOT),
             expected_fingerprint=fingerprint,
+            surface_sha256=surface_sha256,
         )
         catalog = load_elastic_graph_catalog(
             owner.vllm_config, scheduler.kv_cache_config

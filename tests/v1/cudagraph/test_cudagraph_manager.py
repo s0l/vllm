@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
 import weakref
 from contextlib import contextmanager
+from copy import copy
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -23,7 +25,9 @@ from vllm.v1.core.elastic_graph import (
     ElasticAdmissionController,
     ElasticGraphError,
     ElasticPlanKind,
+    GraphPrice,
     RuntimeGeneration,
+    build_execution_manifest,
     resolve_step_physical_keys,
 )
 from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
@@ -1066,6 +1070,578 @@ def test_dynamic_working_set_uses_one_aggregate_loan():
     assert working_set.finish_step() == 30
 
 
+def test_worker_validates_q1_manifest_before_any_graph_mutation() -> None:
+    generation = RuntimeGeneration("worker-current-q1")
+
+    def manager(
+        owner: str,
+        *,
+        activation: str,
+        token_source: str,
+        decode_query_len: int,
+    ) -> MagicMock:
+        result = MagicMock()
+        result.dynamic_graph_owner = owner
+        result.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+        result._runtime_decode_query_lens.return_value = {decode_query_len}
+        result.compiled_piecewise_sizes = frozenset()
+        result.tp3_owner_prequant = False
+        result.elastic_graph_activation = activation
+        result.elastic_graph_token_source = token_source
+        result.elastic_graph_fixed_query_len = None
+        return result
+
+    target = manager(
+        "target", activation="always", token_source="step", decode_query_len=1
+    )
+    mtp_prefill = manager(
+        "mtp_prefill",
+        activation="speculative",
+        token_source="step",
+        decode_query_len=1,
+    )
+    mtp_decode = manager(
+        "mtp_decode",
+        activation="speculative",
+        token_source="requests",
+        decode_query_len=1,
+    )
+    working_set = gpu_cudagraph_utils.DynamicGraphWorkingSet(
+        (target, mtp_prefill, mtp_decode)
+    )
+    policy = gpu_cudagraph_utils.graph_execution_policy_from_managers(
+        working_set.managers
+    )
+    step_key = (0, 3, 1, 1, 0)
+    manifest, dispatch = build_execution_manifest(
+        step_key=step_key,
+        request_ids=("request-0",),
+        per_request_query_lens=(1,),
+        per_request_is_prefilling=(True,),
+        scheduled_draft_rows=(0,),
+        requested_output_k=3,
+        executed_drafter_k=3,
+        phase="mixed",
+        generation=generation,
+        policy=policy,
+        max_num_batched_tokens=4096,
+    )
+    current_keys = tuple(
+        item.physical_key for item in dispatch if item.physical_key is not None
+    )
+    successor_keys = resolve_step_physical_keys(
+        (0, 3, 1, 4, 4),
+        generation,
+        max_num_batched_tokens=4096,
+        policy=policy,
+    )
+    successor_only = tuple(key for key in successor_keys if key not in current_keys)
+    residency_union = tuple((*current_keys, *successor_only))
+    controller = ElasticAdmissionController(generation)
+    for graph_key in residency_union:
+        controller.publish_hot(
+            graph_key,
+            GraphPrice(1, 1, f"test:{graph_key.identity}"),
+            pinned=False,
+        )
+    plan = replace(
+        controller.plan(
+            "q1-user",
+            residency_union,
+            request_bytes=3,
+            available_bytes=10,
+            protected_keys=successor_only,
+        ),
+        execution_manifest=manifest,
+        current_dispatch=dispatch,
+        successor_keys=successor_keys,
+    )
+
+    working_set.validate_execution_manifest(
+        replace(plan, execution_manifest=None, current_dispatch=()),
+        step_key=None,
+        request_ids=(),
+        per_request_query_lens=(),
+        per_request_is_prefilling=(),
+        scheduled_draft_rows=(),
+        requested_output_k=0,
+        executed_drafter_k=0,
+        phase=None,
+        max_num_batched_tokens=4096,
+    )
+
+    working_set.validate_execution_manifest(
+        plan,
+        step_key=step_key,
+        request_ids=("request-0",),
+        per_request_query_lens=(1,),
+        per_request_is_prefilling=(True,),
+        scheduled_draft_rows=(0,),
+        requested_output_k=3,
+        executed_drafter_k=3,
+        phase="mixed",
+        max_num_batched_tokens=4096,
+    )
+
+    with pytest.raises(
+        gpu_cudagraph_utils.ElasticExecutionPlanMismatch,
+        match=(
+            r"fields=request_ids\[0\]: planned='request-0' "
+            r"observed='request-1' lengths=1/1"
+        ),
+    ):
+        working_set.validate_execution_manifest(
+            plan,
+            step_key=step_key,
+            request_ids=("request-1",),
+            per_request_query_lens=(1,),
+            per_request_is_prefilling=(True,),
+            scheduled_draft_rows=(0,),
+            requested_output_k=3,
+            executed_drafter_k=3,
+            phase="mixed",
+            max_num_batched_tokens=4096,
+        )
+
+    with pytest.raises(
+        gpu_cudagraph_utils.ElasticExecutionPlanMismatch,
+        match="cannot inherit a successor carrier",
+    ):
+        working_set.validate_execution_manifest(
+            plan,
+            step_key=(0, 3, 1, 4, 4),
+            request_ids=("request-0",),
+            per_request_query_lens=(1,),
+            per_request_is_prefilling=(True,),
+            scheduled_draft_rows=(0,),
+            requested_output_k=3,
+            executed_drafter_k=3,
+            phase="mixed",
+            max_num_batched_tokens=4096,
+        )
+    with pytest.raises(
+        gpu_cudagraph_utils.ElasticExecutionPlanMismatch,
+        match=(
+            r"fields=per_request_is_prefilling\[0\]: planned=True "
+            r"observed=False lengths=1/1"
+        ),
+    ):
+        working_set.validate_execution_manifest(
+            plan,
+            step_key=step_key,
+            request_ids=("request-0",),
+            per_request_query_lens=(1,),
+            per_request_is_prefilling=(False,),
+            scheduled_draft_rows=(0,),
+            requested_output_k=3,
+            executed_drafter_k=3,
+            phase="mixed",
+            max_num_batched_tokens=4096,
+        )
+    for owner in working_set.managers:
+        owner.evict_physical_key.assert_not_called()
+        owner.queue_physical_key.assert_not_called()
+        owner.finish_dynamic_step.assert_not_called()
+
+    for owner in working_set.managers:
+        owner.is_physical_key_hot.return_value = True
+        owner._dynamic_pending = None
+    working_set.apply_plan(plan)
+    current_by_owner = {key.logical.owner: key for key in current_keys}
+    for owner in working_set.managers:
+        owner.queue_physical_key.assert_called_once_with(
+            current_by_owner[owner.dynamic_graph_owner]
+        )
+    assert successor_only
+    assert all(
+        call.args[0] not in successor_only
+        for owner in working_set.managers
+        for call in owner.queue_physical_key.call_args_list
+    )
+    for key in successor_only:
+        next(
+            owner
+            for owner in working_set.managers
+            if owner.dynamic_graph_owner == key.logical.owner
+        ).acquire_physical_key_lease.assert_any_call(key, plan.transaction_id)
+
+
+def _worker_consensus_fixture():
+    generation = RuntimeGeneration("worker-consensus")
+    managers = tuple(MagicMock() for _ in range(3))
+    for owner, manager in zip(
+        ("target", "unused-1", "unused-2"), managers, strict=True
+    ):
+        manager.dynamic_graph_owner = owner
+        manager.runtime_generation = generation.value
+        manager.tp_size = 3
+        manager.is_physical_key_hot.return_value = owner == "target"
+        manager._dynamic_pending = None
+    working_set = gpu_cudagraph_utils.DynamicGraphWorkingSet(managers)
+    policy = gpu_cudagraph_utils.GraphExecutionPolicy(
+        verifier_contract="consensus-v1",
+        math_contract="consensus-math-v1",
+        owners=(
+            gpu_cudagraph_utils.OwnerGraphExecutionPolicy(
+                "target",
+                (1,),
+                "PIECEWISE",
+                activation="always",
+                token_source="step",
+                execution_order=0,
+            ),
+        ),
+    )
+    step_key = (1, 0, 1, 1, 1)
+    manifest, dispatch = build_execution_manifest(
+        step_key=step_key,
+        request_ids=("request-0",),
+        per_request_query_lens=(1,),
+        per_request_is_prefilling=(False,),
+        scheduled_draft_rows=(0,),
+        requested_output_k=0,
+        executed_drafter_k=0,
+        phase="decode",
+        generation=generation,
+        policy=policy,
+        max_num_batched_tokens=4096,
+    )
+    graph_key = dispatch[0].physical_key
+    assert graph_key is not None
+    controller = ElasticAdmissionController(generation)
+    controller.publish_hot(graph_key, GraphPrice(1, 1, "consensus"), pinned=False)
+    plan = replace(
+        controller.plan(
+            "consensus-user",
+            (graph_key,),
+            request_bytes=1,
+            available_bytes=2,
+        ),
+        execution_manifest=manifest,
+        current_dispatch=dispatch,
+    )
+    return working_set, managers, plan
+
+
+def _assert_no_worker_plan_mutation(managers) -> None:
+    for manager in managers:
+        manager.begin_dynamic_step.assert_not_called()
+        manager.acquire_physical_key_lease.assert_not_called()
+        manager.evict_physical_key.assert_not_called()
+        manager.queue_physical_key.assert_not_called()
+
+
+def test_repeated_manifest_rank_error_votes_before_any_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    working_set, managers, plan = _worker_consensus_fixture()
+
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=object()),
+    )
+
+    vote_count = 0
+    diagnostic_count = 0
+
+    def gather_vote(output, value, **_kwargs):
+        nonlocal vote_count
+        vote_count += 1
+        output.view(3, 5)[:] = value
+        if vote_count == 2:
+            output.view(3, 5)[1, 4] = 1
+
+    def gather_diagnostics(outputs, value, **_kwargs):
+        nonlocal diagnostic_count
+        diagnostic_count += 1
+        outputs[:] = [
+            value,
+            (value[0], "rank-1 rejected repeated manifest"),
+            value,
+        ]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_single", gather_vote)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather_diagnostics)
+    # Establish one accepted vote, then replay the exact same fingerprint.
+    # The repeat must still enter a collective because a peer can have a
+    # rank-local error that is invisible here.
+    working_set.require_rank_consensus(plan)
+    with pytest.raises(
+        gpu_cudagraph_utils.ElasticExecutionPlanMismatch,
+        match="rank-1 rejected repeated manifest",
+    ):
+        working_set.begin_admitted_step(plan)
+    # A rejected status must not poison the reusable fixed-size vote buffers.
+    assert working_set.require_rank_consensus(plan) == plan.fingerprint
+    assert vote_count == 3
+    assert diagnostic_count == 1
+    _assert_no_worker_plan_mutation(managers)
+
+
+@pytest.mark.parametrize("local_error", [None, "rank-0 materialization drift"])
+def test_post_materialization_vote_converges_rank_local_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+    local_error: str | None,
+) -> None:
+    working_set, _managers, plan = _worker_consensus_fixture()
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=object()),
+    )
+    votes = 0
+
+    def gather_vote(output, value, **_kwargs):
+        nonlocal votes
+        votes += 1
+        output.view(3, 5)[:] = value
+        # Regardless of which local rank this unit instance represents, the
+        # shared vote reports one rank-local materialization rejection.
+        output.view(3, 5)[1, 4] = 1
+
+    def gather_diagnostics(outputs, value, **_kwargs):
+        outputs[:] = [
+            (value[0], local_error),
+            (value[0], "rank-1 materialization drift"),
+            (value[0], None),
+        ]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_single", gather_vote)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather_diagnostics)
+
+    with pytest.raises(
+        RuntimeError,
+        match="all-rank input materialization vote rejected before model collectives",
+    ):
+        working_set.require_post_materialization_consensus(
+            plan,
+            validation_error=local_error,
+        )
+
+    assert votes == 1
+    calls, total_ns = working_set.rank_consensus_timing_snapshot()[
+        "post_materialization"
+    ]
+    assert calls == 1
+    assert total_ns > 0
+
+
+def test_post_materialization_vote_rejects_observer_fingerprint_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    working_set, _managers, plan = _worker_consensus_fixture()
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=object()),
+    )
+
+    def gather_vote(output, value, **_kwargs):
+        output.view(3, 5)[:] = value
+        output.view(3, 5)[1, 0] ^= 1
+
+    def gather_diagnostics(outputs, value, **_kwargs):
+        outputs[:] = [value, ("f" * 64, None), value]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_single", gather_vote)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather_diagnostics)
+
+    with pytest.raises(RuntimeError, match="vote rejected before model collectives"):
+        working_set.require_post_materialization_consensus(
+            plan,
+            observer_fingerprint="a" * 64,
+            phase="post_mm_materialization",
+        )
+
+
+def test_one_rank_residency_drift_rejects_before_any_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    working_set, managers, plan = _worker_consensus_fixture()
+    # Simulate rank 1 losing the scheduler-declared HOT executable while ranks
+    # 0 and 2 still have the same immutable plan.
+    managers[0].is_physical_key_hot.return_value = False
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=object()),
+    )
+
+    def gather_vote(output, value, **_kwargs):
+        assert int(value[4]) == 1
+        output.view(3, 5)[:] = value
+        output.view(3, 5)[0, 4] = 0
+        output.view(3, 5)[2, 4] = 0
+
+    def gather_diagnostics(outputs, value, **_kwargs):
+        assert value[1] is not None
+        assert "HOT hit absent from worker residency" in value[1]
+        outputs[:] = [(value[0], None), value, (value[0], None)]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_single", gather_vote)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather_diagnostics)
+    with pytest.raises(
+        gpu_cudagraph_utils.ElasticExecutionPlanMismatch,
+        match="HOT hit absent from worker residency",
+    ):
+        working_set.begin_admitted_step(plan)
+    _assert_no_worker_plan_mutation(managers)
+
+
+def test_victim_current_overlap_rejects_before_any_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    working_set, managers, plan = _worker_consensus_fixture()
+    graph_key = plan.physical_keys[0]
+    with pytest.raises(ValueError, match="current physical key"):
+        replace(plan, victim_keys=(graph_key,))
+
+    # Bypass the frozen dataclass constructor to simulate corrupt transport and
+    # prove that the independent worker validator still rejects it.
+    corrupted_plan = copy(plan)
+    object.__setattr__(corrupted_plan, "victim_keys", (graph_key,))
+    corrupted_plan.__dict__.pop("fingerprint", None)
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=object()),
+    )
+
+    def gather_vote(output, value, **_kwargs):
+        assert int(value[4]) == 1
+        output.view(3, 5)[:] = value
+        output.view(3, 5)[0, 4] = 0
+        output.view(3, 5)[2, 4] = 0
+
+    def gather_diagnostics(outputs, value, **_kwargs):
+        assert "selected as an eviction victim" in value[1]
+        outputs[:] = [(value[0], None), value, (value[0], None)]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_single", gather_vote)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather_diagnostics)
+    with pytest.raises(
+        gpu_cudagraph_utils.ElasticExecutionPlanMismatch,
+        match="selected as an eviction victim",
+    ):
+        working_set.begin_admitted_step(corrupted_plan)
+    _assert_no_worker_plan_mutation(managers)
+
+
+def test_victim_protected_overlap_rejects_before_any_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    working_set, managers, plan = _worker_consensus_fixture()
+    graph_key = plan.physical_keys[0]
+    protected_key = replace(
+        graph_key,
+        logical=replace(graph_key.logical, token_bucket=2),
+    )
+    with pytest.raises(ValueError, match="protected key"):
+        replace(
+            plan,
+            protected_keys=(protected_key,),
+            victim_keys=(protected_key,),
+        )
+
+    # Simulate a corrupt decoded object, bypassing the constructor just as a
+    # transport/runtime type boundary could. Worker validation must remain a
+    # complete guard because applying this plan would acquire the lease before
+    # discovering that the same entry cannot be evicted.
+    corrupted_plan = copy(plan)
+    object.__setattr__(corrupted_plan, "protected_keys", (protected_key,))
+    object.__setattr__(corrupted_plan, "victim_keys", (protected_key,))
+    corrupted_plan.__dict__.pop("fingerprint", None)
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=object()),
+    )
+
+    def gather_vote(output, value, **_kwargs):
+        assert int(value[4]) == 1
+        output.view(3, 5)[:] = value
+        output.view(3, 5)[0, 4] = 0
+        output.view(3, 5)[2, 4] = 0
+
+    def gather_diagnostics(outputs, value, **_kwargs):
+        assert "protected physical key" in value[1]
+        outputs[:] = [(value[0], None), value, (value[0], None)]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_single", gather_vote)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather_diagnostics)
+    with pytest.raises(
+        gpu_cudagraph_utils.ElasticExecutionPlanMismatch,
+        match="protected physical key",
+    ):
+        working_set.begin_admitted_step(corrupted_plan)
+    _assert_no_worker_plan_mutation(managers)
+
+
+def test_rank_plan_hash_drift_rejects_before_any_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    working_set, managers, plan = _worker_consensus_fixture()
+    divergent_plan = replace(plan, transaction_id="rank-2-divergent")
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=object()),
+    )
+
+    def gather_vote(output, value, **_kwargs):
+        output.view(3, 5)[:] = value
+        output.view(3, 5)[2, 0] ^= 1
+
+    def gather_diagnostics(outputs, value, **_kwargs):
+        outputs[:] = [value, value, (divergent_plan.fingerprint, None)]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_single", gather_vote)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather_diagnostics)
+    with pytest.raises(
+        gpu_cudagraph_utils.ElasticExecutionPlanMismatch,
+        match="fingerprint differs by rank",
+    ):
+        working_set.begin_admitted_step(plan)
+    _assert_no_worker_plan_mutation(managers)
+
+
+def test_rank_vote_fast_path_is_fixed_size_and_skips_object_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    working_set, _managers, plan = _worker_consensus_fixture()
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=object()),
+    )
+    vote_count = 0
+
+    def gather_vote(output, value, **_kwargs):
+        nonlocal vote_count
+        vote_count += 1
+        assert value.shape == (5,)
+        assert value.dtype == torch.int64
+        assert value.device.type == "cpu"
+        output.view(3, 5)[:] = value
+
+    object_gather = MagicMock()
+    monkeypatch.setattr(torch.distributed, "all_gather_single", gather_vote)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", object_gather)
+
+    iterations = 128
+    started = time.perf_counter()
+    for _ in range(iterations):
+        assert working_set.require_rank_consensus(plan) == plan.fingerprint
+    elapsed = time.perf_counter() - started
+
+    assert vote_count == iterations
+    object_gather.assert_not_called()
+    # This bounds only Python/tensor bookkeeping with a mocked collective; it
+    # is a regression sentinel, not a claim about real TP/Gloo latency.
+    assert elapsed < 1.0
+
+
 def test_dynamic_working_set_executes_immutable_piecewise_first_capture_order():
     generation = RuntimeGeneration("worker-m160-order")
     desired = resolve_step_physical_keys(
@@ -1080,7 +1656,7 @@ def test_dynamic_working_set_executes_immutable_piecewise_first_capture_order():
         desired,
         request_bytes=0,
         available_bytes=512,
-        owner_set_capture_envelope_bytes=200,
+        destination_capture_endpoint_bytes=200,
     )
 
     managers = []
@@ -1144,6 +1720,7 @@ def test_dynamic_working_set_forwards_reclaim_authority(kind, administrative):
     plan = SimpleNamespace(
         kind=kind,
         transaction_id="idle-x0",
+        generation=generation,
         protected_keys=(),
         victim_keys=(graph_key,),
         physical_keys=(),

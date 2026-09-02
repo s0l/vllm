@@ -17,7 +17,7 @@ from vllm.v1.core.elastic_graph import (
     compute_elastic_runtime_generation_from_factors,
 )
 
-ELASTIC_RUNTIME_GENERATION_SCHEMA_VERSION = 2
+ELASTIC_RUNTIME_GENERATION_SCHEMA_VERSION = 3
 
 
 def elastic_runtime_source_hashes() -> dict[str, str]:
@@ -35,10 +35,18 @@ def elastic_runtime_source_hashes() -> dict[str, str]:
         "vllm.v1.worker.elastic_catalog_tool",
         "vllm.v1.worker.gpu.cudagraph_utils",
         "vllm.v1.worker.gpu.elastic_gdn",
+        "vllm.v1.worker.gpu.mm.encoder_runner",
         "vllm.v1.worker.gpu.model_runner",
+        "vllm.v1.worker.gpu.model_states.default",
+        "vllm.v1.worker.gpu.model_states.encoder_decoder",
+        "vllm.v1.worker.gpu.model_states.interface",
         "vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils",
         "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator",
         "vllm.v1.worker.startup_plan",
+        # Effective Exp22/Qwen3.8 Graph inputs split TP text embedding from the
+        # rank-local multimodal merge. Bind that model-specific DAG owner until
+        # runtime identity derives the loaded model module dynamically.
+        "vllm.model_executor.models.qwen3_5",
     )
     result: dict[str, str] = {}
     for module_name in modules:

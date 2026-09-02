@@ -762,6 +762,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
                 "Layer trace requires query lengths in {1,3}, "
                 "a token id and an absolute position"
             )
+
     def maybe_save_ag2_layer0_trace(
         self,
         input_ids: torch.Tensor,
@@ -1004,6 +1005,33 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         )
 
         return inputs_embeds
+
+    def embed_text_input_ids_for_elastic(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run only the TP text-embedding phase for elastic MM execution."""
+        return self._embed_text_input_ids(
+            input_ids,
+            self.language_model.embed_input_ids,
+            is_multimodal=is_multimodal,
+        )
+
+    def merge_multimodal_embeddings_for_elastic(
+        self,
+        text_embeddings: torch.Tensor,
+        multimodal_embeddings: MultiModalEmbeddings,
+        *,
+        is_multimodal: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the rank-local MM merge after the TP embedding collective."""
+        return _merge_multimodal_embeddings(
+            inputs_embeds=text_embeddings,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=_require_is_multimodal(is_multimodal),
+        )
 
     def forward(
         self,

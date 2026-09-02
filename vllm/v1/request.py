@@ -40,14 +40,11 @@ def _parse_prefix_cache_hint_tokens(extra_args: dict[str, Any] | None) -> int:
         value = os.environ.get("AG2_VLLM_DCP_FINE_PREFIX_HINT_TOKENS")
     if os.environ.get("AG2_VLLM_DCP_FINE_PREFIX", "0") != "1":
         raise ValueError(
-            "ag2_prefix_cache_hint_tokens requires "
-            "AG2_VLLM_DCP_FINE_PREFIX=1"
+            "ag2_prefix_cache_hint_tokens requires AG2_VLLM_DCP_FINE_PREFIX=1"
         )
     configured = os.environ.get("AG2_VLLM_DCP_FINE_PREFIX_HINT_TOKENS")
     if configured is None:
-        raise ValueError(
-            "AG2_VLLM_DCP_FINE_PREFIX_HINT_TOKENS must be configured"
-        )
+        raise ValueError("AG2_VLLM_DCP_FINE_PREFIX_HINT_TOKENS must be configured")
     try:
         configured_tokens = int(configured)
     except ValueError as exc:
@@ -163,9 +160,7 @@ class Request:
             if sampling_params.extra_args is not None:
                 self.force_non_speculative = parse_force_non_speculative_xarg(
                     sampling_params.extra_args,
-                    enabled=os.environ.get(
-                        "AG2_VLLM_ALLOW_FORCE_NON_SPECULATIVE"
-                    )
+                    enabled=os.environ.get("AG2_VLLM_ALLOW_FORCE_NON_SPECULATIVE")
                     == "1",
                 )
                 self.prefix_cache_hint_tokens = _parse_prefix_cache_hint_tokens(
@@ -173,8 +168,7 @@ class Request:
                 )
                 self.prefix_cache_hint_is_default = (
                     self.prefix_cache_hint_tokens > 0
-                    and "ag2_prefix_cache_hint_tokens"
-                    not in sampling_params.extra_args
+                    and "ag2_prefix_cache_hint_tokens" not in sampling_params.extra_args
                 )
                 self.kv_transfer_params = sampling_params.extra_args.get(
                     "kv_transfer_params"
@@ -187,9 +181,7 @@ class Request:
                 )
             else:
                 self.prefix_cache_hint_tokens = _parse_prefix_cache_hint_tokens(None)
-                self.prefix_cache_hint_is_default = (
-                    self.prefix_cache_hint_tokens > 0
-                )
+                self.prefix_cache_hint_is_default = self.prefix_cache_hint_tokens > 0
                 self.kv_cache_report_mode = "incremental"
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
@@ -206,6 +198,14 @@ class Request:
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             prompt_token_ids, prompt_embeds
         )
+        # Authoritative boundary for the token stream that must be replayed as
+        # prefill before ordinary autoregressive decode can resume.  It starts
+        # at the semantic prompt boundary, but a preemption can extend it over
+        # already-emitted output tokens whose KV/state must be reconstructed.
+        # Keep this scheduler-owned value distinct from ``num_prompt_tokens``:
+        # the latter remains the user prompt contract for logprobs, metrics and
+        # stopping, while this value controls execution phase and row ordering.
+        self.execution_prefill_len = self.num_prompt_tokens
         if (
             self.prefix_cache_hint_tokens > 0
             and self.prefix_cache_hint_tokens >= self.num_prompt_tokens
@@ -335,6 +335,13 @@ class Request:
         else:
             self._output_token_ids.extend(token_ids)
             self._all_token_ids.extend(token_ids)
+
+        if self.status == RequestStatus.PREEMPTED:
+            # Async/stale output can arrive after the request's KV was reset but
+            # before it is admitted again.  If those tokens are retained, the
+            # next worker receives them in the replay stream and the execution
+            # boundary must grow with that exact scheduler-owned stream.
+            self.execution_prefill_len = len(self._all_token_ids)
 
         self.update_block_hashes()
 

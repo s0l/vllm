@@ -34,6 +34,9 @@ from vllm.platforms import current_platform
 from vllm.v1.core.elastic_catalog import (
     ELASTIC_GRAPH_CATALOG_SCHEMA_VERSION,
     elastic_graph_catalog_row_complete,
+    expected_semantic_token_witnesses,
+    load_sealed_catalog_with_digest,
+    validate_elastic_catalog_key_inventory,
 )
 from vllm.v1.core.elastic_runtime import (
     elastic_profile_config_factors,
@@ -44,6 +47,15 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_worker import Worker
 
 logger = init_logger(__name__)
+
+
+class ElasticGraphCatalog(dict[tuple[int, ...], dict[str, Any]]):
+    """Validated price rows bound to one exact source byte sequence."""
+
+    def __init__(self, *, source_sha256: str) -> None:
+        super().__init__()
+        self.source_sha256 = source_sha256
+
 
 PLAN_SCHEMA_VERSION = 3
 GRAPH_RECIPE_SCHEMA_VERSION = 2
@@ -283,21 +295,59 @@ def _catalog_policy_row_metadata(
     }
 
 
+def _validated_catalog_resident_key_bytes(
+    raw: Any,
+    *,
+    resident_bytes: int,
+    cold_peak_bytes: int,
+) -> tuple[tuple[str, int], ...] | None:
+    """Validate receipt-key byte provenance carried by one measured endpoint."""
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)):
+        raise RuntimeError("resident-key provenance must be a sequence")
+    pairs: list[tuple[str, int]] = []
+    for item in raw:
+        if (
+            not isinstance(item, (list, tuple))
+            or len(item) != 2
+            or not isinstance(item[0], str)
+            or len(item[0]) != 64
+            or any(character not in "0123456789abcdef" for character in item[0])
+            or isinstance(item[1], bool)
+            or not isinstance(item[1], int)
+            or item[1] < 0
+        ):
+            raise RuntimeError(
+                "resident-key provenance requires lowercase SHA256 identities "
+                "and non-negative byte counts"
+            )
+        pairs.append((item[0], item[1]))
+    if [identity for identity, _value in pairs] != sorted(
+        {identity for identity, _value in pairs}
+    ):
+        raise RuntimeError("resident-key provenance must be sorted and unique")
+    if sum(value for _identity, value in pairs) > min(resident_bytes, cold_peak_bytes):
+        raise RuntimeError("resident-key provenance exceeds its measured endpoint")
+    return tuple(pairs)
+
+
 def load_elastic_graph_catalog(
     vllm_config: VllmConfig, kv_cache_config: Any
-) -> dict[tuple[int, ...], dict[str, int]]:
+) -> dict[tuple[int, ...], dict[str, Any]]:
     """Load only identity-matched, complete cold+hot shape measurements."""
     if not envs.VLLM_ENABLE_STARTUP_PLAN:
         return {}
     fingerprint = compute_elastic_graph_catalog_fingerprint(
         vllm_config, kv_cache_config
     )
-    from vllm.v1.core.elastic_graph import configured_compiled_piecewise_sizes
+    from vllm.v1.core.elastic_graph import (
+        configured_compiled_piecewise_sizes,
+    )
 
     path = _elastic_graph_catalog_path(fingerprint)
     try:
-        with open(path) as stream:
-            payload = json.load(stream)
+        os.lstat(path)
     except FileNotFoundError:
         logger.warning(
             "Elastic CUDA Graph catalog is absent for the effective runtime "
@@ -306,9 +356,25 @@ def load_elastic_graph_catalog(
             fingerprint,
         )
         return {}
-    except (OSError, json.JSONDecodeError) as error:
-        logger.warning("Ignoring unreadable elastic Graph catalog %s: %s", path, error)
-        return {}
+    except OSError as error:
+        raise RuntimeError(
+            "canonical elastic Graph catalog path cannot be inspected; "
+            f"refusing automatic calibration over it: {path}: {error}"
+        ) from error
+    try:
+        payload, source_sha256 = load_sealed_catalog_with_digest(
+            path, require_migration=False
+        )
+    except RuntimeError as error:
+        if "migration lineage" in str(error) or "offline-finalized" in str(error):
+            raise RuntimeError(
+                "serving requires an offline-finalized elastic Graph catalog "
+                "without migration lineage fields"
+            ) from error
+        raise RuntimeError(
+            "canonical elastic Graph catalog exists but is unreadable; "
+            f"refusing automatic calibration over it: {path}: {error}"
+        ) from error
     if isinstance(payload, dict) and (
         "migrated_from" in payload or "migration_scope" in payload
     ):
@@ -326,9 +392,69 @@ def load_elastic_graph_catalog(
             _effective_graph_execution_policy(kv_cache_config),
         )
     ):
-        logger.warning("Ignoring stale or unsealed elastic Graph catalog %s", path)
-        return {}
+        raise RuntimeError(
+            "canonical elastic Graph catalog has stale, unsealed, or "
+            f"identity-mismatched contents: {path}"
+        )
     coverage = payload.get("coverage")
+    if (
+        not isinstance(coverage, dict)
+        or coverage.get("semantic_witness_contract")
+        != "live-current-to-physical-piecewise-v1"
+        or not isinstance(coverage.get("semantic_token_witnesses"), list)
+    ):
+        raise RuntimeError(
+            f"canonical elastic Graph catalog has no semantic witness identity: {path}"
+        )
+    required_inventory, _restore_inventory = validate_elastic_catalog_key_inventory(
+        coverage.get("required_step_keys"),
+        coverage.get("restore_step_keys", []),
+        label="canonical elastic Graph catalog",
+    )
+    required_step_keys = set(required_inventory)
+    decode_k = int(vllm_config.num_speculative_tokens)
+    speculative_config = vllm_config.speculative_config
+    prefill_k = (
+        0
+        if speculative_config is not None
+        and speculative_config.disable_speculation_on_non_decode
+        else decode_k
+    )
+    if any(
+        key[1] != (decode_k if key[0] == 1 else prefill_k) for key in required_inventory
+    ):
+        raise RuntimeError(
+            "canonical elastic Graph catalog differs from phase-specific K"
+        )
+    declared_witnesses = tuple(
+        sorted(
+            (
+                tuple(witness["step_key"]),
+                witness["live_num_tokens"],
+            )
+            for witness in coverage["semantic_token_witnesses"]
+        )
+    )
+    expected_witnesses = expected_semantic_token_witnesses(
+        configured_k=decode_k,
+        prefill_k=prefill_k,
+        max_num_seqs=coverage.get("decode_max_x", 0),
+        max_num_batched_tokens=(vllm_config.scheduler_config.max_num_batched_tokens),
+    )
+    if declared_witnesses != expected_witnesses:
+        raise RuntimeError(
+            "canonical elastic Graph catalog semantic witnesses differ "
+            "from the effective runtime"
+        )
+    shapes = payload.get("shapes")
+    if (
+        not isinstance(shapes, list)
+        or payload.get("complete_shapes") != len(shapes)
+        or coverage.get("required_shapes") != len(required_step_keys)
+    ):
+        raise RuntimeError(
+            f"sealed elastic Graph catalog shape coverage is inconsistent: {path}"
+        )
     policy = _effective_graph_execution_policy(kv_cache_config)
     compiled_piecewise_sizes = configured_compiled_piecewise_sizes(vllm_config)
     representation = (
@@ -336,10 +462,10 @@ def load_elastic_graph_catalog(
         if isinstance(coverage, dict)
         else "pinned_full_family"
     )
-    result: dict[tuple[int, ...], dict[str, int]] = {}
-    for row in payload.get("shapes", []):
+    result = ElasticGraphCatalog(source_sha256=source_sha256)
+    for row in shapes:
         if not isinstance(row, dict):
-            continue
+            raise RuntimeError("elastic Graph catalog contains a non-object row")
         key = row.get("step_key")
         if (
             not isinstance(key, list)
@@ -348,7 +474,12 @@ def load_elastic_graph_catalog(
                 isinstance(value, bool) or not isinstance(value, int) for value in key
             )
         ):
-            continue
+            raise RuntimeError("elastic Graph catalog contains an invalid step key")
+        catalog_key = tuple(key)
+        if catalog_key in result:
+            raise RuntimeError(
+                f"elastic Graph catalog contains duplicate step key: {key!r}"
+            )
         expected_policy_metadata = _catalog_policy_row_metadata(
             key,
             policy=policy,
@@ -385,7 +516,21 @@ def load_elastic_graph_catalog(
             isinstance(finalized_pinned_owner_set, bool)
             or finalized_pinned_owner_set not in {0, 1}
         ):
-            continue
+            raise RuntimeError(
+                "elastic Graph catalog row has invalid numeric fields: "
+                f"step_key={key!r}"
+            )
+        try:
+            resident_key_bytes = _validated_catalog_resident_key_bytes(
+                row.get("resident_key_bytes"),
+                resident_bytes=fields["resident_bytes"],
+                cold_peak_bytes=fields["cold_peak_bytes"],
+            )
+        except RuntimeError as error:
+            raise RuntimeError(
+                "elastic Graph catalog row has invalid resident-key provenance: "
+                f"step_key={key!r}"
+            ) from error
         complete_row = dict(fields)
         if finalized_pinned_owner_set:
             complete_row["finalized_pinned_owner_set"] = finalized_pinned_owner_set
@@ -401,10 +546,20 @@ def load_elastic_graph_catalog(
             and fields["hot_observations"] >= 2
             and fields["hot_stable_replays"] >= 1
         ):
-            continue
+            raise RuntimeError(
+                f"elastic Graph catalog row is incomplete: step_key={key!r}"
+            )
         if finalized_pinned_owner_set:
             fields["finalized_pinned_owner_set"] = finalized_pinned_owner_set
-        result[tuple(key)] = fields  # type: ignore[assignment]
+        if resident_key_bytes is not None:
+            fields["resident_key_bytes"] = resident_key_bytes
+        result[catalog_key] = fields  # type: ignore[assignment]
+    if set(result) != required_step_keys:
+        raise RuntimeError(
+            "sealed elastic Graph catalog does not exactly cover required shapes: "
+            f"missing={sorted(required_step_keys.difference(result))!r} "
+            f"extra={sorted(set(result).difference(required_step_keys))!r}"
+        )
     logger.info(
         "Loaded elastic CUDA Graph catalog %s (%d complete shapes)",
         path,
@@ -425,15 +580,25 @@ def load_elastic_graph_catalog_coverage(
     fingerprint = compute_elastic_graph_catalog_fingerprint(
         vllm_config, kv_cache_config
     )
+    from vllm.v1.core.elastic_graph import (
+        EXECUTION_MANIFEST_SCHEMA,
+        DispatchRepresentation,
+    )
+
     path = _elastic_graph_catalog_path(fingerprint)
     try:
-        with open(path) as f:
-            payload = json.load(f)
-    except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
+        payload, source_sha256 = load_sealed_catalog_with_digest(
+            path, require_migration=False
+        )
+    except RuntimeError as error:
         raise RuntimeError(
             f"sealed elastic Graph catalog coverage is unreadable: {path}"
         ) from error
-    coverage = payload.get("coverage") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"sealed elastic Graph catalog coverage is malformed: {path}"
+        )
+    coverage = payload.get("coverage")
     policy = _effective_graph_execution_policy(kv_cache_config)
     integer_fields = (
         "decode_max_x",
@@ -452,6 +617,11 @@ def load_elastic_graph_catalog_coverage(
     )
     required_step_keys = (
         coverage.get("required_step_keys", []) if isinstance(coverage, dict) else None
+    )
+    _required_inventory, restore_inventory = validate_elastic_catalog_key_inventory(
+        required_step_keys,
+        restore_step_keys,
+        label="sealed elastic Graph catalog",
     )
     from vllm.v1.core.elastic_graph import configured_compiled_piecewise_sizes
 
@@ -477,6 +647,16 @@ def load_elastic_graph_catalog_coverage(
         or coverage.get("verifier_configuration") != policy.verifier_configuration
         or coverage.get("math_contract") != policy.math_contract
         or coverage.get("capture_state_abi") != ELASTIC_CAPTURE_STATE_ABI
+        or coverage.get("execution_manifest_schema") != EXECUTION_MANIFEST_SCHEMA
+        or coverage.get("dispatch_representations")
+        != [item.value for item in DispatchRepresentation]
+        or coverage.get("residency_intent_contract")
+        != "current-dispatch-hot-successor-union-v1"
+        or coverage.get("speculative_depth_contract")
+        != "scheduled-requested-executed-k-v1"
+        or coverage.get("semantic_witness_contract")
+        != "live-current-to-physical-piecewise-v1"
+        or not isinstance(coverage.get("semantic_token_witnesses"), list)
         or any(
             isinstance(coverage.get(name), bool)
             or not isinstance(coverage.get(name), int)
@@ -514,9 +694,7 @@ def load_elastic_graph_catalog_coverage(
             and (
                 coverage["pinned_full_entries"] != 0
                 or coverage["pinned_full_bytes"] != 0
-                or not isinstance(restore_step_keys, list)
-                or not restore_step_keys
-                or any(key not in required_step_keys for key in restore_step_keys)
+                or not restore_inventory
                 or coverage.get("piecewise_replay_contract")
                 != BOUNDED_PIECEWISE_REPLAY_CONTRACT
             )
@@ -525,7 +703,7 @@ def load_elastic_graph_catalog_coverage(
         raise RuntimeError(
             f"sealed elastic Graph catalog has no valid product boundary: {path}"
         )
-    return coverage
+    return dict(coverage) | {"_catalog_source_sha256": source_sha256}
 
 
 def maybe_save_cudagraph_recipe(

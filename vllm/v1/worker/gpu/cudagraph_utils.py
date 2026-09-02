@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ctypes
 import gc
+import hashlib
 import os
 import re
+import time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -39,19 +41,23 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up
 from vllm.v1.core.elastic_graph import (
+    DispatchRepresentation,
+    ElasticGraphError,
     ElasticPlanKind,
     ElasticResidencyEntry,
     ElasticResidencyReceipt,
     ElasticRuntimeConfig,
     ElasticStepPlan,
+    ExecutionManifest,
     GraphExecutionPolicy,
     LogicalDispatchKey,
     OwnerGraphExecutionPolicy,
     PhysicalReplayKey,
     RuntimeGeneration,
+    build_execution_manifest,
     configured_compiled_piecewise_sizes,
-    require_plan_consensus,
 )
+from vllm.v1.executor.worker_failure import WorkerFailureCode
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     elastic_piecewise_token_boundary,
@@ -64,6 +70,66 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+class ElasticExecutionPlanMismatch(RuntimeError):
+    """Current owner geometry differs before any Graph or KV mutation."""
+
+    worker_failure_code = WorkerFailureCode.ELASTIC_EXECUTION_PLAN_MISMATCH
+
+
+def _execution_manifest_difference(
+    planned: ExecutionManifest, observed: ExecutionManifest
+) -> str:
+    """Describe identity-only differences without logging prompt contents."""
+    differences = []
+    for name in (
+        "generation",
+        "invocations",
+        "request_ids",
+        "per_request_query_lens",
+        "per_request_is_prefilling",
+        "scheduled_draft_rows",
+        "scheduled_encoder_inputs",
+        "active_lora_ids",
+        "requested_output_k",
+        "executed_drafter_k",
+        "schema",
+    ):
+        planned_value = getattr(planned, name)
+        observed_value = getattr(observed, name)
+        if planned_value == observed_value:
+            continue
+        if isinstance(planned_value, tuple) and isinstance(observed_value, tuple):
+            common = min(len(planned_value), len(observed_value))
+            first_index = next(
+                (
+                    index
+                    for index in range(common)
+                    if planned_value[index] != observed_value[index]
+                ),
+                common,
+            )
+            planned_item = (
+                planned_value[first_index]
+                if first_index < len(planned_value)
+                else "<missing>"
+            )
+            observed_item = (
+                observed_value[first_index]
+                if first_index < len(observed_value)
+                else "<missing>"
+            )
+            differences.append(
+                f"{name}[{first_index}]: planned={planned_item!r} "
+                f"observed={observed_item!r} "
+                f"lengths={len(planned_value)}/{len(observed_value)}"
+            )
+        else:
+            differences.append(
+                f"{name}: planned={planned_value!r} observed={observed_value!r}"
+            )
+    return "; ".join(differences) or "no field difference"
 
 
 def _effective_mtp_verifier_contract(
@@ -409,6 +475,10 @@ class DynamicGraphWorkingSet:
     def __init__(self, managers: tuple["CudaGraphManager", ...]):
         self.managers = managers
         self._planned_capture_order: tuple[PhysicalReplayKey, ...] = ()
+        self._rank_vote_local: torch.Tensor | None = None
+        self._rank_vote_gathered: torch.Tensor | None = None
+        self._rank_consensus_calls: dict[str, int] = {}
+        self._rank_consensus_ns: dict[str, int] = {}
         if managers and all(
             isinstance(manager, CudaGraphManager) for manager in managers
         ):
@@ -583,34 +653,84 @@ class DynamicGraphWorkingSet:
             )
         return tuple(by_key[key] for key in self._planned_capture_order)
 
-    def apply_plan(self, plan: ElasticStepPlan) -> None:
-        """Execute the scheduler's explicit eviction and owner-key plan.
+    def validate_plan(self, plan: ElasticStepPlan) -> None:
+        """Validate worker-local residency without changing Graph state.
 
-        This is the only ordinary-admission entrypoint allowed to destroy a
-        resident executable.  Policy remains scheduler-owned; workers merely
-        validate physical identity and execute the immutable victim list.
+        This method deliberately resolves every owner and every operation that
+        can fail synchronously before a lease, eviction, queue transition or KV
+        change.  The caller publishes any resulting error in the all-rank vote
+        before entering :meth:`begin_step`.
         """
         if plan.kind == ElasticPlanKind.DEFER:
-            raise RuntimeError("a deferred elastic plan cannot reach a worker")
-        managers = {manager.dynamic_graph_owner: manager for manager in self.managers}
+            raise ElasticExecutionPlanMismatch(
+                "ELASTIC_EXECUTION_PLAN_MISMATCH: a deferred elastic plan "
+                "cannot reach a worker"
+            )
+        owner_names = tuple(manager.dynamic_graph_owner for manager in self.managers)
+        if len(set(owner_names)) != len(owner_names):
+            raise ElasticExecutionPlanMismatch(
+                "ELASTIC_EXECUTION_PLAN_MISMATCH: worker Graph owners are not "
+                f"unique: owners={owner_names!r}"
+            )
+        managers = dict(zip(owner_names, self.managers, strict=True))
+
+        key_groups = {
+            "physical": plan.physical_keys,
+            "HOT": plan.hot_hits,
+            "COLD": plan.cold_misses,
+            "protected": plan.protected_keys,
+            "victim": plan.victim_keys,
+            "capture-order": plan.capture_order,
+        }
+        for label, keys in key_groups.items():
+            if len(set(keys)) != len(keys):
+                raise ElasticExecutionPlanMismatch(
+                    "ELASTIC_EXECUTION_PLAN_MISMATCH: worker plan contains "
+                    f"duplicate {label} keys"
+                )
+            for key in keys:
+                if key.generation != plan.generation:
+                    raise ElasticExecutionPlanMismatch(
+                        "ELASTIC_EXECUTION_PLAN_MISMATCH: worker plan contains "
+                        f"a stale {label} key: key={key.identity}"
+                    )
+                if key.logical.owner not in managers:
+                    raise ElasticExecutionPlanMismatch(
+                        "ELASTIC_EXECUTION_PLAN_MISMATCH: elastic plan references "
+                        f"unknown {label} owner {key.logical.owner!r}"
+                    )
+
+        classified_keys = set(plan.hot_hits).union(plan.cold_misses)
+        if classified_keys != set(plan.physical_keys):
+            raise ElasticExecutionPlanMismatch(
+                "ELASTIC_EXECUTION_PLAN_MISMATCH: physical keys are not exactly "
+                "partitioned into HOT hits and COLD misses"
+            )
+        if set(plan.capture_order) != set(plan.cold_misses):
+            raise ElasticExecutionPlanMismatch(
+                "ELASTIC_EXECUTION_PLAN_MISMATCH: immutable capture order differs "
+                f"from COLD misses: capture={plan.capture_order!r} "
+                f"cold={plan.cold_misses!r}"
+            )
+        if set(plan.victim_keys).intersection(plan.physical_keys):
+            raise ElasticExecutionPlanMismatch(
+                "ELASTIC_EXECUTION_PLAN_MISMATCH: current physical key was also "
+                "selected as an eviction victim"
+            )
+        if set(plan.victim_keys).intersection(plan.protected_keys):
+            raise ElasticExecutionPlanMismatch(
+                "ELASTIC_EXECUTION_PLAN_MISMATCH: protected physical key was also "
+                "selected as an eviction victim"
+            )
+
         # Protected keys belong to a scheduler-owned multi-step physical epoch.
-        # Lease them without making them dispatch candidates for this shape.
+        # Validate the future lease without making them dispatch candidates.
         for key in plan.protected_keys:
-            manager = managers.get(key.logical.owner)
-            if manager is None:
-                raise RuntimeError(
-                    "elastic plan references unknown protected owner "
-                    f"{key.logical.owner!r}"
-                )
-            manager.acquire_physical_key_lease(key, plan.transaction_id)
+            managers[key.logical.owner].validate_physical_key_lease(
+                key, plan.transaction_id
+            )
         for key in plan.victim_keys:
-            manager = managers.get(key.logical.owner)
-            if manager is None:
-                raise RuntimeError(
-                    "elastic plan references unknown victim owner "
-                    f"{key.logical.owner!r}"
-                )
-            manager.evict_physical_key(
+            managers[key.logical.owner].validate_physical_key_eviction(
                 key,
                 transaction_id=plan.transaction_id,
                 reason="elastic_admission_plan",
@@ -621,63 +741,403 @@ class DynamicGraphWorkingSet:
                 },
             )
         for key in plan.physical_keys:
-            manager = managers.get(key.logical.owner)
-            if manager is None:
-                raise RuntimeError(
-                    f"elastic plan references unknown graph owner {key.logical.owner!r}"
-                )
+            manager = managers[key.logical.owner]
             hot = manager.is_physical_key_hot(key)
             if key in plan.hot_hits and not hot:
-                raise RuntimeError(
-                    "scheduler planned a HOT hit absent from worker residency: "
+                raise ElasticExecutionPlanMismatch(
+                    "ELASTIC_EXECUTION_PLAN_MISMATCH: scheduler planned a HOT "
+                    "hit absent from worker residency: "
                     f"owner={key.logical.owner} key={key.identity}"
                 )
             if key in plan.cold_misses and hot:
-                raise RuntimeError(
-                    "scheduler planned a COLD miss already HOT on worker: "
+                raise ElasticExecutionPlanMismatch(
+                    "ELASTIC_EXECUTION_PLAN_MISMATCH: scheduler planned a COLD "
+                    "miss already HOT on worker: "
                     f"owner={key.logical.owner} key={key.identity}"
                 )
             if plan.kind == ElasticPlanKind.USER and not hot:
-                raise RuntimeError("USER elastic plan cannot trigger capture")
-            manager.queue_physical_key(key)
-        pending_keys = tuple(
-            manager._dynamic_pending.physical_replay_key(manager.dynamic_graph_owner)
-            for manager in self.managers
-            if manager._dynamic_pending is not None
+                raise ElasticExecutionPlanMismatch(
+                    "ELASTIC_EXECUTION_PLAN_MISMATCH: USER elastic plan cannot "
+                    "trigger capture"
+                )
+        dispatch_keys = tuple(
+            dispatch.physical_key
+            for dispatch in getattr(plan, "current_dispatch", ())
+            if dispatch.representation == DispatchRepresentation.HOT_GRAPH
         )
-        if set(pending_keys) != set(plan.capture_order):
-            raise RuntimeError(
-                "worker capture set differs from immutable elastic plan: "
-                f"worker={pending_keys!r} plan={plan.capture_order!r}"
+        keys_to_queue = (
+            dispatch_keys
+            if getattr(plan, "execution_manifest", None) is not None
+            else plan.physical_keys
+        )
+        pending_by_owner: dict[str, PhysicalReplayKey] = {}
+        for key in keys_to_queue:
+            if key is None:
+                raise ElasticExecutionPlanMismatch(
+                    "ELASTIC_EXECUTION_PLAN_MISMATCH: HOT Graph dispatch omitted "
+                    "its physical key"
+                )
+            manager = managers[key.logical.owner]
+            manager.validate_physical_key_queue(key)
+            if not manager.is_physical_key_hot(key):
+                prior = pending_by_owner.get(key.logical.owner)
+                if prior is not None and prior != key:
+                    raise ElasticExecutionPlanMismatch(
+                        "ELASTIC_EXECUTION_PLAN_MISMATCH: one Graph owner received "
+                        "multiple simultaneous COLD keys"
+                    )
+                pending_by_owner[key.logical.owner] = key
+
+        predicted_pending = tuple(pending_by_owner.values())
+        if set(predicted_pending) != set(plan.capture_order):
+            raise ElasticExecutionPlanMismatch(
+                "ELASTIC_EXECUTION_PLAN_MISMATCH: worker capture set differs "
+                f"from immutable elastic plan: worker={predicted_pending!r} "
+                f"plan={plan.capture_order!r}"
             )
+
+    def _apply_validated_plan(self, plan: ElasticStepPlan) -> None:
+        """Apply a plan whose complete local preconditions already passed."""
+        managers = {manager.dynamic_graph_owner: manager for manager in self.managers}
+        for key in plan.protected_keys:
+            managers[key.logical.owner].acquire_physical_key_lease(
+                key, plan.transaction_id
+            )
+        for key in plan.victim_keys:
+            managers[key.logical.owner].evict_physical_key(
+                key,
+                transaction_id=plan.transaction_id,
+                reason="elastic_admission_plan",
+                administrative=plan.kind
+                in {
+                    ElasticPlanKind.RECLAIM,
+                    ElasticPlanKind.PRESSURE_RECLAIM,
+                },
+            )
+        dispatch_keys = tuple(
+            dispatch.physical_key
+            for dispatch in getattr(plan, "current_dispatch", ())
+            if dispatch.representation == DispatchRepresentation.HOT_GRAPH
+        )
+        keys_to_queue = (
+            dispatch_keys
+            if getattr(plan, "execution_manifest", None) is not None
+            else plan.physical_keys
+        )
+        for key in keys_to_queue:
+            assert key is not None
+            managers[key.logical.owner].queue_physical_key(key)
         self._planned_capture_order = plan.capture_order
 
-    def require_rank_consensus(self, plan: ElasticStepPlan, *, collective: bool) -> str:
-        """Reject a stale or rank-divergent plan before any CUDA/KV mutation."""
-        if self.managers:
+    def apply_plan(self, plan: ElasticStepPlan) -> None:
+        """Validate then execute a plan for non-distributed/direct callers."""
+        self.validate_plan(plan)
+        self._apply_validated_plan(plan)
+
+    def validate_execution_manifest(
+        self,
+        plan: ElasticStepPlan,
+        *,
+        step_key: tuple[int, int, int, int, int] | None,
+        request_ids: tuple[str, ...],
+        per_request_query_lens: tuple[int, ...],
+        per_request_is_prefilling: tuple[bool, ...],
+        scheduled_draft_rows: tuple[int, ...],
+        scheduled_encoder_inputs: Mapping[str, Sequence[int]] | None = None,
+        requested_output_k: int,
+        executed_drafter_k: int,
+        phase: str | None,
+        max_num_batched_tokens: int,
+        active_loras: int = 0,
+    ) -> None:
+        """Validate exact current work before leases, eviction, capture or KV."""
+        if plan.execution_manifest is None:
+            if per_request_query_lens:
+                raise ElasticExecutionPlanMismatch(
+                    "ELASTIC_EXECUTION_PLAN_MISMATCH: USER plan omitted manifest"
+                )
+            return
+        if step_key is None:
+            raise ElasticExecutionPlanMismatch(
+                "ELASTIC_EXECUTION_PLAN_MISMATCH: manifest omitted step key"
+            )
+        if phase is None:
+            raise ElasticExecutionPlanMismatch(
+                "ELASTIC_EXECUTION_PLAN_MISMATCH: manifest omitted execution phase"
+            )
+        policy = graph_execution_policy_from_managers(self.managers)
+        try:
+            observed_manifest, observed_dispatch = build_execution_manifest(
+                step_key=step_key,
+                request_ids=request_ids,
+                per_request_query_lens=per_request_query_lens,
+                per_request_is_prefilling=per_request_is_prefilling,
+                scheduled_draft_rows=scheduled_draft_rows,
+                scheduled_encoder_inputs=scheduled_encoder_inputs,
+                requested_output_k=requested_output_k,
+                executed_drafter_k=executed_drafter_k,
+                phase=phase,
+                generation=plan.generation,
+                policy=policy,
+                max_num_batched_tokens=max_num_batched_tokens,
+                active_loras=active_loras,
+            )
+        except (ElasticGraphError, ValueError) as exc:
+            raise ElasticExecutionPlanMismatch(
+                f"ELASTIC_EXECUTION_PLAN_MISMATCH: {exc}"
+            ) from exc
+        if observed_manifest != plan.execution_manifest:
+            field_difference = _execution_manifest_difference(
+                plan.execution_manifest, observed_manifest
+            )
+            raise ElasticExecutionPlanMismatch(
+                "ELASTIC_EXECUTION_PLAN_MISMATCH: scheduler and worker manifests "
+                f"differ: planned={plan.execution_manifest.fingerprint} "
+                f"observed={observed_manifest.fingerprint} "
+                f"fields={field_difference}"
+            )
+        if observed_dispatch != plan.current_dispatch:
+            raise ElasticExecutionPlanMismatch(
+                "ELASTIC_EXECUTION_PLAN_MISMATCH: scheduler and worker dispatch "
+                f"differ: planned={plan.current_dispatch!r} "
+                f"observed={observed_dispatch!r}"
+            )
+
+    def require_rank_consensus(
+        self,
+        plan: ElasticStepPlan,
+        *,
+        validation_error: str | None = None,
+        observer_fingerprint: str | None = None,
+        phase: str = "pre_mutation",
+    ) -> str:
+        """Run and account one fixed-size all-rank plan vote."""
+        started_ns = time.perf_counter_ns()
+        try:
+            self._require_rank_consensus_impl(
+                plan,
+                validation_error=validation_error,
+                observer_fingerprint=f"{phase}:{observer_fingerprint or ''}",
+            )
+            return plan.fingerprint
+        finally:
+            elapsed_ns = time.perf_counter_ns() - started_ns
+            calls = self._rank_consensus_calls.get(phase, 0) + 1
+            total_ns = self._rank_consensus_ns.get(phase, 0) + elapsed_ns
+            self._rank_consensus_calls[phase] = calls
+            self._rank_consensus_ns[phase] = total_ns
+            if calls == 1 or calls % 64 == 0:
+                logger.info(
+                    "AG2 elastic rank-consensus timing: phase=%s calls=%d "
+                    "total_ms=%.3f mean_us=%.3f last_us=%.3f",
+                    phase,
+                    calls,
+                    total_ns / 1e6,
+                    total_ns / calls / 1e3,
+                    elapsed_ns / 1e3,
+                )
+
+    def rank_consensus_timing_snapshot(self) -> dict[str, tuple[int, int]]:
+        """Return phase -> (calls, total_ns) for matched perf receipts."""
+        return {
+            phase: (calls, self._rank_consensus_ns.get(phase, 0))
+            for phase, calls in self._rank_consensus_calls.items()
+        }
+
+    def _require_rank_consensus_impl(
+        self,
+        plan: ElasticStepPlan,
+        *,
+        validation_error: str | None = None,
+        observer_fingerprint: str | None = None,
+    ) -> str:
+        """Make every rank accept or reject before any CUDA/KV mutation.
+
+        The compact vote is mandatory even when the manifest fingerprint
+        repeats.  A rank-local residency or request-state error is not known to
+        peers, so conditionally entering this collective would either strand
+        them or let them mutate a plan rejected elsewhere.
+        """
+        local_error = validation_error
+        try:
             generations = {
                 RuntimeGeneration(manager.runtime_generation)
                 for manager in self.managers
             }
-            if generations != {plan.generation}:
-                raise RuntimeError(
-                    "elastic plan generation differs from worker runtime"
+            if self.managers and generations != {plan.generation}:
+                generation_error = (
+                    "ELASTIC_EXECUTION_PLAN_MISMATCH: elastic plan generation "
+                    "differs from worker runtime"
                 )
-        if not collective or not self.managers or self.managers[0].tp_size == 1:
-            return require_plan_consensus((plan,))
-        gathered: list[ElasticStepPlan | None] = [
-            None for _ in range(self.managers[0].tp_size)
-        ]
-        torch.distributed.all_gather_object(
-            gathered,
-            plan,
+                local_error = (
+                    generation_error
+                    if local_error is None
+                    else f"{local_error}; {generation_error}"
+                )
+        except Exception as error:
+            generation_error = (
+                "ELASTIC_EXECUTION_PLAN_MISMATCH: invalid worker runtime "
+                f"generation: {type(error).__name__}: {error}"
+            )
+            local_error = (
+                generation_error
+                if local_error is None
+                else f"{local_error}; {generation_error}"
+            )
+        try:
+            local_fingerprint = plan.fingerprint
+            if observer_fingerprint is not None:
+                local_fingerprint = hashlib.sha256(
+                    f"{local_fingerprint}:{observer_fingerprint}".encode()
+                ).hexdigest()
+        except Exception as error:
+            fingerprint_error = (
+                "ELASTIC_EXECUTION_PLAN_MISMATCH: invalid local plan "
+                f"fingerprint: {type(error).__name__}: {error}"
+            )
+            local_error = (
+                fingerprint_error
+                if local_error is None
+                else f"{local_error}; {fingerprint_error}"
+            )
+            local_fingerprint = f"invalid:{type(error).__name__}"
+
+        if not self.managers or self.managers[0].tp_size == 1:
+            if local_error is not None:
+                raise ElasticExecutionPlanMismatch(local_error)
+            return local_fingerprint
+
+        try:
+            fingerprint_bytes = bytes.fromhex(local_fingerprint)
+            if len(fingerprint_bytes) != 32:
+                raise ValueError("plan fingerprint is not a SHA-256 digest")
+        except (TypeError, ValueError) as error:
+            fingerprint_error = (
+                "ELASTIC_EXECUTION_PLAN_MISMATCH: invalid local plan fingerprint "
+                f"encoding: {type(error).__name__}: {error}"
+            )
+            local_error = (
+                fingerprint_error
+                if local_error is None
+                else f"{local_error}; {fingerprint_error}"
+            )
+            fingerprint_bytes = bytes(32)
+
+        tp_size = self.managers[0].tp_size
+        vote_width = 5
+        if self._rank_vote_local is None:
+            self._rank_vote_local = torch.empty(
+                vote_width, dtype=torch.int64, device="cpu"
+            )
+        if (
+            self._rank_vote_gathered is None
+            or self._rank_vote_gathered.numel() != tp_size * vote_width
+        ):
+            self._rank_vote_gathered = torch.empty(
+                tp_size * vote_width, dtype=torch.int64, device="cpu"
+            )
+        local_vote = self._rank_vote_local
+        gathered_vote = self._rank_vote_gathered
+        for index in range(4):
+            local_vote[index] = int.from_bytes(
+                fingerprint_bytes[index * 8 : (index + 1) * 8],
+                byteorder="big",
+                signed=True,
+            )
+        local_vote[4] = int(local_error is not None)
+        torch.distributed.all_gather_single(
+            gathered_vote,
+            local_vote,
             group=get_tp_group().cpu_group,
         )
-        if any(item is None for item in gathered):
-            raise RuntimeError("elastic rank consensus returned an empty plan")
-        return require_plan_consensus(
-            tuple(item for item in gathered if item is not None)
+        rank_votes = gathered_vote.view(tp_size, vote_width)
+        fingerprint_mismatch = any(
+            not torch.equal(rank_votes[0, :4], rank_votes[rank, :4])
+            for rank in range(1, tp_size)
         )
+        rank_rejected = any(bool(rank_votes[rank, 4]) for rank in range(tp_size))
+        if not fingerprint_mismatch and not rank_rejected:
+            return local_fingerprint
+
+        # The fixed-size vote keeps the accepted decode path free of Python
+        # serialization.  All ranks reach this diagnostic gather only after the
+        # shared tensor result says the step must be rejected.
+        gathered_diagnostics: list[tuple[str, str | None] | None] = [
+            None for _ in range(tp_size)
+        ]
+        torch.distributed.all_gather_object(
+            gathered_diagnostics,
+            (local_fingerprint, local_error),
+            group=get_tp_group().cpu_group,
+        )
+        if any(item is None for item in gathered_diagnostics):
+            raise RuntimeError("elastic rank consensus returned empty diagnostics")
+        rank_results = tuple(item for item in gathered_diagnostics if item is not None)
+        fingerprints = {item[0] for item in rank_results}
+        if len(fingerprints) != 1:
+            raise ElasticExecutionPlanMismatch(
+                "ELASTIC_EXECUTION_PLAN_MISMATCH: elastic graph plan "
+                "fingerprint differs by rank"
+            )
+        errors = tuple(
+            (rank, item[1])
+            for rank, item in enumerate(rank_results)
+            if item[1] is not None
+        )
+        raise ElasticExecutionPlanMismatch(
+            "ELASTIC_EXECUTION_PLAN_MISMATCH: rank validation rejected "
+            f"before mutation: errors={errors!r}"
+        )
+
+    def begin_admitted_step(
+        self,
+        plan: ElasticStepPlan,
+        *,
+        validation_error: str | None = None,
+    ) -> None:
+        """Validate, vote and only then cross the first mutation boundary."""
+        local_error = validation_error
+        try:
+            self.validate_plan(plan)
+        except Exception as error:
+            plan_error = (
+                "ELASTIC_EXECUTION_PLAN_MISMATCH: local worker plan validation "
+                f"failed: {type(error).__name__}: {error}"
+            )
+            local_error = (
+                plan_error if local_error is None else f"{local_error}; {plan_error}"
+            )
+        self.require_rank_consensus(plan, validation_error=local_error)
+        self.begin_step()
+        self._apply_validated_plan(plan)
+
+    def require_post_materialization_consensus(
+        self,
+        plan: ElasticStepPlan,
+        *,
+        validation_error: str | None = None,
+        observer_fingerprint: str | None = None,
+        phase: str = "post_materialization",
+    ) -> str:
+        """Converge rank-local input observers before model collectives.
+
+        This vote is intentionally independent of the pre-mutation vote. Input
+        materialization can expose rank-local request-state drift only after
+        the admitted plan has already crossed its mutation boundary.
+        """
+        try:
+            return self.require_rank_consensus(
+                plan,
+                validation_error=validation_error,
+                observer_fingerprint=observer_fingerprint,
+                phase=phase,
+            )
+        except ElasticExecutionPlanMismatch as error:
+            raise RuntimeError(
+                "ELASTIC_POST_MUTATION_OBSERVER_MISMATCH: all-rank input "
+                "materialization vote rejected before model collectives; "
+                "rank diagnostics are attached as the chained cause"
+            ) from error
 
     def discard_failed_capture(self, plan: ElasticStepPlan) -> None:
         """Remove only destinations created by a failed capture transaction."""
@@ -1941,8 +2401,10 @@ class CudaGraphManager:
         )
         return desc
 
-    def queue_physical_key(self, key: PhysicalReplayKey) -> BatchExecutionDescriptor:
-        """Queue exactly the physical key resolved by the scheduler plan."""
+    def _descriptor_for_physical_key(
+        self, key: PhysicalReplayKey
+    ) -> BatchExecutionDescriptor:
+        """Resolve one scheduler key without changing dynamic Graph state."""
         if key.logical.owner != self.dynamic_graph_owner:
             raise RuntimeError(
                 "elastic graph owner mismatch: "
@@ -2009,6 +2471,29 @@ class CudaGraphManager:
         )
         if desc.physical_replay_key(self.dynamic_graph_owner) != key:
             raise RuntimeError("elastic physical key did not round-trip")
+        return desc
+
+    def validate_physical_key_queue(
+        self, key: PhysicalReplayKey
+    ) -> BatchExecutionDescriptor:
+        """Validate queue preconditions without creating or touching an entry."""
+        desc = self._descriptor_for_physical_key(key)
+        entry = self._dynamic_graph_entries.get(desc)
+        if entry is not None and entry.state == DynamicGraphResidency.COOLDOWN:
+            raise RuntimeError(
+                "required physical CUDA Graph is cooling down after capture failure: "
+                f"owner={self.dynamic_graph_owner} descriptor={desc}"
+            )
+        if self._dynamic_pending is not None and self._dynamic_pending != desc:
+            raise RuntimeError(
+                "one manager received multiple simultaneous cold physical keys"
+            )
+        return desc
+
+    def queue_physical_key(self, key: PhysicalReplayKey) -> BatchExecutionDescriptor:
+        """Queue exactly the physical key resolved by the scheduler plan."""
+        desc = self.validate_physical_key_queue(key)
+        mode = desc.cg_mode
         self._dynamic_step_planned = True
         self.last_dynamic_capture_rejection = None
         self._dynamic_step_candidates.add(desc)
@@ -2024,15 +2509,6 @@ class CudaGraphManager:
         entry.last_used_epoch = self._dynamic_epoch
         if entry.state == DynamicGraphResidency.HOT:
             return desc
-        if entry.state == DynamicGraphResidency.COOLDOWN:
-            raise RuntimeError(
-                "required physical CUDA Graph is cooling down after capture failure: "
-                f"owner={self.dynamic_graph_owner} descriptor={desc}"
-            )
-        if self._dynamic_pending is not None and self._dynamic_pending != desc:
-            raise RuntimeError(
-                "one manager received multiple simultaneous cold physical keys"
-            )
         entry.runtime_num_reqs = key.physical_num_reqs
         entry.state = DynamicGraphResidency.QUEUED
         entry.hits = max(1, entry.hits)
@@ -2048,6 +2524,55 @@ class CudaGraphManager:
             for desc, entry in self._dynamic_graph_entries.items()
         )
 
+    def _entries_for_physical_key(
+        self, key: PhysicalReplayKey
+    ) -> tuple[DynamicGraphEntry, ...]:
+        if key.logical.owner != self.dynamic_graph_owner:
+            raise RuntimeError(
+                "elastic graph owner mismatch: "
+                f"manager={self.dynamic_graph_owner!r} key={key.logical.owner!r}"
+            )
+        return tuple(
+            entry
+            for desc, entry in self._dynamic_graph_entries.items()
+            if desc.physical_replay_key(self.dynamic_graph_owner) == key
+        )
+
+    def validate_physical_key_lease(
+        self, key: PhysicalReplayKey, transaction_id: str
+    ) -> None:
+        """Validate a protected-key lease without touching its lease set."""
+        if not transaction_id:
+            raise RuntimeError("dynamic CUDA Graph lease requires transaction id")
+        matching = self._entries_for_physical_key(key)
+        if len(matching) != 1 or matching[0].state != DynamicGraphResidency.HOT:
+            raise RuntimeError(
+                "scheduler-protected CUDA Graph is not uniquely HOT: "
+                f"owner={self.dynamic_graph_owner} key={key.identity}"
+            )
+
+    def validate_physical_key_eviction(
+        self,
+        key: PhysicalReplayKey,
+        *,
+        transaction_id: str,
+        reason: str,
+        administrative: bool = False,
+    ) -> None:
+        """Validate an eviction victim without synchronizing or freeing CUDA."""
+        matching = self._entries_for_physical_key(key)
+        if len(matching) != 1:
+            raise RuntimeError(
+                "elastic eviction victim is absent or ambiguous: "
+                f"owner={self.dynamic_graph_owner} key={key.identity}"
+            )
+        self._validate_dynamic_entry_eviction(
+            matching[0],
+            transaction_id=transaction_id,
+            reason=reason,
+            administrative=administrative,
+        )
+
     def evict_physical_key(
         self,
         key: PhysicalReplayKey,
@@ -2057,18 +2582,13 @@ class CudaGraphManager:
         administrative: bool = False,
     ) -> None:
         """Destroy one scheduler-selected executable, with exact provenance."""
-        if key.logical.owner != self.dynamic_graph_owner:
-            raise RuntimeError("elastic eviction owner mismatch")
-        matching = [
-            entry
-            for desc, entry in self._dynamic_graph_entries.items()
-            if desc.physical_replay_key(self.dynamic_graph_owner) == key
-        ]
-        if len(matching) != 1:
-            raise RuntimeError(
-                "elastic eviction victim is absent or ambiguous: "
-                f"owner={self.dynamic_graph_owner} key={key.identity}"
-            )
+        matching = self._entries_for_physical_key(key)
+        self.validate_physical_key_eviction(
+            key,
+            transaction_id=transaction_id,
+            reason=reason,
+            administrative=administrative,
+        )
         self._evict_dynamic_entry(
             matching[0],
             transaction_id=transaction_id,
@@ -2275,18 +2795,8 @@ class CudaGraphManager:
         self, key: PhysicalReplayKey, transaction_id: str
     ) -> None:
         """Lease one scheduler-protected HOT key without selecting dispatch."""
-        if not transaction_id:
-            raise RuntimeError("dynamic CUDA Graph lease requires transaction id")
-        matching = [
-            entry
-            for desc, entry in self._dynamic_graph_entries.items()
-            if desc.physical_replay_key(self.dynamic_graph_owner) == key
-        ]
-        if len(matching) != 1 or matching[0].state != DynamicGraphResidency.HOT:
-            raise RuntimeError(
-                "scheduler-protected CUDA Graph is not uniquely HOT: "
-                f"owner={self.dynamic_graph_owner} key={key.identity}"
-            )
+        self.validate_physical_key_lease(key, transaction_id)
+        matching = self._entries_for_physical_key(key)
         matching[0].leases.add(transaction_id)
 
     def release_transaction_leases(self, transaction_id: str) -> None:
@@ -2427,7 +2937,7 @@ class CudaGraphManager:
             if segment.get("segment_pool_id") == graph_pool
         )
 
-    def _evict_dynamic_entry(
+    def _validate_dynamic_entry_eviction(
         self,
         entry: DynamicGraphEntry,
         *,
@@ -2458,6 +2968,21 @@ class CudaGraphManager:
                 "elastic eviction victim is not HOT: "
                 f"owner={self.dynamic_graph_owner} descriptor={entry.descriptor}"
             )
+
+    def _evict_dynamic_entry(
+        self,
+        entry: DynamicGraphEntry,
+        *,
+        transaction_id: str,
+        reason: str,
+        administrative: bool = False,
+    ) -> None:
+        self._validate_dynamic_entry_eviction(
+            entry,
+            transaction_id=transaction_id,
+            reason=reason,
+            administrative=administrative,
+        )
         if entry.state == DynamicGraphResidency.HOT:
             torch.cuda.synchronize(self.device)
         released_capture_state = entry.local_capture_state_bytes

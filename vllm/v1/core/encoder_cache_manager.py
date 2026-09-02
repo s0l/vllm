@@ -92,6 +92,22 @@ class EncoderCacheManager:
         self.num_free_slots = self.cache_size
         self.num_freeable_slots = self.cache_size
 
+    def clone_for_preview(self) -> "EncoderCacheManager":
+        """Clone logical cache/LRU state for a mutation-free cohort replay."""
+        clone = type(self)(self.cache_size)
+        clone.num_free_slots = self.num_free_slots
+        clone.num_freeable_slots = self.num_freeable_slots
+        clone.cached = {
+            key: set(request_ids) for key, request_ids in self.cached.items()
+        }
+        clone.request_cached_ids = {
+            request_id: set(input_ids)
+            for request_id, input_ids in self.request_cached_ids.items()
+        }
+        clone.freeable = OrderedDict(self.freeable)
+        clone.freed = list(self.freed)
+        return clone
+
     def check_and_update_cache(self, request: Request, input_id: int) -> bool:
         """Check if encoder output for a specific multimodal input is cached.
 
@@ -184,13 +200,10 @@ class EncoderCacheManager:
             return True
 
         # Not enough reclaimable slots
-        available_freeable_slots = (
-            self.num_freeable_slots - unavailable_freeable_slots
-        )
+        available_freeable_slots = self.num_freeable_slots - unavailable_freeable_slots
         if available_freeable_slots < 0:
             raise RuntimeError(
-                "encoder cache read-only plan consumed more freeable slots "
-                "than exist"
+                "encoder cache read-only plan consumed more freeable slots than exist"
             )
         if num_embeds > available_freeable_slots:
             return False
@@ -362,6 +375,13 @@ class EncoderDecoderCacheManager(EncoderCacheManager):
         self.num_free_slots = self.cache_size
         self.allocated.clear()
         self.to_free.clear()
+
+    def clone_for_preview(self) -> "EncoderDecoderCacheManager":
+        clone = type(self)(self.cache_size)
+        clone.num_free_slots = self.num_free_slots
+        clone.allocated = list(self.allocated)
+        clone.to_free = list(self.to_free)
+        return clone
 
     def check_and_update_cache(self, request: Request, input_id: int) -> bool:
         return False

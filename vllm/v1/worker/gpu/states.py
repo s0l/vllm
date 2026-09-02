@@ -95,6 +95,7 @@ class RequestState:
         all_token_ids: list[int],
         num_computed_tokens: int,
         max_tokens: int,
+        execution_prefill_len: int | None = None,
     ) -> None:
         assert len(self.free_indices) > 0, "No free indices"
         req_idx = self.free_indices.pop()
@@ -103,9 +104,16 @@ class RequestState:
 
         self.max_seq_len[req_idx] = prompt_len + max_tokens
         self.prompt_len.np[req_idx] = prompt_len
-        prefill_len = len(all_token_ids)
+        prefill_len = (
+            len(all_token_ids)
+            if execution_prefill_len is None
+            else execution_prefill_len
+        )
         assert prefill_len >= prompt_len, (
             f"prefill_len {prefill_len} < prompt_len {prompt_len}"
+        )
+        assert prefill_len <= len(all_token_ids), (
+            f"prefill_len {prefill_len} exceeds token stream {len(all_token_ids)}"
         )
         self.prefill_len.np[req_idx] = prefill_len
         self.total_len.stage_write_elem(req_idx, prefill_len)

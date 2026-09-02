@@ -61,6 +61,20 @@ class ElasticPlanKind(str, Enum):
     DEFER = "defer"
 
 
+class ElasticMaintenanceExecution(str, Enum):
+    """Physical execution boundary for a COLD graph promotion."""
+
+    COUPLED_USER = "coupled_user"
+    GRAPH_ONLY = "graph_only"
+
+
+class DispatchRepresentation(str, Enum):
+    HOT_GRAPH = "hot_graph"
+    COMPILED_ONLY = "compiled_only"
+    INACTIVE = "inactive"
+    FORBIDDEN = "forbidden"
+
+
 @dataclass(frozen=True, order=True)
 class RuntimeGeneration:
     value: str
@@ -427,6 +441,207 @@ class PhysicalReplayKey:
         return _fingerprint(asdict(self))
 
 
+EXECUTION_MANIFEST_SCHEMA = 2
+
+
+@dataclass(frozen=True, order=True)
+class OwnerInvocation:
+    """Exact current invocation for one ordered runtime owner."""
+
+    owner: str
+    activation: str
+    phase: str
+    semantic_num_reqs: int
+    physical_num_reqs: int
+    live_num_tokens: int
+    physical_num_tokens: int
+    uniform_query_len: int | None
+    active_loras: int
+    requested_output_k: int
+    executed_drafter_k: int
+    execution_order: int
+    generation: RuntimeGeneration
+
+    def __post_init__(self) -> None:
+        if (
+            not self.owner
+            or self.activation not in {"always", "speculative"}
+            or self.phase not in {"decode", "mixed"}
+        ):
+            raise ValueError("owner invocation has invalid identity")
+        for name in (
+            "semantic_num_reqs",
+            "physical_num_reqs",
+            "live_num_tokens",
+            "physical_num_tokens",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.physical_num_reqs < self.semantic_num_reqs:
+            raise ValueError("physical request carrier underfills semantic requests")
+        if self.physical_num_tokens < self.live_num_tokens:
+            raise ValueError("physical token carrier underfills live tokens")
+        if self.uniform_query_len is not None and (
+            isinstance(self.uniform_query_len, bool)
+            or not isinstance(self.uniform_query_len, int)
+            or self.uniform_query_len <= 0
+        ):
+            raise ValueError("uniform query length must be a positive integer")
+        for name in (
+            "active_loras",
+            "requested_output_k",
+            "executed_drafter_k",
+            "execution_order",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+
+
+@dataclass(frozen=True)
+class ExecutionManifest:
+    """Immutable current work identity, independent of future residency."""
+
+    generation: RuntimeGeneration
+    invocations: tuple[OwnerInvocation, ...]
+    request_ids: tuple[str, ...]
+    per_request_query_lens: tuple[int, ...]
+    per_request_is_prefilling: tuple[bool, ...]
+    scheduled_draft_rows: tuple[int, ...]
+    scheduled_encoder_inputs: tuple[tuple[str, tuple[int, ...]], ...]
+    active_lora_ids: tuple[int, ...]
+    requested_output_k: int
+    executed_drafter_k: int
+    schema: int = EXECUTION_MANIFEST_SCHEMA
+
+    def __post_init__(self) -> None:
+        if self.schema != EXECUTION_MANIFEST_SCHEMA:
+            raise ValueError("unsupported execution manifest schema")
+        if not self.invocations or self.invocations[0].owner != "target":
+            raise ValueError("execution manifest requires target first")
+        owners = tuple(invocation.owner for invocation in self.invocations)
+        if len(set(owners)) != len(owners):
+            raise ValueError("execution manifest owners must be unique")
+        orders = tuple(invocation.execution_order for invocation in self.invocations)
+        if tuple(sorted(orders)) != orders or len(set(orders)) != len(orders):
+            raise ValueError("execution manifest order must be sorted and unique")
+        if any(
+            invocation.generation != self.generation for invocation in self.invocations
+        ):
+            raise ValueError("execution manifest mixes runtime generations")
+        if (
+            not self.request_ids
+            or len(set(self.request_ids)) != len(self.request_ids)
+            or any(
+                not isinstance(request_id, str) or not request_id
+                for request_id in self.request_ids
+            )
+        ):
+            raise ValueError("manifest request IDs must be non-empty and unique")
+        if len(self.request_ids) != len(self.per_request_query_lens):
+            raise ValueError("manifest request IDs and query lengths differ")
+        if not self.per_request_query_lens or any(
+            isinstance(length, bool) or not isinstance(length, int) or length <= 0
+            for length in self.per_request_query_lens
+        ):
+            raise ValueError("manifest query lengths must be positive integers")
+        if len(self.per_request_is_prefilling) != len(self.request_ids) or any(
+            type(value) is not bool for value in self.per_request_is_prefilling
+        ):
+            raise ValueError("manifest prefill phases must align with requests")
+        if len(self.scheduled_draft_rows) != len(self.per_request_query_lens) or any(
+            isinstance(rows, bool) or not isinstance(rows, int) or rows < 0
+            for rows in self.scheduled_draft_rows
+        ):
+            raise ValueError("manifest draft rows must align with requests")
+        encoder_request_ids = tuple(
+            request_id for request_id, _indices in self.scheduled_encoder_inputs
+        )
+        if (
+            tuple(sorted(encoder_request_ids)) != encoder_request_ids
+            or len(set(encoder_request_ids)) != len(encoder_request_ids)
+            or not set(encoder_request_ids).issubset(self.request_ids)
+            or any(
+                not indices
+                or tuple(sorted(set(indices))) != indices
+                or any(
+                    isinstance(index, bool) or not isinstance(index, int) or index < 0
+                    for index in indices
+                )
+                for _request_id, indices in self.scheduled_encoder_inputs
+            )
+        ):
+            raise ValueError("manifest encoder schedule is not canonical")
+        if tuple(sorted(set(self.active_lora_ids))) != self.active_lora_ids or any(
+            isinstance(lora_id, bool) or not isinstance(lora_id, int) or lora_id <= 0
+            for lora_id in self.active_lora_ids
+        ):
+            raise ValueError("manifest active LoRA IDs must be sorted unique positives")
+        if any(
+            invocation.active_loras != len(self.active_lora_ids)
+            for invocation in self.invocations
+        ):
+            raise ValueError("manifest LoRA identity differs from Graph capture case")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in (self.requested_output_k, self.executed_drafter_k)
+        ):
+            raise ValueError(
+                "manifest speculative K values must be non-negative integers"
+            )
+        if any(
+            invocation.requested_output_k != self.requested_output_k
+            or invocation.executed_drafter_k != self.executed_drafter_k
+            for invocation in self.invocations
+        ):
+            raise ValueError("manifest speculative K differs from owner invocation")
+        if self.requested_output_k == 0 and self.executed_drafter_k != 0:
+            raise ValueError("inactive speculation cannot execute drafter steps")
+        if (
+            self.requested_output_k > 0
+            and self.executed_drafter_k < self.requested_output_k
+        ):
+            raise ValueError("physical drafter depth underfills requested output K")
+        if any(rows > self.executed_drafter_k for rows in self.scheduled_draft_rows):
+            raise ValueError("scheduled draft rows exceed physical drafter depth")
+        semantic_num_reqs = len(self.request_ids)
+        if any(
+            invocation.semantic_num_reqs != semantic_num_reqs
+            for invocation in self.invocations
+        ):
+            raise ValueError("manifest owner request cardinality differs")
+        if self.invocations[0].live_num_tokens != sum(self.per_request_query_lens):
+            raise ValueError("target invocation live tokens differ from request work")
+
+    @cached_property
+    def fingerprint(self) -> str:
+        return _fingerprint(asdict(self))
+
+
+@dataclass(frozen=True)
+class OwnerDispatch:
+    invocation: OwnerInvocation
+    representation: DispatchRepresentation
+    physical_key: PhysicalReplayKey | None = None
+
+    def __post_init__(self) -> None:
+        if self.representation == DispatchRepresentation.HOT_GRAPH:
+            if self.physical_key is None:
+                raise ValueError("HOT_GRAPH dispatch requires a physical key")
+            if self.physical_key.logical.owner != self.invocation.owner:
+                raise ValueError("dispatch key owner differs from invocation")
+            if self.physical_key.generation != self.invocation.generation:
+                raise ValueError("dispatch key generation differs from invocation")
+        elif self.physical_key is not None:
+            raise ValueError("only HOT_GRAPH dispatch may carry a physical key")
+        if self.representation in {
+            DispatchRepresentation.INACTIVE,
+            DispatchRepresentation.FORBIDDEN,
+        }:
+            raise ValueError("inactive or forbidden owners cannot enter dispatch")
+
+
 @dataclass(frozen=True)
 class GraphPrice:
     resident_bytes: int
@@ -491,6 +706,10 @@ class ElasticResidencyEntry:
                 raise ValueError(f"{name} must be a non-negative integer")
         if self.reclaimable_bytes > self.resident_bytes:
             raise ValueError("reclaim proof exceeds resident bytes")
+        if self.local_pool_bytes > self.resident_bytes:
+            raise ValueError("local pool exceeds rank-safe resident bytes")
+        if self.reclaimable_bytes > self.local_pool_bytes:
+            raise ValueError("reclaim proof exceeds the local pool")
         # Pinning is current policy; reclaimable_bytes is the physical proof
         # available after a future explicit idle unpin. A lease, unlike a pin,
         # crosses an active ownership boundary and must still suppress proof.
@@ -546,6 +765,10 @@ class ElasticResidencyReceipt:
             raise ValueError("elastic residency receipt mixes runtime generations")
         if tuple(sorted(keys, key=lambda key: key.identity)) != keys:
             raise ValueError("elastic residency entries must be identity-sorted")
+        if sum(entry.resident_bytes for entry in self.entries) > self.resident_bytes:
+            raise ValueError(
+                "elastic residency entries exceed aggregate resident bytes"
+            )
 
     @cached_property
     def fingerprint(self) -> str:
@@ -642,6 +865,18 @@ class ElasticGraphStats:
 
 
 @dataclass(frozen=True)
+class _AdmissionMutationSnapshot:
+    entries: dict[PhysicalReplayKey, ElasticGraphEntry | None]
+    epoch: int
+    hot_hits: int
+    cold_misses: int
+    promotions: int
+    evictions: int
+    evicted_bytes: int
+    trace: tuple[tuple[str, str, str], ...]
+
+
+@dataclass(frozen=True)
 class ElasticStepPlan:
     transaction_id: str
     generation: RuntimeGeneration
@@ -659,6 +894,10 @@ class ElasticStepPlan:
     capture_loan_bytes: int
     reclaim_bytes: int
     defer_reason: str | None = None
+    execution_manifest: ExecutionManifest | None = None
+    current_dispatch: tuple[OwnerDispatch, ...] = ()
+    successor_keys: tuple[PhysicalReplayKey, ...] = ()
+    maintenance_execution: ElasticMaintenanceExecution | None = None
 
     def __post_init__(self) -> None:
         if not self.transaction_id:
@@ -678,6 +917,11 @@ class ElasticStepPlan:
             raise ValueError("a user plan cannot contain cold graph misses")
         if self.kind == ElasticPlanKind.MAINTENANCE and not self.cold_misses:
             raise ValueError("maintenance requires at least one cold miss")
+        if self.kind == ElasticPlanKind.MAINTENANCE:
+            if self.maintenance_execution is None:
+                raise ValueError("maintenance requires an execution boundary")
+        elif self.maintenance_execution is not None:
+            raise ValueError("only maintenance may carry an execution boundary")
         if self.kind in {
             ElasticPlanKind.RECLAIM,
             ElasticPlanKind.PRESSURE_RECLAIM,
@@ -693,6 +937,56 @@ class ElasticStepPlan:
             raise ValueError("plan hit/miss keys are outside its owner set")
         if set(self.victim_keys).intersection(self.protected_keys):
             raise ValueError("a protected key cannot be selected as a victim")
+        if set(self.victim_keys).intersection(self.physical_keys):
+            raise ValueError("a current physical key cannot be selected as a victim")
+        if self.kind == ElasticPlanKind.USER and self.victim_keys:
+            raise ValueError("a user plan cannot evict graph residency")
+        if self.execution_manifest is None:
+            if self.current_dispatch:
+                raise ValueError("current dispatch requires an execution manifest")
+        else:
+            if self.execution_manifest.generation != self.generation:
+                raise ValueError("execution manifest generation differs from plan")
+            invocation_owners = tuple(
+                invocation.owner for invocation in self.execution_manifest.invocations
+            )
+            dispatch_owners = tuple(
+                dispatch.invocation.owner for dispatch in self.current_dispatch
+            )
+            if dispatch_owners != invocation_owners:
+                raise ValueError("current dispatch does not cover exact owner order")
+            if (
+                tuple(dispatch.invocation for dispatch in self.current_dispatch)
+                != self.execution_manifest.invocations
+            ):
+                raise ValueError("dispatch invocation differs from manifest")
+            current_keys = tuple(
+                dispatch.physical_key
+                for dispatch in self.current_dispatch
+                if dispatch.representation == DispatchRepresentation.HOT_GRAPH
+            )
+            if len(set(current_keys)) != len(current_keys):
+                raise ValueError("current dispatch contains duplicate physical keys")
+            if not set(current_keys).issubset(self.physical_keys):
+                raise ValueError("current dispatch key is outside plan residency")
+            if self.kind == ElasticPlanKind.USER and not set(current_keys).issubset(
+                self.hot_hits
+            ):
+                raise ValueError("every USER Graph dispatch key must be HOT")
+            allowed_residency = set(current_keys).union(self.successor_keys)
+            if not set(self.physical_keys).issubset(allowed_residency):
+                raise ValueError(
+                    "execution residency contains neither current nor successor keys"
+                )
+            protected_successors = set(self.physical_keys).intersection(
+                self.successor_keys
+            ) - set(current_keys)
+            if not protected_successors.issubset(self.protected_keys):
+                raise ValueError("resident successor keys must be explicitly protected")
+        if any(key.generation != self.generation for key in self.successor_keys):
+            raise ValueError("successor residency mixes runtime generations")
+        if len(set(self.successor_keys)) != len(self.successor_keys):
+            raise ValueError("successor residency contains duplicate keys")
 
     @cached_property
     def fingerprint(self) -> str:
@@ -851,6 +1145,15 @@ def resolve_step_physical_keys(
                 )
 
             mode = owner_policy.mode_for(owner_uniform)
+            if (
+                owner_policy.token_source == "step"
+                and semantic_uniform is None
+                and mode == "FULL"
+            ):
+                # FULL replay for token-major owners is legal only for a
+                # scheduler-declared uniform decode. A mixed/prefill q1 tail
+                # can share the same numeric qlen while requiring PIECEWISE.
+                mode = owner_policy.piecewise_mode
             if mode == "NONE":
                 continue
             if mode == "FULL":
@@ -973,6 +1276,258 @@ def resolve_step_physical_keys(
     return resolved
 
 
+def build_execution_manifest(
+    *,
+    step_key: tuple[int, int, int, int, int],
+    request_ids: Sequence[str],
+    per_request_query_lens: Sequence[int],
+    per_request_is_prefilling: Sequence[bool],
+    scheduled_draft_rows: Sequence[int],
+    scheduled_encoder_inputs: Mapping[str, Sequence[int]] | None = None,
+    active_lora_ids: Sequence[int] = (),
+    requested_output_k: int,
+    executed_drafter_k: int,
+    phase: str,
+    generation: RuntimeGeneration,
+    policy: GraphExecutionPolicy,
+    max_num_batched_tokens: int,
+    active_loras: int = 0,
+) -> tuple[ExecutionManifest, tuple[OwnerDispatch, ...]]:
+    """Resolve current owner work without consulting successor residency."""
+    query_lens = tuple(per_request_query_lens)
+    is_prefilling = tuple(per_request_is_prefilling)
+    draft_rows = tuple(scheduled_draft_rows)
+    ordered_request_ids = tuple(request_ids)
+    encoder_inputs = tuple(
+        sorted(
+            (
+                request_id,
+                tuple(sorted(set(indices))),
+            )
+            for request_id, indices in (scheduled_encoder_inputs or {}).items()
+        )
+    )
+    lora_ids = tuple(sorted(set(active_lora_ids)))
+    if not query_lens:
+        raise ElasticGraphError("current execution requires at least one request")
+    if len(ordered_request_ids) != len(query_lens):
+        raise ElasticGraphError("request IDs do not align with current execution")
+    if len(is_prefilling) != len(query_lens) or any(
+        type(value) is not bool for value in is_prefilling
+    ):
+        raise ElasticGraphError("request prefill phases do not align with execution")
+    if len(draft_rows) != len(query_lens):
+        raise ElasticGraphError("scheduled draft rows do not align with requests")
+    if active_loras != len(lora_ids):
+        raise ElasticGraphError(
+            "active LoRA identity differs from the exact Graph capture case"
+        )
+    full, step_k, physical_x, step_tokens, step_uniform = step_key
+    if step_k != requested_output_k:
+        raise ElasticGraphError(
+            "execution step K differs from requested draft output K"
+        )
+    if requested_output_k == 0 and executed_drafter_k != 0:
+        raise ElasticGraphError("inactive speculation cannot execute drafter steps")
+    if requested_output_k > 0 and executed_drafter_k < requested_output_k:
+        raise ElasticGraphError(
+            "physical drafter depth cannot underfill requested draft output K"
+        )
+    if any(rows > executed_drafter_k for rows in draft_rows):
+        raise ElasticGraphError(
+            "scheduled target draft rows exceed physical drafter depth"
+        )
+    semantic_x = len(query_lens)
+    if physical_x < semantic_x:
+        raise ElasticGraphError("execution carrier underfills semantic requests")
+    uniform_step = query_lens[0] if len(set(query_lens)) == 1 else None
+    exact_decode = phase == "decode" and uniform_step is not None
+    if phase == "mixed":
+        if physical_x != semantic_x or step_uniform != 0:
+            raise ElasticGraphError(
+                "mixed current execution cannot inherit a successor carrier"
+            )
+        live_step_tokens = sum(query_lens)
+        if live_step_tokens > max_num_batched_tokens:
+            raise ElasticGraphError("current execution exceeds max_num_batched_tokens")
+        expected_step_tokens = 1 << (live_step_tokens - 1).bit_length()
+    elif exact_decode:
+        if step_uniform != uniform_step:
+            raise ElasticGraphError("decode execution lost exact query length")
+        expected_step_tokens = physical_x * uniform_step
+    else:
+        raise ElasticGraphError("decode execution has inconsistent query geometry")
+    if step_tokens != expected_step_tokens:
+        raise ElasticGraphError(
+            "current execution token carrier differs from observed work: "
+            f"observed={sum(query_lens)} carrier={step_tokens} "
+            f"expected={expected_step_tokens}"
+        )
+    if full and not exact_decode:
+        raise ElasticGraphError("FULL current execution requires exact decode")
+    current_keys = resolve_step_physical_keys(
+        step_key,
+        generation,
+        max_num_batched_tokens=max_num_batched_tokens,
+        policy=policy,
+    )
+    keys_by_owner = {key.logical.owner: key for key in current_keys}
+    if len(keys_by_owner) != len(current_keys):
+        raise ElasticGraphError("current physical owner set contains duplicates")
+
+    invocations: list[OwnerInvocation] = []
+    dispatches: list[OwnerDispatch] = []
+    ordered_policies = tuple(
+        sorted(policy.owners, key=lambda owner: owner.execution_order or 0)
+    )
+    for owner_policy in ordered_policies:
+        if owner_policy.activation == "speculative" and requested_output_k <= 0:
+            continue
+        if owner_policy.token_source == "step":
+            live_tokens = sum(query_lens)
+            owner_uniform = uniform_step
+        elif owner_policy.token_source == "requests":
+            live_tokens = semantic_x
+            owner_uniform = 1
+        elif owner_policy.token_source == "fixed_query":
+            assert owner_policy.fixed_query_len is not None
+            owner_uniform = owner_policy.fixed_query_len
+            live_tokens = semantic_x * owner_uniform
+        else:
+            raise ElasticGraphError(
+                "execution manifest requires an explicit owner token source"
+            )
+
+        key = keys_by_owner.pop(owner_policy.owner, None)
+        if key is not None:
+            physical_tokens = key.logical.token_bucket
+            representation = DispatchRepresentation.HOT_GRAPH
+        else:
+            mode = owner_policy.mode_for(owner_uniform)
+            if (
+                owner_policy.token_source == "step"
+                and phase == "mixed"
+                and mode == "FULL"
+            ):
+                mode = owner_policy.piecewise_mode
+            if mode == "NONE":
+                physical_tokens = live_tokens
+            elif mode == "PIECEWISE":
+                physical_tokens = min(
+                    1 << (live_tokens - 1).bit_length(), max_num_batched_tokens
+                )
+                if physical_tokens not in owner_policy.compiled_piecewise_sizes:
+                    raise ElasticGraphError(
+                        "active owner has neither a Graph nor a compiled-only route: "
+                        f"owner={owner_policy.owner} tokens={live_tokens}"
+                    )
+            else:
+                raise ElasticGraphError(
+                    "active FULL owner has no current physical Graph key: "
+                    f"owner={owner_policy.owner}"
+                )
+            representation = DispatchRepresentation.COMPILED_ONLY
+
+        invocation = OwnerInvocation(
+            owner=owner_policy.owner,
+            activation=owner_policy.activation,
+            phase=phase,
+            semantic_num_reqs=semantic_x,
+            physical_num_reqs=physical_x,
+            live_num_tokens=live_tokens,
+            physical_num_tokens=physical_tokens,
+            uniform_query_len=owner_uniform,
+            active_loras=active_loras,
+            requested_output_k=requested_output_k,
+            executed_drafter_k=executed_drafter_k,
+            execution_order=owner_policy.execution_order or 0,
+            generation=generation,
+        )
+        dispatches.append(
+            OwnerDispatch(
+                invocation=invocation,
+                representation=representation,
+                physical_key=key,
+            )
+        )
+        invocations.append(invocation)
+    if keys_by_owner:
+        raise ElasticGraphError(
+            "current physical owner set contains inactive owners: "
+            f"owners={tuple(sorted(keys_by_owner))}"
+        )
+    manifest = ExecutionManifest(
+        generation=generation,
+        invocations=tuple(invocations),
+        request_ids=ordered_request_ids,
+        per_request_query_lens=query_lens,
+        per_request_is_prefilling=is_prefilling,
+        scheduled_draft_rows=draft_rows,
+        scheduled_encoder_inputs=encoder_inputs,
+        active_lora_ids=lora_ids,
+        requested_output_k=requested_output_k,
+        executed_drafter_k=executed_drafter_k,
+    )
+    return manifest, tuple(dispatches)
+
+
+def execution_manifest_phase_from_step_key(
+    step_key: tuple[int, int, int, int, int] | None,
+) -> str | None:
+    """Return the physical execution lane encoded by a canonical step key.
+
+    A lifecycle-pure decode with variable accepted draft rows uses the same
+    PIECEWISE lane as mixed work. Only an exact uniform-query key carries a
+    non-zero query-length marker and therefore enters the decode lane.
+    """
+    if step_key is None:
+        return None
+    return "decode" if step_key[4] > 0 else "mixed"
+
+
+def canonical_execution_request_order(
+    num_tokens_per_request: Mapping[str, int],
+    *,
+    is_prefilling_by_request: Mapping[str, bool],
+    decode_query_len: int,
+) -> tuple[str, ...]:
+    """Mirror the target InputBatch lifecycle ordering without mutation."""
+    if decode_query_len <= 0:
+        raise ValueError("decode query length must be positive")
+    request_ids = num_tokens_per_request.keys()
+    missing = request_ids - is_prefilling_by_request.keys()
+    extra = is_prefilling_by_request.keys() - request_ids
+    if missing or extra:
+        raise ValueError(
+            "execution lifecycle identity differs from scheduled requests: "
+            f"missing={sorted(missing)} extra={sorted(extra)}"
+        )
+    return tuple(
+        sorted(
+            num_tokens_per_request,
+            key=lambda request_id: (
+                is_prefilling_by_request[request_id],
+                num_tokens_per_request[request_id] != decode_query_len,
+                num_tokens_per_request[request_id],
+            ),
+        )
+    )
+
+
+def short_decode_inventory_xs(max_x: int) -> tuple[int, ...]:
+    """Return the bounded physical cohort classes through ``max_x``."""
+    if isinstance(max_x, bool) or not isinstance(max_x, int) or max_x <= 0:
+        raise ValueError("max_x must be a positive integer")
+    xs: list[int] = []
+    x = 1
+    while x <= max_x:
+        xs.append(x)
+        x <<= 1
+    if xs[-1] != max_x:
+        xs.append(max_x)
+    return tuple(xs)
+
+
 def derive_short_decode_graph_inventory(
     *,
     max_x: int,
@@ -988,8 +1543,7 @@ def derive_short_decode_graph_inventory(
     configured endpoint is retained exactly. DCP is intentionally absent:
     it partitions attention context, not the assembled request/M axis.
     """
-    if max_x <= 0:
-        raise ValueError("max_x must be positive")
+    xs = short_decode_inventory_xs(max_x)
     if num_spec_tokens < 0:
         raise ValueError("short decode requires non-negative K")
     if max_num_batched_tokens <= 0:
@@ -1002,13 +1556,6 @@ def derive_short_decode_graph_inventory(
             f"max_num_batched_tokens={max_num_batched_tokens}"
         )
 
-    xs: list[int] = []
-    x = 1
-    while x <= max_x:
-        xs.append(x)
-        x <<= 1
-    if xs[-1] != max_x:
-        xs.append(max_x)
     return {
         x: resolve_step_physical_keys(
             (
@@ -1075,6 +1622,7 @@ class ElasticAdmissionController:
         self._pending_maintenance_step_key: tuple[int, ...] | None = None
         self._transaction_seq = 0
         self._last_receipt: ElasticResidencyReceipt | None = None
+        self._pre_mutation_snapshots: dict[str, _AdmissionMutationSnapshot] = {}
         # Settled execution shape and the one cold shape awaiting its first
         # authoritative worker measurement.
         self.step_key: tuple[int, ...] | None = None
@@ -1083,6 +1631,13 @@ class ElasticAdmissionController:
         # evidence, never a fixed reserve.
         self.measured_bytes: dict[tuple[int, ...], int] = {}
         self.capture_envelopes: dict[tuple[int, ...], tuple[int, int, int]] = {}
+        self._capture_envelope_provenance: dict[
+            tuple[int, ...],
+            tuple[
+                tuple[int, int, int],
+                tuple[tuple[str, int], ...] | None,
+            ],
+        ] = {}
         self.resident_bytes = 0
         self.pinned_resident_bytes = 0
         self.evictable_resident_bytes = 0
@@ -1237,6 +1792,33 @@ class ElasticAdmissionController:
         self._pending_maintenance_plan = None
         self._pending_maintenance_step_key = None
 
+    def require_armed_maintenance_discardable(
+        self, expected_transaction_id: str
+    ) -> ElasticStepPlan:
+        """Validate that an exact serving proposal has not begun mutation."""
+        plan = self._pending_maintenance_plan
+        if plan is None or plan.transaction_id != expected_transaction_id:
+            raise ElasticGraphError("armed maintenance transaction changed")
+        if plan.kind != ElasticPlanKind.MAINTENANCE:
+            raise ElasticGraphError("exclusive maintenance cannot be discarded")
+        if plan.maintenance_execution != ElasticMaintenanceExecution.COUPLED_USER:
+            raise ElasticGraphError("graph-only maintenance cannot be discarded")
+        capturing = any(
+            self._entries.get(key) is not None
+            and self._entries[key].state == GraphResidency.CAPTURING
+            for key in plan.cold_misses
+        )
+        if expected_transaction_id in self._pre_mutation_snapshots or capturing:
+            raise ElasticGraphError(
+                "armed maintenance cannot be discarded after physical mutation"
+            )
+        return plan
+
+    def discard_armed_maintenance(self, expected_transaction_id: str) -> None:
+        """Discard one exact, validated pre-mutation serving proposal."""
+        self.require_armed_maintenance_discardable(expected_transaction_id)
+        self.clear_maintenance()
+
     def max_pending_grant(self) -> int:
         return max((loan.grant_bytes for loan in self._pending_loans), default=0)
 
@@ -1262,13 +1844,71 @@ class ElasticAdmissionController:
         envelope: tuple[int, int, int],
         *,
         merge_max: bool = False,
+        resident_key_bytes: Mapping[str, int] | Iterable[tuple[str, int]] | None = None,
     ) -> None:
         if any(value < 0 for value in envelope):
             raise ElasticGraphError("elastic capture envelope cannot be negative")
+        if resident_key_bytes is None:
+            provenance = None
+        else:
+            provenance_map = dict(resident_key_bytes)
+            if any(
+                not isinstance(identity, str)
+                or not identity
+                or isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                for identity, value in provenance_map.items()
+            ):
+                raise ElasticGraphError(
+                    "elastic capture provenance requires key identities and byte counts"
+                )
+            if sum(provenance_map.values()) > envelope[0]:
+                raise ElasticGraphError(
+                    "elastic capture provenance exceeds the destination endpoint"
+                )
+            provenance = tuple(sorted(provenance_map.items()))
         if merge_max:
+            has_prior = owner_key in self.capture_envelopes
             prior = self.capture_envelopes.get(owner_key, (0, 0, 0))
+            prior_evidence = self._capture_envelope_provenance.get(owner_key)
+            prior_provenance = (
+                prior_evidence[1]
+                if prior_evidence is not None and prior_evidence[0] == prior
+                else None
+            )
+            if not has_prior:
+                selected_provenance = provenance
+            else:
+                prior_provenance_map = dict(prior_provenance or ())
+                selected_provenance = (
+                    None
+                    if provenance is None or prior_provenance is None
+                    else tuple(
+                        sorted(
+                            (
+                                identity,
+                                min(value, prior_provenance_map[identity]),
+                            )
+                            for identity, value in provenance
+                            if identity in prior_provenance_map
+                        )
+                    )
+                )
             envelope = tuple(max(prior[index], envelope[index]) for index in range(3))
+            provenance = selected_provenance
         self.capture_envelopes[owner_key] = envelope
+        self._capture_envelope_provenance[owner_key] = envelope, provenance
+
+    def capture_envelope_resident_key_bytes(
+        self, owner_key: tuple[int, ...]
+    ) -> tuple[tuple[str, int], ...] | None:
+        """Return source receipt key bytes for the still-selected endpoint."""
+        envelope = self.capture_envelopes.get(owner_key)
+        evidence = self._capture_envelope_provenance.get(owner_key)
+        if envelope is None or evidence is None or evidence[0] != envelope:
+            return None
+        return evidence[1]
 
     def mark_recapture(self, step_key: tuple[int, ...]) -> None:
         self.recapture_pending_key = step_key
@@ -1334,36 +1974,11 @@ class ElasticAdmissionController:
         retained as controller authority only after Graph state synchronization
         succeeds.
         """
-        if receipt.generation != self.generation:
-            raise ElasticGraphError(
-                "worker residency generation differs from controller"
-            )
-        if (
-            expected_transaction_id is not None
-            and receipt.transaction_id != expected_transaction_id
-        ):
-            raise ElasticGraphError(
-                "worker residency transaction differs from controller"
-            )
-        parsed: list[tuple[PhysicalReplayKey, GraphPrice, bool, int]] = []
-        for entry in receipt.entries:
-            if entry.lease_ids:
-                raise ElasticGraphError(
-                    "worker published a HOT receipt before releasing leases"
-                )
-            resident = entry.resident_bytes
-            parsed.append(
-                (
-                    entry.key,
-                    GraphPrice(
-                        resident_bytes=resident,
-                        capture_peak_bytes=resident,
-                        reclaim_group=f"private-pool:{entry.key.identity}",
-                    ),
-                    entry.pinned or entry.reclaimable_bytes == 0,
-                    entry.reclaimable_bytes,
-                )
-            )
+        self.validate_residency_receipt(
+            receipt,
+            expected_transaction_id=expected_transaction_id,
+        )
+        parsed = self._residency_receipt_rows(receipt)
         self.synchronize_hot(parsed)
         self._last_receipt = receipt
         pinned_bytes = sum(
@@ -1379,7 +1994,100 @@ class ElasticAdmissionController:
         self.transition_floor_bytes = receipt.transition_floor_bytes
         if receipt.cublas_workspace_bytes:
             self.cublas_workspace_bytes = receipt.cublas_workspace_bytes
+        if receipt.transaction_id is not None:
+            self._pre_mutation_snapshots.pop(receipt.transaction_id, None)
         return pinned_bytes, evictable_bytes
+
+    @staticmethod
+    def _residency_receipt_rows(
+        receipt: ElasticResidencyReceipt,
+    ) -> list[tuple[PhysicalReplayKey, GraphPrice, bool, int]]:
+        return [
+            (
+                entry.key,
+                GraphPrice(
+                    resident_bytes=entry.resident_bytes,
+                    capture_peak_bytes=entry.resident_bytes,
+                    reclaim_group=f"private-pool:{entry.key.identity}",
+                ),
+                entry.pinned or entry.reclaimable_bytes == 0,
+                entry.reclaimable_bytes,
+            )
+            for entry in receipt.entries
+        ]
+
+    def validate_residency_publication(
+        self,
+        receipt: ElasticResidencyReceipt,
+        *,
+        expected_transaction_id: str | None = None,
+        required_hot_keys: Iterable[PhysicalReplayKey] = (),
+        releasing_transaction_id: str | None = None,
+    ) -> None:
+        """Validate the receipt's post-release HOT replacement read-only."""
+        self.validate_residency_receipt(
+            receipt,
+            expected_transaction_id=expected_transaction_id,
+            required_hot_keys=required_hot_keys,
+        )
+        rows = self._residency_receipt_rows(receipt)
+        observed = {key: price for key, price, _pinned, _proof in rows}
+        observed_ids = tuple(sorted(key.identity for key in observed))
+        for key, entry in self._entries.items():
+            remaining_leases = entry.leases.difference(
+                () if releasing_transaction_id is None else (releasing_transaction_id,)
+            )
+            if entry.hot and key not in observed and remaining_leases:
+                raise ElasticGraphError(
+                    "worker receipt dropped a scheduler-leased graph: "
+                    f"missing={key.identity!r} "
+                    f"leases={tuple(sorted(remaining_leases))!r} "
+                    f"observed={observed_ids!r}"
+                )
+        for key, price in observed.items():
+            entry = self._entries.get(key)
+            if (
+                entry is not None
+                and entry.price is not None
+                and entry.price.reclaim_group != price.reclaim_group
+            ):
+                raise ElasticGraphError(
+                    "graph reclaim identity changed inside one generation"
+                )
+
+    def validate_residency_receipt(
+        self,
+        receipt: ElasticResidencyReceipt,
+        *,
+        expected_transaction_id: str | None = None,
+        required_hot_keys: Iterable[PhysicalReplayKey] = (),
+    ) -> None:
+        """Validate a complete worker receipt without changing controller state."""
+        if receipt.generation != self.generation:
+            raise ElasticGraphError(
+                "worker residency generation differs from controller"
+            )
+        if (
+            expected_transaction_id is not None
+            and receipt.transaction_id != expected_transaction_id
+        ):
+            raise ElasticGraphError(
+                "worker residency transaction differs from controller"
+            )
+        for entry in receipt.entries:
+            if entry.lease_ids:
+                raise ElasticGraphError(
+                    "worker published a HOT receipt before releasing leases"
+                )
+        required = set(required_hot_keys)
+        for key in required:
+            self._require_generation(key)
+        missing = required.difference(entry.key for entry in receipt.entries)
+        if missing:
+            raise ElasticGraphError(
+                "worker residency receipt omitted required HOT keys: "
+                f"{tuple(sorted(key.identity for key in missing))!r}"
+            )
 
     def register(
         self,
@@ -1608,6 +2316,36 @@ class ElasticAdmissionController:
             )
         )
 
+    @staticmethod
+    def compose_destination_capture_loan(
+        *,
+        current_residency_bytes: int,
+        destination_capture_endpoint_bytes: int,
+        retained_transition_overlap_bytes: int = 0,
+        shared_resident_bytes: int = 0,
+    ) -> int:
+        """Compose one cold transaction without duplicating physical owners."""
+        if current_residency_bytes < 0:
+            raise ValueError("current residency cannot be negative")
+        if destination_capture_endpoint_bytes < 0:
+            raise ValueError("destination capture endpoint cannot be negative")
+        if retained_transition_overlap_bytes < 0:
+            raise ValueError("retained transition overlap cannot be negative")
+        if (
+            shared_resident_bytes < 0
+            or shared_resident_bytes > current_residency_bytes
+            or shared_resident_bytes > destination_capture_endpoint_bytes
+        ):
+            raise ValueError(
+                "shared resident bytes must lie inside current and destination sets"
+            )
+        return current_residency_bytes + max(
+            0,
+            destination_capture_endpoint_bytes
+            + retained_transition_overlap_bytes
+            - shared_resident_bytes,
+        )
+
     def plan(
         self,
         transaction_id: str,
@@ -1618,17 +2356,59 @@ class ElasticAdmissionController:
         kv_transition: tuple[int, int] | None = None,
         protected_keys: Iterable[PhysicalReplayKey] = (),
         class_envelopes: Mapping[LogicalDispatchKey, GraphPrice] | None = None,
-        owner_set_capture_envelope_bytes: int | None = None,
+        destination_capture_endpoint_bytes: int | None = None,
         retained_transition_overlap_bytes: int = 0,
         shared_resident_bytes: int = 0,
+        post_transition_endpoint_bytes: int | None = None,
+        post_transition_shared_resident_bytes: int | None = None,
+        post_transition_extra_bytes: int = 0,
+        maintenance_execution: ElasticMaintenanceExecution = (
+            ElasticMaintenanceExecution.COUPLED_USER
+        ),
     ) -> ElasticStepPlan:
         if request_bytes < 0 or available_bytes < 0:
             raise ValueError("admission byte counts cannot be negative")
-        if retained_transition_overlap_bytes < 0:
+        if destination_capture_endpoint_bytes is not None:
+            # Validate the complete endpoint contract before inspecting keys;
+            # malformed accounting cannot become a HOT-path no-op.
+            self.compose_destination_capture_loan(
+                current_residency_bytes=request_bytes,
+                destination_capture_endpoint_bytes=(destination_capture_endpoint_bytes),
+                retained_transition_overlap_bytes=(retained_transition_overlap_bytes),
+                shared_resident_bytes=shared_resident_bytes,
+            )
+        elif retained_transition_overlap_bytes < 0:
             raise ValueError("retained transition overlap cannot be negative")
-        if shared_resident_bytes < 0 or shared_resident_bytes > request_bytes:
+        elif shared_resident_bytes < 0 or shared_resident_bytes > request_bytes:
             raise ValueError(
                 "shared resident bytes must lie inside current request bytes"
+            )
+        if post_transition_extra_bytes < 0:
+            raise ValueError("post-transition extra bytes cannot be negative")
+        if destination_capture_endpoint_bytes is None and (
+            post_transition_endpoint_bytes is not None
+            or post_transition_shared_resident_bytes is not None
+            or post_transition_extra_bytes
+        ):
+            raise ValueError(
+                "post-transition accounting requires a destination capture endpoint"
+            )
+        if post_transition_endpoint_bytes is not None:
+            if post_transition_endpoint_bytes < 0:
+                raise ValueError("post-transition endpoint bytes cannot be negative")
+            post_shared = (
+                shared_resident_bytes
+                if post_transition_shared_resident_bytes is None
+                else post_transition_shared_resident_bytes
+            )
+            self.compose_destination_capture_loan(
+                current_residency_bytes=request_bytes,
+                destination_capture_endpoint_bytes=post_transition_endpoint_bytes,
+                shared_resident_bytes=post_shared,
+            )
+        elif post_transition_shared_resident_bytes is not None:
+            raise ValueError(
+                "post-transition shared bytes require an explicit endpoint"
             )
         keys = tuple(dict.fromkeys(physical_keys))
         protected = tuple(dict.fromkeys(protected_keys))
@@ -1647,7 +2427,7 @@ class ElasticAdmissionController:
             price = entry.price if entry is not None else None
             price = price or envelopes.get(key.logical)
             if price is None:
-                if owner_set_capture_envelope_bytes is not None:
+                if destination_capture_endpoint_bytes is not None:
                     continue
                 return self._defer(
                     transaction_id,
@@ -1662,15 +2442,49 @@ class ElasticAdmissionController:
                 )
             prices[key] = price
 
-        if owner_set_capture_envelope_bytes is not None:
-            if owner_set_capture_envelope_bytes < 0:
-                raise ValueError("owner-set capture envelope cannot be negative")
+        if destination_capture_endpoint_bytes is not None:
+            # The destination endpoint is measured independently of the
+            # current set. Both coexist until capture settlement; subtract only
+            # the intersection published by the worker receipt. This temporary
+            # loan is returned to KV after settlement.
             capture_loan = (
-                owner_set_capture_envelope_bytes + retained_transition_overlap_bytes
+                self.compose_destination_capture_loan(
+                    current_residency_bytes=request_bytes,
+                    destination_capture_endpoint_bytes=(
+                        destination_capture_endpoint_bytes
+                    ),
+                    retained_transition_overlap_bytes=(
+                        retained_transition_overlap_bytes
+                    ),
+                    shared_resident_bytes=shared_resident_bytes,
+                )
                 if misses
                 else 0
             )
-            required_bytes = max(request_bytes, capture_loan)
+            # Capture and the later consumer can have different peaks.  Select
+            # one victim set that proves both phases without charging the
+            # consumer-only allocation during capture.
+            post_transition_bytes = (
+                self.compose_destination_capture_loan(
+                    current_residency_bytes=request_bytes,
+                    destination_capture_endpoint_bytes=(
+                        destination_capture_endpoint_bytes
+                        if post_transition_endpoint_bytes is None
+                        else post_transition_endpoint_bytes
+                    ),
+                    shared_resident_bytes=(
+                        shared_resident_bytes
+                        if post_transition_shared_resident_bytes is None
+                        else post_transition_shared_resident_bytes
+                    ),
+                )
+                + post_transition_extra_bytes
+            )
+            required_bytes = max(
+                request_bytes,
+                capture_loan,
+                post_transition_bytes,
+            )
         else:
             capture_loan = (
                 sum(price.capture_peak_bytes for price in prices.values())
@@ -1678,6 +2492,23 @@ class ElasticAdmissionController:
             )
             required_bytes = request_bytes + capture_loan
         deficit = max(0, required_bytes - available_bytes)
+        if not misses and deficit:
+            # A USER step may acquire leases but cannot retire residency: the
+            # scheduler and worker otherwise apply different physical state.
+            # Reclaim must be an explicit maintenance transaction followed by
+            # a newly priced USER step.
+            return self._defer(
+                transaction_id,
+                keys,
+                tuple(hits),
+                (),
+                protected,
+                request_bytes,
+                available_bytes,
+                kv_transition,
+                "hot_endpoint_requires_explicit_reclaim",
+                capture_loan=capture_loan,
+            )
         victims, groups, reclaimed = self._select_victims(
             deficit, set(keys).union(protected)
         )
@@ -1697,7 +2528,7 @@ class ElasticAdmissionController:
                 reclaimed=reclaimed,
                 capture_loan=capture_loan,
             )
-        if owner_set_capture_envelope_bytes is not None and misses and reclaimed:
+        if destination_capture_endpoint_bytes is not None and misses and reclaimed:
             # The owner-set envelope is an endpoint bound for the resident set
             # before the planned victims are destroyed.  A reclaim proof is the
             # only evidence that can reduce that endpoint before capture; carry
@@ -1721,6 +2552,9 @@ class ElasticAdmissionController:
             available_bytes=available_bytes,
             capture_loan_bytes=capture_loan,
             reclaim_bytes=reclaimed,
+            maintenance_execution=(
+                maintenance_execution if kind == ElasticPlanKind.MAINTENANCE else None
+            ),
         )
 
     def commit_user(self, plan: ElasticStepPlan) -> None:
@@ -1729,6 +2563,7 @@ class ElasticAdmissionController:
             entry = self._entries.get(key)
             if entry is None or not entry.hot:
                 raise ElasticGraphError("user commit requires every key HOT")
+        self._snapshot_pre_mutation(plan.transaction_id, plan.physical_keys)
         self._epoch += 1
         for key in plan.physical_keys:
             entry = self._entries[key]
@@ -1854,6 +2689,7 @@ class ElasticAdmissionController:
         }:
             raise ElasticGraphError("unexpected elastic plan kind")
         self._validate_plan(plan, plan.kind)
+        self._snapshot_pre_mutation(plan.transaction_id, plan.victim_keys)
         for key in plan.victim_keys:
             entry = self._entries.get(key)
             admissible = bool(
@@ -1878,15 +2714,21 @@ class ElasticAdmissionController:
 
     def begin_maintenance(self, plan: ElasticStepPlan) -> None:
         self._validate_plan(plan, ElasticPlanKind.MAINTENANCE)
+        touched_keys = tuple(dict.fromkeys((*plan.victim_keys, *plan.cold_misses)))
         for key in plan.victim_keys:
             entry = self._entries.get(key)
             if entry is None or not entry.reclaimable:
                 raise ElasticGraphError("maintenance victim is no longer reclaimable")
+        for key in plan.cold_misses:
+            entry = self._entries.get(key)
+            if entry is not None and (entry.hot or entry.leases):
+                raise ElasticGraphError("maintenance miss changed before capture")
+        self._snapshot_pre_mutation(plan.transaction_id, touched_keys)
+        for key in plan.victim_keys:
+            entry = self._entries[key]
             self._entries[key] = replace(entry, state=GraphResidency.COLD)
         for key in plan.cold_misses:
             entry = self._entries.get(key) or ElasticGraphEntry(key=key)
-            if entry.hot or entry.leases:
-                raise ElasticGraphError("maintenance miss changed before capture")
             self._entries[key] = replace(entry, state=GraphResidency.CAPTURING)
         self._cold_misses += len(plan.cold_misses)
         self._evictions += len(plan.victim_keys)
@@ -1920,6 +2762,50 @@ class ElasticAdmissionController:
                 self._entries[key] = replace(
                     entry, state=GraphResidency.COLD, leases=frozenset()
                 )
+        self._pre_mutation_snapshots.pop(plan.transaction_id, None)
+
+    def _snapshot_pre_mutation(
+        self,
+        transaction_id: str,
+        keys: Iterable[PhysicalReplayKey],
+    ) -> None:
+        if transaction_id in self._pre_mutation_snapshots:
+            raise ElasticGraphError("transaction already has a mutation snapshot")
+        self._pre_mutation_snapshots[transaction_id] = _AdmissionMutationSnapshot(
+            entries={key: self._entries.get(key) for key in keys},
+            epoch=self._epoch,
+            hot_hits=self._hot_hits,
+            cold_misses=self._cold_misses,
+            promotions=self._promotions,
+            evictions=self._evictions,
+            evicted_bytes=self._evicted_bytes,
+            trace=tuple(self._trace),
+        )
+
+    def rollback_pre_mutation(self, plan: ElasticStepPlan) -> None:
+        """Restore scheduler policy when workers rejected before mutation."""
+        if plan.kind not in {
+            ElasticPlanKind.USER,
+            ElasticPlanKind.MAINTENANCE,
+            ElasticPlanKind.RECLAIM,
+            ElasticPlanKind.PRESSURE_RECLAIM,
+        }:
+            raise ElasticGraphError("execution kind cannot roll back pre-mutation")
+        snapshot = self._pre_mutation_snapshots.pop(plan.transaction_id, None)
+        if snapshot is None:
+            raise ElasticGraphError("execution rollback lost its state snapshot")
+        for key, entry in snapshot.entries.items():
+            if entry is None:
+                self._entries.pop(key, None)
+            else:
+                self._entries[key] = entry
+        self._epoch = snapshot.epoch
+        self._hot_hits = snapshot.hot_hits
+        self._cold_misses = snapshot.cold_misses
+        self._promotions = snapshot.promotions
+        self._evictions = snapshot.evictions
+        self._evicted_bytes = snapshot.evicted_bytes
+        self._trace = deque(snapshot.trace, maxlen=128)
 
     def release(self, transaction_id: str) -> None:
         for key, entry in tuple(self._entries.items()):

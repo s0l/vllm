@@ -48,6 +48,11 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
+    # Scheduler-owned boundary of the token stream that must execute as
+    # prefill.  For a resumed request this can extend past the user prompt over
+    # output tokens whose KV/state is being reconstructed.
+    execution_prefill_len: int | None = None
+
     @classmethod
     def from_request(
         cls,
@@ -67,6 +72,7 @@ class NewRequestData:
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
+            execution_prefill_len=request.execution_prefill_len,
         )
 
     def __repr__(self) -> str:
@@ -78,6 +84,7 @@ class NewRequestData:
             f"req_id={self.req_id},"
             f"prompt_token_ids={self.prompt_token_ids},"
             f"prefill_token_ids={self.prefill_token_ids},"
+            f"execution_prefill_len={self.execution_prefill_len},"
             f"mm_features={self.mm_features},"
             f"sampling_params={self.sampling_params},"
             f"block_ids={self.block_ids},"
@@ -103,6 +110,7 @@ class NewRequestData:
             f"req_id={self.req_id},"
             f"prompt_token_ids_len={prompt_token_ids_len},"
             f"prefill_token_ids_len={prefill_token_ids_len},"
+            f"execution_prefill_len={self.execution_prefill_len},"
             f"mm_features={self.mm_features},"
             f"sampling_params={self.sampling_params},"
             f"block_ids={self.block_ids},"

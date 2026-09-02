@@ -224,3 +224,30 @@ def test_execute_mm_encoder_is_a_noop_without_scheduled_items():
 
     assert not cache.encoder_outputs
     state.encoder_runner.execute_mm_encoder.assert_not_called()
+
+
+def test_elastic_encoder_defers_multi_group_validation_until_all_calls(monkeypatch):
+    runner = object.__new__(EncoderRunner)
+    runner.device = torch.device("cpu")
+    runner.model = MagicMock()
+    runner.prepare_mm_inputs = MagicMock(
+        return_value=(["hash-a", "hash-b"], [("image", object())])
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.mm.encoder_runner.group_and_batch_mm_kwargs",
+        lambda *_args, **_kwargs: iter(
+            [
+                ("image", 1, {"pixels": torch.zeros(1)}),
+                ("audio", 1, {"audio": torch.zeros(1)}),
+            ]
+        ),
+    )
+
+    _hashes, batches = runner.stage_mm_encoder_batches({"req0": [0, 1]})
+    runner.model.embed_multimodal.side_effect = [[], [torch.zeros(1, HIDDEN)]]
+
+    grouped = runner.execute_staged_mm_encoder_batches(batches)
+
+    assert runner.model.embed_multimodal.call_count == 2
+    with pytest.raises(AssertionError):
+        runner.finalize_staged_mm_encoder_outputs(grouped)

@@ -71,7 +71,13 @@ class DefaultModelState(ModelState):
         req_states: RequestState,
     ) -> torch.Tensor:
         self.execute_mm_encoder(scheduled_encoder_inputs)
+        staged = self.stage_mm_embeddings(input_batch, req_states)
+        embeddings = self.execute_staged_mm_embeddings(staged, input_batch)
+        return self.commit_staged_mm_embeddings(embeddings, input_batch)
 
+    def stage_mm_embeddings(
+        self, input_batch: InputBatch, req_states: RequestState
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
         mm_embeds, is_mm_embed = super().gather_mm_embeddings(input_batch)
         if self.mm_pruner is not None and mm_embeds:
             # EVS: recompute mrope positions for pruned media.
@@ -79,12 +85,48 @@ class DefaultModelState(ModelState):
             # We must flush the staged rope updates for prepare_inputs() to pick up.
             self.apply_staged_writes()
 
+        return mm_embeds, is_mm_embed
+
+    def execute_staged_mm_embeddings(
+        self,
+        staged: tuple[list[torch.Tensor], torch.Tensor],
+        input_batch: InputBatch,
+    ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor, bool]:
+        mm_embeds, is_mm_embed = staged
         # Use unpadded input_ids to match is_mm_embed size (num_tokens).
         # input_batch.input_ids may be padded for CUDA graphs.
         input_ids_unpadded = input_batch.input_ids[: input_batch.num_tokens]
-        inputs_embeds = self.encoder_runner.get_inputs_embeds(
-            input_ids_unpadded, mm_embeds, is_mm_embed
+        embed_text = getattr(self.model, "embed_text_input_ids_for_elastic", None)
+        if callable(embed_text):
+            text_embeddings = embed_text(input_ids_unpadded, is_multimodal=is_mm_embed)
+            return text_embeddings, mm_embeds, is_mm_embed, False
+        merged_embeddings = self.model.embed_input_ids(
+            input_ids_unpadded,
+            multimodal_embeddings=mm_embeds,
+            is_multimodal=is_mm_embed,
         )
+        return merged_embeddings, [], is_mm_embed, True
+
+    def commit_staged_mm_embeddings(
+        self,
+        embeddings: tuple[torch.Tensor, list[torch.Tensor], torch.Tensor, bool],
+        input_batch: InputBatch,
+    ) -> torch.Tensor:
+        text_embeddings, mm_embeds, is_mm_embed, already_merged = embeddings
+        if not already_merged:
+            merge_mm = getattr(
+                self.model, "merge_multimodal_embeddings_for_elastic", None
+            )
+            if not callable(merge_mm):
+                raise RuntimeError("missing elastic multimodal merge hook")
+            if mm_embeds:
+                text_embeddings = merge_mm(
+                    text_embeddings,
+                    mm_embeds,
+                    is_multimodal=is_mm_embed,
+                )
+        inputs_embeds = self.encoder_runner.inputs_embeds
+        inputs_embeds[: text_embeddings.shape[0]] = text_embeddings
         return inputs_embeds[: input_batch.num_tokens_after_padding]
 
     def gather_mm_embeddings(
@@ -172,9 +214,7 @@ class DefaultModelState(ModelState):
         num_scheduled_tokens_cpu[: input_batch.num_reqs] = torch.from_numpy(
             input_batch.num_scheduled_tokens
         )
-        num_computed_tokens_provenance_cpu = torch.zeros(
-            num_reqs, dtype=torch.int32
-        )
+        num_computed_tokens_provenance_cpu = torch.zeros(num_reqs, dtype=torch.int32)
         num_computed_tokens_provenance_cpu[: input_batch.num_reqs] = torch.from_numpy(
             input_batch.num_computed_tokens_np
         )
@@ -200,9 +240,7 @@ class DefaultModelState(ModelState):
             is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
             request_ids=request_ids,
             num_scheduled_tokens_cpu=num_scheduled_tokens_cpu,
-            num_computed_tokens_provenance_cpu=(
-                num_computed_tokens_provenance_cpu
-            ),
+            num_computed_tokens_provenance_cpu=(num_computed_tokens_provenance_cpu),
             num_prompt_tokens_cpu=num_prompt_tokens_cpu,
             mm_req_doc_ranges=req_doc_ranges,
             for_cudagraph_capture=for_capture,

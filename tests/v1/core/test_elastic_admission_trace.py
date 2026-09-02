@@ -80,7 +80,10 @@ class _LegacySchedulerBoundary:
 
 
 def _load_trace() -> dict[str, Any]:
-    return json.loads(TRACE_PATH.read_text())
+    trace = json.loads(TRACE_PATH.read_text())
+    if trace.get("schema") != 2:
+        raise AssertionError("FIX7 trace requires explicit destination-set schema v2")
+    return trace
 
 
 def _keys(
@@ -176,9 +179,10 @@ def _replay(trace: dict[str, Any], boundary: Any) -> dict[str, Any]:
                 request_bytes=event["request_bytes"],
                 available_bytes=event["available_bytes"],
                 kv_transition=tuple(event["kv_transition"]),
-                owner_set_capture_envelope_bytes=event.get(
-                    "owner_set_capture_envelope_bytes"
+                destination_capture_endpoint_bytes=event.get(
+                    "destination_capture_endpoint_bytes"
                 ),
+                shared_resident_bytes=event.get("shared_resident_bytes", 0),
             )
             actual = _plan_projection(plan, labels)
             if op == "plan_user_cancel":

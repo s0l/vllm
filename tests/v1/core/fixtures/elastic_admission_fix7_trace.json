@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "provenance": {
     "accepted_source_commit": "1e1b8cbf598385a6c7a17f709e6615f83d41d468",
     "live_boundary_artifact": "evals/results/exp22-kv-fix7-serving-idle-epoch-v1-20260828/x39.json",
@@ -115,7 +115,8 @@
       "keys": ["B"],
       "request_bytes": 40,
       "available_bytes": 100,
-      "owner_set_capture_envelope_bytes": 50,
+      "destination_capture_endpoint_bytes": 50,
+      "shared_resident_bytes": 40,
       "kv_transition": [20, 10],
       "expected": {
         "kind": "maintenance",

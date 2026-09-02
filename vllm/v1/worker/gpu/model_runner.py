@@ -19,8 +19,11 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import hashlib
+import json
 import os
 import time
+from collections.abc import Callable
 from copy import copy, deepcopy
 from typing import Any, NamedTuple
 
@@ -60,11 +63,19 @@ from vllm.multimodal.encoder_budget import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
+from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.attention.backend import AttentionCGSupport
-from vllm.v1.core.elastic_graph import ElasticPlanKind, ElasticStepPlan
+from vllm.v1.core.elastic_graph import (
+    DispatchRepresentation,
+    ElasticPlanKind,
+    ElasticStepPlan,
+    ExecutionManifest,
+    canonical_execution_request_order,
+    execution_manifest_phase_from_step_key,
+)
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import (
@@ -94,11 +105,12 @@ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     DynamicGraphWorkingSet,
+    ElasticExecutionPlanMismatch,
     ModelCudaGraphManager,
     get_uniform_token_count,
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
-from vllm.v1.worker.gpu.ec_connector import get_ec_connector
+from vllm.v1.worker.gpu.ec_connector import NO_OP_EC_CONNECTOR, get_ec_connector
 from vllm.v1.worker.gpu.elastic_gdn import (
     ElasticKVController,
     V2GDNCheckpointManager,
@@ -156,6 +168,237 @@ logger = init_logger(__name__)
 
 _AG2_GRAPH_MODE_RECEIPT = os.environ.get("AG2_VLLM_GRAPH_MODE_RECEIPT") == "1"
 _AG2_GRAPH_MODE_LOGGED_RECEIPTS: set[tuple[str, str, int, int, int]] = set()
+
+
+def _elastic_new_request_prompt_len(request: Any) -> int:
+    """Return the prompt boundary used by both Scheduler and ReqState.
+
+    V2 ``prefill_token_ids`` is the complete current token stream and may
+    already include output tokens on a cached/repeated request. It is not the
+    semantic prompt boundary used by ``Request.num_prompt_tokens``.
+    """
+    try:
+        return length_from_prompt_token_ids_or_embeds(
+            request.prompt_token_ids,
+            getattr(request, "prompt_embeds", None),
+        )
+    except ValueError as error:
+        raise ElasticExecutionPlanMismatch(
+            "ELASTIC_EXECUTION_PLAN_MISMATCH: invalid new-request prompt "
+            f"identity: {error}"
+        ) from error
+
+
+def _elastic_new_request_execution_prefill_len(request: Any) -> int:
+    """Validate and return the scheduler-owned execution phase boundary.
+
+    The semantic prompt length is not sufficient after preemption: emitted
+    output tokens can become part of the stream whose KV/state must be
+    reconstructed.  Elastic manifest validation therefore consumes the
+    explicit scheduler boundary that ``RequestState.prefill_len`` will use,
+    while retaining prompt and token-stream bounds as transport checks.
+    """
+    prompt_len = _elastic_new_request_prompt_len(request)
+    execution_prefill_len = getattr(request, "execution_prefill_len", None)
+    if type(execution_prefill_len) is not int:
+        raise ElasticExecutionPlanMismatch(
+            "ELASTIC_EXECUTION_PLAN_MISMATCH: new request omitted a valid "
+            "integer execution_prefill_len"
+        )
+    if execution_prefill_len < prompt_len:
+        raise ElasticExecutionPlanMismatch(
+            "ELASTIC_EXECUTION_PLAN_MISMATCH: execution_prefill_len "
+            f"{execution_prefill_len} is smaller than prompt length {prompt_len}"
+        )
+    prefill_token_ids = getattr(request, "prefill_token_ids", None)
+    if prefill_token_ids is None:
+        raise ElasticExecutionPlanMismatch(
+            "ELASTIC_EXECUTION_PLAN_MISMATCH: new request omitted the "
+            "transported prefill token stream"
+        )
+    if execution_prefill_len > len(prefill_token_ids):
+        raise ElasticExecutionPlanMismatch(
+            "ELASTIC_EXECUTION_PLAN_MISMATCH: execution_prefill_len "
+            f"{execution_prefill_len} exceeds transported token stream "
+            f"{len(prefill_token_ids)}"
+        )
+    return execution_prefill_len
+
+
+def _validate_elastic_materialized_input_batch(
+    manifest: ExecutionManifest,
+    input_batch: InputBatch,
+) -> None:
+    """Read back the exact row lifecycle materialized by ``prepare_inputs``."""
+    observed_request_ids = tuple(input_batch.req_ids)
+    observed_query_lens = tuple(
+        int(value) for value in input_batch.num_scheduled_tokens
+    )
+    observed_is_prefilling = tuple(
+        bool(value) for value in input_batch.is_prefilling_np
+    )
+    observed_draft_rows = (
+        (0,) * input_batch.num_reqs
+        if input_batch.num_draft_tokens_per_req is None
+        else tuple(int(value) for value in input_batch.num_draft_tokens_per_req)
+    )
+    if (
+        observed_request_ids != manifest.request_ids
+        or observed_query_lens != manifest.per_request_query_lens
+        or observed_is_prefilling != manifest.per_request_is_prefilling
+        or observed_draft_rows != manifest.scheduled_draft_rows
+    ):
+        raise RuntimeError(
+            "ELASTIC_POST_MUTATION_OBSERVER_MISMATCH: predicted and "
+            "materialized InputBatch identities differ: "
+            f"planned_ids={manifest.request_ids!r} "
+            f"observed_ids={observed_request_ids!r} "
+            f"planned_qlens={manifest.per_request_query_lens!r} "
+            f"observed_qlens={observed_query_lens!r} "
+            f"planned_prefill={manifest.per_request_is_prefilling!r} "
+            f"observed_prefill={observed_is_prefilling!r} "
+            f"planned_drafts={manifest.scheduled_draft_rows!r} "
+            f"observed_drafts={observed_draft_rows!r}"
+        )
+
+
+def _prepare_elastic_local_staging_with_consensus(
+    prepare_local_staging: Callable[[], Any],
+    plan: ElasticStepPlan,
+    working_set: Any,
+    *,
+    consensus_phase: str = "post_materialization",
+    observer_fingerprint: Callable[[Any], str] | None = None,
+) -> Any:
+    """Finish local staging, then make every rank vote before collectives.
+
+    Local request/input copies, attention table construction, Mamba state
+    preprocessing, and LoRA activation can fail asymmetrically after the
+    admitted plan has mutated worker state. Convert every such failure into
+    the same post-mutation vote; raising locally before that vote can strand
+    peers at the first model collective.
+    """
+    staged = None
+    staging_error = None
+    staged_fingerprint = None
+    try:
+        staged = prepare_local_staging()
+        if observer_fingerprint is not None:
+            staged_fingerprint = observer_fingerprint(staged)
+    except Exception as error:
+        staging_error = (
+            "ELASTIC_POST_MUTATION_OBSERVER_MISMATCH: local input "
+            f"staging failed: {type(error).__name__}: {error}"
+        )
+    working_set.require_post_materialization_consensus(
+        plan,
+        validation_error=staging_error,
+        observer_fingerprint=staged_fingerprint,
+        phase=consensus_phase,
+    )
+    if staged is None:
+        raise RuntimeError(
+            "ELASTIC_POST_MUTATION_OBSERVER_MISMATCH: all-rank vote accepted "
+            "failed local input staging"
+        )
+    return staged
+
+
+def _elastic_mm_staging_fingerprint(staged: Any) -> str:
+    """Hash the ordered local MM tensor contract before TP embedding."""
+    staged_embeddings, _prepared_inputs = staged
+    if staged_embeddings is None:
+        encoder_outputs = _prepared_inputs.get("encoder_outputs", [])
+        payload = {
+            "encoder_decoder_outputs": [
+                {"shape": list(tensor.shape), "dtype": str(tensor.dtype)}
+                for tensor in encoder_outputs
+            ]
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    mm_embeddings, is_mm_embed = staged_embeddings
+    payload = {
+        "embeddings": [
+            {"shape": list(tensor.shape), "dtype": str(tensor.dtype)}
+            for tensor in mm_embeddings
+        ],
+        "mask_shape": list(is_mm_embed.shape),
+        "mask_count": int(is_mm_embed.sum().item()),
+        "mask_indices": torch.nonzero(is_mm_embed, as_tuple=False).flatten().tolist(),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _elastic_input_staging_fingerprint(staged: Any) -> str:
+    """Bind branch choice and scheduled encoder identity into the first vote."""
+
+    def schema(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return {"shape": list(value.shape), "dtype": str(value.dtype)}
+        if isinstance(value, dict):
+            return {
+                str(key): schema(item)
+                for key, item in sorted(value.items(), key=lambda item: str(item[0]))
+            }
+        if isinstance(value, (list, tuple)):
+            return [schema(item) for item in value]
+        return type(value).__qualname__
+
+    staged_encoder = staged[7]
+    encoder_signature: list[tuple[str, str]] = []
+    encoder_batch_schema: list[Any] = []
+    if staged_encoder is not None:
+        hashes, batches = staged_encoder
+        modalities = [
+            modality
+            for modality, num_items, _kwargs in batches
+            for _ in range(num_items)
+        ]
+        encoder_signature = list(zip(hashes, modalities, strict=True))
+        encoder_batch_schema = [
+            {
+                "modality": modality,
+                "num_items": num_items,
+                "kwargs": schema(kwargs),
+            }
+            for modality, num_items, kwargs in batches
+        ]
+    payload = {
+        "mm_finalize_after_encoder": bool(staged[6]),
+        "encoder_signature": encoder_signature,
+        "encoder_batch_schema": encoder_batch_schema,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _stage_elastic_mm_inputs_with_consensus(
+    model_state: Any,
+    completed_encoder: Any,
+    input_batch: InputBatch,
+    req_states: Any,
+    plan: ElasticStepPlan,
+    working_set: Any,
+) -> tuple[Any, dict[str, Any]]:
+    """Gather local post-encoder state before the TP embedding collective."""
+
+    def stage_mm_inputs():
+        model_state.commit_staged_mm_encoder(completed_encoder)
+        staged_embeddings = model_state.stage_mm_embeddings(input_batch, req_states)
+        return staged_embeddings, model_state.prepare_inputs(input_batch, req_states)
+
+    return _prepare_elastic_local_staging_with_consensus(
+        stage_mm_inputs,
+        plan,
+        working_set,
+        consensus_phase="post_mm_materialization",
+        observer_fingerprint=_elastic_mm_staging_fingerprint,
+    )
 
 
 def _release_idle_graph_cache(scheduler_output: SchedulerOutput) -> bool:
@@ -1083,7 +1326,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
         for new_req_data in scheduler_output.scheduled_new_reqs:
-            assert new_req_data.prompt_token_ids is not None
             assert new_req_data.prefill_token_ids is not None
             req_id = new_req_data.req_id
 
@@ -1092,7 +1334,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # with the updated prompt_token_ids and mm_features.
             self._remove_request(req_id)
 
-            prompt_len = len(new_req_data.prompt_token_ids)
+            prompt_len = length_from_prompt_token_ids_or_embeds(
+                new_req_data.prompt_token_ids,
+                new_req_data.prompt_embeds,
+            )
             sampling_params = new_req_data.sampling_params
             self.req_states.add_request(
                 req_id=req_id,
@@ -1100,6 +1345,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 all_token_ids=new_req_data.prefill_token_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
+                execution_prefill_len=new_req_data.execution_prefill_len,
             )
             req_index = self.req_states.req_id_to_index[req_id]
 
@@ -1893,16 +2139,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if baseline_reserved is None or baseline_driver_free is None:
             local_peak_external = effective_external
         else:
+            transient_peak = max(
+                0,
+                torch.cuda.max_memory_reserved(self.device) - baseline_reserved,
+                baseline_driver_free - torch.cuda.mem_get_info(self.device)[0],
+            )
+            mm_overlap_peak = getattr(self, "_elastic_step_mm_overlap_peak_bytes", 0)
             local_peak_external = max(
                 effective_external,
-                max(
-                    0,
-                    torch.cuda.max_memory_reserved(self.device) - baseline_reserved,
-                ),
-                max(
-                    0,
-                    baseline_driver_free - torch.cuda.mem_get_info(self.device)[0],
-                ),
+                transient_peak,
+                mm_overlap_peak,
             )
         peak = torch.tensor(
             local_peak_external,
@@ -1918,6 +2164,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._elastic_last_step_peak_external_bytes = int(peak.item())
         self._elastic_step_baseline_reserved_bytes = None
         self._elastic_step_baseline_driver_free_bytes = None
+        self._elastic_step_mm_overlap_peak_bytes = 0
+        self._elastic_step_baseline_external_bytes = None
         if release_idle_cache:
             dynamic_wave = getattr(self, "_elastic_dynamic_wave_observed", False)
             previous_floor = getattr(self, "_elastic_idle_logged_floor_bytes", None)
@@ -1999,9 +2247,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self, "_elastic_last_step_peak_external_bytes", 0
         )
         self._set_elastic_cublas_workspace_unit(model_runner_output)
-        self._publish_elastic_residency_receipt(
-            model_runner_output, transaction_id
-        )
+        self._publish_elastic_residency_receipt(model_runner_output, transaction_id)
 
     def _begin_elastic_step_measurement(self) -> None:
         """Start the physical high-water window after KV has been shrunk."""
@@ -2020,7 +2266,43 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._elastic_step_baseline_driver_free_bytes = torch.cuda.mem_get_info(
             self.device
         )[0]
+        working_set = self._dynamic_graph_working_set()
+        self._elastic_step_baseline_external_bytes = (
+            working_set.resident_bytes
+            + self._measure_elastic_cublas_workspace_bytes()
+            + getattr(self, "_elastic_retained_transition_floor_bytes", 0)
+        )
         torch.cuda.reset_peak_memory_stats(self.device)
+
+    @staticmethod
+    def _elastic_mm_overlap_peak(
+        baseline_external_bytes: int, observed_transient_delta_bytes: int
+    ) -> int:
+        return baseline_external_bytes + observed_transient_delta_bytes
+
+    def _record_elastic_mm_transient_peak(self) -> None:
+        """Record transient MM bytes separately from the HOT Graph endpoint."""
+        baseline_reserved = getattr(self, "_elastic_step_baseline_reserved_bytes", None)
+        baseline_driver_free = getattr(
+            self, "_elastic_step_baseline_driver_free_bytes", None
+        )
+        baseline_external = getattr(self, "_elastic_step_baseline_external_bytes", None)
+        if (
+            baseline_reserved is None
+            or baseline_driver_free is None
+            or baseline_external is None
+        ):
+            raise RuntimeError("MM activation loan has no active measurement window")
+        observed = max(
+            0,
+            torch.cuda.max_memory_reserved(self.device) - baseline_reserved,
+            baseline_driver_free - torch.cuda.mem_get_info(self.device)[0],
+        )
+        overlap = self._elastic_mm_overlap_peak(baseline_external, observed)
+        self._elastic_step_mm_overlap_peak_bytes = max(
+            getattr(self, "_elastic_step_mm_overlap_peak_bytes", 0),
+            overlap,
+        )
 
     def _prepare_dynamic_graph_idle_kv_return(
         self,
@@ -2107,60 +2389,242 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and not scheduler_output.elastic_preserve_graph_residency
         ):
             working_set = self._dynamic_graph_working_set()
-            working_set.begin_step()
-            elastic_dynamic_graph_step_started = True
-            if elastic_plan is not None:
-                if elastic_transaction_id != elastic_plan.transaction_id:
-                    raise RuntimeError(
-                        "elastic transaction id differs from immutable plan"
-                    )
-                if (
-                    scheduler_output.elastic_plan_fingerprint
-                    != elastic_plan.fingerprint
-                ):
-                    raise RuntimeError(
-                        "elastic plan fingerprint changed in scheduler transport"
-                    )
-                if elastic_plan.kv_transition != scheduler_output.elastic_kv_transition:
-                    raise RuntimeError(
-                        "elastic KV transition differs from immutable plan"
-                    )
-                if (
-                    elastic_plan.capture_loan_bytes
-                    != scheduler_output.elastic_external_memory_bytes
-                ):
-                    raise RuntimeError(
-                        "elastic capture loan differs from immutable plan"
-                    )
-                working_set.require_rank_consensus(
-                    elastic_plan,
-                    collective=elastic_plan.kind != ElasticPlanKind.USER,
-                )
-                working_set.apply_plan(elastic_plan)
             early_num_reqs = 0
             early_num_toks = 0
             early_uniform_tok_count = None
-            if (
-                self.lora_config is None
-                and scheduler_output.total_num_scheduled_tokens > 0
-            ):
-                early_num_reqs = len(scheduler_output.num_scheduled_tokens)
-                early_num_toks = scheduler_output.total_num_scheduled_tokens
-                early_max_query_len = max(
-                    scheduler_output.num_scheduled_tokens.values()
+            early_geometry_error = None
+            speculative_active = False
+            semantic_short_decode = False
+            try:
+                if (
+                    self.lora_config is None
+                    and scheduler_output.total_num_scheduled_tokens > 0
+                ):
+                    early_num_reqs = len(scheduler_output.num_scheduled_tokens)
+                    early_num_toks = scheduler_output.total_num_scheduled_tokens
+                    early_max_query_len = max(
+                        scheduler_output.num_scheduled_tokens.values()
+                    )
+                    early_uniform_tok_count = get_uniform_token_count(
+                        early_num_reqs,
+                        early_num_toks,
+                        early_max_query_len,
+                    )
+                speculative_active = scheduler_output.num_spec_tokens_to_schedule > 0
+                semantic_short_decode = bool(
+                    scheduler_output.is_pure_decode_step
+                    and speculative_active
+                    and early_uniform_tok_count == self.decode_query_len
+                    and early_num_toks == early_num_reqs * self.decode_query_len
                 )
-                early_uniform_tok_count = get_uniform_token_count(
-                    early_num_reqs,
-                    early_num_toks,
-                    early_max_query_len,
+            except Exception as error:
+                early_geometry_error = (
+                    "ELASTIC_EXECUTION_PLAN_MISMATCH: local pre-mutation batch "
+                    f"geometry failed: {type(error).__name__}: {error}"
                 )
-            speculative_active = scheduler_output.num_spec_tokens_to_schedule > 0
-            semantic_short_decode = bool(
-                scheduler_output.is_pure_decode_step
-                and speculative_active
-                and early_uniform_tok_count == self.decode_query_len
-                and early_num_toks == early_num_reqs * self.decode_query_len
-            )
+            compiled_dispatch_owners: frozenset[str] | None = None
+            if elastic_plan is not None:
+                validation_error = early_geometry_error
+                try:
+                    if self.dp_size != 1:
+                        raise ElasticExecutionPlanMismatch(
+                            "ELASTIC_EXECUTION_PLAN_MISMATCH: elastic on-demand "
+                            "graphs require DP=1 until cross-DP failure consensus "
+                            "is implemented"
+                        )
+                    if self.parallel_config.pipeline_parallel_size != 1:
+                        raise ElasticExecutionPlanMismatch(
+                            "ELASTIC_EXECUTION_PLAN_MISMATCH: elastic on-demand "
+                            "graphs require PP=1 until intermediate-tensor "
+                            "failure consensus is implemented"
+                        )
+                    if self.lora_config is not None:
+                        raise ElasticExecutionPlanMismatch(
+                            "ELASTIC_EXECUTION_PLAN_MISMATCH: elastic on-demand "
+                            "graphs do not yet bind active LoRA identity"
+                        )
+                    if self.kv_connector is not NO_OP_KV_CONNECTOR:
+                        raise ElasticExecutionPlanMismatch(
+                            "ELASTIC_EXECUTION_PLAN_MISMATCH: elastic on-demand "
+                            "graphs do not yet bind active KV connector state"
+                        )
+                    if (
+                        self.supports_mm_inputs
+                        and self.is_first_pp_rank
+                        and self.ec_connector is not NO_OP_EC_CONNECTOR
+                    ):
+                        raise ElasticExecutionPlanMismatch(
+                            "ELASTIC_EXECUTION_PLAN_MISMATCH: elastic MM "
+                            "execution does not yet support active encoder-cache "
+                            "transfer"
+                        )
+                    if (
+                        self.supports_mm_inputs
+                        and self.is_first_pp_rank
+                        and not self.is_encoder_only
+                        and not self.is_encoder_decoder
+                    ):
+                        self.model_state.validate_elastic_mm_embedding_split()
+                    if elastic_transaction_id != elastic_plan.transaction_id:
+                        raise ElasticExecutionPlanMismatch(
+                            "ELASTIC_EXECUTION_PLAN_MISMATCH: elastic transaction "
+                            "id differs from immutable plan"
+                        )
+                    if (
+                        scheduler_output.elastic_plan_fingerprint
+                        != elastic_plan.fingerprint
+                    ):
+                        raise ElasticExecutionPlanMismatch(
+                            "ELASTIC_EXECUTION_PLAN_MISMATCH: elastic plan "
+                            "fingerprint changed in scheduler transport"
+                        )
+                    if (
+                        elastic_plan.kv_transition
+                        != scheduler_output.elastic_kv_transition
+                    ):
+                        raise ElasticExecutionPlanMismatch(
+                            "ELASTIC_EXECUTION_PLAN_MISMATCH: elastic KV transition "
+                            "differs from immutable plan"
+                        )
+                    if (
+                        elastic_plan.capture_loan_bytes
+                        != scheduler_output.elastic_external_memory_bytes
+                    ):
+                        raise ElasticExecutionPlanMismatch(
+                            "ELASTIC_EXECUTION_PLAN_MISMATCH: elastic capture loan "
+                            "differs from immutable plan"
+                        )
+                    new_requests = {
+                        request.req_id: request
+                        for request in scheduler_output.scheduled_new_reqs
+                    }
+                    cached_computed_tokens = dict(
+                        zip(
+                            scheduler_output.scheduled_cached_reqs.req_ids,
+                            scheduler_output.scheduled_cached_reqs.num_computed_tokens,
+                            strict=True,
+                        )
+                    )
+                    is_prefilling_by_request: dict[str, bool] = {}
+                    for request_id in scheduler_output.num_scheduled_tokens:
+                        new_request = new_requests.get(request_id)
+                        if new_request is not None:
+                            computed_tokens = new_request.num_computed_tokens
+                            prefill_len = _elastic_new_request_execution_prefill_len(
+                                new_request
+                            )
+                        else:
+                            request_index = self.req_states.req_id_to_index.get(
+                                request_id
+                            )
+                            if request_index is None:
+                                raise ElasticExecutionPlanMismatch(
+                                    "ELASTIC_EXECUTION_PLAN_MISMATCH: worker omitted "
+                                    f"request state for {request_id!r}"
+                                )
+                            computed_tokens = cached_computed_tokens.get(
+                                request_id,
+                                int(
+                                    self.req_states.num_computed_tokens_np[
+                                        request_index
+                                    ]
+                                ),
+                            )
+                            prefill_len = int(
+                                self.req_states.prefill_len.np[request_index]
+                            )
+                        is_prefilling_by_request[request_id] = (
+                            computed_tokens < prefill_len
+                        )
+                    ordered_execution_ids = canonical_execution_request_order(
+                        scheduler_output.num_scheduled_tokens,
+                        is_prefilling_by_request=is_prefilling_by_request,
+                        decode_query_len=self.decode_query_len,
+                    )
+                    working_set.validate_execution_manifest(
+                        elastic_plan,
+                        step_key=scheduler_output.elastic_graph_step_key,
+                        request_ids=ordered_execution_ids,
+                        per_request_query_lens=tuple(
+                            scheduler_output.num_scheduled_tokens[request_id]
+                            for request_id in ordered_execution_ids
+                        ),
+                        per_request_is_prefilling=tuple(
+                            is_prefilling_by_request[request_id]
+                            for request_id in ordered_execution_ids
+                        ),
+                        scheduled_draft_rows=tuple(
+                            len(
+                                scheduler_output.scheduled_spec_decode_tokens.get(
+                                    request_id, ()
+                                )
+                            )
+                            for request_id in ordered_execution_ids
+                        ),
+                        scheduled_encoder_inputs=(
+                            scheduler_output.scheduled_encoder_inputs
+                        ),
+                        requested_output_k=(
+                            scheduler_output.num_spec_tokens_to_schedule
+                        ),
+                        executed_drafter_k=(
+                            self.num_speculative_steps
+                            if scheduler_output.num_spec_tokens_to_schedule > 0
+                            else 0
+                        ),
+                        phase=execution_manifest_phase_from_step_key(
+                            scheduler_output.elastic_graph_step_key
+                        ),
+                        max_num_batched_tokens=self.max_num_tokens,
+                    )
+                    compiled_dispatch_owners = frozenset(
+                        dispatch.invocation.owner
+                        for dispatch in elastic_plan.current_dispatch
+                        if dispatch.representation
+                        == DispatchRepresentation.COMPILED_ONLY
+                    )
+                    managers = {
+                        manager.dynamic_graph_owner: manager
+                        for manager in working_set.managers
+                    }
+                    if not compiled_dispatch_owners.issubset(managers):
+                        raise ElasticExecutionPlanMismatch(
+                            "ELASTIC_EXECUTION_PLAN_MISMATCH: explicit compiled "
+                            "dispatch references an unknown owner"
+                        )
+                    for owner in compiled_dispatch_owners:
+                        manager = managers[owner]
+                        if not manager.is_compiled_piecewise_shape(
+                            early_num_toks,
+                            num_reqs=early_num_reqs,
+                            semantic_decode=semantic_short_decode,
+                        ):
+                            raise ElasticExecutionPlanMismatch(
+                                "ELASTIC_EXECUTION_PLAN_MISMATCH: explicit compiled "
+                                f"route is not executable: owner={owner!r}"
+                            )
+                except Exception as error:
+                    # Every deterministic identity/read-back failure in this
+                    # pre-mutation block must enter the same CPU-group vote.
+                    # Letting one rank escape early would strand its peers in
+                    # the collective or allow a partial Graph/KV transition.
+                    local_validation_error = (
+                        "ELASTIC_EXECUTION_PLAN_MISMATCH: local pre-mutation "
+                        f"validation failed: {type(error).__name__}: {error}"
+                    )
+                    validation_error = (
+                        local_validation_error
+                        if validation_error is None
+                        else f"{validation_error}; {local_validation_error}"
+                    )
+                    compiled_dispatch_owners = frozenset()
+                working_set.begin_admitted_step(
+                    elastic_plan,
+                    validation_error=validation_error,
+                )
+            else:
+                working_set.begin_step()
+            elastic_dynamic_graph_step_started = True
             active_graph_bytes_before_shape_release = working_set.active_graph_bytes
             if elastic_plan is None:
                 managers_to_queue = working_set.managers
@@ -2169,18 +2633,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # no physical CUDA Graph key in the immutable plan. It still
                 # needs the exact same-step descriptor so dispatch can enter
                 # the compiled PIECEWISE path; no other missing owner is allowed.
+                assert compiled_dispatch_owners is not None
                 managers_to_queue = tuple(
                     manager
                     for manager in working_set.managers
-                    if manager.is_compiled_piecewise_shape(
-                        early_num_toks,
-                        num_reqs=early_num_reqs,
-                        semantic_decode=semantic_short_decode,
-                    )
-                    and (
-                        manager.elastic_graph_activation == "always"
-                        or speculative_active
-                    )
+                    if manager.dynamic_graph_owner in compiled_dispatch_owners
                     and not manager._dynamic_step_planned
                 )
             if managers_to_queue:
@@ -2274,8 +2731,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 requested_external = idle_external_floor
                 transition = None
             capture_managers = working_set.pending_managers()
-            measurement_required = bool(capture_managers) or (
-                requested_external != self.elastic_kv_controller.external_memory_bytes
+            measurement_required = (
+                bool(capture_managers)
+                or requested_external
+                != self.elastic_kv_controller.external_memory_bytes
+                or scheduler_output.elastic_mm_activation_loan_bytes > 0
             )
             with record_function_or_nullcontext("ag2.elastic_kv_transition"):
                 self._apply_next_elastic_kv_step(
@@ -2285,6 +2745,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             elastic_transition_applied = True
             if measurement_required:
                 self._begin_elastic_step_measurement()
+                self._elastic_step_mm_overlap_peak_bytes = 0
             if capture_managers:
                 with self.maybe_setup_dummy_loras(self.lora_config):
                     try:
@@ -2355,48 +2816,74 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             working_set.acquire_leases(elastic_transaction_id)
         if not dummy_run:
-            if not elastic_transition_applied:
-                with record_function_or_nullcontext("ag2.elastic_kv_transition"):
-                    self.elastic_kv_controller.apply_scheduler_step(
-                        scheduler_output.elastic_kv_transition,
-                        scheduler_output.elastic_external_memory_bytes,
+
+            def apply_scheduler_state() -> bool:
+                if not elastic_transition_applied:
+                    with record_function_or_nullcontext("ag2.elastic_kv_transition"):
+                        self.elastic_kv_controller.apply_scheduler_step(
+                            scheduler_output.elastic_kv_transition,
+                            scheduler_output.elastic_external_memory_bytes,
+                        )
+                if self.gdn_checkpoint_manager is not None:
+                    self.gdn_checkpoint_manager.update_request_blocks(scheduler_output)
+                self.update_pp_decode_requests()
+                self.finish_requests(scheduler_output)
+                self.free_states(scheduler_output)
+                self.add_requests(scheduler_output)
+                self.update_requests(scheduler_output)
+                self.block_tables.apply_staged_writes()
+                additional_config = self.vllm_config.additional_config
+                if isinstance(additional_config, dict) and additional_config.get(
+                    "p3_block_range_diagnostic", False
+                ):
+                    validate_elastic_attention_block_tables(
+                        self.block_tables,
+                        self.kv_cache_config,
+                        self.req_states.req_id_to_index,
+                        scheduler_output.num_scheduled_tokens,
+                        self.elastic_kv_controller.mapped_attention_block_capacity(),
                     )
-            if self.gdn_checkpoint_manager is not None:
-                self.gdn_checkpoint_manager.update_request_blocks(scheduler_output)
-            # Update the request states.
-            self.update_pp_decode_requests()
-            self.finish_requests(scheduler_output)
-            self.free_states(scheduler_output)
-            self.add_requests(scheduler_output)
-            self.update_requests(scheduler_output)
-            self.block_tables.apply_staged_writes()
-            additional_config = self.vllm_config.additional_config
-            if isinstance(additional_config, dict) and additional_config.get(
-                "p3_block_range_diagnostic", False
-            ):
-                validate_elastic_attention_block_tables(
-                    self.block_tables,
-                    self.kv_cache_config,
-                    self.req_states.req_id_to_index,
-                    scheduler_output.num_scheduled_tokens,
-                    self.elastic_kv_controller.mapped_attention_block_capacity(),
-                )
-            if self.gdn_checkpoint_manager is not None:
-                num_computed_tokens = {
-                    req_id: int(
-                        self.req_states.num_computed_tokens_np[
-                            self.req_states.req_id_to_index[req_id]
-                        ]
+                if self.gdn_checkpoint_manager is not None:
+                    num_computed_tokens = {
+                        req_id: int(
+                            self.req_states.num_computed_tokens_np[
+                                self.req_states.req_id_to_index[req_id]
+                            ]
+                        )
+                        for req_id in scheduler_output.num_scheduled_tokens
+                    }
+                    self.gdn_checkpoint_manager.prepare(
+                        scheduler_output,
+                        self.kv_cache_config,
+                        num_computed_tokens,
+                        self.compilation_config.static_forward_context,
                     )
-                    for req_id in scheduler_output.num_scheduled_tokens
-                }
-                self.gdn_checkpoint_manager.prepare(
-                    scheduler_output,
-                    self.kv_cache_config,
-                    num_computed_tokens,
-                    self.compilation_config.static_forward_context,
-                )
+                return True
+
+            state_application_error: Exception | None = None
+            try:
+                apply_scheduler_state()
+            except Exception as error:
+                state_application_error = error
             if scheduler_output.total_num_scheduled_tokens == 0:
+                if elastic_plan is not None:
+                    assert working_set is not None
+                    working_set.require_post_materialization_consensus(
+                        elastic_plan,
+                        validation_error=(
+                            None
+                            if state_application_error is None
+                            else (
+                                "ELASTIC_POST_MUTATION_OBSERVER_MISMATCH: local "
+                                "scheduler-state application failed: "
+                                f"{type(state_application_error).__name__}: "
+                                f"{state_application_error}"
+                            )
+                        ),
+                        phase="post_state_application",
+                    )
+                elif state_application_error is not None:
+                    raise state_application_error
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 if isinstance(empty_output, ModelRunnerOutput):
@@ -2446,6 +2933,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         scheduler_output.elastic_mm_activation_loan_bytes
                     )
                 return empty_output
+
+            if state_application_error is not None and elastic_plan is None:
+                raise state_application_error
 
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
@@ -2546,38 +3036,175 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         if not dummy_run:
-            # Common case.
-            # Prepare all the inputs and copy to the input buffers.
-            with record_function_or_nullcontext("ag2.target_prepare_inputs"):
-                input_batch = self.prepare_inputs(scheduler_output, batch_desc)
-            self._validate_elastic_calibration_sampling_indices(
-                input_batch,
-                hidden_rows=input_batch.num_tokens_after_padding,
-                phase="pre_forward",
-                only_single_token_prefill=True,
-            )
-            with record_function_or_nullcontext("ag2.target_prepare_attention"):
-                block_tables, slot_mappings = self.prepare_attn(input_batch)
-            # Mamba "align" pre-copy: migrate recurrent state across block
-            # boundaries before the forward. Runs only on real batches, and
-            # before model_state.prepare_attn gathers num_accepted_tokens so the
-            # boundary reset is visible to the attention metadata.
-            with record_function_or_nullcontext("ag2.target_preprocess_state"):
-                self.model_state.preprocess_state(
+
+            def prepare_real_input_staging():
+                # Finish every rank-local fallible stage before the final
+                # all-rank vote. The next operation after this closure is the
+                # common model-state attention phase.
+                if state_application_error is not None:
+                    raise RuntimeError(
+                        "local scheduler-state application failed: "
+                        f"{type(state_application_error).__name__}: "
+                        f"{state_application_error}"
+                    ) from state_application_error
+                with record_function_or_nullcontext("ag2.target_prepare_inputs"):
+                    input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+                if elastic_plan is not None:
+                    assert elastic_plan.execution_manifest is not None
+                    _validate_elastic_materialized_input_batch(
+                        elastic_plan.execution_manifest, input_batch
+                    )
+                self._validate_elastic_calibration_sampling_indices(
+                    input_batch,
+                    hidden_rows=input_batch.num_tokens_after_padding,
+                    phase="pre_forward",
+                    only_single_token_prefill=True,
+                )
+                with record_function_or_nullcontext("ag2.target_prepare_attention"):
+                    block_tables, slot_mappings = self.prepare_attn(input_batch)
+                # Mamba "align" pre-copy migrates recurrent state before
+                # attention metadata observes accepted-token state.
+                with record_function_or_nullcontext("ag2.target_preprocess_state"):
+                    self.model_state.preprocess_state(
+                        input_batch,
+                        block_tables,
+                        self.kv_cache_config,
+                        self.req_states.num_computed_tokens.gpu,
+                    )
+                if self.lora_config:
+                    lora_inputs = self.lora_state.make_lora_inputs(
+                        input_batch.req_ids,
+                        input_batch.idx_mapping_np,
+                        input_batch.num_scheduled_tokens,
+                    )
+                    self._set_active_loras(*lora_inputs)
+                slot_mappings_by_layer = build_slot_mappings_by_layer(
+                    slot_mappings, self.kv_cache_config
+                )
+                with record_function_or_nullcontext(
+                    "ag2.target_prepare_attention_metadata"
+                ):
+                    attn_metadata = self.model_state.prepare_attn(
+                        input_batch,
+                        batch_desc.cg_mode,
+                        block_tables,
+                        slot_mappings,
+                        self.attn_groups,
+                        self.kv_cache_config,
+                        for_capture=False,
+                    )
+                if (
+                    self.supports_mm_inputs
+                    and self.is_first_pp_rank
+                    and self.lora_config is not None
+                ):
+                    set_active_mm_loras(
+                        model=self.model,
+                        lora_manager=self.lora_manager,
+                        encoder_cache=self.encoder_cache,
+                        req_id_to_index=self.req_states.req_id_to_index,
+                        lora_state=self.lora_state,
+                        scheduled_encoder_inputs=(
+                            scheduler_output.scheduled_encoder_inputs
+                        ),
+                    )
+                # MM model states finalize positions/encoder outputs only
+                # after get_mm_embeddings. Non-MM inputs are complete here.
+                mm_finalize_after_encoder = bool(
+                    self.supports_mm_inputs
+                    and self.is_first_pp_rank
+                    and self.encoder_cache is not None
+                    and any(
+                        self.encoder_cache.mm_features.get(request_id)
+                        for request_id in input_batch.req_ids
+                    )
+                )
+                if (
+                    elastic_plan is not None
+                    and self.supports_mm_inputs
+                    and self.is_first_pp_rank
+                    and not self.is_encoder_only
+                    and not self.is_encoder_decoder
+                ):
+                    self.model_state.validate_elastic_mm_embedding_split(input_batch)
+                if mm_finalize_after_encoder and elastic_plan is not None:
+                    self.model_state.validate_mm_cache_readiness(
+                        scheduler_output.scheduled_encoder_inputs,
+                        input_batch,
+                    )
+                staged_mm_encoder = (
+                    self.model_state.stage_mm_encoder(
+                        scheduler_output.scheduled_encoder_inputs,
+                        input_batch.req_ids,
+                    )
+                    if mm_finalize_after_encoder and elastic_plan is not None
+                    else None
+                )
+                if mm_finalize_after_encoder and elastic_plan is not None:
+                    self.model_state.validate_staged_mm_encoder(
+                        scheduler_output.scheduled_encoder_inputs,
+                        staged_mm_encoder,
+                        input_batch.req_ids,
+                    )
+                staged_mm_embeddings = (
+                    self.model_state.stage_mm_embeddings(input_batch, self.req_states)
+                    if (
+                        self.supports_mm_inputs
+                        and self.is_first_pp_rank
+                        and not self.is_encoder_only
+                        and not mm_finalize_after_encoder
+                        and elastic_plan is not None
+                    )
+                    else None
+                )
+                prepared_model_inputs = (
+                    None
+                    if mm_finalize_after_encoder
+                    else self.model_state.prepare_inputs(input_batch, self.req_states)
+                )
+                self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
+                return (
                     input_batch,
                     block_tables,
-                    self.kv_cache_config,
-                    self.req_states.num_computed_tokens.gpu,
+                    slot_mappings,
+                    slot_mappings_by_layer,
+                    attn_metadata,
+                    prepared_model_inputs,
+                    mm_finalize_after_encoder,
+                    staged_mm_encoder,
+                    staged_mm_embeddings,
                 )
 
-            if self.lora_config:
-                # Activate LoRA adapters.
-                lora_inputs = self.lora_state.make_lora_inputs(
-                    input_batch.req_ids,
-                    input_batch.idx_mapping_np,
-                    input_batch.num_scheduled_tokens,
+            if elastic_plan is not None:
+                assert working_set is not None
+                (
+                    input_batch,
+                    block_tables,
+                    slot_mappings,
+                    slot_mappings_by_layer,
+                    attn_metadata,
+                    prepared_model_inputs,
+                    mm_finalize_after_encoder,
+                    staged_mm_encoder,
+                    staged_mm_embeddings,
+                ) = _prepare_elastic_local_staging_with_consensus(
+                    prepare_real_input_staging,
+                    elastic_plan,
+                    working_set,
+                    observer_fingerprint=_elastic_input_staging_fingerprint,
                 )
-                self._set_active_loras(*lora_inputs)
+            else:
+                (
+                    input_batch,
+                    block_tables,
+                    slot_mappings,
+                    slot_mappings_by_layer,
+                    attn_metadata,
+                    prepared_model_inputs,
+                    mm_finalize_after_encoder,
+                    staged_mm_encoder,
+                    staged_mm_embeddings,
+                ) = prepare_real_input_staging()
         else:
             # No actual tokens to run. A dummy run for DP or memory profiling.
             input_batch = InputBatch.make_dummy(
@@ -2595,29 +3222,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 block_tables = None
                 slot_mappings = None
 
-        attn_metadata = None
-        slot_mappings_by_layer = None
+        if dummy_run:
+            attn_metadata = None
+            slot_mappings_by_layer = None
         if not (dummy_run and skip_attn_for_dummy_run):
             assert slot_mappings is not None
-            slot_mappings_by_layer = build_slot_mappings_by_layer(
-                slot_mappings, self.kv_cache_config
-            )
-            assert block_tables is not None
-            with record_function_or_nullcontext(
-                "ag2.target_prepare_attention_metadata"
-            ):
-                attn_metadata = self.model_state.prepare_attn(
-                    input_batch,
-                    batch_desc.cg_mode,
-                    block_tables,
-                    slot_mappings,
-                    self.attn_groups,
-                    self.kv_cache_config,
-                    # FULL replay reads capture-time metadata buffers. Re-stage them
-                    # from zeroed dummy block tables instead of retaining state
-                    # indices from the previous real batch.
-                    for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
+            if dummy_run:
+                slot_mappings_by_layer = build_slot_mappings_by_layer(
+                    slot_mappings, self.kv_cache_config
                 )
+            if dummy_run:
+                assert block_tables is not None
+                with record_function_or_nullcontext(
+                    "ag2.target_prepare_attention_metadata"
+                ):
+                    attn_metadata = self.model_state.prepare_attn(
+                        input_batch,
+                        batch_desc.cg_mode,
+                        block_tables,
+                        slot_mappings,
+                        self.attn_groups,
+                        self.kv_cache_config,
+                        # FULL replay re-stages capture-time metadata buffers.
+                        for_capture=batch_desc.cg_mode == CUDAGraphMode.FULL,
+                    )
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
@@ -2632,29 +3260,105 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             else:
                 scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
-                if self.lora_config is not None:
-                    set_active_mm_loras(
-                        model=self.model,
-                        lora_manager=self.lora_manager,
-                        encoder_cache=self.encoder_cache,
-                        req_id_to_index=self.req_states.req_id_to_index,
-                        lora_state=self.lora_state,
-                        scheduled_encoder_inputs=scheduled_encoder_inputs,
-                    )
                 with self.ec_connector.maybe_get_output(
                     scheduler_output
                 ) as ec_connector_output:
+                    completed_encoder = None
+                    if mm_finalize_after_encoder and elastic_plan is not None:
+                        # Readiness was converged before entering the encoder
+                        # phase. Every rank executes it in the same order.
+                        completed_encoder = (
+                            self.model_state.execute_staged_mm_encoder_collective(
+                                staged_mm_encoder
+                            )
+                        )
                     if self.is_encoder_only:
                         # Encode and publish, nothing else: this instance runs no
                         # language model, so the gather inside get_mm_embeddings
                         # would build an inputs_embeds nobody reads -- and it
                         # raises "Encoder cache miss" for any scheduled item this
                         # instance did not encode, taking the engine down with it.
-                        self.model_state.execute_mm_encoder(scheduled_encoder_inputs)
-                    else:
-                        inputs_embeds = self.model_state.get_mm_embeddings(
-                            scheduled_encoder_inputs, input_batch, self.req_states
-                        )
+                        if mm_finalize_after_encoder and elastic_plan is None:
+                            self.model_state.execute_mm_encoder(
+                                scheduled_encoder_inputs
+                            )
+                        elif mm_finalize_after_encoder:
+                            assert working_set is not None
+                            _prepare_elastic_local_staging_with_consensus(
+                                lambda: (
+                                    self.model_state.commit_staged_mm_encoder(
+                                        completed_encoder
+                                    ),
+                                ),
+                                elastic_plan,
+                                working_set,
+                                consensus_phase="post_mm_encoder_commit",
+                            )
+                            if scheduler_output.elastic_mm_activation_loan_bytes:
+                                self._record_elastic_mm_transient_peak()
+                    elif mm_finalize_after_encoder:
+                        if elastic_plan is not None:
+                            assert working_set is not None
+                            (
+                                staged_mm_embeddings,
+                                prepared_model_inputs,
+                            ) = _stage_elastic_mm_inputs_with_consensus(
+                                self.model_state,
+                                completed_encoder,
+                                input_batch,
+                                self.req_states,
+                                elastic_plan,
+                                working_set,
+                            )
+                            computed_embeddings = (
+                                self.model_state.execute_staged_mm_embeddings(
+                                    staged_mm_embeddings, input_batch
+                                )
+                            )
+                            (inputs_embeds,) = (
+                                _prepare_elastic_local_staging_with_consensus(
+                                    lambda: (
+                                        self.model_state.commit_staged_mm_embeddings(
+                                            computed_embeddings, input_batch
+                                        ),
+                                    ),
+                                    elastic_plan,
+                                    working_set,
+                                    consensus_phase="post_mm_embedding",
+                                )
+                            )
+                            if scheduler_output.elastic_mm_activation_loan_bytes:
+                                self._record_elastic_mm_transient_peak()
+                        else:
+                            inputs_embeds = self.model_state.get_mm_embeddings(
+                                scheduled_encoder_inputs,
+                                input_batch,
+                                self.req_states,
+                            )
+                            prepared_model_inputs = self.model_state.prepare_inputs(
+                                input_batch, self.req_states
+                            )
+                    elif not self.is_encoder_only:
+                        if elastic_plan is not None:
+                            computed_embeddings = (
+                                self.model_state.execute_staged_mm_embeddings(
+                                    staged_mm_embeddings, input_batch
+                                )
+                            )
+                            # With no media state, manifest validation proves a
+                            # uniform token-only merge shape. Avoid a third CPU
+                            # consensus on the steady text path.
+                            inputs_embeds = (
+                                self.model_state.commit_staged_mm_embeddings(
+                                    computed_embeddings, input_batch
+                                )
+                            )
+                        else:
+                            inputs_embeds = self.model_state.get_mm_embeddings(
+                                scheduled_encoder_inputs,
+                                input_batch,
+                                self.req_states,
+                            )
             if inputs_embeds is not None and not self.model.requires_raw_input_tokens:
                 input_ids = None
 
@@ -2663,6 +3367,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output.ec_connector_output = ec_connector_output
             return output
 
+        if dummy_run:
+            prepared_model_inputs = self.model_state.prepare_inputs(
+                input_batch, self.req_states
+            )
         model_inputs = {
             "input_ids": input_ids,
             "positions": input_batch.positions,
@@ -2670,7 +3378,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             "intermediate_tensors": None,
             # NOTE: Values returned by `prepare_inputs` will override the default
             # values above.
-            **self.model_state.prepare_inputs(input_batch, self.req_states),
+            **prepared_model_inputs,
         }
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
@@ -2690,8 +3398,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
             del intermediate_tensors
 
-        # Update the EPLB meta.
-        self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
+        # Real input staging updates EPLB before its final all-rank vote.
+        if dummy_run:
+            self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:

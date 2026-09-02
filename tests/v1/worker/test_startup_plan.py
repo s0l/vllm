@@ -5,7 +5,11 @@ from types import SimpleNamespace
 import pytest
 
 import vllm.envs as envs
-from vllm.v1.core.elastic_graph import GraphExecutionPolicy, OwnerGraphExecutionPolicy
+from vllm.v1.core.elastic_graph import (
+    EXECUTION_MANIFEST_SCHEMA,
+    GraphExecutionPolicy,
+    OwnerGraphExecutionPolicy,
+)
 from vllm.v1.worker import startup_plan
 
 pytestmark = pytest.mark.cpu_test
@@ -27,6 +31,8 @@ def _catalog_config() -> SimpleNamespace:
     return SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
         additional_config={"elastic_compiled_piecewise_sizes": []},
+        num_speculative_tokens=3,
+        speculative_config=None,
     )
 
 
@@ -185,8 +191,7 @@ def test_cudagraph_recipe_missing_corrupt_and_disabled_are_empty(tmp_path, monke
     )
 
 
-
-def _write_catalog(tmp_path, *, sealed=True, fingerprint="elastic-fp"):
+def _write_catalog(tmp_path, *, sealed=True, fingerprint="0123456789abcdef"):
     config = _catalog_config()
     kv_config = _catalog_kv_config()
     key = (1, 3, 1, 1, 1)
@@ -196,6 +201,7 @@ def _write_catalog(tmp_path, *, sealed=True, fingerprint="elastic-fp"):
         "hot_peak_bytes": 192,
         "resident_bytes": 160,
         "floor_bytes": 16,
+        "resident_key_bytes": [["a" * 64, 96], ["b" * 64, 48]],
         "cold_observations": 2,
         "cold_stable_replays": 1,
         "hot_observations": 2,
@@ -207,34 +213,68 @@ def _write_catalog(tmp_path, *, sealed=True, fingerprint="elastic-fp"):
             compiled_piecewise_sizes=frozenset(),
         ),
     }
+    semantic_witnesses = startup_plan.expected_semantic_token_witnesses(
+        configured_k=3,
+        max_num_seqs=1,
+        max_num_batched_tokens=4096,
+    )
+    shapes = [row]
+    for witness_key, _live_tokens in semantic_witnesses:
+        witness_row = dict(row)
+        witness_row["step_key"] = list(witness_key)
+        witness_row.update(
+            startup_plan._catalog_policy_row_metadata(
+                witness_key,
+                policy=_catalog_policy(),
+                max_num_batched_tokens=4096,
+                compiled_piecewise_sizes=frozenset(),
+            )
+        )
+        shapes.append(witness_row)
+    required_keys = [key, *(witness_key for witness_key, _ in semantic_witnesses)]
     coverage = {
         "decode_max_x": 1,
         "mixed_max_x": 1,
         "full_context_max_x": 1,
         "pinned_full_entries": 1,
         "pinned_full_bytes": 160,
-        "required_shapes": 1,
-        "required_step_keys": [list(key)],
+        "required_shapes": len(required_keys),
+        "required_step_keys": [list(required_key) for required_key in required_keys],
+        "semantic_token_witnesses": [
+            {"step_key": list(witness_key), "live_num_tokens": live_tokens}
+            for witness_key, live_tokens in semantic_witnesses
+        ],
+        "semantic_witness_contract": "live-current-to-physical-piecewise-v1",
         "compiled_piecewise_sizes": [],
         "graph_execution_policy_fingerprint": _catalog_policy().fingerprint,
         "verifier_contract": _catalog_policy().verifier_contract,
         "verifier_configuration": _catalog_policy().verifier_configuration,
         "math_contract": _catalog_policy().math_contract,
         "capture_state_abi": startup_plan.ELASTIC_CAPTURE_STATE_ABI,
+        "execution_manifest_schema": EXECUTION_MANIFEST_SCHEMA,
+        "dispatch_representations": [
+            "hot_graph",
+            "compiled_only",
+            "inactive",
+            "forbidden",
+        ],
+        "residency_intent_contract": "current-dispatch-hot-successor-union-v1",
+        "speculative_depth_contract": "scheduled-requested-executed-k-v1",
     }
     payload = {
         "schema": startup_plan.ELASTIC_GRAPH_CATALOG_SCHEMA_VERSION,
         "fingerprint": fingerprint,
         "sealed": sealed,
-        "complete_shapes": 1,
+        "finalized_offline": True,
+        "complete_shapes": len(shapes),
         "coverage": coverage,
         "graph_execution_policy": _catalog_policy().to_payload(),
-        "shapes": [row],
+        "shapes": shapes,
     }
     path = (
         tmp_path
         / "elastic_graph_catalog"
-        / "elastic_graph_catalog_elastic-fp.json"
+        / "elastic_graph_catalog_0123456789abcdef.json"
     )
     path.parent.mkdir()
     path.write_text(json.dumps(payload))
@@ -249,12 +289,13 @@ def test_exact_elastic_catalog_loads_complete_identity_matched_rows(
     monkeypatch.setattr(
         startup_plan,
         "compute_elastic_graph_catalog_fingerprint",
-        lambda *_: "elastic-fp",
+        lambda *_: "0123456789abcdef",
     )
     config, kv_config, key, row, _path = _write_catalog(tmp_path)
 
-    assert startup_plan.load_elastic_graph_catalog(config, kv_config) == {
-        key: {
+    loaded = startup_plan.load_elastic_graph_catalog(config, kv_config)
+    assert loaded[key] == (
+        {
             name: row[name]
             for name in (
                 "cold_peak_bytes",
@@ -267,13 +308,48 @@ def test_exact_elastic_catalog_loads_complete_identity_matched_rows(
                 "hot_stable_replays",
             )
         }
-    }
+        | {"resident_key_bytes": (("a" * 64, 96), ("b" * 64, 48))}
+    )
+    assert len(loaded) == 1 + len(
+        startup_plan.expected_semantic_token_witnesses(
+            configured_k=3,
+            max_num_seqs=1,
+            max_num_batched_tokens=4096,
+        )
+    )
     coverage = startup_plan.load_elastic_graph_catalog_coverage(config, kv_config)
     assert coverage["decode_max_x"] == 1
-    assert coverage["required_step_keys"] == [list(key)]
+    assert coverage["required_step_keys"] == [
+        list(key),
+        *(
+            list(witness_key)
+            for witness_key, _live_tokens in (
+                startup_plan.expected_semantic_token_witnesses(
+                    configured_k=3,
+                    max_num_seqs=1,
+                    max_num_batched_tokens=4096,
+                )
+            )
+        ),
+    ]
 
 
-@pytest.mark.parametrize("mutation", ["unsealed", "stale", "lineage", "migration"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "unsealed",
+        "stale",
+        "not_finalized",
+        "lineage",
+        "migration",
+        "witness",
+        "provenance",
+        "provenance_overflow",
+        "provenance_uppercase",
+        "provenance_short",
+        "provenance_nonhex",
+    ],
+)
 def test_exact_elastic_catalog_rejects_invalid_serving_artifact(
     tmp_path, monkeypatch, mutation
 ):
@@ -282,7 +358,7 @@ def test_exact_elastic_catalog_rejects_invalid_serving_artifact(
     monkeypatch.setattr(
         startup_plan,
         "compute_elastic_graph_catalog_fingerprint",
-        lambda *_: "elastic-fp",
+        lambda *_: "0123456789abcdef",
     )
     config, kv_config, _key, _row, path = _write_catalog(tmp_path)
     payload = json.loads(path.read_text())
@@ -290,18 +366,146 @@ def test_exact_elastic_catalog_rejects_invalid_serving_artifact(
         payload["sealed"] = False
     elif mutation == "stale":
         payload["fingerprint"] = "stale-fingerprint"
+    elif mutation == "not_finalized":
+        payload["finalized_offline"] = False
     elif mutation == "lineage":
         payload["graph_execution_policy"]["fingerprint"] = "0" * 64
+    elif mutation == "witness":
+        payload["coverage"]["semantic_token_witnesses"] = None
+    elif mutation == "provenance":
+        payload["shapes"][0]["resident_key_bytes"] = [["a" * 64, -1]]
+    elif mutation == "provenance_overflow":
+        payload["shapes"][0]["resident_key_bytes"] = [["a" * 64, 161]]
+    elif mutation == "provenance_uppercase":
+        payload["shapes"][0]["resident_key_bytes"] = [["A" * 64, 1]]
+    elif mutation == "provenance_short":
+        payload["shapes"][0]["resident_key_bytes"] = [["a" * 63, 1]]
+    elif mutation == "provenance_nonhex":
+        payload["shapes"][0]["resident_key_bytes"] = [["g" * 64, 1]]
     else:
         payload["migrated_from"] = "0123456789abcdef"
         payload["migration_scope"] = "removed"
     path.write_text(json.dumps(payload))
 
-    if mutation == "migration":
+    if mutation in {"migration", "not_finalized"}:
         with pytest.raises(RuntimeError, match="offline-finalized"):
             startup_plan.load_elastic_graph_catalog(config, kv_config)
+    elif mutation.startswith("provenance"):
+        with pytest.raises(RuntimeError, match="resident-key provenance"):
+            startup_plan.load_elastic_graph_catalog(config, kv_config)
     else:
-        assert startup_plan.load_elastic_graph_catalog(config, kv_config) == {}
+        with pytest.raises(RuntimeError, match="canonical elastic Graph catalog"):
+            startup_plan.load_elastic_graph_catalog(config, kv_config)
+
+
+@pytest.mark.parametrize("inventory", ["required_step_keys", "restore_step_keys"])
+def test_elastic_catalog_rejects_duplicate_key_inventory(
+    tmp_path, monkeypatch, inventory
+):
+    monkeypatch.setattr(envs, "VLLM_ENABLE_STARTUP_PLAN", True)
+    monkeypatch.setattr(envs, "VLLM_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        startup_plan,
+        "compute_elastic_graph_catalog_fingerprint",
+        lambda *_: "0123456789abcdef",
+    )
+    config, kv_config, key, _row, path = _write_catalog(tmp_path)
+    payload = json.loads(path.read_text())
+    payload["coverage"][inventory] = [list(key), list(key)]
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(RuntimeError, match=f"duplicate {inventory.split('_')[0]}"):
+        startup_plan.load_elastic_graph_catalog(config, kv_config)
+
+
+def test_existing_corrupt_canonical_catalog_is_not_a_calibration_miss(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(envs, "VLLM_ENABLE_STARTUP_PLAN", True)
+    monkeypatch.setattr(envs, "VLLM_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        startup_plan,
+        "compute_elastic_graph_catalog_fingerprint",
+        lambda *_: "0123456789abcdef",
+    )
+    config, kv_config, _key, _row, path = _write_catalog(tmp_path)
+    path.write_text("{")
+
+    with pytest.raises(RuntimeError, match="refusing automatic calibration"):
+        startup_plan.load_elastic_graph_catalog(config, kv_config)
+
+
+def test_broken_symlink_canonical_catalog_is_not_a_calibration_miss(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(envs, "VLLM_ENABLE_STARTUP_PLAN", True)
+    monkeypatch.setattr(envs, "VLLM_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        startup_plan,
+        "compute_elastic_graph_catalog_fingerprint",
+        lambda *_: "0123456789abcdef",
+    )
+    config, kv_config, _key, _row, path = _write_catalog(tmp_path)
+    path.unlink()
+    path.symlink_to(path.with_name("missing-catalog.json"))
+
+    with pytest.raises(RuntimeError, match="refusing automatic calibration"):
+        startup_plan.load_elastic_graph_catalog(config, kv_config)
+
+
+def test_uninspectable_canonical_catalog_is_not_a_calibration_miss(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(envs, "VLLM_ENABLE_STARTUP_PLAN", True)
+    monkeypatch.setattr(envs, "VLLM_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        startup_plan,
+        "compute_elastic_graph_catalog_fingerprint",
+        lambda *_: "0123456789abcdef",
+    )
+    config, kv_config, _key, _row, path = _write_catalog(tmp_path)
+    real_lstat = startup_plan.os.lstat
+
+    def reject_catalog_lstat(candidate):
+        if candidate == str(path):
+            raise PermissionError("catalog access denied")
+        return real_lstat(candidate)
+
+    monkeypatch.setattr(startup_plan.os, "lstat", reject_catalog_lstat)
+    with pytest.raises(RuntimeError, match="cannot be inspected"):
+        startup_plan.load_elastic_graph_catalog(config, kv_config)
+
+
+def test_elastic_catalog_rejects_partial_required_shape_subset(tmp_path, monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_ENABLE_STARTUP_PLAN", True)
+    monkeypatch.setattr(envs, "VLLM_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        startup_plan,
+        "compute_elastic_graph_catalog_fingerprint",
+        lambda *_: "0123456789abcdef",
+    )
+    config, kv_config, _key, _row, path = _write_catalog(tmp_path)
+    payload = json.loads(path.read_text())
+    missing_key = [1, 3, 2, 2, 1]
+    payload["coverage"]["required_step_keys"].append(missing_key)
+    payload["coverage"]["required_shapes"] += 1
+    broken_row = dict(payload["shapes"][0])
+    broken_row["step_key"] = missing_key
+    broken_row.update(
+        startup_plan._catalog_policy_row_metadata(
+            missing_key,
+            policy=_catalog_policy(),
+            max_num_batched_tokens=4096,
+            compiled_piecewise_sizes=frozenset(),
+        )
+    )
+    broken_row["cold_peak_bytes"] = -1
+    payload["shapes"].append(broken_row)
+    payload["complete_shapes"] += 1
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(RuntimeError, match="invalid numeric fields"):
+        startup_plan.load_elastic_graph_catalog(config, kv_config)
 
 
 def test_missing_exact_elastic_catalog_is_empty_and_coverage_fails(
@@ -312,7 +516,7 @@ def test_missing_exact_elastic_catalog_is_empty_and_coverage_fails(
     monkeypatch.setattr(
         startup_plan,
         "compute_elastic_graph_catalog_fingerprint",
-        lambda *_: "elastic-fp",
+        lambda *_: "0123456789abcdef",
     )
     config = _catalog_config()
     kv_config = _catalog_kv_config()

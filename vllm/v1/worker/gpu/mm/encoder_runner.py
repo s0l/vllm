@@ -58,6 +58,35 @@ class EncoderRunner:
 
         return mm_hashes, mm_kwargs
 
+    def stage_mm_encoder_batches(
+        self, scheduled_encoder_inputs: dict[str, list[int]]
+    ) -> tuple[list[str], list[tuple[str, int, dict[str, torch.Tensor]]]]:
+        """Materialize and bound encoder groups before any model collective."""
+        mm_hashes, mm_kwargs = self.prepare_mm_inputs(scheduled_encoder_inputs)
+        batches = list(
+            group_and_batch_mm_kwargs(mm_kwargs, device=self.device, pin_memory=True)
+        )
+        return mm_hashes, batches
+
+    def execute_staged_mm_encoder_batches(
+        self, batches: list[tuple[str, int, dict[str, torch.Tensor]]]
+    ) -> list[tuple[int, object]]:
+        """Execute staged model calls without rank-local validation tails."""
+        return [
+            (num_items, self.model.embed_multimodal(**mm_kwargs_batch))
+            for _modality, num_items, mm_kwargs_batch in batches
+        ]
+
+    def finalize_staged_mm_encoder_outputs(
+        self, grouped_outputs: list[tuple[int, object]]
+    ) -> list[torch.Tensor]:
+        """Validate and flatten raw encoder outputs after model collectives."""
+        encoder_outputs: list[torch.Tensor] = []
+        for num_items, batch_outputs in grouped_outputs:
+            sanity_check_mm_encoder_outputs(batch_outputs, expected_num_items=num_items)
+            encoder_outputs.extend(batch_outputs)
+        return encoder_outputs
+
     @torch.inference_mode()
     def profile_encoder_cache(
         self,
@@ -195,6 +224,37 @@ class EncoderRunner:
                 mm_embeds.append(mm_embeds_item)
 
         return mm_embeds, is_mm_embed
+
+    def validate_cache_readiness(
+        self,
+        scheduled_encoder_inputs: dict[str, list[int]],
+        req_ids: list[str],
+        num_scheduled_tokens: np.ndarray,
+        prefill_lens: np.ndarray,
+        num_computed_tokens: np.ndarray,
+    ) -> None:
+        """Validate every current-window embedding before encoder collectives."""
+        pending_hashes, _pending_inputs = self.prepare_mm_inputs(
+            scheduled_encoder_inputs
+        )
+        available = set(self.encoder_cache.encoder_outputs).union(pending_hashes)
+        query_start = num_computed_tokens.tolist()
+        query_end = (num_computed_tokens + num_scheduled_tokens).tolist()
+        for index, req_id in enumerate(req_ids):
+            if query_start[index] >= int(prefill_lens[index]):
+                continue
+            mm_features = self.encoder_cache.mm_features[req_id]
+            lo, hi = get_mm_features_in_window(
+                mm_features,
+                start=query_start[index],
+                end=query_end[index],
+            )
+            for feature in mm_features[lo:hi]:
+                if feature.identifier not in available:
+                    raise RuntimeError(
+                        "Encoder cache is not ready for current MM window: "
+                        f"{feature.identifier}"
+                    )
 
     @torch.inference_mode()
     def get_inputs_embeds(

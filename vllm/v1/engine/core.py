@@ -85,6 +85,7 @@ from vllm.v1.engine.utils import (
     get_physical_gpu_ids_for_local_dp_rank,
 )
 from vllm.v1.executor import Executor
+from vllm.v1.executor.worker_failure import WorkerFailureCode, WorkerRemoteError
 from vllm.v1.fault_tolerance.engine_core_sentinel import (
     FT_UTILITY_METHOD,
     EngineCoreSentinel,
@@ -358,23 +359,19 @@ class EngineCore:
 
     def _restore_elastic_bounded_hotset(self) -> None:
         """Restore only the sealed minimal carrier set before READY."""
+        from vllm.v1.core.elastic_catalog import (
+            validate_elastic_catalog_key_inventory,
+        )
+
         scheduler = cast(Any, self.scheduler)
         coverage = scheduler._elastic_graph_catalog_coverage
-        required = {
-            tuple(int(value) for value in key)
-            for key in coverage["required_step_keys"]
-            if isinstance(key, list) and len(key) == 5
-        }
-        restore = {
-            tuple(int(value) for value in key)
-            for key in coverage.get("restore_step_keys", [])
-            if isinstance(key, list) and len(key) == 5
-        }
-        if not restore or not restore.issubset(required):
-            raise RuntimeError(
-                "bounded elastic catalog has an invalid restore subset: "
-                f"restore={sorted(restore)!r} required={sorted(required)!r}"
-            )
+        _required, restore_inventory = validate_elastic_catalog_key_inventory(
+            coverage.get("required_step_keys"),
+            coverage.get("restore_step_keys", []),
+            label="bounded elastic catalog",
+            require_restore=True,
+        )
+        restore = set(restore_inventory)
         full_keys = sorted(key for key in restore if key[0] == 1)
         piecewise_keys = sorted(key for key in restore if key[0] == 0)
         if len(full_keys) != 1 or len(piecewise_keys) != 1:
@@ -384,15 +381,7 @@ class EngineCore:
             )
         full_key = full_keys[0]
         piecewise_key = piecewise_keys[0]
-        speculative_config = getattr(
-            getattr(scheduler, "vllm_config", None), "speculative_config", None
-        )
-        piecewise_k = (
-            0
-            if speculative_config is not None
-            and speculative_config.disable_speculation_on_non_decode
-            else scheduler.num_spec_tokens
-        )
+        piecewise_k = self._elastic_restore_prefill_k(scheduler.num_spec_tokens)
         if (
             full_key[1] != scheduler.num_spec_tokens
             or piecewise_key[1] != piecewise_k
@@ -402,6 +391,20 @@ class EngineCore:
                 "bounded elastic restore carrier pair has incompatible K/X: "
                 f"full={full_key!r} piecewise={piecewise_key!r} "
                 f"expected_piecewise_k={piecewise_k}"
+            )
+        expected_restore = set(
+            self._elastic_restore_wave_step_keys(
+                k=full_key[1],
+                x=full_key[2],
+                query_len=full_key[4],
+            )
+        )
+        if restore != expected_restore:
+            raise RuntimeError(
+                "bounded elastic restore carrier pair differs from the exact "
+                "prefill/decode wave identity: "
+                f"declared={sorted(restore)!r} "
+                f"expected={sorted(expected_restore)!r}"
             )
 
         started = time.monotonic()
@@ -576,10 +579,7 @@ class EngineCore:
         if not scheduler.prepare_elastic_restore_capture(step_key):
             return
         maintenance = self._run_elastic_restore_step()
-        residency_step_key = scheduler._elastic_graph_carrier_closure_step_key(step_key)
-        expected_physical_keys = scheduler._resolve_elastic_step_physical_keys(
-            residency_step_key
-        )
+        expected_physical_keys = scheduler._elastic_step_residency_intent(step_key)[2]
         actual_physical_keys = (
             ()
             if maintenance.elastic_step_plan is None
@@ -635,16 +635,19 @@ class EngineCore:
         pinned graphs from a rejected larger cohort resident and make the next
         prefix pay for stale state from the failed epoch.
         """
+        scheduler = cast(Any, self.scheduler)
+        retention_id = getattr(scheduler, "_elastic_restore_retention_id", None)
+        if retention_id is not None:
+            scheduler.release_elastic_restore_retention(retention_id)
         self.abort_requests(request_ids)
         if finish_unexecuted_step:
-            scheduler = cast(Any, self.scheduler)
             scheduler.finish_unexecuted_elastic_restore_step()
         self._drain_elastic_restore()
         self._reclaim_elastic_restore_hotset_before_wave()
 
     def _drain_elastic_restore(self, *, max_steps: int = 32) -> None:
         steps = 0
-        while self.scheduler.has_requests():
+        while self._has_scheduler_step_work():
             scheduler = cast(Any, self.scheduler)
             reclaim_ready = bool(
                 scheduler._needs_elastic_idle_reclaim()
@@ -661,6 +664,8 @@ class EngineCore:
                     "elastic startup calibration did not reach X0 within "
                     f"{max_steps} steps"
                 )
+        scheduler = cast(Any, self.scheduler)
+        scheduler.finish_elastic_restore_epoch()
 
     def _assert_elastic_restore_key(
         self,
@@ -683,21 +688,77 @@ class EngineCore:
     def _elastic_restore_decode_key(
         self, *, k: int, x: int, query_len: int
     ) -> tuple[int, int, int, int, int]:
-        """Name a calibration wave by the active verifier representation."""
+        """Derive decode identity through the scheduler's active policy."""
         scheduler = cast(Any, self.scheduler)
-        policy = getattr(scheduler, "_elastic_graph_execution_policy", None)
-        batched_piecewise = bool(
-            k > 0
-            and query_len == k + 1
-            and getattr(policy, "verifier_contract", None) == "batched-causal-q1-v1"
-        )
-        return (
-            0 if batched_piecewise else 1,
+        key = scheduler._canonical_elastic_graph_step_key(
+            {f"_elastic_restore_decode_shape_{index}": query_len for index in range(x)},
             k,
-            x,
-            x * query_len,
-            query_len,
+            True,
         )
+        if key is None:
+            raise RuntimeError("elastic restore decode has no graph identity")
+        return key
+
+    def _elastic_restore_wave_step_keys(
+        self, *, k: int, x: int, query_len: int
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """Derive the exact prefill/decode pair before physical mutation."""
+        if x <= 0:
+            raise ValueError("elastic restore wave requires a positive X")
+        scheduler = cast(Any, self.scheduler)
+        prospective_prefill_tokens = {
+            f"_elastic_restore_shape_{index}": 2 for index in range(x)
+        }
+        prefill_key = scheduler._canonical_elastic_graph_step_key(
+            prospective_prefill_tokens,
+            self._elastic_restore_prefill_k(k),
+            False,
+        )
+        if prefill_key is None:
+            raise RuntimeError("elastic restore prefill has no graph identity")
+        decode_key = self._elastic_restore_decode_key(
+            k=k,
+            x=x,
+            query_len=query_len,
+        )
+        return prefill_key, decode_key
+
+    def _elastic_restore_execution_step_keys(
+        self, *, k: int, x: int, query_len: int
+    ) -> tuple[tuple[int, ...], ...]:
+        """Return every physical step needed to reach the target decode.
+
+        When the effective MTP policy disables speculation on non-decode work,
+        prefill produces no drafts.  A q(1 + K) target then has a real q1
+        bridge that produces the drafts consumed by the target step.  The
+        bridge belongs to the same predeclared physical epoch because
+        calibration cannot capture a new graph while requests own KV state.
+        """
+        prefill_key, target_key = self._elastic_restore_wave_step_keys(
+            k=k,
+            x=x,
+            query_len=query_len,
+        )
+        if not self._elastic_restore_needs_decode_bridge(k=k, query_len=query_len):
+            return prefill_key, target_key
+        bridge_key = self._elastic_restore_decode_key(k=k, x=x, query_len=1)
+        return tuple(dict.fromkeys((prefill_key, bridge_key, target_key)))
+
+    def _elastic_restore_needs_decode_bridge(self, *, k: int, query_len: int) -> bool:
+        return k > 0 and query_len > 1 and self._elastic_restore_prefill_k(k) == 0
+
+    def _elastic_restore_prefill_k(self, k: int) -> int:
+        """Mirror the scheduler's non-decode speculation phase policy."""
+        scheduler = cast(Any, self.scheduler)
+        speculative_config = getattr(
+            getattr(scheduler, "vllm_config", None), "speculative_config", None
+        )
+        if (
+            speculative_config is not None
+            and speculative_config.disable_speculation_on_non_decode
+        ):
+            return 0
+        return k
 
     def _run_elastic_full_restore_wave(
         self,
@@ -731,21 +792,13 @@ class EngineCore:
             for index in range(x)
         ]
         scheduler = cast(Any, self.scheduler)
-        prospective_prefill_tokens = dict.fromkeys(req_ids, 2)
-        prefill_key = scheduler._canonical_elastic_graph_step_key(
-            prospective_prefill_tokens,
-            k,
-            False,
-        )
-        if prefill_key is None:
-            raise RuntimeError("elastic restore prefill has no graph identity")
-        decode_key = self._elastic_restore_decode_key(
+        declared_step_keys = self._elastic_restore_execution_step_keys(
             k=k,
             x=x,
             query_len=query_len,
         )
-        declared_step_keys = (prefill_key, decode_key)
         self._begin_elastic_restore_physical_epoch(declared_step_keys)
+        retention_id = scheduler.retain_elastic_restore_captures(declared_step_keys)
         for req_id in req_ids:
             self._add_elastic_restore_request(
                 request_id=req_id,
@@ -829,9 +882,81 @@ class EngineCore:
                 query_len,
             )
             return None, admitted_x
-        if k > 0 and query_len == 1:
+        needs_decode_bridge = self._elastic_restore_needs_decode_bridge(
+            k=k,
+            query_len=query_len,
+        )
+        if k > 0 and (query_len == 1 or needs_decode_bridge):
             for req_id in req_ids:
                 scheduler.requests[req_id].spec_token_ids.clear()
+        if needs_decode_bridge:
+            bridge_expected = self._elastic_restore_decode_key(
+                k=k,
+                x=x,
+                query_len=1,
+            )
+            scheduler.prepare_elastic_restore_execution(bridge_expected)
+            self._elastic_restore_expected_decode_ids = frozenset(req_ids)
+            try:
+                bridge = self._run_elastic_restore_step()
+            except _ElasticRestorePartialWave as contraction:
+                self._elastic_restore_expected_decode_ids = frozenset()
+                self._rollback_elastic_restore_physical_epoch(
+                    request_ids=req_ids,
+                    step_keys=declared_step_keys,
+                    finish_unexecuted_step=True,
+                )
+                logger.warning(
+                    "Elastic MTP bridge downshifted before target decode: "
+                    "requested_x=%d admitted_x=%d K=%d query_len=%d",
+                    x,
+                    contraction.admitted_x,
+                    k,
+                    query_len,
+                )
+                return None, contraction.admitted_x
+            finally:
+                self._elastic_restore_expected_decode_ids = frozenset()
+            bridge_admitted_x = len(bridge.num_scheduled_tokens)
+            if bridge_admitted_x != x:
+                self._rollback_elastic_restore_physical_epoch(
+                    request_ids=req_ids,
+                    step_keys=declared_step_keys,
+                )
+                raise RuntimeError(
+                    "elastic MTP bridge made no exact decode progress: "
+                    f"requested_x={x} admitted_x={bridge_admitted_x}"
+                )
+            self._assert_elastic_restore_key(bridge, bridge_expected)
+            draft_counts = {
+                req_id: len(scheduler.requests[req_id].spec_token_ids)
+                for req_id in req_ids
+            }
+            if any(count != k for count in draft_counts.values()):
+                self._rollback_elastic_restore_physical_epoch(
+                    request_ids=req_ids,
+                    step_keys=declared_step_keys,
+                )
+                raise RuntimeError(
+                    "elastic MTP bridge did not produce the target draft width: "
+                    f"expected_k={k} draft_counts={draft_counts!r}"
+                )
+        elif k > 0 and query_len > 1:
+            draft_counts = {
+                req_id: len(scheduler.requests[req_id].spec_token_ids)
+                for req_id in req_ids
+            }
+            if any(count != k for count in draft_counts.values()):
+                self._rollback_elastic_restore_physical_epoch(
+                    request_ids=req_ids,
+                    step_keys=declared_step_keys,
+                )
+                raise RuntimeError(
+                    "elastic MTP prefill did not produce the target draft width: "
+                    f"expected_k={k} draft_counts={draft_counts!r}"
+                )
+        expected = self._elastic_restore_decode_key(k=k, x=x, query_len=query_len)
+        scheduler.prepare_elastic_restore_execution(expected)
         self._elastic_restore_expected_decode_ids = frozenset(req_ids)
         try:
             cold = self._run_elastic_restore_step()
@@ -877,13 +1002,13 @@ class EngineCore:
                 query_len,
             )
             return None, cold_admitted_x
-        expected = self._elastic_restore_decode_key(k=k, x=x, query_len=query_len)
         self._assert_elastic_restore_key(cold, expected)
         if k > 0 and query_len == 1:
             for req_id in req_ids:
                 request = scheduler.requests.get(req_id)
                 if request is not None:
                     request.spec_token_ids.clear()
+        scheduler.prepare_elastic_restore_execution(expected)
         self._elastic_restore_expected_decode_ids = frozenset(req_ids)
         try:
             hot = self._run_elastic_restore_step()
@@ -898,6 +1023,7 @@ class EngineCore:
         finally:
             self._elastic_restore_expected_decode_ids = frozenset()
         self._assert_elastic_restore_key(hot, expected)
+        scheduler.release_elastic_restore_retention(retention_id)
         self.abort_requests(req_ids)
         self._drain_elastic_restore()
         return expected, x
@@ -1292,9 +1418,46 @@ class EngineCore:
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
-            model_output = future.result()
-            if model_output is None:
-                model_output = self.model_executor.sample_tokens(grammar_output)
+            try:
+                model_output = future.result()
+                if model_output is None:
+                    model_output = self.model_executor.sample_tokens(grammar_output)
+            except WorkerRemoteError as error:
+                if (
+                    error.failure.code
+                    != WorkerFailureCode.ELASTIC_EXECUTION_PLAN_MISMATCH
+                ):
+                    raise
+                # Match the ordinary result path: aborts accepted while the
+                # worker future was running take effect before its output.
+                self._process_aborts_queue()
+                failed = self.scheduler.recover_elastic_execution_plan_mismatch(
+                    scheduler_output
+                )
+                recovered_outputs = {
+                    client_index: EngineCoreOutputs(finished_requests=set(request_ids))
+                    for client_index, request_ids in (
+                        self.scheduler.take_finished_request_ids().items()
+                    )
+                }
+                for request in failed:
+                    client_output = recovered_outputs.setdefault(
+                        request.client_index,
+                        EngineCoreOutputs(finished_requests=set()),
+                    )
+                    assert client_output.finished_requests is not None
+                    client_output.finished_requests.add(request.request_id)
+                    client_output.outputs.append(
+                        EngineCoreOutput(
+                            request_id=request.request_id,
+                            new_token_ids=[],
+                            finish_reason=FinishReason.ERROR,
+                            events=request.take_events(),
+                            trace_headers=request.trace_headers,
+                        )
+                    )
+                self._attach_iteration_details(recovered_outputs, iteration_details)
+                return recovered_outputs, False
         future_end_ns = time.perf_counter_ns() if trace_enabled else 0
 
         # Before processing the model output, process any aborts that happened

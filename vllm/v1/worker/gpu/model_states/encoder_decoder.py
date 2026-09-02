@@ -73,7 +73,6 @@ class EncoderDecoderModelState(ModelState):
         input_batch: InputBatch,
         req_states: RequestState,
     ) -> None:
-        # Ensure encoder inputs are ordered consistently with input_batch.req_ids.
         encoder_inputs: dict[str, list[int]] = {}
         for req_id in input_batch.req_ids:
             req_encoder_inputs = scheduled_encoder_inputs.get(req_id, [])
@@ -81,16 +80,48 @@ class EncoderDecoderModelState(ModelState):
                 encoder_inputs[req_id] = req_encoder_inputs
         _, mm_kwargs = self.encoder_runner.prepare_mm_inputs(encoder_inputs)
         if mm_kwargs:
+            self.encoder_outputs = self.encoder_runner.execute_mm_encoder(mm_kwargs)
+        else:
+            self.encoder_outputs = []
+        return None
+
+    def stage_mm_encoder(
+        self,
+        scheduled_encoder_inputs: dict[str, list[int]],
+        req_ids: list[str] | None = None,
+    ) -> tuple[list[str], list[Any]]:
+        # Ensure encoder inputs are ordered consistently with input_batch.req_ids.
+        encoder_inputs: dict[str, list[int]] = {}
+        for req_id in req_ids or scheduled_encoder_inputs:
+            req_encoder_inputs = scheduled_encoder_inputs.get(req_id, [])
+            if req_encoder_inputs:
+                encoder_inputs[req_id] = req_encoder_inputs
+        return self.encoder_runner.stage_mm_encoder_batches(encoder_inputs)
+
+    def execute_staged_mm_encoder(self, staged: tuple[list[str], list[Any]]) -> None:
+        completed = self.execute_staged_mm_encoder_collective(staged)
+        self.commit_staged_mm_encoder(completed)
+
+    def execute_staged_mm_encoder_collective(
+        self, staged: tuple[list[str], list[tuple[str, Any]]]
+    ) -> list[tuple[int, object]]:
+        _mm_hashes, batches = staged
+        return self.encoder_runner.execute_staged_mm_encoder_batches(batches)
+
+    def commit_staged_mm_encoder(self, completed: list[tuple[int, object]]) -> None:
+        encoder_outputs = self.encoder_runner.finalize_staged_mm_encoder_outputs(
+            completed
+        )
+        if encoder_outputs:
             # Encoder-decoder models consume encoder outputs through the
             # `encoder_outputs` forward kwarg, not `inputs_embeds`. Single modality
             # so execute_mm_encoder preserves request order; use its return value
             # directly. No need to store in encoder_cache: cross-attention K/V are
             # written to the KV cache on the first step; decode steps use the cache.
-            self.encoder_outputs = self.encoder_runner.execute_mm_encoder(mm_kwargs)
+            self.encoder_outputs = encoder_outputs
         else:
             # Decode steps: encoder K/V are in cross-attention KV cache.
             self.encoder_outputs = []
-        return None
 
     def prepare_inputs(
         self, input_batch: InputBatch, req_states: RequestState

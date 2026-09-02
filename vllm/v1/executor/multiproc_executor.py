@@ -66,6 +66,11 @@ from vllm.utils.torch_utils import (
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
+from vllm.v1.executor.worker_failure import (
+    WorkerFailure,
+    WorkerFailureCode,
+    WorkerRemoteError,
+)
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
@@ -413,10 +418,15 @@ class MultiprocExecutor(Executor):
                 except TimeoutError as e:
                     raise TimeoutError(f"RPC call to {method} timed out.") from e
                 if status != WorkerProc.ResponseStatus.SUCCESS:
-                    raise RuntimeError(
-                        f"Worker failed with error '{result}', please check the"
-                        " stack trace above for the root cause"
-                    )
+                    if not isinstance(result, WorkerFailure):
+                        # Compatibility with an older worker process epoch.
+                        # It remains an unclassified fatal failure.
+                        result = WorkerFailure(
+                            code=WorkerFailureCode.GENERIC,
+                            remote_type="legacy.worker.Exception",
+                            message=str(result),
+                        )
+                    raise WorkerRemoteError(result)
                 responses.append(result)
             return responses[0] if output_rank is not None else responses
 
@@ -971,7 +981,10 @@ class WorkerProc:
                 output = e
 
         if isinstance(output, Exception):
-            result = (WorkerProc.ResponseStatus.FAILURE, str(output))
+            result = (
+                WorkerProc.ResponseStatus.FAILURE,
+                WorkerFailure.from_exception(output),
+            )
         else:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
         if (response_mq := self.worker_response_mq) is not None:
@@ -1013,9 +1026,7 @@ class WorkerProc:
                 indefinite=True
             )
             try:
-                memory_snapshot_dir = os.environ.get(
-                    "AG2_VLLM_MEMORY_SNAPSHOT_DIR", ""
-                )
+                memory_snapshot_dir = os.environ.get("AG2_VLLM_MEMORY_SNAPSHOT_DIR", "")
                 if (
                     memory_snapshot_dir
                     and method == "execute_model"
