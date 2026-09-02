@@ -166,6 +166,17 @@ class GemmaRMSNorm(CustomOp):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         return self.forward_native(x, residual)
 
+    def forward_native_output_only(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        """Normalize ``x + residual`` when the residual result is not consumed."""
+        weight = self.weight.float() + 1.0
+        return ir.ops.fused_add_rms_norm_output_only(
+            x, residual, weight, self.variance_epsilon
+        )
+
 
 # --8<-- [start:rms_norm_gated]
 @CustomOp.register("rms_norm_gated")

@@ -13,6 +13,10 @@ from vllm.model_executor.layers.fusion.quant_activation import (
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
+from vllm.model_executor.layers.quantization.utils.ag2_nvfp4_arc import (
+    ensure_ag2_nvfp4_base_owner_metadata,
+    maybe_apply_ag2_nvfp4_arc_sidecar,
+)
 from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
@@ -136,6 +140,9 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                 layer.input_global_scale * layer.weight_global_scale,
                 requires_grad=False,
             )
+
+        maybe_apply_ag2_nvfp4_arc_sidecar(layer, getattr(layer, "prefix", None))
+        ensure_ag2_nvfp4_base_owner_metadata(layer)
 
         # Convert layer to NVFP4 linear kernel format
         self.kernel.process_weights_after_loading(layer)

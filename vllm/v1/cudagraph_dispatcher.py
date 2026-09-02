@@ -307,7 +307,17 @@ class CudagraphDispatcher:
         if CUDAGraphMode.FULL in allowed_modes:
             # check if key exists for full cudagraph
             batch_desc_to_check = batch_desc
-            if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.FULL]:
+            # Uniform multi-token decode carries request-indexed speculative
+            # and GDN state. Token padding must not invent carrier requests.
+            full_request_shape_exact = (
+                not normalized_uniform
+                or self.uniform_decode_query_len == 1
+                or batch_desc.num_tokens == num_tokens
+            )
+            if (
+                batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.FULL]
+                and full_request_shape_exact
+            ):
                 return CUDAGraphMode.FULL, batch_desc_to_check
 
         if CUDAGraphMode.PIECEWISE in allowed_modes:

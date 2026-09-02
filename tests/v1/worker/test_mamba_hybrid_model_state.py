@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -12,8 +12,39 @@ from vllm.v1.attention.backends.recoverssm_metadata import (
     RecoverSSMMetadata,
     RecoverSSMPostprocessMetadata,
 )
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
+
+
+def test_constructor_defines_recoverssm_for_every_cache_mode() -> None:
+    source = MambaHybridModelState.__init__.__code__.co_names
+
+    assert "recoverssm" in source
+    assert "use_kda_recoverssm" in source
+    assert "RecoverSSMState" in source
+
+
+def test_add_request_resets_reused_separate_pool_slot() -> None:
+    state = object.__new__(MambaHybridModelState)
+    state.num_accepted_tokens_gpu = torch.full((4,), 4, dtype=torch.int32)
+    state._mamba_state_idx_gpu = torch.full((4,), 7, dtype=torch.int32)
+    state._align_mode = True
+    state._separate_mamba_pool = True
+
+    with patch.object(DefaultModelState, "add_request") as parent_add:
+        request = SimpleNamespace(num_computed_tokens=128)
+        state.add_request(2, request)
+
+    parent_add.assert_called_once_with(2, request)
+    torch.testing.assert_close(
+        state.num_accepted_tokens_gpu,
+        torch.tensor([4, 4, 1, 4], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        state._mamba_state_idx_gpu,
+        torch.tensor([7, 7, 0, 7], dtype=torch.int32),
+    )
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")

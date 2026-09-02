@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import threading
 from contextlib import nullcontext
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -43,6 +44,13 @@ def test_piecewise_capture_builds_fresh_metadata_for_both_passes():
     manager._capture_descs = {CUDAGraphMode.PIECEWISE: [desc]}
     manager._graphs_captured = False
     manager.use_breakable_cg = True
+    manager.defer_startup_graphs = False
+    manager.dynamic_graph_owner = "test"
+    manager.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(rank=0),
+    )
+    manager.max_num_reqs = 8
+    manager._dynamic_graph_entries = {}
 
     create_calls = []
     forward_calls = []
@@ -67,6 +75,7 @@ def test_piecewise_capture_builds_fresh_metadata_for_both_passes():
             "vllm.v1.worker.gpu.cudagraph_utils.is_global_first_rank",
             return_value=False,
         ),
+        patch("torch.cuda.synchronize"),
     ):
         manager.capture(create_forward_fn)
 
@@ -208,6 +217,143 @@ def test_capture_with_no_eager_break_records_one_graph(cuda_capture_stream):
     assert len(cap.segments) == 1
     assert cap.num_graphs == 1
     assert cap.num_eager_breaks == 0
+
+
+def test_reset_destroys_every_graph_segment():
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+    graphs = [MagicMock(), MagicMock()]
+    cap = BreakableCUDAGraphCapture(pool=object())
+    cap.graphs = graphs
+    cap.segments = [graphs[0].replay, lambda: None, graphs[1].replay]
+    cap._num_graphs = 2
+    cap._num_eager_breaks = 1
+
+    reset_order = []
+    graphs[0].reset.side_effect = lambda: reset_order.append(0)
+    graphs[1].reset.side_effect = lambda: reset_order.append(1)
+
+    cap.reset()
+
+    for graph in graphs:
+        graph.reset.assert_called_once_with()
+    assert reset_order == [1, 0]
+    assert cap.graphs == []
+    assert cap.segments == []
+    assert cap.num_graphs == 0
+    assert cap.num_eager_breaks == 0
+
+
+def test_first_breakable_replay_rejects_changed_input_address(monkeypatch):
+    from vllm.compilation.breakable_cudagraph import (
+        BreakableCUDAGraphWrapper,
+        _BreakableEntry,
+    )
+    from vllm.forward_context import BatchDescriptor
+
+    wrapper = object.__new__(BreakableCUDAGraphWrapper)
+    wrapper.is_debugging_mode = False
+    expected = torch.empty(4)
+    actual = torch.empty(4)
+    entry = _BreakableEntry(
+        batch_descriptor=BatchDescriptor(num_tokens=4),
+        capture=MagicMock(),
+        input_addresses=[expected.data_ptr()],
+    )
+    monkeypatch.setattr(
+        "vllm.compilation.breakable_cudagraph.get_offloader",
+        lambda: MagicMock(),
+    )
+
+    with pytest.raises(RuntimeError, match="input addresses changed"):
+        wrapper._replay(entry, (actual,), {})
+    entry.capture.replay.assert_not_called()
+
+
+def test_first_breakable_replay_validates_address_once(monkeypatch):
+    from vllm.compilation.breakable_cudagraph import (
+        BreakableCUDAGraphWrapper,
+        _BreakableEntry,
+    )
+    from vllm.forward_context import BatchDescriptor
+
+    wrapper = object.__new__(BreakableCUDAGraphWrapper)
+    wrapper.is_debugging_mode = False
+    tensor = torch.empty(4)
+    entry = _BreakableEntry(
+        batch_descriptor=BatchDescriptor(num_tokens=4),
+        capture=MagicMock(),
+        input_addresses=[tensor.data_ptr()],
+    )
+    monkeypatch.setattr(
+        "vllm.compilation.breakable_cudagraph.get_offloader",
+        lambda: MagicMock(),
+    )
+
+    wrapper._replay(entry, (tensor,), {})
+
+    assert entry.first_replay_addresses_validated
+    entry.capture.replay.assert_called_once_with()
+
+
+def test_descriptor_private_pool_count_and_eviction(monkeypatch):
+    from vllm.compilation.breakable_cudagraph import (
+        BreakableCUDAGraphCapture,
+        BreakableCUDAGraphWrapper,
+        _BreakableEntry,
+    )
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import BatchDescriptor
+
+    private_pool = object()
+    other_pool = object()
+    descriptor = BatchDescriptor(
+        num_tokens=1,
+        has_lora=False,
+        num_active_loras=0,
+        cudagraph_owner="target",
+    )
+    other_descriptor = BatchDescriptor(
+        num_tokens=2,
+        has_lora=False,
+        num_active_loras=0,
+        cudagraph_owner="target",
+    )
+    monkeypatch.setattr(
+        "vllm.compilation.breakable_cudagraph.current_platform.get_global_graph_pool",
+        lambda: other_pool,
+    )
+    config = MagicMock()
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+    wrapper = BreakableCUDAGraphWrapper(lambda x: x, config)
+
+    capture = BreakableCUDAGraphCapture(pool=private_pool)
+    capture.graphs = [MagicMock(), MagicMock()]
+    capture.segments = [capture.graphs[0].replay, capture.graphs[1].replay]
+    capture._num_graphs = 2
+    other_capture = BreakableCUDAGraphCapture(pool=other_pool)
+    other_capture.graphs = [MagicMock()]
+    other_capture.segments = [other_capture.graphs[0].replay]
+    other_capture._num_graphs = 1
+    wrapper.entries = {
+        descriptor: _BreakableEntry(
+            descriptor, capture=capture, graph_pool=private_pool
+        ),
+        other_descriptor: _BreakableEntry(
+            other_descriptor, capture=other_capture, graph_pool=other_pool
+        ),
+    }
+
+    assert (
+        BreakableCUDAGraphWrapper.count_batch_descriptor(descriptor, private_pool) == 2
+    )
+    assert BreakableCUDAGraphWrapper.count_batch_descriptor(descriptor, other_pool) == 0
+    assert (
+        BreakableCUDAGraphWrapper.evict_batch_descriptor(descriptor, private_pool) == 2
+    )
+    assert descriptor not in wrapper.entries
+    assert other_descriptor in wrapper.entries
+    assert capture.graphs == []
 
 
 def test_add_eager_creates_alternating_graph_eager_graph(cuda_capture_stream):

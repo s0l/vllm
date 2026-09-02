@@ -47,6 +47,15 @@ if TYPE_CHECKING:
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
+    VLLM_DCP_NATIVE_RS_MAX_ROWS: int = 0
+    VLLM_TP3_CE_REDUCE: bool = False
+    VLLM_TP3_CE_MAX_ROWS: int = 12288
+    VLLM_TP3_LL_REDUCE: bool = False
+    VLLM_TP3_LL_MAX_ROWS: int = 16
+    VLLM_TP3_SD_CANONICAL_REDUCE: bool = False
+    VLLM_TP3_SD_DETERMINISTIC_REDUCE: bool = False
+    VLLM_TP3_SD_DETERMINISTIC_MAX_ROWS: int = 24
+    VLLM_TP3_SD_PHASE_REDUCE: bool = False
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -91,6 +100,18 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
+    AG2_VLLM_NVFP4_BATCH_INVARIANT: bool = False
+    AG2_VLLM_NVFP4_B12X: bool = False
+    AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE: bool = False
+    AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL: bool = False
+    AG2_VLLM_NVFP4_MARLIN_WHOLE_SLICE_PREFILL: bool = False
+    AG2_VLLM_NVFP4_MARLIN_GATE_UP_SCRATCH: bool = False
+    AG2_VLLM_MTP_BF16_GATE_UP_SCRATCH: bool = False
+    AG2_VLLM_MTP_FC_BATCH_INVARIANT: bool = False
+    AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH: bool = False
+    AG2_VLLM_TP3_OWNER_PREQUANT: bool = False
+    AG2_VLLM_TP3_OWNER_MIN_ROWS: int = 32
+    AG2_VLLM_NVFP4_HUMMING_NARROW_PAD64: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
@@ -619,8 +640,39 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
-    "VLLM_REPLICATE_EMBED": lambda: (
-        os.getenv("VLLM_REPLICATE_EMBED", "0").strip().lower() in ("1", "true")
+    "AG2_VLLM_NVFP4_BATCH_INVARIANT": lambda: bool(
+        int(os.getenv("AG2_VLLM_NVFP4_BATCH_INVARIANT", "0"))
+    ),
+    "AG2_VLLM_NVFP4_B12X": lambda: bool(int(os.getenv("AG2_VLLM_NVFP4_B12X", "0"))),
+    "AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE": lambda: bool(
+        int(os.getenv("AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE", "0"))
+    ),
+    "AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL": lambda: bool(
+        int(os.getenv("AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL", "0"))
+    ),
+    "AG2_VLLM_NVFP4_MARLIN_WHOLE_SLICE_PREFILL": lambda: bool(
+        int(os.getenv("AG2_VLLM_NVFP4_MARLIN_WHOLE_SLICE_PREFILL", "0"))
+    ),
+    "AG2_VLLM_NVFP4_MARLIN_GATE_UP_SCRATCH": lambda: bool(
+        int(os.getenv("AG2_VLLM_NVFP4_MARLIN_GATE_UP_SCRATCH", "0"))
+    ),
+    "AG2_VLLM_MTP_BF16_GATE_UP_SCRATCH": lambda: bool(
+        int(os.getenv("AG2_VLLM_MTP_BF16_GATE_UP_SCRATCH", "0"))
+    ),
+    "AG2_VLLM_MTP_FC_BATCH_INVARIANT": lambda: bool(
+        int(os.getenv("AG2_VLLM_MTP_FC_BATCH_INVARIANT", "0"))
+    ),
+    "AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH": lambda: bool(
+        int(os.getenv("AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH", "0"))
+    ),
+    "AG2_VLLM_TP3_OWNER_PREQUANT": lambda: bool(
+        int(os.getenv("AG2_VLLM_TP3_OWNER_PREQUANT", "0"))
+    ),
+    "AG2_VLLM_TP3_OWNER_MIN_ROWS": lambda: int(
+        os.getenv("AG2_VLLM_TP3_OWNER_MIN_ROWS", "32")
+    ),
+    "AG2_VLLM_NVFP4_HUMMING_NARROW_PAD64": lambda: bool(
+        int(os.getenv("AG2_VLLM_NVFP4_HUMMING_NARROW_PAD64", "0"))
     ),
     # Use tensor descriptors for Q/K/V loads and output stores in the
     # Triton unified-attention kernel.  Enables HW 2D block reads on
@@ -859,6 +911,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
         bool(int(os.environ["VLLM_USE_FLASHINFER_SAMPLER"]))
         if "VLLM_USE_FLASHINFER_SAMPLER" in os.environ
         else True
+    ),
+    # Default-off decode-shape DCP reduce-scatter. Positive values select the
+    # native transpose + NCCL reduce-scatter path only up to this physical M;
+    # larger prefill shapes retain the memory-bounded chunked implementation.
+    "VLLM_DCP_NATIVE_RS_MAX_ROWS": lambda: int(
+        os.environ.get("VLLM_DCP_NATIVE_RS_MAX_ROWS", "0")
+    ),
+    "VLLM_TP3_CE_REDUCE": lambda: os.environ.get("VLLM_TP3_CE_REDUCE", "0") == "1",
+    "VLLM_TP3_CE_MAX_ROWS": lambda: int(
+        os.environ.get("VLLM_TP3_CE_MAX_ROWS", "12288")
+    ),
+    "VLLM_TP3_LL_REDUCE": lambda: os.environ.get("VLLM_TP3_LL_REDUCE", "0") == "1",
+    "VLLM_TP3_LL_MAX_ROWS": lambda: int(os.environ.get("VLLM_TP3_LL_MAX_ROWS", "16")),
+    "VLLM_TP3_SD_CANONICAL_REDUCE": lambda: (
+        os.environ.get("VLLM_TP3_SD_CANONICAL_REDUCE", "0") == "1"
+    ),
+    "VLLM_TP3_SD_DETERMINISTIC_REDUCE": lambda: (
+        os.environ.get("VLLM_TP3_SD_DETERMINISTIC_REDUCE", "0") == "1"
+    ),
+    "VLLM_TP3_SD_DETERMINISTIC_MAX_ROWS": lambda: int(
+        os.environ.get("VLLM_TP3_SD_DETERMINISTIC_MAX_ROWS", "24")
+    ),
+    "VLLM_TP3_SD_PHASE_REDUCE": lambda: (
+        os.environ.get("VLLM_TP3_SD_PHASE_REDUCE", "0") == "1"
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),

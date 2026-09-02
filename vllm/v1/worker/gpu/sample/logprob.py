@@ -6,6 +6,7 @@ import torch
 
 from vllm.sampling_params import MAX_LOGPROB_TOKEN_IDS, SamplingParams
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import next_power_of_2
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 
@@ -92,7 +93,7 @@ def compute_token_logprobs(
     logprobs = logits.new_empty((batch_size, num_logprobs), dtype=torch.float32)
     # Cap the kernel's per-iteration width so very large num_logprobs requests
     # stream the gather in bounded-size chunks, avoiding excessive mem use.
-    topk_block_size = min(triton.next_power_of_2(num_logprobs), _MAX_TOPK_BLOCK)
+    topk_block_size = min(next_power_of_2(num_logprobs), _MAX_TOPK_BLOCK)
     _topk_log_softmax_kernel[(batch_size,)](
         logprobs,
         logits,

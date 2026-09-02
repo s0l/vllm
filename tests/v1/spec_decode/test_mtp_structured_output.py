@@ -221,7 +221,8 @@ def test_bitmask_post_reasoning_end_drafts_skip_grammar_advance(backend, caplog)
     # A token that the JSON grammar would reject as the first post-marker
     # token; without the fix grammar.accept_tokens fires the assertion.
     invalid_post = tokenizer.encode("z")[0]
-    drafts = [pre, marker, invalid_post]
+    valid_only_if_invalid_were_skipped = tokenizer.encode('"key"')[0]
+    drafts = [pre, marker, invalid_post, valid_only_if_invalid_were_skipped]
 
     bitmask = manager.grammar_bitmask(
         requests={request.request_id: request},
@@ -233,6 +234,7 @@ def test_bitmask_post_reasoning_end_drafts_skip_grammar_advance(backend, caplog)
     assert bitmask.shape[0] == len(drafts) + 1
     # Post-marker position is still bitmask-constrained.
     assert not (bitmask[2] == -1).all()
+    assert "Failed to advance FSM" not in caplog.text
     # Grammar must not have advanced through the unvalidated draft.
     assert not grammar.is_terminated()
     assert "Failed to advance FSM" not in caplog.text

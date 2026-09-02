@@ -1,15 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from abc import ABC, abstractmethod
+from bisect import bisect_right
+from collections import OrderedDict
 from collections.abc import Sequence
 from typing import NamedTuple
 
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_capacity import PhysicalPoolCapacityPlanner
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    BlockHashListWithBlockSize,
     KVCacheBlock,
     dcp_world_size_for_kv_cache_spec,
 )
@@ -62,6 +67,28 @@ def _validate_prefix_cache_retention_interval(
         )
 
 
+class KVCacheBlockPoolRequirements(NamedTuple):
+    primary: int = 0
+    mamba: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.primary + self.mamba
+
+    def __add__(
+        self, other: "KVCacheBlockPoolRequirements"
+    ) -> "KVCacheBlockPoolRequirements":
+        return KVCacheBlockPoolRequirements(
+            self.primary + other.primary,
+            self.mamba + other.mamba,
+        )
+
+
+class ElasticAdmissionPlan(NamedTuple):
+    max_requests: int
+    requirements: KVCacheBlockPoolRequirements
+
+
 class KVCacheCoordinator(ABC):
     """
     Coordinate the KV cache of different KV cache groups.
@@ -102,6 +129,7 @@ class KVCacheCoordinator(ABC):
             hash_block_size=hash_block_size,
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
+            prefer_low_id_allocations=bool(kv_cache_config.elastic_mapping_quantum),
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
@@ -134,12 +162,73 @@ class KVCacheCoordinator(ABC):
                 f" (={num_prefill_lookahead})."
             )
 
-        self.single_type_managers = tuple(
-            get_manager_for_kv_cache_spec(
+        separate_mamba_specs = [
+            group.kv_cache_spec
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+            and group.kv_cache_spec.separate_pool
+        ]
+        separate_gdn_pool = bool(separate_mamba_specs)
+        self.mamba_block_pool: BlockPool | None = None
+        self.gdn_checkpoint_keys: OrderedDict[BlockHash, None] | None = None
+        self.gdn_checkpoint_limit = 8
+        self._elastic_transition: tuple[int, int] | None = None
+        self._last_emitted_elastic_transition: tuple[int, int] | None = None
+        self._physical_pool_planner: PhysicalPoolCapacityPlanner | None = None
+        self.elastic_external_memory_bytes = 0
+        self.last_elastic_rejection: dict[str, object] | None = None
+        if separate_gdn_pool:
+            pool_sizes = {
+                spec.separate_pool_num_blocks for spec in separate_mamba_specs
+            }
+            if len(pool_sizes) != 1 or 0 in pool_sizes:
+                raise ValueError(
+                    "Separate GDN cache groups must use one positive pool size"
+                )
+            self.mamba_block_pool = BlockPool(
+                num_gpu_blocks=pool_sizes.pop(),
+                enable_caching=enable_caching,
+                hash_block_size=hash_block_size,
+                enable_kv_cache_events=enable_kv_cache_events,
+                metrics_collector=metrics_collector,
+                active_num_gpu_blocks=(
+                    kv_cache_config.elastic_gdn_initial_blocks or None
+                ),
+            )
+            # This mirrors the pinned-host LRU in every worker. It contains
+            # content identities only; recurrent bytes never live in EngineCore.
+            self.gdn_checkpoint_keys = OrderedDict()
+
+        if kv_cache_config.elastic_mapping_quantum and self.mamba_block_pool:
+            attention_block_sizes = tuple(
+                tensor.logical_block_size
+                for tensor in kv_cache_config.kv_cache_tensors
+                if tensor.backing_id.startswith("elastic-attention-")
+            ) or (kv_cache_config.elastic_attention_stride,)
+            self._physical_pool_planner = PhysicalPoolCapacityPlanner(
+                primary_block_sizes=attention_block_sizes,
+                secondary_block_stride=kv_cache_config.elastic_gdn_stride,
+                mapping_quantum=kv_cache_config.elastic_mapping_quantum,
+                budget_bytes=kv_cache_config.elastic_budget_bytes,
+            )
+            self._last_emitted_elastic_transition = (
+                self.block_pool.active_num_gpu_blocks,
+                self.mamba_block_pool.active_num_gpu_blocks,
+            )
+
+        managers: list[SingleTypeKVCacheManager] = []
+        for i, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+            manager_pool = (
+                self.mamba_block_pool
+                if self.mamba_block_pool is not None
+                and isinstance(kv_cache_group.kv_cache_spec, MambaSpec)
+                else self.block_pool
+            )
+            manager = get_manager_for_kv_cache_spec(
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
                 max_in_flight_tokens=max_in_flight_tokens,
                 max_model_len=max_model_len,
-                block_pool=self.block_pool,
+                block_pool=manager_pool,
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
                 dcp_world_size=dcp_world_size_for_kv_cache_spec(
@@ -149,8 +238,8 @@ class KVCacheCoordinator(ABC):
                 scheduler_block_size=self.scheduler_block_size,
                 needs_kv_cache_zeroing=self.kv_cache_config.needs_kv_cache_zeroing,
             )
-            for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
-        )
+            managers.append(manager)
+        self.single_type_managers = tuple(managers)
 
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
@@ -159,6 +248,650 @@ class KVCacheCoordinator(ABC):
         _validate_prefix_cache_retention_interval(
             self.retention_interval, self.scheduler_block_size, kv_cache_config
         )
+
+    def _elastic_attention_capacity(
+        self,
+        gdn_blocks: int,
+        external_memory_bytes: int | None = None,
+    ) -> int:
+        if external_memory_bytes is None:
+            external_memory_bytes = self.elastic_external_memory_bytes
+        primary_surfaces = self.kv_cache_config.elastic_rank_primary_mapped_bytes
+        gdn_surfaces = self.kv_cache_config.elastic_rank_gdn_mapped_bytes
+        rank_budgets = self.kv_cache_config.elastic_rank_budget_bytes
+        if primary_surfaces or gdn_surfaces or rank_budgets:
+            if not (len(primary_surfaces) == len(gdn_surfaces) == len(rank_budgets)):
+                raise RuntimeError("elastic rank capacity surfaces are incomplete")
+            quantum = self.kv_cache_config.elastic_mapping_quantum
+            external_mapped = cdiv(external_memory_bytes, quantum) * quantum
+            capacities = []
+            for primary_bytes, gdn_bytes, budget in zip(
+                primary_surfaces, gdn_surfaces, rank_budgets, strict=True
+            ):
+                if not 0 <= gdn_blocks < len(gdn_bytes):
+                    return 0
+                available_primary = budget - gdn_bytes[gdn_blocks] - external_mapped
+                capacities.append(bisect_right(primary_bytes, available_primary) - 1)
+            return max(min(capacities), 0)
+
+        rank_safe_capacity = (
+            self.kv_cache_config.elastic_attention_capacity_by_gdn_blocks
+        )
+        if rank_safe_capacity:
+            if not 0 <= gdn_blocks < len(rank_safe_capacity):
+                return 0
+            return rank_safe_capacity[gdn_blocks]
+        assert self._physical_pool_planner is not None
+        return self._physical_pool_planner.max_primary_blocks(
+            gdn_blocks,
+            upper_bound=self.block_pool.num_gpu_blocks,
+            external_bytes=external_memory_bytes,
+        )
+
+    def max_elastic_full_context_requests(
+        self,
+        primary_blocks_per_request: int,
+        external_memory_bytes: int,
+        max_requests: int,
+    ) -> int:
+        """Exact known-footprint capacity for max-length request residency.
+
+        The result includes the permanent null block in both pools, GDN growth
+        per request, rank-asymmetric mapped-byte surfaces and the supplied
+        executable loan. It is exact to the configured mapping quantum; it is
+        meaningful only when ``external_memory_bytes`` is measured or comes
+        from a previously proven capture envelope.
+        """
+        if primary_blocks_per_request <= 0 or max_requests < 0:
+            raise ValueError("elastic full-context capacity inputs are invalid")
+        config = self.kv_cache_config
+        gdn_per_request = config.elastic_gdn_blocks_per_request
+        if gdn_per_request <= 0:
+            return 0
+        executable_x = 0
+        for num_reqs in range(1, max_requests + 1):
+            gdn_blocks = max(
+                config.elastic_gdn_initial_blocks,
+                1 + num_reqs * gdn_per_request,
+            )
+            attention_blocks = self._elastic_attention_capacity(
+                gdn_blocks,
+                external_memory_bytes,
+            )
+            if attention_blocks < 1 + num_reqs * primary_blocks_per_request:
+                break
+            executable_x = num_reqs
+        return executable_x
+
+    def elastic_full_context_capacity_receipt(
+        self,
+        primary_blocks_per_request: int,
+        external_memory_bytes: int,
+        num_reqs: int,
+    ) -> dict[str, int]:
+        """Return the exact mapped-block ledger for one proven runtime shape."""
+        if primary_blocks_per_request <= 0 or num_reqs < 0:
+            raise ValueError("elastic full-context receipt inputs are invalid")
+        config = self.kv_cache_config
+        gdn_blocks = max(
+            config.elastic_gdn_initial_blocks,
+            1 + num_reqs * config.elastic_gdn_blocks_per_request,
+        )
+        attention_blocks = self._elastic_attention_capacity(
+            gdn_blocks,
+            external_memory_bytes,
+        )
+        required_attention_blocks = 1 + num_reqs * primary_blocks_per_request
+        return {
+            "num_reqs": num_reqs,
+            "external_memory_bytes": external_memory_bytes,
+            "gdn_blocks": gdn_blocks,
+            "attention_blocks": attention_blocks,
+            "required_attention_blocks": required_attention_blocks,
+            "residual_attention_blocks": (attention_blocks - required_attention_blocks),
+        }
+
+    def elastic_kv_authority_receipt(
+        self,
+        primary_blocks_per_max_request: int,
+        external_memory_bytes: int | None = None,
+    ) -> dict[str, object]:
+        """Publish raw and executable KV capacity without conflating MaxX.
+
+        ``attention_token_equivalent`` is deliberately expressed in
+        max-model-length-equivalent scheduler tokens. Hybrid groups consume a
+        different number of physical pages, so a single raw "token count" is
+        otherwise ambiguous. The block ledger remains the physical authority.
+        """
+        if primary_blocks_per_max_request <= 0:
+            raise ValueError("KV authority requires positive max-request blocks")
+        config = self.kv_cache_config
+        external = (
+            self.elastic_external_memory_bytes
+            if external_memory_bytes is None
+            else external_memory_bytes
+        )
+        if external < 0:
+            raise ValueError("KV authority external bytes cannot be negative")
+        gdn_blocks = (
+            self.mamba_block_pool.active_num_gpu_blocks
+            if self.mamba_block_pool is not None
+            else 0
+        )
+
+        def rank_capacities(gdn: int, graph_bytes: int) -> tuple[int, ...]:
+            primary = config.elastic_rank_primary_mapped_bytes
+            secondary = config.elastic_rank_gdn_mapped_bytes
+            budgets = config.elastic_rank_budget_bytes
+            if primary or secondary or budgets:
+                if not (len(primary) == len(secondary) == len(budgets)):
+                    raise RuntimeError("elastic rank capacity surfaces are incomplete")
+                quantum = config.elastic_mapping_quantum
+                mapped_graph = cdiv(graph_bytes, quantum) * quantum
+                capacities = []
+                for primary_bytes, gdn_bytes, budget in zip(
+                    primary, secondary, budgets, strict=True
+                ):
+                    if not 0 <= gdn < len(gdn_bytes):
+                        capacities.append(0)
+                        continue
+                    available = budget - gdn_bytes[gdn] - mapped_graph
+                    capacities.append(
+                        max(bisect_right(primary_bytes, available) - 1, 0)
+                    )
+                return tuple(capacities)
+            return (self._elastic_attention_capacity(gdn, graph_bytes),)
+
+        raw_gdn = config.elastic_gdn_initial_blocks if self.mamba_block_pool else 0
+        raw_blocks = rank_capacities(raw_gdn, 0)
+        effective_blocks = rank_capacities(gdn_blocks, external)
+
+        def mapped_attention_bytes(blocks_by_rank: tuple[int, ...]) -> tuple[int, ...]:
+            primary = config.elastic_rank_primary_mapped_bytes
+            if primary:
+                if len(primary) != len(blocks_by_rank):
+                    raise RuntimeError("elastic rank attention surfaces are incomplete")
+                result = []
+                for blocks, surface in zip(blocks_by_rank, primary, strict=True):
+                    if not 0 <= blocks < len(surface):
+                        raise RuntimeError(
+                            "elastic attention block receipt exceeds a rank surface"
+                        )
+                    result.append(int(surface[blocks]))
+                return tuple(result)
+            stride = int(config.elastic_attention_stride)
+            return tuple(blocks * stride for blocks in blocks_by_rank)
+
+        def token_equivalent(blocks: int) -> int:
+            usable_blocks = max(blocks - 1, 0)  # permanent null block
+            return usable_blocks * self.max_model_len // primary_blocks_per_max_request
+
+        return {
+            "max_model_len": self.max_model_len,
+            "scheduler_block_size": self.scheduler_block_size,
+            "primary_blocks_per_max_request": primary_blocks_per_max_request,
+            "raw_attention_blocks_per_rank": raw_blocks,
+            "raw_attention_bytes_per_rank": mapped_attention_bytes(raw_blocks),
+            "raw_attention_token_equivalent_per_rank": tuple(
+                token_equivalent(blocks) for blocks in raw_blocks
+            ),
+            "effective_attention_blocks_per_rank": effective_blocks,
+            "effective_attention_bytes_per_rank": mapped_attention_bytes(
+                effective_blocks
+            ),
+            "effective_attention_token_equivalent_per_rank": tuple(
+                token_equivalent(blocks) for blocks in effective_blocks
+            ),
+            "active_gdn_blocks": gdn_blocks,
+            "graph_external_bytes": external,
+            "rank_budget_bytes": tuple(config.elastic_rank_budget_bytes),
+        }
+
+    def set_elastic_external_memory(
+        self,
+        requested_bytes: int,
+        minimum_free_primary_blocks: int = 0,
+    ) -> bool:
+        """Loan free attention-tail quanta to a step-scoped external owner."""
+        config = self.kv_cache_config
+        pool = self.mamba_block_pool
+        if requested_bytes < 0:
+            raise ValueError("elastic external memory cannot be negative")
+        if minimum_free_primary_blocks < 0:
+            raise ValueError("elastic primary headroom cannot be negative")
+        if not config.elastic_mapping_quantum or pool is None:
+            return requested_bytes == 0
+
+        normalized = self.normalize_elastic_external_memory(requested_bytes)
+        previous = self.elastic_external_memory_bytes
+        self.elastic_external_memory_bytes = normalized
+        desired_attention = self._elastic_attention_capacity(pool.active_num_gpu_blocks)
+        if desired_attention < 1:
+            self.elastic_external_memory_bytes = previous
+            return self._reject_elastic_capacity(
+                "external_physical_budget",
+                KVCacheBlockPoolRequirements(),
+                desired_gdn_blocks=pool.active_num_gpu_blocks,
+                desired_attention_blocks=desired_attention,
+            )
+
+        used_primary = (
+            self.block_pool.active_num_gpu_blocks
+            - self.block_pool.get_num_free_blocks()
+        )
+        if desired_attention < used_primary + minimum_free_primary_blocks:
+            self.elastic_external_memory_bytes = previous
+            return self._reject_elastic_capacity(
+                "external_attention_headroom",
+                KVCacheBlockPoolRequirements(primary=minimum_free_primary_blocks),
+                desired_gdn_blocks=pool.active_num_gpu_blocks,
+                desired_attention_blocks=desired_attention,
+            )
+
+        current_attention = self.block_pool.active_num_gpu_blocks
+        if desired_attention < current_attention:
+            if not self.block_pool.deactivate_tail_blocks(desired_attention):
+                pinned_tail = tuple(
+                    (block.block_id, block.ref_cnt)
+                    for block in self.block_pool.blocks[
+                        desired_attention:current_attention
+                    ]
+                    if block.ref_cnt != 0
+                )
+                self.elastic_external_memory_bytes = previous
+                return self._reject_elastic_capacity(
+                    "external_attention_tail_pinned",
+                    KVCacheBlockPoolRequirements(),
+                    desired_gdn_blocks=pool.active_num_gpu_blocks,
+                    desired_attention_blocks=desired_attention,
+                    pinned_attention_tail=pinned_tail,
+                )
+        elif desired_attention > current_attention:
+            self.block_pool.activate_tail_blocks(desired_attention)
+
+        if desired_attention != current_attention:
+            self._record_elastic_transition()
+        self.last_elastic_rejection = None
+        return True
+
+    def normalize_elastic_external_memory(self, requested_bytes: int) -> int:
+        """Return the physical mapping-quantum representation of a loan."""
+        if requested_bytes < 0:
+            raise ValueError("elastic external memory cannot be negative")
+        quantum = self.kv_cache_config.elastic_mapping_quantum
+        if not quantum:
+            return requested_bytes
+        return cdiv(requested_bytes, quantum) * quantum
+
+    def max_elastic_external_memory(
+        self,
+        minimum_free_primary_blocks: int = 0,
+        minimum_attention_blocks: int = 0,
+        gdn_blocks: int | None = None,
+    ) -> int:
+        """Return the largest step-scoped loan the current KV tail can fund."""
+        config = self.kv_cache_config
+        pool = self.mamba_block_pool
+        quantum = config.elastic_mapping_quantum
+        if not quantum or pool is None:
+            return 0
+        if minimum_free_primary_blocks < 0:
+            raise ValueError("elastic primary headroom cannot be negative")
+        if minimum_attention_blocks < 0:
+            raise ValueError("elastic minimum attention capacity cannot be negative")
+        if gdn_blocks is None:
+            gdn_blocks = pool.active_num_gpu_blocks
+        if not 0 <= gdn_blocks <= pool.num_gpu_blocks:
+            raise ValueError("elastic GDN capacity is outside the virtual pool")
+
+        current_attention = self.block_pool.active_num_gpu_blocks
+        used_primary = current_attention - self.block_pool.get_num_free_blocks()
+        minimum_attention = max(
+            used_primary + minimum_free_primary_blocks,
+            minimum_attention_blocks,
+            1,
+        )
+        for block in self.block_pool.blocks[:current_attention]:
+            if block.ref_cnt:
+                minimum_attention = max(minimum_attention, block.block_id + 1)
+        # This is a prospective query: the next admitted request can require
+        # more primary blocks than are mapped under the current external loan.
+        # Pricing only the currently active prefix overstates the loan that can
+        # coexist with that request and moves the rejection past KV allocation.
+        if minimum_attention > self.block_pool.num_gpu_blocks:
+            return 0
+
+        rank_budgets = config.elastic_rank_budget_bytes
+        rank_primary = config.elastic_rank_primary_mapped_bytes
+        rank_gdn = config.elastic_rank_gdn_mapped_bytes
+        if rank_budgets and rank_primary and rank_gdn:
+            available = min(
+                budget
+                - primary[min(minimum_attention, len(primary) - 1)]
+                - gdn[min(gdn_blocks, len(gdn) - 1)]
+                for budget, primary, gdn in zip(
+                    rank_budgets, rank_primary, rank_gdn, strict=True
+                )
+            )
+        else:
+            assert self._physical_pool_planner is not None
+            available = (
+                self._physical_pool_planner.budget_bytes
+                - self._physical_pool_planner.primary_mapped_bytes(minimum_attention)
+                - self._physical_pool_planner.secondary_mapped_bytes(gdn_blocks)
+            )
+        return max(available // quantum * quantum, 0)
+
+    def elastic_gdn_blocks_after_allocation(
+        self,
+        required_blocks: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...] = (),
+    ) -> int:
+        """Return post-allocation GDN residency with unused lookahead removed."""
+        pool = self.mamba_block_pool
+        if pool is None:
+            return 0
+        if required_blocks < 0:
+            raise ValueError("elastic GDN allocation cannot be negative")
+        current_free_blocks = pool.get_num_free_blocks()
+        missing_blocks = max(required_blocks - current_free_blocks, 0)
+        future_active_blocks = min(
+            pool.active_num_gpu_blocks + missing_blocks,
+            pool.num_gpu_blocks,
+        )
+        highest_used = max(
+            (block.block_id for block in pool.blocks if block.ref_cnt),
+            default=0,
+        )
+        prospective_blocks = pool.free_block_queue.peek_left_n(
+            min(required_blocks, current_free_blocks)
+        )
+        highest_prospective = max(
+            (block.block_id for block in prospective_blocks),
+            default=0,
+        )
+        highest_cached = 0
+        for blocks in new_computed_blocks:
+            for block in blocks:
+                block_id = block.block_id
+                if (
+                    0 <= block_id < pool.num_gpu_blocks
+                    and block is pool.blocks[block_id]
+                ):
+                    highest_cached = max(highest_cached, block_id)
+        return max(
+            self.kv_cache_config.elastic_gdn_initial_blocks,
+            future_active_blocks,
+            highest_used + 1,
+            highest_prospective + 1,
+            highest_cached + 1,
+        )
+
+    def _record_elastic_transition(self) -> None:
+        assert self.mamba_block_pool is not None
+        self._elastic_transition = (
+            self.block_pool.active_num_gpu_blocks,
+            self.mamba_block_pool.active_num_gpu_blocks,
+        )
+
+    def _reject_elastic_capacity(
+        self,
+        reason: str,
+        requirements: "KVCacheBlockPoolRequirements",
+        *,
+        desired_gdn_blocks: int,
+        desired_attention_blocks: int | None = None,
+        pinned_attention_tail: tuple[tuple[int, int], ...] = (),
+    ) -> bool:
+        assert self.mamba_block_pool is not None
+        rejection: dict[str, object] = {
+            "reason": reason,
+            "requirements": requirements,
+            "attention_active": self.block_pool.active_num_gpu_blocks,
+            "attention_free": self.block_pool.get_num_free_blocks(),
+            "gdn_active": self.mamba_block_pool.active_num_gpu_blocks,
+            "gdn_free": self.mamba_block_pool.get_num_free_blocks(),
+            "desired_gdn": desired_gdn_blocks,
+            "desired_attention": desired_attention_blocks,
+            "pinned_attention_tail": pinned_attention_tail,
+        }
+        if rejection != self.last_elastic_rejection:
+            logger.warning("Elastic KV admission rejected: %s", rejection)
+        self.last_elastic_rejection = rejection
+        return False
+
+    def ensure_elastic_capacity(
+        self, requirements: "KVCacheBlockPoolRequirements"
+    ) -> bool:
+        """Prepare enough mapped logical capacity before block allocation."""
+        config = self.kv_cache_config
+        pool = self.mamba_block_pool
+        if not config.elastic_mapping_quantum or pool is None:
+            return True
+        missing = max(requirements.mamba - pool.get_num_free_blocks(), 0)
+        if missing == 0:
+            self.last_elastic_rejection = None
+            return True
+        new_gdn_blocks = pool.active_num_gpu_blocks + missing
+        if new_gdn_blocks > pool.num_gpu_blocks:
+            return self._reject_elastic_capacity(
+                "virtual_gdn_limit",
+                requirements,
+                desired_gdn_blocks=new_gdn_blocks,
+            )
+        new_attention_blocks = self._elastic_attention_capacity(new_gdn_blocks)
+        if new_attention_blocks < 1:
+            return self._reject_elastic_capacity(
+                "physical_budget",
+                requirements,
+                desired_gdn_blocks=new_gdn_blocks,
+                desired_attention_blocks=new_attention_blocks,
+            )
+        if not self.block_pool.deactivate_tail_blocks(new_attention_blocks):
+            pinned_tail = tuple(
+                (block.block_id, block.ref_cnt)
+                for block in self.block_pool.blocks[
+                    new_attention_blocks : self.block_pool.active_num_gpu_blocks
+                ]
+                if block.ref_cnt != 0
+            )
+            return self._reject_elastic_capacity(
+                "attention_tail_pinned",
+                requirements,
+                desired_gdn_blocks=new_gdn_blocks,
+                desired_attention_blocks=new_attention_blocks,
+                pinned_attention_tail=pinned_tail,
+            )
+        pool.activate_tail_blocks(new_gdn_blocks)
+        self._record_elastic_transition()
+        self.last_elastic_rejection = None
+        return True
+
+    def plan_elastic_admission_wave(
+        self,
+        primary_blocks_per_request: Sequence[int],
+        *,
+        external_memory_bytes: int | None = None,
+    ) -> ElasticAdmissionPlan | None:
+        """Compute MaxX for the next admission wave without mutating pools.
+
+        Incremental GDN growth can otherwise let early requests take logical
+        attention IDs from a tail that a later request needs to deactivate.
+        """
+        pool = self.mamba_block_pool
+        blocks_per_request = self.kv_cache_config.elastic_gdn_blocks_per_request
+        if (
+            not primary_blocks_per_request
+            or not self.kv_cache_config.elastic_mapping_quantum
+            or pool is None
+            or blocks_per_request <= 0
+        ):
+            return None
+        if any(blocks < 0 for blocks in primary_blocks_per_request):
+            raise ValueError("primary admission requirements cannot be negative")
+        if external_memory_bytes is None:
+            external_memory_bytes = self.elastic_external_memory_bytes
+        if external_memory_bytes < 0:
+            raise ValueError("external admission requirement cannot be negative")
+
+        max_virtual_requests = (pool.num_gpu_blocks - 1) // blocks_per_request
+        candidates = min(len(primary_blocks_per_request), max_virtual_requests)
+        # active - free includes the null block and every referenced primary
+        # block. Cached tail blocks have ref_cnt=0 and may be evicted.
+        used_primary = (
+            self.block_pool.active_num_gpu_blocks
+            - self.block_pool.get_num_free_blocks()
+        )
+        for num_requests in range(candidates, 0, -1):
+            required_primary = sum(primary_blocks_per_request[:num_requests])
+            required_free_gdn = num_requests * blocks_per_request
+            missing_gdn = max(required_free_gdn - pool.get_num_free_blocks(), 0)
+            desired_gdn = pool.active_num_gpu_blocks + missing_gdn
+            if desired_gdn > pool.num_gpu_blocks:
+                continue
+
+            desired_attention = (
+                self.block_pool.active_num_gpu_blocks
+                if missing_gdn == 0 and not external_memory_bytes
+                else self._elastic_attention_capacity(
+                    desired_gdn, external_memory_bytes
+                )
+            )
+            # Preserve every candidate's conservative full-sequence primary
+            # requirement in addition to null/currently referenced blocks.
+            if desired_attention < used_primary + required_primary:
+                continue
+            if desired_attention < self.block_pool.active_num_gpu_blocks and any(
+                block.ref_cnt != 0
+                for block in self.block_pool.blocks[
+                    desired_attention : self.block_pool.active_num_gpu_blocks
+                ]
+            ):
+                continue
+
+            return ElasticAdmissionPlan(
+                max_requests=num_requests,
+                requirements=KVCacheBlockPoolRequirements(
+                    primary=required_primary,
+                    mamba=required_free_gdn,
+                ),
+            )
+        return None
+
+    def apply_elastic_admission_wave(
+        self,
+        primary_blocks_per_request: Sequence[int],
+        *,
+        external_memory_bytes: int | None = None,
+    ) -> int:
+        """Compute and apply the feasible MaxX layout before allocation."""
+        explicit_external = external_memory_bytes is not None
+        plan = self.plan_elastic_admission_wave(
+            primary_blocks_per_request,
+            external_memory_bytes=external_memory_bytes,
+        )
+        if plan is None:
+            return 0
+        previous_external = self.elastic_external_memory_bytes
+        if explicit_external:
+            assert external_memory_bytes is not None
+            if not self.set_elastic_external_memory(
+                external_memory_bytes,
+                minimum_free_primary_blocks=plan.requirements.primary,
+            ):
+                return 0
+        if not self.ensure_elastic_capacity(plan.requirements):
+            if explicit_external:
+                self.rebalance_elastic_capacity()
+                if not self.set_elastic_external_memory(previous_external):
+                    raise RuntimeError(
+                        "elastic admission failure could not restore external memory"
+                    )
+            return 0
+        return plan.max_requests
+
+    def rebalance_elastic_capacity(self) -> None:
+        """Return unused GDN tail mappings to the attention arena."""
+        config = self.kv_cache_config
+        pool = self.mamba_block_pool
+        if not config.elastic_mapping_quantum or pool is None:
+            return
+        highest_used = max(
+            (block.block_id for block in pool.blocks if block.ref_cnt > 0),
+            default=0,
+        )
+        desired_gdn = max(config.elastic_gdn_initial_blocks, highest_used + 1)
+        changed = desired_gdn != pool.active_num_gpu_blocks
+        if desired_gdn < pool.active_num_gpu_blocks:
+            assert pool.deactivate_tail_blocks(desired_gdn)
+        desired_attention = self._elastic_attention_capacity(desired_gdn)
+        if desired_attention > self.block_pool.active_num_gpu_blocks:
+            self.block_pool.activate_tail_blocks(desired_attention)
+            changed = True
+        if changed:
+            self._record_elastic_transition()
+
+    def take_elastic_transition(self) -> tuple[int, int] | None:
+        transition = self._elastic_transition
+        self._elastic_transition = None
+        if transition == self._last_emitted_elastic_transition:
+            return None
+        if transition is not None:
+            self._last_emitted_elastic_transition = transition
+        return transition
+
+    def register_gdn_checkpoint(self, key: bytes) -> None:
+        if self.gdn_checkpoint_keys is None:
+            return
+        block_hash = BlockHash(key)
+        self.gdn_checkpoint_keys[block_hash] = None
+        self.gdn_checkpoint_keys.move_to_end(block_hash)
+        while len(self.gdn_checkpoint_keys) > self.gdn_checkpoint_limit:
+            self.gdn_checkpoint_keys.popitem(last=False)
+
+    def sync_gdn_checkpoints(self, keys: tuple[bytes, ...]) -> None:
+        """Replace scheduler membership with the authoritative worker LRU."""
+        if self.gdn_checkpoint_keys is None:
+            return
+        if len(keys) > self.gdn_checkpoint_limit or len(set(keys)) != len(keys):
+            raise RuntimeError("Invalid worker GDN checkpoint snapshot")
+        self.gdn_checkpoint_keys = OrderedDict((BlockHash(key), None) for key in keys)
+
+    def has_gdn_checkpoint(self, key: BlockHash, *, touch: bool = True) -> bool:
+        if self.gdn_checkpoint_keys is None or key not in self.gdn_checkpoint_keys:
+            return False
+        if touch:
+            self.gdn_checkpoint_keys.move_to_end(key)
+        return True
+
+    def find_gdn_checkpoint_boundary(
+        self,
+        block_hashes: list[BlockHash],
+        max_length: int,
+        spec: MambaSpec,
+    ) -> int:
+        """Return the newest exact recurrent checkpoint boundary in tokens."""
+        checkpoint_block_size = (
+            self.hash_block_size
+            if getattr(self, "enable_dcp_fine_prefix", False)
+            else spec.block_size * self.dcp_world_size * self.pcp_world_size
+        )
+        spec_hashes = BlockHashListWithBlockSize(
+            block_hashes,
+            self.hash_block_size,
+            checkpoint_block_size,
+        )
+        num_blocks = min(max_length // checkpoint_block_size, len(spec_hashes))
+        while num_blocks > 0 and not self.has_gdn_checkpoint(
+            spec_hashes[num_blocks - 1], touch=False
+        ):
+            num_blocks -= 1
+        # Lookup can run for a waiting request that is not admitted in this
+        # scheduler step. Touching the scheduler-side LRU here would then have
+        # no matching restore in the workers and can make their eviction order
+        # diverge. The scheduler touches the key only when it emits the actual
+        # restore command.
+        return num_blocks * checkpoint_block_size
 
     def get_num_blocks_to_allocate(
         self,
@@ -196,12 +929,36 @@ class KVCacheCoordinator(ABC):
         Returns:
             The number of blocks to allocate.
         """
-        num_blocks_to_allocate = 0
+        requirements = self.get_block_pool_requirements(
+            request_id=request_id,
+            num_tokens=num_tokens,
+            new_computed_blocks=new_computed_blocks,
+            num_encoder_tokens=num_encoder_tokens,
+            total_computed_tokens=total_computed_tokens,
+            num_local_computed_tokens=num_local_computed_tokens,
+            num_tokens_main_model=num_tokens_main_model,
+            apply_admission_cap=apply_admission_cap,
+        )
+        return requirements.total
+
+    def get_block_pool_requirements(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> "KVCacheBlockPoolRequirements":
+        primary_blocks = 0
+        mamba_blocks = 0
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                manager_blocks = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_encoder_tokens,
                     [],
@@ -211,7 +968,7 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                manager_blocks = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_tokens,
                     new_computed_blocks[i],
@@ -220,7 +977,31 @@ class KVCacheCoordinator(ABC):
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
                 )
-        return num_blocks_to_allocate
+            if manager.block_pool is self.mamba_block_pool:
+                mamba_blocks += manager_blocks
+            else:
+                primary_blocks += manager_blocks
+        return KVCacheBlockPoolRequirements(primary_blocks, mamba_blocks)
+
+    def can_allocate(
+        self,
+        requirements: "KVCacheBlockPoolRequirements",
+        reserved: "KVCacheBlockPoolRequirements | None" = None,
+        primary_watermark_blocks: int = 0,
+    ) -> bool:
+        reserved = reserved or KVCacheBlockPoolRequirements()
+        if (
+            requirements.primary + reserved.primary + primary_watermark_blocks
+            > self.block_pool.get_num_free_blocks()
+        ):
+            return False
+        mamba_required = requirements.mamba + reserved.mamba
+        if mamba_required == 0:
+            return True
+        return (
+            self.mamba_block_pool is not None
+            and mamba_required <= self.mamba_block_pool.get_num_free_blocks()
+        )
 
     def allocate_new_computed_blocks(
         self,
@@ -599,6 +1380,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # can be a multiple of hash_block_size.
         self.hash_block_size = hash_block_size
         self.dcp_world_size = dcp_world_size
+        self.pcp_world_size = pcp_world_size
         group_block_sizes = [
             manager.block_size
             for manager, group in zip(
@@ -639,7 +1421,33 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             )
             for g in kv_cache_config.kv_cache_groups
         )
-        self.enable_partial_hash_hits = has_partial_mamba_group
+        self.enable_dcp_fine_prefix = (
+            os.environ.get("AG2_VLLM_DCP_FINE_PREFIX", "0") == "1"
+        )
+        if self.enable_dcp_fine_prefix:
+            if dcp_world_size <= 1:
+                raise ValueError("AG2_VLLM_DCP_FINE_PREFIX requires DCP world size > 1")
+            if self.gdn_checkpoint_keys is None:
+                raise ValueError(
+                    "AG2_VLLM_DCP_FINE_PREFIX requires a separate GDN pool"
+                )
+            if hash_block_size % dcp_world_size != 0:
+                raise ValueError(
+                    "DCP fine-prefix match unit must be divisible by DCP world size"
+                )
+            if not all(
+                isinstance(g.kv_cache_spec, (FullAttentionSpec, MambaSpec))
+                for g in kv_cache_config.kv_cache_groups
+            ):
+                raise ValueError(
+                    "DCP fine-prefix only supports full-attention + Mamba groups"
+                )
+        # Partial hash hits are limited to full-attention + mamba ("align")
+        # without context parallelism. The research-only separate-GDN path
+        # pairs each partial attention boundary with an exact host checkpoint.
+        self.enable_partial_hash_hits = (
+            dcp_world_size == 1 or self.enable_dcp_fine_prefix
+        ) and has_partial_mamba_group
         if self.enable_partial_hash_hits:
             unsupported_partial_hit_managers = {
                 type(manager).__name__
@@ -848,21 +1656,35 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     _max_length = min(
                         curr_hit_length + eagle_margin, max_cache_hit_length
                     )
-                hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(
-                    block_hashes=block_hashes,
-                    max_length=_max_length,
-                    kv_cache_group_ids=group_ids,
-                    block_pool=self.block_pool,
-                    kv_cache_spec=spec,
-                    drop_eagle_block=drop_eagle_block,
-                    alignment_tokens=self._cache_hit_alignment_tokens,
-                    dcp_world_size=self.single_type_managers[
-                        first_group_id
-                    ].dcp_world_size,
-                    pcp_world_size=self.single_type_managers[
-                        first_group_id
-                    ].pcp_world_size,
-                )
+                if isinstance(spec, MambaSpec) and spec.separate_pool:
+                    # The exact recurrent bytes live in the worker host LRU,
+                    # not in a GPU KV block. Search exact DCP/PCP-aligned
+                    # boundaries newest-first and represent a verified hit with
+                    # positional nulls. Allocation later creates one live slot.
+                    checkpoint_block_size = (
+                        self.hash_block_size
+                        if self.enable_dcp_fine_prefix
+                        else spec.block_size * self.dcp_world_size * self.pcp_world_size
+                    )
+                    _new_hit_length = self.find_gdn_checkpoint_boundary(
+                        block_hashes, _max_length, spec
+                    )
+                    num_blocks = _new_hit_length // checkpoint_block_size
+                    hit_blocks = tuple(
+                        [self.block_pool.null_block] * num_blocks for _ in group_ids
+                    )
+                else:
+                    hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(
+                        block_hashes=block_hashes,
+                        max_length=_max_length,
+                        kv_cache_group_ids=group_ids,
+                        block_pool=self.block_pool,
+                        kv_cache_spec=spec,
+                        drop_eagle_block=drop_eagle_block,
+                        alignment_tokens=self._cache_hit_alignment_tokens,
+                        dcp_world_size=self.dcp_world_size,
+                        pcp_world_size=self.pcp_world_size,
+                    )
                 if drop_eagle_block:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
@@ -918,7 +1740,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         hit_lengths: list[int] = [0] * num_groups
 
         for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
-            manager = self.single_type_managers[group_ids[0]]
             blocks, group_hit = manager_cls.find_longest_cache_hit(
                 block_hashes=block_hashes,
                 max_length=max_cache_hit_length,
@@ -927,8 +1748,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 kv_cache_spec=spec,
                 drop_eagle_block=use_eagle,
                 alignment_tokens=self._cache_hit_alignment_tokens,
-                dcp_world_size=manager.dcp_world_size,
-                pcp_world_size=manager.pcp_world_size,
+                dcp_world_size=self.dcp_world_size,
+                pcp_world_size=self.pcp_world_size,
             )
             for gid, blks in zip(group_ids, blocks):
                 hit_blocks[gid] = blks

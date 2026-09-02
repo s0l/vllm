@@ -295,6 +295,28 @@ def test_getitem_in_stitching_graph(x: torch.Tensor) -> None:
     )
 
 
+@pytest.mark.skipif(
+    not is_torch_equal_or_newer("2.12.0.dev"),
+    reason="split_module tuple_return requires PyTorch >= 2.12",
+)
+def test_dynamic_slice_getitem_in_split_subgraph(x: torch.Tensor) -> None:
+    """A tensor-returning splitting op may be followed by a dynamic slice."""
+
+    def model_fn(x: torch.Tensor) -> torch.Tensor:
+        output = x.relu()
+        return output[: x.shape[0]]
+
+    split_gm = _trace_and_split(model_fn, (x,), ["aten::relu.default"])
+    code, submod_names, consts = generate_execution_code(split_gm)
+    submod_callables = {
+        name: getattr(split_gm, name)
+        for name in submod_names
+        if not isinstance(getattr(split_gm, name), fx.GraphModule)
+    }
+    fn = compile_execution_fn(code, submod_callables, submod_names, consts)
+    assert torch.equal(fn(x), model_fn(x))
+
+
 def test_del_emitted_for_intermediate_values(x: torch.Tensor) -> None:
     """The codegen schedules ``del`` after a value's last use to free
     memory early. Multi-submod splits naturally have intermediates whose

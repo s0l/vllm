@@ -69,6 +69,11 @@ from vllm.utils.torch_utils import (
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
+from vllm.v1.executor.worker_failure import (
+    WorkerFailure,
+    WorkerFailureCode,
+    WorkerRemoteError,
+)
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
@@ -434,10 +439,15 @@ class MultiprocExecutor(Executor):
                 except TimeoutError as e:
                     raise TimeoutError(f"RPC call to {method} timed out.") from e
                 if status != WorkerProc.ResponseStatus.SUCCESS:
-                    raise RuntimeError(
-                        f"Worker failed with error '{result}', please check the"
-                        " stack trace above for the root cause"
-                    )
+                    if not isinstance(result, WorkerFailure):
+                        # Compatibility with an older worker process epoch.
+                        # It remains an unclassified fatal failure.
+                        result = WorkerFailure(
+                            code=WorkerFailureCode.GENERIC,
+                            remote_type="legacy.worker.Exception",
+                            message=str(result),
+                        )
+                    raise WorkerRemoteError(result)
                 responses.append(result)
             return responses[0] if output_rank is not None else responses
 
@@ -992,7 +1002,10 @@ class WorkerProc:
                 output = e
 
         if isinstance(output, Exception):
-            result = (WorkerProc.ResponseStatus.FAILURE, str(output))
+            result = (
+                WorkerProc.ResponseStatus.FAILURE,
+                WorkerFailure.from_exception(output),
+            )
         else:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
         if (response_mq := self.worker_response_mq) is not None:
@@ -1038,23 +1051,57 @@ class WorkerProc:
     ) -> None:
         """Execute one RPC in a separate frame from the dequeue loop."""
         method, args, kwargs, output_rank = rpc_request
+        memory_snapshot_dir = os.environ.get("AG2_VLLM_MEMORY_SNAPSHOT_DIR", "")
         try:
+            if (
+                memory_snapshot_dir
+                and method == "execute_model"
+                and not getattr(self, "_ag2_memory_history_started", False)
+            ):
+                torch.cuda.memory._record_memory_history(
+                    enabled="all",
+                    context="all",
+                    stacks="all",
+                    max_entries=20_000,
+                    clear_history=True,
+                )
+                self._ag2_memory_history_started = True
+                logger.warning(
+                    "Bounded CUDA allocator history armed for rank %d; "
+                    "snapshots will be written under %s on first OOM.",
+                    self.rank,
+                    memory_snapshot_dir,
+                )
             if isinstance(method, str):
                 func = getattr(self.worker, method)
             elif isinstance(method, bytes):
                 func = partial(cloudpickle.loads(method), self.worker)
 
             output = func(*args, **kwargs)
-
             if output_rank is None or self.rank == output_rank:
                 self.handle_output(output)
         except Exception as e:
-            # Notes have been introduced in python 3.11
+            if (
+                isinstance(e, torch.OutOfMemoryError)
+                and getattr(self, "_ag2_memory_history_started", False)
+                and not getattr(self, "_ag2_memory_snapshot_dumped", False)
+            ):
+                try:
+                    os.makedirs(memory_snapshot_dir, exist_ok=True)
+                    snapshot_path = os.path.join(
+                        memory_snapshot_dir,
+                        f"cuda-oom-rank{self.rank}-{time.time_ns()}.pickle",
+                    )
+                    torch.cuda.memory._dump_snapshot(snapshot_path)
+                    self._ag2_memory_snapshot_dumped = True
+                    logger.error(
+                        "CUDA allocator OOM snapshot written: %s", snapshot_path
+                    )
+                except Exception:
+                    logger.exception("Failed to write CUDA allocator snapshot")
             if hasattr(e, "add_note"):
                 e.add_note(traceback.format_exc())
             logger.exception("WorkerProc hit an exception.")
-            # enqueue_output converts the exception to a FAILURE response
-            # containing its string representation before transport.
             if output_rank is None or self.rank == output_rank:
                 self.handle_output(e)
 

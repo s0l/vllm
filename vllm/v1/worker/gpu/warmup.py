@@ -12,6 +12,7 @@ from vllm import PoolingParams, SamplingParams
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.kv_cache_capacity import PhysicalPoolCapacityPlanner
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -84,6 +85,66 @@ def _warmup_block_counter(
     return block_count
 
 
+def _make_warmup_block_allocator(
+    kv_cache_specs: list[Any],
+) -> tuple[Callable[[int, Any], list[int]], dict[str, int]]:
+    """Allocate synthetic block IDs in the same physical-pool namespaces."""
+    next_block_ids = {"primary": 1, "mamba": 1}
+
+    def alloc(num_blocks: int, spec: Any) -> list[int]:
+        pool = (
+            "mamba" if isinstance(spec, MambaSpec) and spec.separate_pool else "primary"
+        )
+        start = next_block_ids[pool]
+        next_block_ids[pool] += num_blocks
+        return list(range(start, next_block_ids[pool]))
+
+    return alloc, next_block_ids
+
+
+def _set_elastic_warmup_transition(
+    scheduler_output: SchedulerOutput,
+    model_runner: GPUModelRunner,
+    next_block_ids: dict[str, int],
+    *,
+    restore_initial: bool = False,
+) -> None:
+    """Map enough elastic capacity for a scheduler-bypassing warmup batch."""
+    scheduler_output.is_synthetic_warmup = True
+    config = model_runner.kv_cache_config
+    if not config.elastic_mapping_quantum:
+        return
+
+    primary_block_sizes = tuple(
+        tensor.logical_block_size
+        for tensor in config.kv_cache_tensors
+        if tensor.backing_id.startswith("elastic-attention-")
+    )
+    planner = PhysicalPoolCapacityPlanner(
+        primary_block_sizes=primary_block_sizes,
+        secondary_block_stride=config.elastic_gdn_stride,
+        mapping_quantum=config.elastic_mapping_quantum,
+        budget_bytes=config.elastic_budget_bytes,
+    )
+    gdn_blocks = (
+        config.elastic_gdn_initial_blocks
+        if restore_initial
+        else next_block_ids["mamba"]
+    )
+    attention_blocks = planner.max_primary_blocks(
+        gdn_blocks,
+        upper_bound=config.num_blocks,
+    )
+    required_attention_blocks = 1 if restore_initial else next_block_ids["primary"]
+    if attention_blocks < required_attention_blocks:
+        raise RuntimeError(
+            "Synthetic warmup batch exceeds elastic KV capacity: "
+            f"requires attention={required_attention_blocks}, gdn={gdn_blocks}; "
+            f"available attention={attention_blocks}"
+        )
+    scheduler_output.elastic_kv_transition = (attention_blocks, gdn_blocks)
+
+
 def run_mixed_prefill_decode_warmup(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
@@ -131,13 +192,8 @@ def run_mixed_prefill_decode_warmup(
         )
         return False
 
-    next_block_id = 1
-
-    def _alloc_blocks(num_blocks: int) -> list[int]:
-        nonlocal next_block_id
-        block_ids = list(range(next_block_id, next_block_id + num_blocks))
-        next_block_id += num_blocks
-        return block_ids
+    kv_cache_specs = [g.kv_cache_spec for g in kv_cache_groups]
+    alloc_blocks, next_block_ids = _make_warmup_block_allocator(kv_cache_specs)
 
     sampling_params = SamplingParams(max_tokens=2, temperature=0.0)
 
@@ -149,7 +205,10 @@ def run_mixed_prefill_decode_warmup(
             mm_features=[],
             sampling_params=sampling_params,
             pooling_params=None,
-            block_ids=tuple(_alloc_blocks(n) for n in decode_prefill_block_counts),
+            block_ids=tuple(
+                alloc_blocks(n, spec)
+                for n, spec in zip(decode_prefill_block_counts, kv_cache_specs)
+            ),
             num_computed_tokens=0,
             lora_request=None,
             prefill_token_ids=decode_token_ids,
@@ -160,8 +219,11 @@ def run_mixed_prefill_decode_warmup(
     }
     decode_prefill_output.total_num_scheduled_tokens = decode_prompt_len
     decode_prefill_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+    _set_elastic_warmup_transition(decode_prefill_output, model_runner, next_block_ids)
 
-    decode_new_blocks = tuple(_alloc_blocks(n) for n in decode_block_deltas)
+    decode_new_blocks = tuple(
+        alloc_blocks(n, spec) for n, spec in zip(decode_block_deltas, kv_cache_specs)
+    )
     cached_decode_req = CachedRequestData.make_empty()
     cached_decode_req.req_ids = [decode_req_id]
     cached_decode_req.num_computed_tokens = [decode_prompt_len]
@@ -179,7 +241,10 @@ def run_mixed_prefill_decode_warmup(
             mm_features=[],
             sampling_params=sampling_params,
             pooling_params=None,
-            block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
+            block_ids=tuple(
+                alloc_blocks(n, spec)
+                for n, spec in zip(prefill_block_counts, kv_cache_specs)
+            ),
             num_computed_tokens=0,
             lora_request=None,
             prefill_token_ids=prefill_token_ids,
@@ -191,9 +256,13 @@ def run_mixed_prefill_decode_warmup(
     }
     mixed_output.total_num_scheduled_tokens = num_tokens
     mixed_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+    _set_elastic_warmup_transition(mixed_output, model_runner, next_block_ids)
 
     cleanup_output = SchedulerOutput.make_empty()
     cleanup_output.finished_req_ids = {decode_req_id, prefill_req_id}
+    _set_elastic_warmup_transition(
+        cleanup_output, model_runner, next_block_ids, restore_initial=True
+    )
 
     context = mixed_step_context or nullcontext()
     model_runner.kv_connector.set_disabled(True)
@@ -291,12 +360,8 @@ def warmup_kernels(
         sampling_params = SamplingParams.for_sampler_warmup()
         pooling_params = None
 
-    # Assign distinct block IDs per request per group. 0 null block, start from 1.
-    next_block_id = 1
-
-    def _alloc_blocks(num_blocks: int) -> list[int]:
-        nonlocal next_block_id
-        return list(range(next_block_id, next_block_id := next_block_id + num_blocks))
+    # Assign distinct block IDs per physical pool. Block 0 is the null block.
+    alloc_blocks, next_block_ids = _make_warmup_block_allocator(kv_cache_specs)
 
     # The KV-block zeroing kernel is driven by the scheduler's
     # new_block_ids_to_zero, so none of the steps below reach it.
@@ -313,7 +378,10 @@ def warmup_kernels(
                 pooling_params,
                 mm_features=warmup_mm_features,
             ),
-            block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
+            block_ids=tuple(
+                alloc_blocks(n, spec)
+                for n, spec in zip(prefill_block_counts, kv_cache_specs)
+            ),
             prefill_token_ids=prompt_token_ids,
         )
         for i in range(num_reqs)
@@ -324,6 +392,7 @@ def warmup_kernels(
     prefill_output.num_scheduled_tokens = {rid: prompt_len for rid in req_ids}
     prefill_output.total_num_scheduled_tokens = prompt_len * num_reqs
     prefill_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+    _set_elastic_warmup_transition(prefill_output, model_runner, next_block_ids)
 
     # Disable KV connector for warmup run.
     model_runner.kv_connector.set_disabled(True)
@@ -369,7 +438,11 @@ def warmup_kernels(
                     for spec, held in zip(kv_cache_specs, req_blocks[i])
                 ]
                 cached_req_data.new_block_ids.append(
-                    tuple(_alloc_blocks(n) for n in deltas) if any(deltas) else None
+                    tuple(
+                        alloc_blocks(n, spec) for n, spec in zip(deltas, kv_cache_specs)
+                    )
+                    if any(deltas)
+                    else None
                 )
                 req_blocks[i] = [
                     held + delta for held, delta in zip(req_blocks[i], deltas)
@@ -386,6 +459,7 @@ def warmup_kernels(
                 step_num_scheduled_tokens.values()
             )
             decode_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+            _set_elastic_warmup_transition(decode_output, model_runner, next_block_ids)
 
             worker_execute_model(decode_output)
             worker_sample_tokens(None)
@@ -423,6 +497,9 @@ def warmup_kernels(
     # Clean up - process finish_req_ids.
     cleanup_output = SchedulerOutput.make_empty()
     cleanup_output.finished_req_ids = set(req_ids)
+    _set_elastic_warmup_transition(
+        cleanup_output, model_runner, next_block_ids, restore_initial=True
+    )
     worker_execute_model(cleanup_output)
     model_runner.kv_connector.set_disabled(False)
     torch.accelerator.synchronize()

@@ -649,53 +649,119 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
                 layer.impl._v_scale_cache = None
 
 
+@dataclass(frozen=True)
+class KVCacheBlockCopyRegion:
+    """One block-major byte region used by attention copy-on-write.
+
+    Elastic VMM allocations reserve a quantum-rounded virtual storage whose
+    trailing padding is not part of any logical KV block.  Keeping the logical
+    stride explicit prevents that padding from being distributed across blocks
+    when the raw storage is reshaped.
+    """
+
+    tensor: torch.Tensor
+    num_blocks: int
+    block_stride_bytes: int
+
+
 def copy_kv_cache_blocks_inplace(
-    kv_caches: Iterable[torch.Tensor],
+    kv_caches: Iterable[torch.Tensor | list[torch.Tensor] | KVCacheBlockCopyRegion],
     num_blocks: int,
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
 ) -> None:
     if not kv_cache_block_copies:
         return
 
+    storage_tensors: list[torch.Tensor] = []
+    copy_regions: list[KVCacheBlockCopyRegion] = []
+    for entry in kv_caches:
+        if isinstance(entry, KVCacheBlockCopyRegion):
+            copy_regions.append(entry)
+            continue
+        # Mamba layers hold a list of state tensors; attention layers a single
+        # tensor. Preserve each view here: upstream's copy path decides whether
+        # a view spans a complete block-major backing or only a strided slice.
+        tensors = entry if isinstance(entry, (list, tuple)) else (entry,)
+        storage_tensors.extend(tensors)
+
+    if not storage_tensors and not copy_regions:
+        return
+    first_tensor = copy_regions[0].tensor if copy_regions else storage_tensors[0]
+    device = first_tensor.device
     indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
-    indices: torch.Tensor | None = None
-    seen: set[tuple[torch.device, int]] = set()
+    indices = async_tensor_h2d(indices_np, device=device)
+    src_indices, dst_indices = indices.unbind(dim=1)
+
+    # A complete backing is copied at most once. Exact views that cover only a
+    # strided slice retain upstream's independent view semantics below.
     copied_storages: set[tuple[torch.device, int]] = set()
-    for cache in kv_caches:
+
+    for region in copy_regions:
+        tensor = region.tensor
+        if tensor.device != device:
+            raise ValueError("KV block-copy regions must share one device")
+        if region.num_blocks != num_blocks:
+            raise ValueError(
+                "KV block-copy region disagrees with worker block count: "
+                f"{region.num_blocks=} {num_blocks=}"
+            )
+        if region.block_stride_bytes <= 0:
+            raise ValueError("KV block-copy stride must be positive")
+        logical_bytes = region.num_blocks * region.block_stride_bytes
+        if tensor.untyped_storage().nbytes() < logical_bytes:
+            raise ValueError(
+                "KV block-copy region exceeds its backing storage: "
+                f"{logical_bytes=} storage_bytes="
+                f"{tensor.untyped_storage().nbytes()}"
+            )
+        storage = tensor.untyped_storage()
+        storage_key = (tensor.device, storage.data_ptr())
+        if storage_key in copied_storages:
+            continue
+        copied_storages.add(storage_key)
+        blocks = torch.empty(0, dtype=torch.uint8, device=device)
+        blocks.set_(
+            storage,
+            storage_offset=0,
+            size=(region.num_blocks, region.block_stride_bytes),
+            stride=(region.block_stride_bytes, 1),
+        )
+        blocks[dst_indices] = blocks[src_indices]
+
+    seen_views: set[tuple[torch.device, int]] = set()
+    for tensor in storage_tensors:
+        if tensor.device != device:
+            raise ValueError("KV block-copy tensors must share one device")
         # Layers sharing KV (cross-layer sharing) alias the same view; copy it
         # once. data_ptr distinguishes per-layer views of a shared allocation.
-        key = (cache.device, cache.data_ptr())
-        if key in seen:
+        view_key = (tensor.device, tensor.data_ptr())
+        if view_key in seen_views:
             continue
-        seen.add(key)
+        seen_views.add(view_key)
 
-        if indices is None:
-            indices = async_tensor_h2d(indices_np, device=cache.device)
-        assert cache.device == indices.device
-        src, dst = indices.unbind(dim=1)
-
-        kernel_blocks_per_block, remainder = divmod(cache.shape[0], num_blocks)
-        assert remainder == 0, (
-            f"{cache.shape[0]} kernel blocks not divisible by "
-            f"{num_blocks} scheduler blocks"
-        )
-        storage = cache.untyped_storage()
-        storage_key = (cache.device, storage.data_ptr())
+        kernel_blocks_per_block, remainder = divmod(tensor.shape[0], num_blocks)
+        if remainder:
+            raise ValueError(
+                f"{tensor.shape[0]} kernel blocks not divisible by "
+                f"{num_blocks} scheduler blocks"
+            )
+        storage = tensor.untyped_storage()
+        storage_key = (tensor.device, storage.data_ptr())
         scheduler_block_stride = (
-            cache.stride(0) * cache.element_size() * kernel_blocks_per_block
+            tensor.stride(0) * tensor.element_size() * kernel_blocks_per_block
         )
         if storage.nbytes() == num_blocks * scheduler_block_stride:
             if storage_key in copied_storages:
                 continue
             copied_storages.add(storage_key)
-            blocks = torch.empty(0, dtype=torch.uint8, device=cache.device)
+            blocks = torch.empty(0, dtype=torch.uint8, device=device)
             blocks.set_(storage)
             blocks = blocks.view(num_blocks, -1)
         else:
-            # Fold virtual block splitting into the shape so that dim 0 counts
-            # scheduler blocks; unflatten of dim 0 is always a view.
-            blocks = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))
-        blocks[dst] = blocks[src]
+            # Fold virtual block splitting into the shape so dim 0 counts
+            # scheduler blocks; unflatten of dim 0 remains a view.
+            blocks = tensor.unflatten(0, (num_blocks, kernel_blocks_per_block))
+        blocks[dst_indices] = blocks[src_indices]
 
 
 def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:
@@ -714,6 +780,64 @@ def get_uniform_decode_token_count(
     if not has_prefill and is_uniform_query_len(num_reqs, num_tokens, max_query_len):
         return max_query_len
     return None
+
+
+def get_kv_caches_for_block_copy(
+    runner_kv_caches: list[torch.Tensor | list[torch.Tensor]],
+    kv_caches_by_layer: dict[str, Any],
+    kv_cache_config: KVCacheConfig,
+) -> list[torch.Tensor | list[torch.Tensor] | KVCacheBlockCopyRegion]:
+    """Select backing storages addressed by attention block IDs.
+
+    In the normal shared-pool layout a CoW block copy deliberately covers the
+    complete packed backing, so preserve the existing runner list.  A
+    separate-pool Mamba/GDN layout has an independent block-ID namespace and
+    page geometry, however.  Applying an attention ``(src, dst)`` pair to that
+    backing can write an unrelated or unmapped VMM range.  In that case copy
+    only non-Mamba layer views; recurrent state is restored by its checkpoint
+    manager, not by attention CoW.
+    """
+    separate_mamba_layers = {
+        layer_name
+        for group in kv_cache_config.kv_cache_groups
+        if isinstance(group.kv_cache_spec, MambaSpec)
+        and group.kv_cache_spec.separate_pool
+        for layer_name in group.layer_names
+    }
+    if not separate_mamba_layers:
+        return runner_kv_caches
+
+    elastic_attention_regions: list[KVCacheBlockCopyRegion] = []
+    seen_backings: set[str] = set()
+    for tensor_config in kv_cache_config.kv_cache_tensors:
+        if (
+            not tensor_config.mapping_quantum
+            or not tensor_config.backing_id.startswith("elastic-attention-")
+            or tensor_config.backing_id in seen_backings
+        ):
+            continue
+        if tensor_config.num_blocks <= 0 or tensor_config.logical_block_size <= 0:
+            raise ValueError("elastic attention CoW requires explicit logical geometry")
+        layer_name = tensor_config.shared_by[0]
+        tensor = kv_caches_by_layer[layer_name]
+        if isinstance(tensor, (list, tuple)):
+            raise TypeError("elastic attention cache must be a single tensor view")
+        elastic_attention_regions.append(
+            KVCacheBlockCopyRegion(
+                tensor=tensor,
+                num_blocks=tensor_config.num_blocks,
+                block_stride_bytes=tensor_config.logical_block_size,
+            )
+        )
+        seen_backings.add(tensor_config.backing_id)
+    if elastic_attention_regions:
+        return elastic_attention_regions
+
+    return [
+        kv_cache
+        for layer_name, kv_cache in kv_caches_by_layer.items()
+        if layer_name not in separate_mamba_layers
+    ]
 
 
 def is_residual_scattered_for_sp(

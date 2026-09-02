@@ -59,6 +59,7 @@ def _make_profiling_runner(
 ) -> Any:
     runner: Any = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
     runner.compilation_config = SimpleNamespace(cudagraph_mode=cudagraph_mode)
+    runner.device = torch.device("cuda:0")
     runner.cudagraph_manager = _FakeCudaGraphManager(
         needs_capture, num_full_descs, piecewise_only
     )
@@ -107,6 +108,7 @@ def _patch_module(monkeypatch) -> None:
     monkeypatch.setattr(
         cgu, "_teardown_profiling_state", lambda r: r.events.append("teardown")
     )
+    monkeypatch.setattr(cgu, "_trim_device_graph_memory", lambda _device: None)
     # The profiler reads free GPU memory before/after to compute what it
     # retained; default to a constant (nothing retained).
     monkeypatch.setattr(cgu.torch.accelerator, "empty_cache", lambda: None)
@@ -198,6 +200,18 @@ def test_profile_cudagraph_memory_tears_down_on_capture_error(monkeypatch):
 
     # Teardown still runs even if capture raises.
     assert runner.events == ["init", "capture", "teardown"]
+
+
+def test_profile_cudagraph_memory_trims_after_throwaway_teardown(monkeypatch):
+    _patch_module(monkeypatch)
+    runner = _make_profiling_runner(CUDAGraphMode.FULL)
+    trimmed: list[torch.device] = []
+    monkeypatch.setattr(cgu, "_trim_device_graph_memory", trimmed.append)
+
+    cgu.profile_cudagraph_memory(runner)
+
+    assert trimmed == [runner.device]
+    assert _FakePlatform._global_graph_pool == GLOBAL_POOL
 
 
 def test_profile_cudagraph_memory_restores_compilation_counters(monkeypatch):
@@ -424,6 +438,8 @@ def test_teardown_profiling_state_clears_mamba_align_metadata(monkeypatch):
     )
     runner.cache_config = SimpleNamespace(num_gpu_blocks=1)
     runner.kv_caches = []
+    block_copy_owner = [object()]
+    runner.kv_caches_for_block_copy = block_copy_owner
     runner.attn_groups = []
     runner.kv_cache_config = SimpleNamespace()
     runner.cudagraph_manager = object()
@@ -438,3 +454,5 @@ def test_teardown_profiling_state_clears_mamba_align_metadata(monkeypatch):
     assert runner.model_state._mamba_ctx is None
     assert runner.model_state._mamba_group_ids == []
     assert runner.model_state._mamba_spec is None
+    assert block_copy_owner == []
+    assert not hasattr(runner, "kv_caches_for_block_copy")

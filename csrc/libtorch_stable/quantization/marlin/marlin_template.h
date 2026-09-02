@@ -69,7 +69,8 @@ __global__ void Marlin(
     int prob_n,           // output dimension n
     int prob_k,           // reduction dimension k
     int* locks,           // extra global storage for barrier synchronization
-    bool use_fp32_reduce  // whether to use fp32 global reduce
+    bool use_fp32_reduce,  // whether to use fp32 global reduce
+    bool whole_slice_schedule
 ) {}
 
 }  // namespace marlin
@@ -267,6 +268,7 @@ __global__ void Marlin(
     bool has_bias,
     bool use_atomic_add,   // whether to use atomic add to reduce
     bool use_fp32_reduce,  // whether to use fp32 global reduce
+    bool whole_slice_schedule,  // keep complete K slices on one block
     int max_shared_mem) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
@@ -385,11 +387,25 @@ __global__ void Marlin(
 
   if (global_mn_tiles > gridDim.x) {
     part2_mn_tiles = global_mn_tiles % gridDim.x;
-    if (part2_mn_tiles * 3 <= gridDim.x) part2_mn_tiles += gridDim.x;
+    if (whole_slice_schedule) {
+      // The normal flattened KxMN stripe balances arbitrary shapes by
+      // splitting some output slices across blocks.  That changes the
+      // floating-point reduction tree when unrelated M rows are packed.
+      // Prefill already exposes enough MN tiles to occupy the device, so give
+      // each block a complete K slice and allow excess blocks in the final
+      // round to remain idle.  Every caller that requires shape-invariant
+      // arithmetic must retain this complete-K route for every physical M;
+      // M-tile geometry is an independent performance choice.
+      if (part2_mn_tiles == 0) part2_mn_tiles = gridDim.x;
+    } else if (part2_mn_tiles * 3 <= gridDim.x) {
+      part2_mn_tiles += gridDim.x;
+    }
     part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / gridDim.x;
   }
 
-  int iters = div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
+  int iters = whole_slice_schedule
+                  ? k_tiles
+                  : div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
 
   if constexpr (!has_act_order && group_blocks != -1) {
     if (group_blocks >= thread_k_blocks) {

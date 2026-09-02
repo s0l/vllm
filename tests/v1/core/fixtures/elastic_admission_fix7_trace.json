@@ -1,0 +1,190 @@
+{
+  "schema": 2,
+  "provenance": {
+    "accepted_source_commit": "1e1b8cbf598385a6c7a17f709e6615f83d41d468",
+    "live_boundary_artifact": "evals/results/exp22-kv-fix7-serving-idle-epoch-v1-20260828/x39.json",
+    "role": "behavior-preserving Step 4 extraction oracle"
+  },
+  "equivalence": [
+    "transaction_id",
+    "plan_kind",
+    "physical_keys",
+    "hot_hits",
+    "cold_misses",
+    "victim_keys",
+    "kv_transition",
+    "capture_loan_bytes",
+    "reclaim_bytes",
+    "defer_reason",
+    "fifo_loans",
+    "final_entry_state",
+    "final_accounting"
+  ],
+  "generation": "kv6-fix7-trace",
+  "keys": {
+    "A": {
+      "owner": "target",
+      "mode": "PIECEWISE",
+      "token_bucket": 32,
+      "physical_x": 8
+    },
+    "B": {
+      "owner": "target",
+      "mode": "FULL",
+      "token_bucket": 1,
+      "physical_x": 1
+    }
+  },
+  "events": [
+    {
+      "op": "next_transaction",
+      "expected": "elastic-00000000000000000001"
+    },
+    {
+      "op": "publish_hot",
+      "key": "A",
+      "resident_bytes": 40,
+      "capture_peak_bytes": 60,
+      "reclaim_group": "physical_private_pool",
+      "pinned": false
+    },
+    {
+      "op": "reserve_loan",
+      "step_key": [0, 3, 8, 32, 0],
+      "grant_bytes": 64,
+      "expected_loans": [[[0, 3, 8, 32, 0], 64]]
+    },
+    {
+      "op": "reserve_loan",
+      "step_key": [1, 3, 1, 4, 4],
+      "grant_bytes": 96,
+      "expected_loans": [
+        [[0, 3, 8, 32, 0], 64],
+        [[1, 3, 1, 4, 4], 96]
+      ]
+    },
+    {
+      "op": "plan_user_cancel",
+      "transaction_id": "elastic-00000000000000000002",
+      "keys": ["A"],
+      "request_bytes": 40,
+      "available_bytes": 64,
+      "kv_transition": [10, 20],
+      "expected": {
+        "kind": "user",
+        "physical_keys": ["A"],
+        "hot_hits": ["A"],
+        "cold_misses": [],
+        "victim_keys": [],
+        "kv_transition": [10, 20],
+        "capture_loan_bytes": 0,
+        "reclaim_bytes": 0,
+        "defer_reason": null
+      }
+    },
+    {
+      "op": "settle_next_loan",
+      "expected": [[0, 3, 8, 32, 0], 64]
+    },
+    {
+      "op": "cancel_latest_loan",
+      "expected": [[1, 3, 1, 4, 4], 96]
+    },
+    {
+      "op": "plan_defer",
+      "transaction_id": "elastic-00000000000000000003",
+      "keys": ["B"],
+      "request_bytes": 40,
+      "available_bytes": 64,
+      "kv_transition": [20, 10],
+      "expected": {
+        "kind": "defer",
+        "physical_keys": ["B"],
+        "hot_hits": [],
+        "cold_misses": ["B"],
+        "victim_keys": [],
+        "kv_transition": [20, 10],
+        "capture_loan_bytes": 0,
+        "reclaim_bytes": 0,
+        "defer_reason": "missing_exact_price_or_class_envelope"
+      }
+    },
+    {
+      "op": "plan_capture_fail_recovery",
+      "transaction_id": "elastic-00000000000000000004",
+      "keys": ["B"],
+      "request_bytes": 40,
+      "available_bytes": 100,
+      "destination_capture_endpoint_bytes": 50,
+      "shared_resident_bytes": 40,
+      "kv_transition": [20, 10],
+      "expected": {
+        "kind": "maintenance",
+        "physical_keys": ["B"],
+        "hot_hits": [],
+        "cold_misses": ["B"],
+        "victim_keys": [],
+        "kv_transition": [20, 10],
+        "capture_loan_bytes": 50,
+        "reclaim_bytes": 0,
+        "defer_reason": null
+      }
+    },
+    {
+      "op": "accept_receipt",
+      "transaction_id": null,
+      "resident_bytes": 52,
+      "floor_bytes": 12,
+      "transition_floor_bytes": 20,
+      "peak_bytes": 64,
+      "cublas_workspace_bytes": 8,
+      "entries": [
+        {
+          "key": "A",
+          "resident_bytes": 40,
+          "local_pool_bytes": 40,
+          "pinned": false,
+          "reclaimable_bytes": 40,
+          "lease_ids": []
+        }
+      ],
+      "expected": {
+        "resident_bytes": 52,
+        "pinned_resident_bytes": 0,
+        "evictable_resident_bytes": 40,
+        "floor_bytes": 12,
+        "transition_floor_bytes": 20,
+        "cublas_workspace_bytes": 8
+      }
+    }
+  ],
+  "final": {
+    "pending_loans": [],
+    "entries": {
+      "A": ["hot_evictable", []],
+      "B": ["cold", []]
+    },
+    "accounting": {
+      "resident_bytes": 52,
+      "pinned_resident_bytes": 0,
+      "evictable_resident_bytes": 40,
+      "floor_bytes": 12,
+      "transition_floor_bytes": 20,
+      "cublas_workspace_bytes": 8
+    },
+    "stats": {
+      "hot_hits": 1,
+      "cold_misses": 1,
+      "promotions": 0,
+      "evictions": 0,
+      "evicted_bytes": 0,
+      "deferrals": 1,
+      "defer_reasons": [["missing_exact_price_or_class_envelope", 1]]
+    }
+  },
+  "declared_validator_difference": {
+    "mutation": "stale residency generation",
+    "legacy": "raw scheduler tuple had no generation validator",
+    "controller": "reject before mutation"
+  }
+}

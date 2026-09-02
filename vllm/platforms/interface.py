@@ -773,6 +773,49 @@ class Platform:
         For hybrid attention/mamba models, ensure that the attention page
         size is >= the mamba page size, and pad the mamba page size to match.
         """
+        if vllm_config.additional_config.get("gdn_separate_pool", False):
+            # The experimental allocator gives recurrent state its own page
+            # geometry and block-id namespace. Keep the scheduler granularity
+            # shared, but do not inflate attention pages to the GDN state size.
+            from math import lcm
+
+            from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
+
+            base_block = vllm_config.cache_config.block_size
+            dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+            state_alignment = GDNAttentionBackend.get_state_update_chunk_alignment()
+            geometry_quantum = lcm(base_block, dcp_size, state_alignment)
+            configured_block = vllm_config.additional_config.get(
+                "gdn_attention_block_size"
+            )
+            if configured_block is None:
+                minimum_block = 2352
+                requested_block = (
+                    (minimum_block + geometry_quantum - 1) // geometry_quantum
+                ) * geometry_quantum
+            else:
+                requested_block = int(configured_block)
+            if requested_block % geometry_quantum:
+                raise ValueError(
+                    "gdn_attention_block_size must be divisible by the common "
+                    "attention/DCP/GDN state-update alignment "
+                    f"({geometry_quantum})"
+                )
+            prefix_match_unit = vllm_config.cache_config.prefix_match_unit
+            if (
+                prefix_match_unit is not None
+                and prefix_match_unit % state_alignment != 0
+            ):
+                raise ValueError(
+                    "prefix_match_unit must be divisible by the GDN "
+                    f"state-update alignment ({state_alignment})"
+                )
+            vllm_config.cache_config.block_size = requested_block
+            vllm_config.cache_config.mamba_block_size = (
+                vllm_config.cache_config.block_size
+            )
+            return
+
         from math import lcm
 
         from vllm.config.vllm import set_current_vllm_config

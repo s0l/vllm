@@ -6,12 +6,12 @@ from __future__ import annotations
 import copy
 from collections import Counter
 from collections.abc import Collection, Sequence
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum, IntEnum
 from fractions import Fraction
 from functools import cached_property
 from math import prod
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import torch
 from typing_extensions import Self
@@ -29,6 +29,21 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _SpecT = TypeVar("_SpecT", bound="KVCacheSpec")
+
+
+def elastic_piecewise_token_boundary(num_tokens: int, max_tokens: int) -> int:
+    """Return a runtime-derived PIECEWISE Graph class.
+
+    Logical M values are canonicalized to powers of two plus the configured B
+    tail. The class list is derived from ``max_num_batched_tokens`` and is
+    never supplied by an env capture-size list.
+    """
+    if num_tokens <= 0 or max_tokens <= 0 or num_tokens > max_tokens:
+        raise ValueError(
+            "elastic PIECEWISE tokens must satisfy 0 < num_tokens <= max_tokens"
+        )
+    boundary = 1 << (num_tokens - 1).bit_length()
+    return min(boundary, max_tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +200,18 @@ class KVCacheSpec:
     @property
     def num_states(self) -> int:
         return self.get_num_kernel_states(self.block_size)
+
+    @property
+    def storage_block_size(self) -> int:
+        """Physical state slots in one logical block for legacy consumers.
+
+        Current layout code expresses compression through ``tokens_per_state``
+        and ``get_num_kernel_states``. Exp22's V2 allocator still consumes the
+        older ``storage_block_size`` name for token-compressed attention.
+        """
+        if isinstance(self.tokens_per_state, int) and self.tokens_per_state > 1:
+            return self.block_size // self.tokens_per_state
+        return self.block_size
 
     def get_num_kernel_states(self, kernel_block_size: int) -> int:
         if self.tokens_per_state > 0:
@@ -865,8 +892,11 @@ class MambaSpec(KVCacheSpec):
     num_heads: int = 1
     tokens_per_state: int = -1
     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
-    # rank holds the full state (e.g. the replicated PLE conv state).
+    # rank holds the full state (e.g. a replicated recurrent state).
     tp_replicated: bool = False
+    separate_pool: bool = False
+    separate_pool_num_blocks: int = 0
+    state_update_chunk_alignment: int = 1
 
     @property
     def state_content_size_bytes(self) -> int:
@@ -877,10 +907,7 @@ class MambaSpec(KVCacheSpec):
 
     @property
     def page_size_bytes(self) -> int:
-        page_size = sum(
-            prod(shape) * get_dtype_size(dtype)
-            for (shape, dtype) in zip(self.shapes, self.dtypes)
-        )
+        page_size = self.state_content_size_bytes
         if self.page_size_padded is not None:
             assert self.page_size_padded >= page_size
             return self.page_size_padded
@@ -893,6 +920,8 @@ class MambaSpec(KVCacheSpec):
                 cdiv(max_model_len, self.block_size) + self.num_speculative_blocks
             ) * self.page_size_bytes
         elif vllm_config.cache_config.mamba_cache_mode == "align":
+            if self.separate_pool:
+                return self.page_size_bytes
             return self.page_size_bytes * (
                 2 + self.num_speculative_blocks + self.num_prefill_checkpoint_blocks
             )
@@ -903,6 +932,8 @@ class MambaSpec(KVCacheSpec):
         # Mamba state is replicated across DCP/PCP ranks, never sharded, so
         # no CP scaling applies.
         if vllm_config.cache_config.mamba_cache_mode == "align":
+            if self.separate_pool:
+                return 1
             # Block table rows are position-indexed over the full sequence
             # even though only 2 + num_speculative_blocks state blocks are
             # resident at a time (earlier states are nulled out by
@@ -920,6 +951,7 @@ class MambaSpec(KVCacheSpec):
             and spec.num_prefill_checkpoint_blocks == self.num_prefill_checkpoint_blocks
             and spec.page_size_bytes == self.page_size_bytes
             and spec.tp_replicated == self.tp_replicated
+            and spec.state_update_chunk_alignment == self.state_update_chunk_alignment
             for spec in kv_cache_specs.values()
         )
 
@@ -1084,6 +1116,16 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             for spec in self.kv_cache_specs.values()
         )
 
+    # Compatibility helpers consumed by the Exp22 mixed-MLA planner. Current
+    # specs retain the same page-size authority, only the representation moved.
+    def get_page_sizes(self) -> list[int]:
+        return list(set(spec.page_size_bytes for spec in self.kv_cache_specs.values()))
+
+    def get_num_layer_tuples(self) -> int:
+        return Counter(
+            spec.page_size_bytes for spec in self.kv_cache_specs.values()
+        ).most_common(1)[0][1]
+
 
 def iter_layer_specs(kv_cache_spec: KVCacheSpec) -> Collection[KVCacheSpec]:
     """The per-layer specs a KV cache group spec covers.
@@ -1184,11 +1226,35 @@ class KVCacheTensor:
     because a block ID is owned by one group at a time.
     """
 
-    size: int  # total size of the backing allocation in bytes
-    layers: list[str]  # layer names in L order
-    layer_stride: int
-    block_stride: int
-    offset: int = 0  # byte offset of layers[0]'s block 0
+    size: int  # size of the KV cache tensor in bytes
+    # ``layers``/``layer_stride`` are the current layout-aware placement API.
+    # ``shared_by`` and the backing fields carry the Exp22 elastic allocation
+    # contract. Keep both views during the squash; they name the same ordered
+    # layer set, while the allocator decides whether layer_stride or the
+    # explicit elastic backing geometry is authoritative.
+    layers: list[str] = field(default_factory=list)
+    layer_stride: int = 0
+    shared_by: list[str] = field(default_factory=list)
+    offset: int = 0  # byte offset of this layer within a contiguous block
+    block_stride: int = 0  # total bytes per block in a packed layout (0 = not packed)
+    backing_id: str = ""  # tensors with the same id alias one backing allocation
+    committed_size: int = 0  # initially mapped bytes (0 = fully committed)
+    mapping_quantum: int = 0  # CUDA-VMM resize quantum in bytes
+    num_blocks: int = 0  # logical blocks when reserved size includes tail padding
+    logical_block_size: int = 0  # mapped bytes contributed by one logical block
+
+    def __post_init__(self) -> None:
+        if self.layers and self.shared_by and self.layers != self.shared_by:
+            raise ValueError(
+                "KV cache tensor layers/shared_by disagree: "
+                f"layers={self.layers}, shared_by={self.shared_by}"
+            )
+        if not self.layers and not self.shared_by:
+            raise ValueError("KV cache tensor must name at least one layer")
+        if self.layers:
+            self.shared_by = self.layers
+        else:
+            self.layers = self.shared_by
 
 
 @dataclass
@@ -1230,6 +1296,20 @@ class KVCacheConfig:
     """Resolved retention policy for local prefix-cache checkpoints."""
     kv_cache_layout: str | None = None
     """The KV cache layout resolved by the engine core, adopted by all workers."""
+    elastic_attention_stride: int = 0
+    elastic_gdn_stride: int = 0
+    elastic_mapping_quantum: int = 0
+    elastic_gdn_initial_blocks: int = 0
+    elastic_gdn_blocks_per_request: int = 0
+    elastic_budget_bytes: int = 0
+    elastic_attention_capacity_by_gdn_blocks: tuple[int, ...] = ()
+    elastic_rank_primary_mapped_bytes: tuple[tuple[int, ...], ...] = ()
+    elastic_rank_gdn_mapped_bytes: tuple[tuple[int, ...], ...] = ()
+    elastic_rank_budget_bytes: tuple[int, ...] = ()
+    effective_max_resident_seqs: int = 0
+    """Post-profile hard residency cap for elastic KV; 0 leaves it disabled."""
+    elastic_graph_execution_policy: dict[str, Any] | None = None
+    """All-rank effective Graph representation policy for scheduler startup."""
 
     @cached_property
     def transfer_group_ids(self) -> tuple[int, ...]:

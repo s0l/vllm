@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from unittest.mock import Mock
+
 from vllm.v1.core.sched.output import ScheduledEncoderInputStats, SchedulerOutput
 from vllm.v1.engine import EngineCoreOutputs, FinishReason
+from vllm.v1.metrics.loggers import PrometheusStatLogger
 from vllm.v1.metrics.stats import (
     IterationStats,
     PrefillStats,
@@ -33,6 +36,7 @@ def test_scheduler_iteration_details_serialization():
     outputs = EngineCoreOutputs(
         scheduler_stats=SchedulerStats(
             kv_cache_usage=0.5,
+            num_kv_tail_deferrals=3,
             iteration_details=iteration_details,
         )
     )
@@ -42,7 +46,38 @@ def test_scheduler_iteration_details_serialization():
 
     assert decoded.scheduler_stats is not None
     assert decoded.scheduler_stats.kv_cache_usage == 0.5
+    assert decoded.scheduler_stats.num_kv_tail_deferrals == 3
     assert decoded.scheduler_stats.iteration_details == iteration_details
+
+
+def test_elastic_graph_stats_are_exported_as_aggregate_gauges():
+    logger = object.__new__(PrometheusStatLogger)
+    hot_hits = Mock()
+    external_bytes = Mock()
+    logger.gauge_elastic_graph_stats = {
+        "hot_hits": {0: hot_hits},
+        "external_bytes": {0: external_bytes},
+    }
+    logger._elastic_graph_base_labelvalues = {0: ["model", "0"]}
+    logger.gauge_elastic_graph_key_total = Mock()
+    key_gauge = logger.gauge_elastic_graph_key_total.labels.return_value
+
+    logger._record_elastic_graph_stats(
+        {
+            "hot_hits": 17,
+            "external_bytes": 640 << 20,
+            "defer_reasons": {"capture_loan": 3},
+            "key_totals": {"target|PIECEWISE|32|HOT": 4},
+        },
+        0,
+    )
+
+    hot_hits.set.assert_called_once_with(17)
+    external_bytes.set.assert_called_once_with(640 << 20)
+    logger.gauge_elastic_graph_key_total.labels.assert_called_once_with(
+        "model", "0", "target", "PIECEWISE", "32", "HOT"
+    )
+    key_gauge.set.assert_called_once_with(4)
 
 
 def test_compute_iteration_details_includes_encoder_stats():

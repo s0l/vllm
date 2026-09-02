@@ -7,18 +7,37 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
+from vllm.distributed.communication_op import (
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_v1_block5_fused_add_rms_norm,
+)
+from vllm.distributed.parallel_state import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.logger import init_logger
+from vllm.model_executor.determinism.batch_invariant import (
+    linear_mtp_fc_batch_invariant,
+)
+from vllm.model_executor.kernels.linear.nvfp4.marlin import (
+    get_nvfp4_marlin_gate_up_scratch,
+)
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
-from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.model_executor.layers.linear import PaddedMergedColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
+)
+from vllm.model_executor.models.ag2_fp8_draft_head import (
+    Fp8DraftHead,
+    install_shared_fp8_lm_head,
+    shared_fp8_head_enabled,
 )
 from vllm.model_executor.models.interfaces import LocalArgmaxMixin
 from vllm.model_executor.models.qwen3_5 import (
@@ -29,6 +48,7 @@ from vllm.model_executor.models.qwen3_5 import (
 from vllm.model_executor.models.qwen3_next import (
     Qwen3NextSparseMoeBlock,
     QwenNextMixtureOfExperts,
+    _all_gather_hidden_and_residual,
 )
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
@@ -50,6 +70,14 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _mtp_fc_padded_output_size(
+    hidden_size: int, tp_size: int, local_alignment: int = 64
+) -> int:
+    """Pad the MTP projection so every TP rank owns an aligned output shard."""
+    global_alignment = tp_size * local_alignment
+    return ((hidden_size + global_alignment - 1) // global_alignment) * global_alignment
 
 
 @support_torch_compile(
@@ -95,15 +123,37 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             if (quant_config and quant_config.get_name() == "modelopt_fp4")
             else quant_config
         )
-        self.fc = ColumnParallelLinear(
+        # The following draft layer needs the full hidden vector. Pad the
+        # projection output to aligned TP shards, all-gather it, then discard
+        # the zero-padded tail. This avoids replicating the 100 MiB BF16 matrix
+        # when hidden_size is not divisible by TP.
+        tp_size = get_tensor_model_parallel_world_size()
+        self.fc_padded_output_size = _mtp_fc_padded_output_size(
+            self.config.hidden_size, tp_size
+        )
+        if self.fc_padded_output_size != self.config.hidden_size:
+            logger.warning_once(
+                "Padding Qwen3.5 MTP fc output from %d to %d for "
+                "tensor_parallel_size=%d.",
+                self.config.hidden_size,
+                self.fc_padded_output_size,
+                tp_size,
+            )
+        self.fc = PaddedMergedColumnParallelLinear(
             self.config.hidden_size * 2,
-            self.config.hidden_size,
+            output_sizes=[self.config.hidden_size],
+            padded_output_sizes=[self.fc_padded_output_size],
             gather_output=True,
             bias=False,
             return_bias=False,
             quant_config=fc_quant,
             prefix=f"{prefix}.fc",
         )
+        if envs.AG2_VLLM_MTP_FC_BATCH_INVARIANT:
+            logger.warning_once(
+                "Using the experimental row-invariant BF16 kernel only for "
+                "Qwen3.5 MTP fc; global batch-invariant mode remains disabled."
+            )
 
         # GPTQ: quantized checkpoints may exclude MTP from quantization via
         # quantization_config.dynamic with "-:pattern" entries. When detected,
@@ -123,6 +173,31 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             )
             for idx in range(self.num_mtp_layers)
         )
+        self._ag2_tp3_mtp_block5 = any(
+            getattr(layer, "_ag2_tp3_mtp_block5", False) for layer in self.layers
+        )
+        if envs.AG2_VLLM_MTP_BF16_GATE_UP_SCRATCH:
+            max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            shared_scratch = get_nvfp4_marlin_gate_up_scratch()
+            if envs.AG2_VLLM_NVFP4_MARLIN_GATE_UP_SCRATCH and shared_scratch is None:
+                raise RuntimeError(
+                    "Shared target/MTP gate/up workspace was requested but the "
+                    "model runner has not installed the NVFP4 Marlin scratch"
+                )
+            for layer in self.layers:
+                layer.mlp.enable_bf16_gate_up_scratch(
+                    max_num_tokens,
+                    scratch=shared_scratch,
+                )
+            scratch = self.layers[0].mlp._bf16_gate_up_scratch
+            assert scratch is not None
+            logger.warning_once(
+                "Configured MTP-owned BF16 gate/up scratch: shape=%s bytes=%d "
+                "shared_with_nvfp4_marlin=%s",
+                tuple(scratch.shape),
+                scratch.numel() * scratch.element_size(),
+                shared_scratch is not None,
+            )
         vllm_config.quant_config = original_quant
         self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
             self.layers,
@@ -151,15 +226,40 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
-    ) -> torch.Tensor:
+        return_ag2_mtp_trace: bool = False,
+    ):
+        mtp_trace: dict[str, torch.Tensor] = {}
+        if return_ag2_mtp_trace:
+            mtp_trace["input_ids"] = input_ids
+            mtp_trace["positions"] = positions
         if get_pp_group().is_first_rank:
             if inputs_embeds is None:
                 inputs_embeds = self.embed_input_ids(input_ids)
+            if return_ag2_mtp_trace:
+                mtp_trace["embedding"] = inputs_embeds
             assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
+            if return_ag2_mtp_trace:
+                # Preserve the consumed target-feedback boundary separately
+                # from its RMSNorm result. This distinguishes inherited target
+                # noise from an MTP normalization/graph-row defect.
+                mtp_trace["feedback_input"] = hidden_states
             inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
             hidden_states = self.pre_fc_norm_hidden(hidden_states)
+            if return_ag2_mtp_trace:
+                mtp_trace["embedding_norm"] = inputs_embeds
+                mtp_trace["feedback_norm"] = hidden_states
             hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
-            hidden_states = self.fc(hidden_states)
+            if envs.AG2_VLLM_MTP_FC_BATCH_INVARIANT:
+                output_parallel = linear_mtp_fc_batch_invariant(
+                    hidden_states,
+                    self.fc.weight,
+                )
+                hidden_states = tensor_model_parallel_all_gather(output_parallel)
+            else:
+                hidden_states = self.fc(hidden_states)
+            hidden_states = hidden_states[..., : self.config.hidden_size]
+            if return_ag2_mtp_trace:
+                mtp_trace["fc_output"] = hidden_states
             residual = None
         else:
             assert intermediate_tensors is not None
@@ -172,22 +272,48 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             assert hidden_states.shape[0] == positions.shape[-1]
             hidden_states = sequence_parallel_chunk(hidden_states)
             assert residual is None
-        hidden_states, residual = mtp_layer(
+        layer_result = mtp_layer(
             positions=positions,
             hidden_states=hidden_states,
             residual=residual,
+            return_ag2_mtp_trace=return_ag2_mtp_trace,
         )
+        if return_ag2_mtp_trace:
+            hidden_states, residual, layer_trace = layer_result
+            mtp_trace.update(layer_trace)
+        else:
+            hidden_states, residual = layer_result
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
         if mtp_layer.use_attn_reduce_scatter_for_moe:
-            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
-            hidden_states = hidden_states[: positions.shape[-1]]
-        return hidden_states
+            hidden_states, residual = _all_gather_hidden_and_residual(
+                hidden_states,
+                residual,
+                positions.shape[-1],
+                self.config.hidden_size,
+            )
+
+        # The predictor returns only normalized hidden states. Avoid the
+        # two-output fused op here: its residual result is dead but otherwise
+        # materializes a full BF16 [tokens, hidden] tensor in compiled prefill.
+        assert residual is not None
+        if self._ag2_tp3_mtp_block5:
+            output, _ = tensor_model_parallel_v1_block5_fused_add_rms_norm(
+                hidden_states,
+                residual,
+                self.norm.weight.float() + 1.0,
+                self.norm.variance_epsilon,
+            )
+        else:
+            output = self.norm.forward_native_output_only(hidden_states, residual)
+        if return_ag2_mtp_trace:
+            mtp_trace["final_norm"] = output
+            return output, output, mtp_trace
+        return output
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = maybe_fuse_shared_experts(
@@ -253,6 +379,110 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self._ag2_fp8_head: Fp8DraftHead | None = None
+
+    def ag2_init_fp8_head(self) -> None:
+        """Build the FP8 draft-head copy after lm_head sharing, before capture."""
+        if shared_fp8_head_enabled():
+            if Fp8DraftHead.enabled():
+                raise ValueError(
+                    "AG2 shared and additive FP8 lm_head modes are mutually exclusive"
+                )
+            if self.config.tie_word_embeddings:
+                raise ValueError(
+                    "AG2 shared FP8 lm_head cannot replace tied input embeddings"
+                )
+            source_bytes, installed_bytes = install_shared_fp8_lm_head(self.lm_head)
+            if source_bytes:
+                logger.warning(
+                    "AG2 shared target/draft FP8 lm_head POC enabled: shard %s, "
+                    "%.1f -> %.1f MiB",
+                    tuple(self.lm_head.weight.shape),
+                    source_bytes / 1024**2,
+                    installed_bytes / 1024**2,
+                )
+            return
+        if not Fp8DraftHead.enabled() or self._ag2_fp8_head is not None:
+            return
+        self._ag2_fp8_head = Fp8DraftHead(self.lm_head.weight)
+        logger.info(
+            "AG2 FP8 draft lm_head enabled: shard %s, +%.0f MiB",
+            tuple(self.lm_head.weight.shape),
+            self._ag2_fp8_head.w8.nbytes / 1024**2,
+        )
+
+    def ag2_enable_top_token_trace(self, max_num_reqs: int) -> None:
+        self.logits_processor.ag2_enable_top_token_trace(
+            max_num_reqs,
+            get_tensor_model_parallel_world_size(),
+            self.lm_head.weight.device,
+        )
+
+    def ag2_get_top_token_trace(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            self.logits_processor.ag2_top_token_gathered_pairs,
+            self.logits_processor.ag2_top_token_selected,
+        )
+
+    def ag2_enable_mtp_layer_trace(
+        self, *, rows: int = 5, history_tokens: int = 640
+    ) -> None:
+        layer = self.model.layers[0]
+        attention = layer.self_attn
+        attention.o_proj._ag2_aux_output_parallel_enabled = True
+        attention.attn._ag2_aux_dcp_pack_enabled = True
+        attention.attn._ag2_aux_dcp_pack_rows = rows
+        attention.attn._ag2_aux_dcp_kv_history_enabled = True
+        attention.attn._ag2_aux_dcp_kv_history_rows = rows
+        attention.attn._ag2_aux_dcp_kv_history_tokens = history_tokens
+
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        head = self._ag2_fp8_head
+        # The FP8 GEMV kernel re-reads the weight shard per row of M, so it
+        # only wins for latency-bound small batches; BF16 cuBLAS reads the
+        # shard once for the whole batch.
+        if head is None or hidden_states.shape[0] > 2:
+            return super().get_top_tokens(hidden_states)
+        lp = self.logits_processor
+        assert lp.scale == 1.0 and getattr(lp, "soft_cap", None) is None
+        logits = head.logits(hidden_states)
+        num_pad = self.lm_head.shard_indices.num_org_vocab_padding
+        if num_pad > 0:
+            logits[..., -num_pad:] = -float("inf")
+        local_max_vals, local_max_indices = logits.max(dim=-1)
+        global_indices = (
+            local_max_indices + self.lm_head.shard_indices.org_vocab_start_index
+        )
+        tp_size = get_tensor_model_parallel_world_size()
+        local_pair = torch.stack(
+            [local_max_vals.float(), global_indices.float()], dim=-1
+        )
+        if tp_size == 1:
+            gathered = local_pair.unsqueeze(1)
+            top = global_indices
+        else:
+            gathered = tensor_model_parallel_all_gather(local_pair, dim=-1).view(
+                hidden_states.shape[0], tp_size, 2
+            )
+            max_rank_idx = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
+            top = (
+                gathered[:, :, 1]
+                .gather(dim=-1, index=max_rank_idx)
+                .squeeze(-1)
+                .to(torch.int64)
+            )
+        d2t = getattr(self, "draft_id_to_target_id", None)
+        if d2t is not None:
+            top = top + d2t[top]
+        trace_pairs = getattr(
+            self.logits_processor, "ag2_top_token_gathered_pairs", None
+        )
+        trace_selected = getattr(self.logits_processor, "ag2_top_token_selected", None)
+        if trace_pairs is not None and trace_selected is not None:
+            rows = hidden_states.shape[0]
+            trace_pairs[:rows].copy_(gathered)
+            trace_selected[:rows].copy_(top)
+        return top
 
     def embed_input_ids(
         self,
@@ -289,8 +519,14 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ):
+        return_ag2_mtp_trace = bool(kwargs.pop("return_ag2_mtp_trace", False))
         hidden_states = self.model(
-            input_ids, positions, hidden_states, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            return_ag2_mtp_trace=return_ag2_mtp_trace,
         )
         return hidden_states
 

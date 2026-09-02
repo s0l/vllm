@@ -20,9 +20,11 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.model import ModelConfig
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.kernels.linear import (
+    FlashInferB12xNvFp4LinearKernel,
     FlashInferCuteDslNvFp4W4A16LinearKernel,
     HummingNvFp4LinearKernel,
     MarlinNvFp4LinearKernel,
+    init_nvfp4_linear_kernel,
 )
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
@@ -124,6 +126,241 @@ def test_modelopt_nvfp4_quantizes_parallel_lm_head():
     assert isinstance(method, ModelOptLinearMethod)
     assert method.spec.weight is kNvfp4Static
     assert method.spec.activation is kNvfp4Dynamic
+    assert method.layer_prefix == "lm_head"
+
+
+def test_modelopt_nvfp4_generic_method_runs_arc_owner_hooks():
+    from vllm.config.quantization import QuantSpec
+    from vllm.model_executor.layers.quantization import modelopt as m
+
+    method = ModelOptLinearMethod.__new__(ModelOptLinearMethod)
+    method.spec = QuantSpec(weight=kNvfp4Static, activation=kNvfp4Dynamic)
+    method.layer_prefix = "model.layers.0.mlp.gate_up_proj"
+    method.wkey = Mock()
+    method.akey = Mock()
+    method.fmt = Mock()
+    method.kernel = Mock()
+    layer = torch.nn.Module()
+
+    with (
+        patch.object(m, "maybe_apply_ag2_nvfp4_arc_sidecar") as apply_arc,
+        patch.object(m, "ensure_ag2_nvfp4_base_owner_metadata") as ensure_owner,
+    ):
+        method.process_weights_after_loading(layer)
+
+    apply_arc.assert_called_once_with(layer, method.layer_prefix)
+    ensure_owner.assert_called_once_with(layer)
+    method.kernel.process_weights_after_loading.assert_called_once_with(layer)
+
+
+def test_modelopt_nvfp4_selective_a16_prefix(monkeypatch):
+    from vllm.model_executor.layers.linear import LinearBase
+
+    config = ModelOptNvFp4Config(
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=[],
+    )
+    fake_layer = MagicMock(spec=LinearBase)
+    monkeypatch.setenv(
+        "AG2_VLLM_NVFP4_A16_PREFIXES",
+        "*.layers.49.mlp.gate_up_proj,*.layers.60.mlp.gate_up_proj",
+    )
+    selected = config.get_quant_method(
+        fake_layer, "language_model.model.layers.60.mlp.gate_up_proj"
+    )
+    unselected = config.get_quant_method(
+        fake_layer, "language_model.model.layers.61.mlp.gate_up_proj"
+    )
+
+    assert isinstance(selected, ModelOptLinearMethod)
+    assert selected.spec.activation is None
+    assert selected.layer_prefix.endswith(".mlp.gate_up_proj")
+    assert isinstance(unselected, ModelOptLinearMethod)
+    assert unselected.spec.activation is kNvfp4Dynamic
+
+
+def test_modelopt_nvfp4_selective_a4_prefix_on_w4a16_base(monkeypatch):
+    from vllm.model_executor.layers.linear import LinearBase
+
+    config = ModelOptNvFp4Config(
+        quant_method="W4A16_NVFP4",
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=[],
+    )
+    fake_layer = MagicMock(spec=LinearBase)
+    monkeypatch.setenv(
+        "AG2_VLLM_NVFP4_A4_PREFIXES",
+        ",".join(
+            (
+                "language_model.model.layers.*.mlp.gate_up_proj",
+                "language_model.model.layers.*.linear_attn.in_proj_qkvz",
+                "language_model.model.layers.*.self_attn.qkv_proj",
+            )
+        ),
+    )
+    selected = config.get_quant_method(
+        fake_layer, "language_model.model.layers.60.mlp.gate_up_proj"
+    )
+    selected_gdn = config.get_quant_method(
+        fake_layer,
+        "language_model.model.layers.60.linear_attn.in_proj_qkvz",
+    )
+    selected_attention = config.get_quant_method(
+        fake_layer,
+        "language_model.model.layers.59.self_attn.qkv_proj",
+    )
+    unselected = config.get_quant_method(
+        fake_layer, "language_model.model.layers.60.mlp.down_proj"
+    )
+    mtp_unselected = config.get_quant_method(
+        fake_layer, "mtp.layers.0.mlp.gate_up_proj"
+    )
+
+    assert isinstance(selected, ModelOptLinearMethod)
+    assert selected.spec.activation is kNvfp4Dynamic
+    assert selected.layer_prefix.endswith(".mlp.gate_up_proj")
+    assert isinstance(selected_gdn, ModelOptLinearMethod)
+    assert selected_gdn.spec.activation is kNvfp4Dynamic
+    assert selected_gdn.layer_prefix.endswith(".linear_attn.in_proj_qkvz")
+    assert isinstance(selected_attention, ModelOptLinearMethod)
+    assert selected_attention.spec.activation is kNvfp4Dynamic
+    assert selected_attention.layer_prefix.endswith(".self_attn.qkv_proj")
+    assert isinstance(unselected, ModelOptLinearMethod)
+    assert unselected.spec.activation is None
+    assert isinstance(mtp_unselected, ModelOptLinearMethod)
+    assert mtp_unselected.spec.activation is None
+
+
+def test_modelopt_nvfp4_selective_a4_requires_w4a16_base(monkeypatch):
+    from vllm.model_executor.layers.linear import LinearBase
+
+    config = ModelOptNvFp4Config(
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=[],
+    )
+    monkeypatch.setenv(
+        "AG2_VLLM_NVFP4_A4_PREFIXES",
+        "language_model.model.layers.*.mlp.gate_up_proj",
+    )
+    with pytest.raises(ValueError, match="requires a W4A16 base"):
+        config.get_quant_method(
+            MagicMock(spec=LinearBase),
+            "language_model.model.layers.60.mlp.gate_up_proj",
+        )
+
+
+def test_modelopt_nvfp4_selective_a4_and_a16_are_mutually_exclusive(monkeypatch):
+    from vllm.model_executor.layers.linear import LinearBase
+
+    config = ModelOptNvFp4Config(
+        quant_method="W4A16_NVFP4",
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=[],
+    )
+    monkeypatch.setenv("AG2_VLLM_NVFP4_A4_PREFIXES", "*.mlp.gate_up_proj")
+    monkeypatch.setenv("AG2_VLLM_NVFP4_A16_PREFIXES", "*.mlp.down_proj")
+    with pytest.raises(ValueError, match="cannot combine A16 and A4"):
+        config.get_quant_method(
+            MagicMock(spec=LinearBase),
+            "language_model.model.layers.60.mlp.gate_up_proj",
+        )
+
+
+def test_nvfp4_batch_invariant_allows_explicit_b12x(monkeypatch):
+    import vllm.envs as envs
+    import vllm.model_executor.kernels.linear as linear_kernels
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    monkeypatch.setattr(envs, "AG2_VLLM_NVFP4_BATCH_INVARIANT", False)
+    monkeypatch.setattr(
+        linear_kernels,
+        "_get_linear_backend",
+        lambda: "flashinfer_b12x",
+    )
+    monkeypatch.setattr(
+        FlashInferB12xNvFp4LinearKernel,
+        "is_supported",
+        classmethod(lambda cls, compute_capability=None: (True, None)),
+    )
+
+    kernel = init_nvfp4_linear_kernel(use_a16=False)
+
+    assert isinstance(kernel, FlashInferB12xNvFp4LinearKernel)
+
+
+def test_nvfp4_per_format_b12x_selector(monkeypatch):
+    import vllm.envs as envs
+    import vllm.model_executor.kernels.linear as linear_kernels
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    monkeypatch.setattr(envs, "AG2_VLLM_NVFP4_BATCH_INVARIANT", False)
+    monkeypatch.setattr(envs, "AG2_VLLM_NVFP4_B12X", True)
+    monkeypatch.setattr(linear_kernels, "_get_linear_backend", lambda: "auto")
+    monkeypatch.setattr(
+        FlashInferB12xNvFp4LinearKernel,
+        "is_supported",
+        classmethod(lambda cls, compute_capability=None: (True, None)),
+    )
+
+    kernel = init_nvfp4_linear_kernel(use_a16=False)
+
+    assert isinstance(kernel, FlashInferB12xNvFp4LinearKernel)
+
+
+def test_nvfp4_per_format_b12x_rejects_w4a16(monkeypatch):
+    import vllm.envs as envs
+    import vllm.model_executor.kernels.linear as linear_kernels
+
+    monkeypatch.setattr(envs, "AG2_VLLM_NVFP4_B12X", True)
+    monkeypatch.setattr(linear_kernels, "_get_linear_backend", lambda: "auto")
+
+    with pytest.raises(ValueError, match="supports only W4A4"):
+        init_nvfp4_linear_kernel(use_a16=True)
+
+
+def test_nvfp4_per_format_b12x_fails_when_unsupported(monkeypatch):
+    import vllm.envs as envs
+    import vllm.model_executor.kernels.linear as linear_kernels
+
+    monkeypatch.setattr(envs, "AG2_VLLM_NVFP4_B12X", True)
+    monkeypatch.setattr(linear_kernels, "_get_linear_backend", lambda: "auto")
+    monkeypatch.setattr(
+        FlashInferB12xNvFp4LinearKernel,
+        "is_supported",
+        classmethod(lambda cls, compute_capability=None: (False, "test unsupported")),
+    )
+
+    with pytest.raises(ValueError, match="test unsupported"):
+        init_nvfp4_linear_kernel(use_a16=False)
+
+
+def test_modelopt_fp8_force_torch_scaled_mm_uses_generic_dispatch(monkeypatch):
+    from vllm.model_executor.kernels.linear import (
+        PerTensorTorchFP8ScaledMMLinearKernel,
+    )
+    from vllm.model_executor.layers.quantization import modelopt as m
+
+    monkeypatch.setenv("AG2_VLLM_FP8_FORCE_TORCH_SCALED_MM", "1")
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "weight", torch.nn.Parameter(torch.empty(8, 8), requires_grad=False)
+    )
+    spec = m.QuantSpec(
+        weight=kFp8StaticTensorSym,
+        activation=kFp8StaticTensorSym,
+    )
+    rt = m.RuntimeDtypes(torch.bfloat16, torch.bfloat16)
+
+    with patch.object(m, "init_fp8_linear_kernel") as init_kernel:
+        m.select_linear_kernel(spec, layer, rt)
+
+    assert init_kernel.call_args.kwargs["force_kernel"] is (
+        PerTensorTorchFP8ScaledMMLinearKernel
+    )
 
 
 def test_modelopt_fp8_updates_weight_dims_after_transpose():
@@ -230,6 +467,19 @@ def test_modelopt_nvfp4_leaves_excluded_parallel_lm_head_unquantized():
         kv_cache_quant_algo=None,
         exclude_modules=["lm_head"],
     )
+
+    method = config.get_quant_method(_mock_lm_head(), prefix="lm_head")
+
+    assert isinstance(method, UnquantizedLinearMethod)
+
+
+def test_modelopt_nvfp4_selective_override_respects_exclusion(monkeypatch):
+    config = ModelOptNvFp4Config(
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=["lm_head"],
+    )
+    monkeypatch.setenv("AG2_VLLM_NVFP4_A16_PREFIXES", "lm_head")
 
     method = config.get_quant_method(_mock_lm_head(), prefix="lm_head")
 
@@ -606,6 +856,39 @@ def test_modelopt_linear_method_builder_registry_override(monkeypatch):
     assert method is sentinel  # bespoke builder wins over the generic path
 
 
+def test_modelopt_nvfp4_env_can_force_w4a4_checkpoint_to_w4a16(monkeypatch):
+    """The research override changes only runtime activation arithmetic.
+
+    W4A4-shaped checkpoints retain their packed weights/scales and are loaded
+    by the W4A16 method, whose compatibility placeholder consumes and discards
+    the otherwise-unused input scale.
+    """
+    from vllm.model_executor.layers.linear import LinearBase
+
+    monkeypatch.setenv("AG2_VLLM_NVFP4_FORCE_W4A16", "1")
+    config = ModelOptNvFp4Config._from_config(
+        quant_method="NVFP4",
+        kv_cache_quant_method=None,
+        exclude_modules=[],
+        original_config={
+            "quantization": {
+                "group_size": 16,
+                "kv_cache_quant_algo": None,
+                "exclude_modules": [],
+            }
+        },
+        group_size=16,
+    )
+
+    assert config.quant_method == "W4A16_NVFP4"
+    method = config.get_quant_method(
+        MagicMock(spec=LinearBase), "model.layers.0.fake_proj"
+    )
+    assert isinstance(method, ModelOptLinearMethod)
+    assert method.spec.weight is kNvfp4Static
+    assert method.spec.activation is None
+
+
 @pytest.mark.parametrize(
     ("linear_backend", "kernel_cls"),
     [
@@ -678,6 +961,32 @@ def test_modelopt_linear_exposes_humming_layer_attrs(dist_init, monkeypatch):
     linear.has_bias = True
     build(linear)
     assert linear.has_bias is True
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+def test_modelopt_w4a16_batch_invariant_dispatches_humming(monkeypatch):
+    """The narrow W4A16 flag must not alter attention or select W4A4 CUTLASS."""
+    from vllm import envs
+
+    envs.disable_envs_cache()
+    monkeypatch.setenv("AG2_VLLM_NVFP4_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE", "0")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    kernel = init_nvfp4_linear_kernel(use_a16=True)
+    assert isinstance(kernel, HummingNvFp4LinearKernel)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+def test_modelopt_w4a16_batch_invariant_dispatches_fixed_marlin(monkeypatch):
+    """The fixed-schedule POC keeps W4A16 and selects Marlin explicitly."""
+    from vllm import envs
+
+    envs.disable_envs_cache()
+    monkeypatch.setenv("AG2_VLLM_NVFP4_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE", "1")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    kernel = init_nvfp4_linear_kernel(use_a16=True)
+    assert isinstance(kernel, MarlinNvFp4LinearKernel)
 
 
 @pytest.mark.parametrize(

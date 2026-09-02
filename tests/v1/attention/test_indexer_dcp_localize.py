@@ -823,7 +823,7 @@ def test_dcp_global_topk_physical_attention_matches_non_dcp(interleave: int):
 def test_correct_attn_out_zeroes_empty_nan_partial(is_lse_base_on_e: bool):
     out = torch.full((1, 1, 4), float("nan"), device="cuda")
     lses = torch.tensor(
-        [[[0.0]], [[float("-inf")]]],
+        [[[0.0]], [[float("-inf")]], [[float("-inf")]]],
         dtype=torch.float32,
         device="cuda",
     )
@@ -962,3 +962,22 @@ def test_sparse_decode_dcp_short_context_matches_non_dcp():
     dcp_out, dcp_lse = _dcp_lse_merge(local_outs, local_lses)
     torch.testing.assert_close(dcp_out, ref_out, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(dcp_lse, ref_lse, atol=1e-5, rtol=1e-5)
+
+
+def test_correct_attn_out_tp3_uses_power_of_two_triton_tile() -> None:
+    class CaptureContext:
+        def __init__(self) -> None:
+            self.const_args = None
+
+        def call_kernel(self, _kernel, _grid, *_args, **const_args) -> None:
+            self.const_args = const_args
+
+    ctx = CaptureContext()
+    out = torch.empty((2, 4, 128), dtype=torch.float32)
+    lses = torch.empty((3, 2, 4), dtype=torch.float32)
+
+    correct_attn_out(out, lses, cp_rank=1, ctx=ctx)
+
+    assert ctx.const_args is not None
+    assert ctx.const_args["N"] == 3
+    assert ctx.const_args["N_ROUNDED"] == 4

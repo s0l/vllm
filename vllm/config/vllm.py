@@ -1991,6 +1991,33 @@ class VllmConfig:
             not be used.
         """
 
+        elastic_on_demand_graphs = bool(
+            isinstance(self.additional_config, dict)
+            and self.additional_config.get("elastic_gdn_backing", False)
+            and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        )
+        if elastic_on_demand_graphs:
+            configured_sizes = self.compilation_config.cudagraph_capture_sizes
+            if configured_sizes not in (None, []):
+                raise ValueError(
+                    "elastic CUDA Graph shapes are runtime-derived; remove "
+                    "cudagraph_capture_sizes from compilation config"
+                )
+            # Keep only the runtime reachability ceiling. There are no startup
+            # capture candidates: exact descriptors are derived after scheduler
+            # admission and captured under a step-scoped KV loan.
+            self.compilation_config.max_cudagraph_capture_size = (
+                self.scheduler_config.max_num_batched_tokens
+            )
+            self.compilation_config.cudagraph_capture_sizes = []
+            self.compilation_config.post_init_cudagraph_sizes()
+            logger.info(
+                "Elastic CUDA Graph shapes are runtime-derived up to %d tokens; "
+                "static capture-size list is empty",
+                self.scheduler_config.max_num_batched_tokens,
+            )
+            return
+
         if (
             self.model_config is not None
             and not self.model_config.enforce_eager
@@ -2796,6 +2823,7 @@ class VllmConfig:
         finalised block_size.
         """
         block_size = self.cache_config.block_size
+        logger.info_once("Validated scheduler/cache block size: %d tokens.", block_size)
 
         # Skip DCP interleave-size compatibility when a KV connector is configured:
         # cp_kv_cache_interleave_size is pinned to block_size for PD by each worker

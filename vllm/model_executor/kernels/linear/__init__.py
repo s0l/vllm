@@ -1023,35 +1023,76 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
         HummingNvFp4LinearKernel,
     )
 
-    # VLLM_BATCH_INVARIANT forces deterministic execution. Prefer the
-    # batch-invariant CUTLASS implementation when available, otherwise fall
-    # back to emulation. It overrides --linear-backend.
+    # Global batch invariance forces deterministic execution for every
+    # supported subsystem. The narrower AG2 flag is a W4A16 diagnostic that
+    # leaves attention unchanged. W4A16 cannot use the CUTLASS W4A4 kernel, so
+    # route it through Humming's batch-invariant implementation. For W4A4,
+    # prefer CUTLASS and retain emulation as the fallback. This overrides
+    # --linear-backend.
     force_kernel: type[NvFp4LinearKernel] | None = None
     linear_backend = _get_linear_backend()
-    if envs.VLLM_BATCH_INVARIANT:
-        bi_supported, reason = CutlassNvFp4LinearKernel.is_supported()
+    nvfp4_batch_invariant = (
+        envs.VLLM_BATCH_INVARIANT or envs.AG2_VLLM_NVFP4_BATCH_INVARIANT
+    )
+    if envs.AG2_VLLM_NVFP4_B12X:
+        if use_a16:
+            raise ValueError("AG2_VLLM_NVFP4_B12X supports only W4A4 NVFP4 layers")
+        if linear_backend not in ("auto", "flashinfer_b12x"):
+            raise ValueError(
+                "AG2_VLLM_NVFP4_B12X requires --linear-backend=auto or flashinfer_b12x"
+            )
+        force_kernel = FlashInferB12xNvFp4LinearKernel
+        logger.info_once(
+            "AG2 per-format NVFP4 routing selects the B12x CuTe-DSL backend; "
+            "non-NVFP4 schemes retain their independently selected backend."
+        )
+    elif nvfp4_batch_invariant:
+        if use_a16 and envs.AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE:
+            bi_kernel = MarlinNvFp4LinearKernel
+        elif not use_a16 and linear_backend == "flashinfer_b12x":
+            # Explicit SM120 opt-in after target-model packed/singleton and
+            # one-call/split invariance controls have passed.
+            bi_kernel = FlashInferB12xNvFp4LinearKernel
+        else:
+            bi_kernel = (
+                HummingNvFp4LinearKernel if use_a16 else CutlassNvFp4LinearKernel
+            )
+        bi_supported, reason = bi_kernel.is_supported()
         if bi_supported:
-            if linear_backend not in ("auto", "cutlass"):
+            if use_a16:
+                bi_backend = (
+                    "marlin" if bi_kernel is MarlinNvFp4LinearKernel else "humming"
+                )
+            else:
+                bi_backend = (
+                    "flashinfer_b12x"
+                    if bi_kernel is FlashInferB12xNvFp4LinearKernel
+                    else "cutlass"
+                )
+            if linear_backend not in ("auto", bi_backend):
                 logger.warning_once(
-                    "VLLM_BATCH_INVARIANT overrides --linear-backend=%s; "
-                    "using the CUTLASS backend for deterministic execution.",
+                    "NVFP4 batch invariance overrides --linear-backend=%s; "
+                    "using the %s backend for deterministic execution.",
                     linear_backend,
+                    bi_backend,
                 )
             else:
                 logger.info_once(
-                    "VLLM_BATCH_INVARIANT forces NVFP4 linear to use the "
-                    "CUTLASS backend for deterministic execution."
+                    "NVFP4 batch invariance forces %s linear to use the "
+                    "%s backend for deterministic execution.",
+                    "W4A16" if use_a16 else "W4A4",
+                    bi_backend,
                 )
-            force_kernel = CutlassNvFp4LinearKernel
+            force_kernel = bi_kernel
         else:
             if linear_backend not in ("auto", "emulation"):
                 logger.warning_once(
-                    "VLLM_BATCH_INVARIANT overrides --linear-backend=%s; "
+                    "NVFP4 batch invariance overrides --linear-backend=%s; "
                     "using the emulation backend for deterministic execution.",
                     linear_backend,
                 )
             logger.info_once(
-                "VLLM_BATCH_INVARIANT is set but the batch-invariant NVFP4 "
+                "NVFP4 batch invariance is set but its deterministic "
                 "kernel is not supported on this platform; falling back to "
                 "emulation for deterministic execution. Reason: %s",
                 reason,

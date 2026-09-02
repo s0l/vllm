@@ -16,6 +16,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import get_dcp_group
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import next_power_of_2
 from vllm.v1.attention.ops.cp_common import (
     DirectCPWorkspace,
     direct_cp_enabled,
@@ -39,10 +40,15 @@ def mask_dcp_empty_shards_(
     seq_lens: torch.Tensor | None,
     query_start_loc: torch.Tensor | None,
 ) -> None:
-    if seq_lens is None and query_start_loc is None:
+    if seq_lens is None:
+        if query_start_loc is not None:
+            raise ValueError("query_start_loc requires seq_lens")
         return
-    if seq_lens is None or query_start_loc is None:
-        raise ValueError("seq_lens and query_start_loc must be provided together")
+    if query_start_loc is None:
+        if seq_lens.ndim != 1 or seq_lens.shape[0] != lse.shape[0]:
+            raise ValueError("row-aligned seq_lens must match LSE rows")
+        lse.masked_fill_((seq_lens == 0)[:, None], float("-inf"))
+        return
     if (
         seq_lens.ndim != 1
         or query_start_loc.ndim != 1
@@ -79,6 +85,7 @@ def _correct_attn_cp_out_kernel(
     lses_stride_H,
     lse_idx,
     HEAD_DIM: tl.constexpr,
+    N: tl.constexpr,
     N_ROUNDED: tl.constexpr,
     IS_BASE_E: tl.constexpr,
 ):
@@ -110,7 +117,11 @@ def _correct_attn_cp_out_kernel(
     )
 
     # calc final lse
-    lse = tl.load(lses_ptr + lse_offsets).to(tl.float32)
+    lse = tl.load(
+        lses_ptr + lse_offsets,
+        mask=num_n_offsets < N,
+        other=-float("inf"),
+    ).to(tl.float32)
     lse = tl.where((lse != lse) | (lse == float("inf")), -float("inf"), lse)
     lse_max = tl.max(lse, axis=0)
     lse_max = tl.where(lse_max == -float("inf"), 0, lse_max)
@@ -233,7 +244,12 @@ def correct_attn_out(
         l_sH,
         cp_rank,
     )
-    const_args = {"HEAD_DIM": D, "N_ROUNDED": N, "IS_BASE_E": is_lse_base_on_e}
+    const_args = {
+        "HEAD_DIM": D,
+        "N": N,
+        "N_ROUNDED": next_power_of_2(N),
+        "IS_BASE_E": is_lse_base_on_e,
+    }
     ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
     return out, lse
 

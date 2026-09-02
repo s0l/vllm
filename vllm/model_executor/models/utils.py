@@ -43,6 +43,13 @@ logger = init_logger(__name__)
 ShardId: TypeAlias = str | int | tuple[int, ...]
 
 
+def ceil_to_multiple(value: int, multiple: int) -> int:
+    """Return the smallest multiple greater than or equal to ``value``."""
+    if multiple <= 0:
+        raise ValueError("multiple must be positive")
+    return ((value + multiple - 1) // multiple) * multiple
+
+
 @dataclass
 class WeightsMapper:
     """Maps the name of each weight if they match the following patterns.

@@ -19,6 +19,24 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 
+def test_v2_static_owner_contract_and_signature_are_explicit():
+    assert hasattr(GPUModelRunner, "prepare_static_attn_owners_for_kv_sizing")
+
+    spec_a = object()
+    spec_b = object()
+    config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(layer_names=["a", "b"], kv_cache_spec=spec_a),
+            SimpleNamespace(layer_names=["c"], kv_cache_spec=spec_b),
+        ]
+    )
+    signature = GPUModelRunner._attn_config_signature(config)
+
+    assert signature == ((("a", "b"), spec_a), (("c",), spec_b))
+    config.kv_cache_groups[0].layer_names.reverse()
+    assert GPUModelRunner._attn_config_signature(config) != signature
+
+
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.max_model_len = 262144

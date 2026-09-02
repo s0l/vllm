@@ -11,7 +11,10 @@ from tests.v1.attention.utils import dense_kv_cache_views
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
     KVCacheLayout,
+    MambaSpec,
     SlidingWindowSpec,
 )
 from vllm.v1.worker import utils as worker_utils
@@ -19,6 +22,7 @@ from vllm.v1.worker.utils import (
     AttentionGroup,
     KVBlockZeroer,
     _zero_kv_blocks_kernel,
+    get_kv_caches_for_block_copy,
 )
 
 
@@ -98,6 +102,65 @@ def test_block_ids_are_not_overwritten_while_copy_is_in_flight():
     assert torch.all(storage[1] == 0)
     assert torch.all(storage[2] == 0)
     assert torch.all(storage[3] == 1)
+
+
+def test_block_copy_excludes_separate_mamba_pool():
+    attention = torch.zeros(1)
+    mamba = torch.zeros(1)
+    attention_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=16,
+        dtype=torch.float16,
+    )
+    mamba_spec = MambaSpec(
+        block_size=16,
+        shapes=((16,),),
+        dtypes=(torch.float16,),
+        separate_pool=True,
+        separate_pool_num_blocks=4,
+    )
+    config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["attention"], attention_spec),
+            KVCacheGroupSpec(["gdn"], mamba_spec),
+        ],
+    )
+
+    selected = get_kv_caches_for_block_copy(
+        [attention, mamba],
+        {"attention": attention, "gdn": mamba},
+        config,
+    )
+
+    assert selected == [attention]
+
+
+def test_block_copy_preserves_shared_pool_behavior():
+    attention = torch.zeros(1)
+    mamba = torch.zeros(1)
+    runner_caches = [attention, mamba]
+    mamba_spec = MambaSpec(
+        block_size=16,
+        shapes=((16,),),
+        dtypes=(torch.float16,),
+        separate_pool=False,
+    )
+    config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["gdn"], mamba_spec)],
+    )
+
+    selected = get_kv_caches_for_block_copy(
+        runner_caches,
+        {"gdn": mamba},
+        config,
+    )
+
+    assert selected is runner_caches
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
