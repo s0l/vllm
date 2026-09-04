@@ -127,6 +127,64 @@ class ElasticKVController:
             if missing:
                 self.backings[key].resize(targets[key], fence)
 
+    def _target_sizes(
+        self,
+        transition: tuple[int, int],
+        external_memory_bytes: int,
+    ) -> dict[str, int]:
+        """Derive the exact backing layout for one logical transition."""
+        attention_blocks, gdn_blocks = transition
+        targets: dict[str, int] = {}
+        for key, owner in self.backings.items():
+            block_bytes = self.geometry[key]
+            blocks = gdn_blocks if key == "elastic-gdn" else attention_blocks
+            targets[key] = (
+                (blocks * block_bytes + owner.info.quantum - 1)
+                // owner.info.quantum
+                * owner.info.quantum
+            )
+        return self._preserve_physical_budget(targets, external_memory_bytes)
+
+    def validate_equal_scheduler_step(
+        self,
+        transition: tuple[int, int] | None,
+        external_memory_bytes: int,
+    ) -> bool:
+        """Validate a common-plan no-op before the existing all-rank vote.
+
+        Returning ``True`` authorizes the caller to skip ``apply()`` only
+        after that vote succeeds. A local backing drift raises here and is
+        therefore propagated to every rank by the plan-consensus boundary.
+        """
+        if (
+            transition is not None
+            or not self.backings
+            or self._physical_budget_bytes is None
+            or self._mapping_quantum is None
+        ):
+            return False
+        target_transition = self._logical_transition
+        if target_transition is None:
+            return False
+        if (
+            external_memory_bytes < 0
+            or external_memory_bytes != self._external_memory_bytes
+        ):
+            return False
+        quantum = self._mapping_quantum
+        requested = (external_memory_bytes + quantum - 1) // quantum * quantum
+        current = (self._external_memory_bytes + quantum - 1) // quantum * quantum
+        if requested != current:
+            return False
+        expected = self._target_sizes(target_transition, requested)
+        observed = {key: owner.info.committed for key, owner in self.backings.items()}
+        if observed != expected:
+            raise RuntimeError(
+                "equal elastic scheduler step has divergent backing geometry: "
+                f"expected={expected!r} observed={observed!r}"
+            )
+        return True
+
     def apply(
         self,
         transition: tuple[int, int] | None,
@@ -142,19 +200,10 @@ class ElasticKVController:
             key for key in self.backings if key.startswith("elastic-attention-")
         )
         old_sizes = {key: owner.info.committed for key, owner in self.backings.items()}
-        attention_blocks, gdn_blocks = target_transition
         targets: dict[str, int] = {}
         preflight_error: Exception | None = None
         try:
-            for key, owner in self.backings.items():
-                block_bytes = self.geometry[key]
-                blocks = gdn_blocks if key == "elastic-gdn" else attention_blocks
-                targets[key] = (
-                    (blocks * block_bytes + owner.info.quantum - 1)
-                    // owner.info.quantum
-                    * owner.info.quantum
-                )
-            targets = self._preserve_physical_budget(targets, external_memory_bytes)
+            targets = self._target_sizes(target_transition, external_memory_bytes)
         except Exception as exc:
             preflight_error = exc
 

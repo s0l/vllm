@@ -150,6 +150,24 @@ def test_startup_plan_fingerprint_sensitivity(plan_env):
         return_value={"changed": "source"},
     ):
         assert base != fp(_plan_worker().vllm_config, 0, 1)
+    with patch.object(
+        startup_plan,
+        "elastic_runtime_source_hashes",
+        return_value={"changed": "runtime-source"},
+    ):
+        assert base != fp(_plan_worker().vllm_config, 0, 1)
+
+
+@pytest.mark.parametrize(
+    "name",
+    startup_plan.STARTUP_PROFILE_ENV_NAMES,
+)
+def test_startup_plan_fingerprint_tracks_physical_dag_env(plan_env, monkeypatch, name):
+    fp = startup_plan.compute_plan_fingerprint
+    monkeypatch.setenv(name, "before")
+    before = fp(_plan_worker().vllm_config, 0, 1)
+    monkeypatch.setenv(name, "after")
+    assert before != fp(_plan_worker().vllm_config, 0, 1)
 
 
 def test_elastic_identities_include_profile_config(plan_env):

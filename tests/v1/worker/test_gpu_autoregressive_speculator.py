@@ -33,6 +33,7 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
 )
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
+    _ag2_mtp_layer_trace_shape_from_env,
 )
 from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
     MultiModuleMTPSpeculator,
@@ -76,6 +77,23 @@ class _TextOnlyDraftModel(torch.nn.Module):
         is_multimodal=None,
     ):
         raise AssertionError("embed_input_ids should not be called during loading")
+
+
+def test_mtp_layer_trace_shape_defaults_and_overrides(monkeypatch):
+    monkeypatch.delenv("AG2_VLLM_MTP_LAYER_CAPTURE_ROWS", raising=False)
+    monkeypatch.delenv("AG2_VLLM_MTP_LAYER_CAPTURE_HISTORY_TOKENS", raising=False)
+    assert _ag2_mtp_layer_trace_shape_from_env() == (8, 640)
+
+    monkeypatch.setenv("AG2_VLLM_MTP_LAYER_CAPTURE_ROWS", "1")
+    monkeypatch.setenv("AG2_VLLM_MTP_LAYER_CAPTURE_HISTORY_TOKENS", "512")
+    assert _ag2_mtp_layer_trace_shape_from_env() == (1, 512)
+
+
+@pytest.mark.parametrize(("name", "value"), [("ROWS", "0"), ("HISTORY_TOKENS", "-1")])
+def test_mtp_layer_trace_shape_rejects_non_positive(monkeypatch, name, value):
+    monkeypatch.setenv(f"AG2_VLLM_MTP_LAYER_CAPTURE_{name}", value)
+    with pytest.raises(ValueError, match="shape must be positive"):
+        _ag2_mtp_layer_trace_shape_from_env()
 
 
 @pytest.mark.parametrize(

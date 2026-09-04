@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import gc
 import time
 import weakref
 from collections import defaultdict
@@ -1335,7 +1336,7 @@ def _assert_no_worker_plan_mutation(managers) -> None:
         manager.queue_physical_key.assert_not_called()
 
 
-def test_repeated_manifest_rank_error_votes_before_any_mutation(
+def test_identical_steady_decode_reuses_unanimous_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     working_set, managers, plan = _worker_consensus_fixture()
@@ -1347,40 +1348,297 @@ def test_repeated_manifest_rank_error_votes_before_any_mutation(
     )
 
     vote_count = 0
-    diagnostic_count = 0
 
     def gather_vote(output, value, **_kwargs):
         nonlocal vote_count
         vote_count += 1
         output.view(3, 5)[:] = value
-        if vote_count == 2:
-            output.view(3, 5)[1, 4] = 1
-
-    def gather_diagnostics(outputs, value, **_kwargs):
-        nonlocal diagnostic_count
-        diagnostic_count += 1
-        outputs[:] = [
-            value,
-            (value[0], "rank-1 rejected repeated manifest"),
-            value,
-        ]
 
     monkeypatch.setattr(torch.distributed, "all_gather_single", gather_vote)
-    monkeypatch.setattr(torch.distributed, "all_gather_object", gather_diagnostics)
-    # Establish one accepted vote, then replay the exact same fingerprint.
-    # The repeat must still enter a collective because a peer can have a
-    # rank-local error that is invisible here.
-    working_set.require_rank_consensus(plan)
-    with pytest.raises(
-        gpu_cudagraph_utils.ElasticExecutionPlanMismatch,
-        match="rank-1 rejected repeated manifest",
-    ):
-        working_set.begin_admitted_step(plan)
-    # A rejected status must not poison the reusable fixed-size vote buffers.
-    assert working_set.require_rank_consensus(plan) == plan.fingerprint
-    assert vote_count == 3
-    assert diagnostic_count == 1
+    object_gather = MagicMock()
+    monkeypatch.setattr(torch.distributed, "all_gather_object", object_gather)
+
+    working_set.begin_admitted_step(plan)
+    working_set.require_post_materialization_consensus(
+        plan, observer_fingerprint="stable"
+    )
+    working_set.finish_step()
+    assert vote_count == 2
+
+    repeated = replace(
+        plan,
+        transaction_id="consensus-user-2",
+        reuse_rank_consensus=True,
+    )
+    for manager in managers:
+        manager.reset_mock()
+    working_set.begin_admitted_step(repeated)
+    working_set.require_post_materialization_consensus(
+        repeated, observer_fingerprint="stable"
+    )
+    assert vote_count == 2
+    assert working_set.rank_consensus_reuse_snapshot() == {
+        "pre_mutation": 1,
+        "post_materialization": 1,
+    }
+    object_gather.assert_not_called()
+    for manager in managers:
+        manager.begin_dynamic_step.assert_called_once()
+    managers[0].queue_physical_key.assert_called_once()
+    managers[1].queue_physical_key.assert_not_called()
+    managers[2].queue_physical_key.assert_not_called()
+
+
+def test_changed_decode_epoch_votes_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    working_set, _managers, plan = _worker_consensus_fixture()
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=object()),
+    )
+    votes = 0
+
+    def gather_vote(output, value, **_kwargs):
+        nonlocal votes
+        votes += 1
+        output.view(3, 5)[:] = value
+
+    monkeypatch.setattr(torch.distributed, "all_gather_single", gather_vote)
+    working_set.begin_admitted_step(plan)
+    working_set.require_post_materialization_consensus(
+        plan, observer_fingerprint="stable"
+    )
+    working_set.finish_step()
+
+    assert plan.execution_manifest is not None
+    changed = replace(
+        plan,
+        transaction_id="consensus-user-changed",
+        execution_manifest=replace(
+            plan.execution_manifest, request_ids=("request-changed",)
+        ),
+    )
+    working_set.begin_admitted_step(changed)
+    working_set.require_post_materialization_consensus(
+        changed, observer_fingerprint="stable"
+    )
+    assert votes == 4
+    assert working_set.rank_consensus_reuse_snapshot() == {}
+
+
+def test_scheduler_declined_reuse_forces_all_rank_votes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    working_set, _managers, plan = _worker_consensus_fixture()
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=object()),
+    )
+    votes = 0
+
+    def gather_vote(output, value, **_kwargs):
+        nonlocal votes
+        votes += 1
+        output.view(3, 5)[:] = value
+
+    monkeypatch.setattr(torch.distributed, "all_gather_single", gather_vote)
+    working_set.begin_admitted_step(plan)
+    working_set.require_post_materialization_consensus(
+        plan, observer_fingerprint="stable"
+    )
+    working_set.finish_step()
+
+    repeated = replace(plan, transaction_id="consensus-user-2")
+    working_set.begin_admitted_step(repeated)
+    working_set.require_post_materialization_consensus(
+        repeated, observer_fingerprint="stable"
+    )
+    assert votes == 4
+
+
+def test_scheduler_reuse_without_worker_epoch_is_fatal_without_collective(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    working_set, managers, plan = _worker_consensus_fixture()
+    gather_vote = MagicMock()
+    monkeypatch.setattr(torch.distributed, "all_gather_single", gather_vote)
+    reuse = replace(plan, reuse_rank_consensus=True)
+
+    with pytest.raises(RuntimeError, match="without the matching locally accepted"):
+        working_set.begin_admitted_step(reuse)
+
+    gather_vote.assert_not_called()
     _assert_no_worker_plan_mutation(managers)
+
+
+def test_transaction_id_is_not_part_of_decode_epoch() -> None:
+    _working_set, _managers, plan = _worker_consensus_fixture()
+    repeated = replace(plan, transaction_id="another-transaction")
+
+    assert repeated.fingerprint != plan.fingerprint
+    assert repeated.execution_epoch_fingerprint == plan.execution_epoch_fingerprint
+
+
+def test_admission_byte_ledger_is_not_part_of_hot_decode_epoch() -> None:
+    _working_set, _managers, plan = _worker_consensus_fixture()
+    repriced = replace(
+        plan,
+        request_bytes=plan.request_bytes + 1,
+        available_bytes=plan.available_bytes + 2,
+        capture_loan_bytes=plan.capture_loan_bytes + 3,
+        reclaim_bytes=plan.reclaim_bytes + 4,
+    )
+
+    assert repriced.fingerprint != plan.fingerprint
+    assert repriced.execution_epoch_fingerprint == plan.execution_epoch_fingerprint
+
+
+def test_kv_transition_cannot_reuse_decode_epoch() -> None:
+    working_set, _managers, plan = _worker_consensus_fixture()
+    transitioned = replace(plan, kv_transition=(8, 7))
+
+    assert working_set._reusable_decode_epoch(plan) is not None
+    assert working_set._reusable_decode_epoch(transitioned) is None
+    with pytest.raises(ValueError, match="mutation-free HOT text decode"):
+        replace(transitioned, reuse_rank_consensus=True)
+
+
+def test_decode_epoch_is_published_only_after_successful_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    working_set, _managers, plan = _worker_consensus_fixture()
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=object()),
+    )
+
+    def gather_vote(output, value, **_kwargs):
+        output.view(3, 5)[:] = value
+
+    monkeypatch.setattr(torch.distributed, "all_gather_single", gather_vote)
+    working_set.begin_admitted_step(plan)
+    working_set.require_post_materialization_consensus(
+        plan, observer_fingerprint="stable"
+    )
+
+    assert working_set._accepted_decode_epoch is None
+    working_set.finish_step()
+    assert working_set._accepted_decode_epoch == plan.execution_epoch_fingerprint
+
+
+def test_idle_step_invalidates_decode_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
+    working_set, _managers, plan = _worker_consensus_fixture()
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=object()),
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(gc, "collect", lambda: 0)
+
+    def gather_vote(output, value, **_kwargs):
+        output.view(3, 5)[:] = value
+
+    monkeypatch.setattr(torch.distributed, "all_gather_single", gather_vote)
+    working_set.begin_admitted_step(plan)
+    working_set.require_post_materialization_consensus(
+        plan, observer_fingerprint="stable"
+    )
+    working_set.finish_step()
+    assert working_set._accepted_decode_epoch is not None
+
+    working_set.finish_idle_step()
+    assert working_set._accepted_decode_epoch is None
+
+
+def test_reused_decode_local_drift_is_fatal_and_invalidates_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    working_set, managers, plan = _worker_consensus_fixture()
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=object()),
+    )
+    votes = 0
+
+    def gather_vote(output, value, **_kwargs):
+        nonlocal votes
+        votes += 1
+        output.view(3, 5)[:] = value
+
+    monkeypatch.setattr(torch.distributed, "all_gather_single", gather_vote)
+    working_set.begin_admitted_step(plan)
+    working_set.require_post_materialization_consensus(
+        plan, observer_fingerprint="stable"
+    )
+    working_set.finish_step()
+
+    repeated = replace(
+        plan,
+        transaction_id="consensus-user-2",
+        reuse_rank_consensus=True,
+    )
+    for manager in managers:
+        manager.reset_mock()
+    managers[0].is_physical_key_hot.return_value = False
+    with pytest.raises(RuntimeError, match="ELASTIC_STEADY_EPOCH_LOCAL_DRIFT"):
+        working_set.begin_admitted_step(repeated)
+    assert votes == 2
+    _assert_no_worker_plan_mutation(managers)
+
+    managers[0].is_physical_key_hot.return_value = True
+    working_set.begin_admitted_step(
+        replace(repeated, transaction_id="consensus-user-3", reuse_rank_consensus=False)
+    )
+    assert votes == 3
+
+
+def test_reused_decode_observer_drift_is_fatal_and_invalidates_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    working_set, _managers, plan = _worker_consensus_fixture()
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=object()),
+    )
+    votes = 0
+
+    def gather_vote(output, value, **_kwargs):
+        nonlocal votes
+        votes += 1
+        output.view(3, 5)[:] = value
+
+    monkeypatch.setattr(torch.distributed, "all_gather_single", gather_vote)
+    working_set.begin_admitted_step(plan)
+    working_set.require_post_materialization_consensus(
+        plan, observer_fingerprint="stable"
+    )
+    working_set.finish_step()
+
+    repeated = replace(
+        plan,
+        transaction_id="consensus-user-2",
+        reuse_rank_consensus=True,
+    )
+    working_set.begin_admitted_step(repeated)
+    with pytest.raises(RuntimeError, match="observer differs"):
+        working_set.require_post_materialization_consensus(
+            repeated, observer_fingerprint="drifted"
+        )
+    assert votes == 2
+    working_set.finish_step()
+    retry = replace(
+        plan,
+        transaction_id="consensus-user-3",
+        reuse_rank_consensus=False,
+    )
+    working_set.begin_admitted_step(retry)
+    assert votes == 3
 
 
 @pytest.mark.parametrize("local_error", [None, "rank-0 materialization drift"])
@@ -1400,9 +1658,10 @@ def test_post_materialization_vote_converges_rank_local_rejection(
         nonlocal votes
         votes += 1
         output.view(3, 5)[:] = value
-        # Regardless of which local rank this unit instance represents, the
-        # shared vote reports one rank-local materialization rejection.
-        output.view(3, 5)[1, 4] = 1
+        if votes == 2:
+            # Regardless of which local rank this unit instance represents,
+            # the post-materialization vote reports one rank-local rejection.
+            output.view(3, 5)[1, 4] = 1
 
     def gather_diagnostics(outputs, value, **_kwargs):
         outputs[:] = [
@@ -1414,6 +1673,7 @@ def test_post_materialization_vote_converges_rank_local_rejection(
     monkeypatch.setattr(torch.distributed, "all_gather_single", gather_vote)
     monkeypatch.setattr(torch.distributed, "all_gather_object", gather_diagnostics)
 
+    working_set.begin_admitted_step(plan)
     with pytest.raises(
         RuntimeError,
         match="all-rank input materialization vote rejected before model collectives",
@@ -1423,7 +1683,7 @@ def test_post_materialization_vote_converges_rank_local_rejection(
             validation_error=local_error,
         )
 
-    assert votes == 1
+    assert votes == 2
     calls, total_ns = working_set.rank_consensus_timing_snapshot()[
         "post_materialization"
     ]
@@ -1441,9 +1701,14 @@ def test_post_materialization_vote_rejects_observer_fingerprint_drift(
         lambda: SimpleNamespace(cpu_group=object()),
     )
 
+    votes = 0
+
     def gather_vote(output, value, **_kwargs):
+        nonlocal votes
+        votes += 1
         output.view(3, 5)[:] = value
-        output.view(3, 5)[1, 0] ^= 1
+        if votes == 2:
+            output.view(3, 5)[1, 0] ^= 1
 
     def gather_diagnostics(outputs, value, **_kwargs):
         outputs[:] = [value, ("f" * 64, None), value]
@@ -1451,6 +1716,7 @@ def test_post_materialization_vote_rejects_observer_fingerprint_drift(
     monkeypatch.setattr(torch.distributed, "all_gather_single", gather_vote)
     monkeypatch.setattr(torch.distributed, "all_gather_object", gather_diagnostics)
 
+    working_set.begin_admitted_step(plan)
     with pytest.raises(RuntimeError, match="vote rejected before model collectives"):
         working_set.require_post_materialization_consensus(
             plan,
@@ -3251,6 +3517,73 @@ def test_working_set_idle_finish_releases_allocator_before_measurement(monkeypat
         "empty_cache",
         ("synchronize", torch.device("cuda:2")),
     ]
+
+
+def test_pre_consensus_idle_reclaim_preserves_active_plan(monkeypatch):
+    events = []
+    manager = MagicMock()
+    manager.device = torch.device("cuda:2")
+    manager.dynamic_resident_bytes = 0
+    manager.finish_dynamic_step.side_effect = lambda: events.append("finish")
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.torch.cuda,
+        "synchronize",
+        lambda device: events.append(("synchronize", device)),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.gc, "collect", lambda: events.append("collect")
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.torch.accelerator,
+        "empty_cache",
+        lambda: events.append("empty_cache"),
+    )
+
+    working_set = gpu_cudagraph_utils.DynamicGraphWorkingSet((manager,))
+    working_set._accepted_decode_epoch = "previous-decode"
+    working_set._accepted_decode_observer = ("post_materialization", "stable")
+    working_set._active_step_plan_fingerprint = "active-reclaim"
+
+    assert working_set.prepare_idle_reclaim_before_post_consensus() == 0
+    assert working_set._active_step_plan_fingerprint == "active-reclaim"
+    assert working_set._accepted_decode_epoch is None
+    assert working_set._accepted_decode_observer is None
+    assert events == [
+        "finish",
+        ("synchronize", torch.device("cuda:2")),
+        "collect",
+        "empty_cache",
+        ("synchronize", torch.device("cuda:2")),
+    ]
+
+
+@pytest.mark.parametrize("active_decode,reuses", [("decode", False), (None, True)])
+def test_pre_consensus_idle_reclaim_rejects_decode_state(active_decode, reuses):
+    manager = MagicMock()
+    manager.dynamic_resident_bytes = 0
+    working_set = gpu_cudagraph_utils.DynamicGraphWorkingSet((manager,))
+    working_set._active_step_plan_fingerprint = "active"
+    working_set._active_step_decode_epoch = active_decode
+    working_set._active_step_reuses_consensus = reuses
+
+    with pytest.raises(RuntimeError, match="active non-decode step"):
+        working_set.prepare_idle_reclaim_before_post_consensus()
+
+    manager.finish_dynamic_step.assert_not_called()
+
+
+def test_post_consensus_without_active_plan_reports_transaction_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    working_set, _managers, plan = _worker_consensus_fixture()
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=object()),
+    )
+
+    with pytest.raises(RuntimeError, match="ELASTIC_ACTIVE_STEP_PLAN_DRIFT"):
+        working_set.require_post_materialization_consensus(plan)
 
 
 def test_dynamic_graph_retains_hot_shape_across_falling_wave_and_x1(monkeypatch):

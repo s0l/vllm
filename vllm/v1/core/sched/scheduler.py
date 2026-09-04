@@ -368,6 +368,10 @@ class Scheduler(SchedulerInterface):
         self._elastic_admission_controller = ElasticAdmissionController(
             RuntimeGeneration(runtime_generation)
         )
+        # SchedulerOutput is the single broadcast authority for whether every
+        # rank enters a boundary vote. Never derive this decision from a
+        # rank-local worker cache: divergent collective order would deadlock.
+        self._elastic_accepted_decode_consensus_epoch: str | None = None
         self._elastic_deferred_mm_wave: DeferredMMWave | None = None
         # A zero-token staged replacement keeps its victims as physical
         # lifetime fences until its exact USER shape consumes the candidate.
@@ -4537,6 +4541,19 @@ class Scheduler(SchedulerInterface):
                         )
                     ),
                 )
+            decode_consensus_epoch = (
+                elastic_step_plan.execution_epoch_fingerprint
+                if elastic_step_plan.reusable_decode_consensus_epoch
+                else None
+            )
+            elastic_step_plan = replace(
+                elastic_step_plan,
+                reuse_rank_consensus=bool(
+                    decode_consensus_epoch is not None
+                    and decode_consensus_epoch
+                    == self._elastic_accepted_decode_consensus_epoch
+                ),
+            )
             if elastic_step_plan.kind == ElasticPlanKind.USER:
                 self._elastic_admission_controller.commit_user(elastic_step_plan)
                 useful_started = getattr(self, "_elastic_useful_started", None)
@@ -5755,8 +5772,21 @@ class Scheduler(SchedulerInterface):
                 for key in physical_keys
             )
         ):
+            # Request-free maintenance publishes the Graph owners before the
+            # first real calibration replay. That replay can materialize one
+            # measured cuBLAS/runtime workspace just as it can in serving.
+            # Include the unit in finite-wave preflight so an oversized cohort
+            # contracts before KV/request mutation instead of overrunning its
+            # committed loan during settlement.
+            first_replay_workspace = (
+                self._elastic_admission_controller.cublas_workspace_bytes
+                if self._elastic_admission_controller.last_maintenance_step_key
+                == step_key
+                else 0
+            )
             return max(
-                self._elastic_admission_controller.resident_bytes,
+                self._elastic_admission_controller.resident_bytes
+                + first_replay_workspace,
                 self._elastic_admission_controller.measured_bytes.get(step_key, 0),
             ), False
         if (
@@ -8079,6 +8109,13 @@ class Scheduler(SchedulerInterface):
             model_runner_output.elastic_external_memory_transition_floor_bytes,
             model_runner_output.elastic_residency_receipt,
         )
+        completed_plan = scheduler_output.elastic_step_plan
+        self._elastic_accepted_decode_consensus_epoch = (
+            completed_plan.execution_epoch_fingerprint
+            if completed_plan is not None
+            and completed_plan.reusable_decode_consensus_epoch
+            else None
+        )
         if scheduler_output.total_num_scheduled_tokens > 0:
             self._commit_elastic_graph_carrier_step_key(
                 scheduler_output.elastic_graph_step_key
@@ -9161,6 +9198,7 @@ class Scheduler(SchedulerInterface):
         self, scheduler_output: SchedulerOutput
     ) -> list[Request]:
         """Abort one pre-mutation execution while preserving the engine epoch."""
+        self._elastic_accepted_decode_consensus_epoch = None
         plan = scheduler_output.elastic_step_plan
         if plan is None:
             raise RuntimeError("execution-plan recovery requires an immutable plan")

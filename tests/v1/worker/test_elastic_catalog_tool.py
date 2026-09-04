@@ -914,7 +914,7 @@ def test_calibration_checkpoint_round_trip_preserves_complete_evidence():
         full_context_max_x=1,
         mixed_query_witnesses=(witness,),
     )
-    row = {**_complete_row(), "resident_key_bytes": (("target", 32),)}
+    row = {**_complete_row(), "resident_key_bytes": (("target", 1),)}
     payload = calibration_checkpoint_payload(
         catalog={key: row},
         mixed_query_witnesses={witness},
@@ -936,7 +936,45 @@ def test_calibration_checkpoint_round_trip_preserves_complete_evidence():
     assert parsed.wall_seconds == 12.5
 
 
-def test_calibration_checkpoint_rejects_incomplete_row():
+def test_calibration_checkpoint_preserves_consistent_partial_row():
+    key = (0, 3, 1, 2, 0)
+    surface = CalibrationSurface(
+        required=(key,),
+        restore=(key,),
+        decode_max_x=1,
+        mixed_max_x=1,
+        full_context_max_x=1,
+    )
+    row = {
+        **_complete_row(),
+        "cold_observations": 1,
+        "cold_stable_replays": 0,
+        "hot_observations": 0,
+        "hot_stable_replays": 0,
+        "hot_peak_bytes": 0,
+    }
+    payload = calibration_checkpoint_payload(
+        catalog={key: row},
+        mixed_query_witnesses=set(),
+        fingerprint="0123456789abcdef",
+        surface_sha256="a" * 64,
+        process_epochs=1,
+        calibration_wall_seconds=1.0,
+    )
+
+    parsed = parse_calibration_checkpoint(
+        payload,
+        surface=surface,
+        fingerprint="0123456789abcdef",
+        surface_sha256="a" * 64,
+    )
+
+    assert parsed.catalog == {key: row}
+    assert payload["completed_shapes"] == 0
+    assert payload["observed_shapes"] == 1
+
+
+def test_calibration_checkpoint_rejects_inconsistent_partial_row():
     key = (0, 3, 1, 2, 0)
     surface = CalibrationSurface(
         required=(key,),
@@ -954,7 +992,7 @@ def test_calibration_checkpoint_rejects_incomplete_row():
         calibration_wall_seconds=1.0,
     )
 
-    with pytest.raises(RuntimeError, match="contains incomplete row"):
+    with pytest.raises(RuntimeError, match="observations are inconsistent"):
         parse_calibration_checkpoint(
             payload,
             surface=surface,
@@ -1016,6 +1054,146 @@ def test_calibrator_resumes_only_missing_rows_after_bounded_process_epoch(
 
     assert set(second.calibrate(surface, checkpoint=checkpoint)) == set(keys)
     assert calls == [keys[0], keys[1]]
+
+
+def test_calibrator_resumes_partial_row_in_fresh_producer_epoch(monkeypatch):
+    key = (0, 3, 1, 2, 0)
+    scheduler = SimpleNamespace(
+        _elastic_graph_catalog={},
+        _elastic_restore_mode=False,
+        _elastic_graph_catalog_coverage={},
+        _resolve_elastic_step_physical_keys=lambda _key: ("physical",),
+        num_spec_tokens=3,
+    )
+    owner = SimpleNamespace(
+        scheduler=scheduler,
+        is_pooling_model=False,
+        async_scheduling=False,
+    )
+    calls = []
+
+    def balanced(*, k, x, m):
+        calls.append((k, x, m))
+        scheduler._elastic_graph_catalog[key] = (
+            {
+                **_complete_row(),
+                "cold_observations": 1,
+                "cold_stable_replays": 0,
+                "hot_observations": 0,
+                "hot_stable_replays": 0,
+                "hot_peak_bytes": 0,
+            }
+            if len(calls) == 1
+            else _complete_row()
+        )
+        return key, x
+
+    surface = CalibrationSurface(
+        required=(key,),
+        restore=(key,),
+        decode_max_x=1,
+        mixed_max_x=1,
+        full_context_max_x=1,
+    )
+    saved = {}
+    first = ElasticCatalogCalibrator(owner)
+    monkeypatch.setattr(first, "_validate_surface_before_mutation", lambda _s: None)
+    monkeypatch.setattr(first, "_balanced_prefill_pair", balanced)
+
+    with pytest.raises(ElasticCalibrationRestartRequired, match="producer_epochs=1"):
+        first.calibrate(
+            surface,
+            checkpoint_callback=lambda catalog, witnesses: saved.update(
+                catalog=catalog, witnesses=set(witnesses)
+            ),
+            max_producer_epochs_per_process=1,
+        )
+
+    assert saved["catalog"][key]["cold_observations"] == 1
+    second = ElasticCatalogCalibrator(owner)
+    monkeypatch.setattr(second, "_validate_surface_before_mutation", lambda _s: None)
+    monkeypatch.setattr(second, "_balanced_prefill_pair", balanced)
+    measured = second.calibrate(
+        surface,
+        checkpoint=CalibrationCheckpoint(saved["catalog"], frozenset()),
+        checkpoint_callback=lambda _catalog, _witnesses: None,
+        max_producer_epochs_per_process=1,
+    )
+
+    assert measured[key] == _complete_row()
+    assert calls == [(3, 1, 2), (3, 1, 2)]
+
+
+def test_calibrator_does_not_checkpoint_contracted_producer(monkeypatch):
+    key = (0, 3, 2, 4, 0)
+    scheduler = SimpleNamespace(
+        _elastic_graph_catalog={},
+        _elastic_restore_mode=False,
+        _elastic_graph_catalog_coverage={},
+        _resolve_elastic_step_physical_keys=lambda _key: ("physical",),
+        num_spec_tokens=3,
+    )
+    owner = SimpleNamespace(
+        scheduler=scheduler,
+        is_pooling_model=False,
+        async_scheduling=False,
+    )
+    calibrator = ElasticCatalogCalibrator(owner)
+    monkeypatch.setattr(
+        calibrator, "_validate_surface_before_mutation", lambda _s: None
+    )
+
+    def contracted(**_kwargs):
+        scheduler._elastic_graph_catalog[key] = {
+            **_complete_row(),
+            "cold_observations": 1,
+            "cold_stable_replays": 0,
+        }
+        return None, 1
+
+    monkeypatch.setattr(calibrator, "_balanced_prefill_pair", contracted)
+    checkpoint = Mock()
+    surface = CalibrationSurface(
+        required=(key,),
+        restore=(key,),
+        decode_max_x=2,
+        mixed_max_x=2,
+        full_context_max_x=1,
+    )
+
+    with pytest.raises(RuntimeError, match="contracted accepted surface"):
+        calibrator.calibrate(
+            surface,
+            checkpoint_callback=checkpoint,
+            max_producer_epochs_per_process=1,
+        )
+
+    checkpoint.assert_not_called()
+
+
+def test_calibrator_rejects_producer_limit_without_checkpoint_sink():
+    scheduler = SimpleNamespace(
+        _elastic_graph_catalog={},
+        _elastic_restore_mode=False,
+        _elastic_graph_catalog_coverage={},
+    )
+    calibrator = ElasticCatalogCalibrator(
+        SimpleNamespace(
+            scheduler=scheduler,
+            is_pooling_model=False,
+            async_scheduling=False,
+        )
+    )
+    surface = CalibrationSurface(
+        required=((0, 3, 1, 2, 0),),
+        restore=((0, 3, 1, 2, 0),),
+        decode_max_x=1,
+        mixed_max_x=1,
+        full_context_max_x=1,
+    )
+
+    with pytest.raises(ValueError, match="requires a checkpoint callback"):
+        calibrator.calibrate(surface, max_producer_epochs_per_process=1)
 
 
 def test_calibrator_resume_does_not_repeat_mixed_semantic_witness(monkeypatch):
@@ -1230,7 +1408,7 @@ def test_calibrator_measures_restore_owner_only_through_full_lifecycle(monkeypat
     balanced.assert_called_once_with(k=3, x=38, m=76)
 
 
-def test_calibrator_checkpoints_complete_restore_family_before_restart(monkeypatch):
+def test_calibrator_checkpoints_partial_restore_family_before_restart(monkeypatch):
     piecewise = (0, 3, 38, 128, 0)
     full = (1, 3, 38, 38, 1)
     later = (0, 3, 1, 2, 0)
@@ -1269,9 +1447,12 @@ def test_calibrator_checkpoints_complete_restore_family_before_restart(monkeypat
             _complete_row()
             if restore_calls == 2
             else {
-                "cold_peak_bytes": 1,
+                **_complete_row(),
                 "cold_observations": 1,
                 "cold_stable_replays": 0,
+                "hot_observations": 0,
+                "hot_stable_replays": 0,
+                "hot_peak_bytes": 0,
             }
         )
         return full, 38
@@ -1296,6 +1477,28 @@ def test_calibrator_checkpoints_complete_restore_family_before_restart(monkeypat
         )
 
     assert set(saved["catalog"]) == {piecewise, full}
+    assert saved["catalog"][full]["cold_observations"] == 1
+    assert owner._run_elastic_full_restore_wave.call_count == 1
+    balanced_mock.assert_called_once_with(k=3, x=38, m=76)
+
+    resumed = ElasticCatalogCalibrator(owner)
+    monkeypatch.setattr(
+        resumed, "_validate_surface_before_mutation", lambda _surface: None
+    )
+    monkeypatch.setattr(resumed, "_balanced_prefill_pair", balanced_mock)
+    resumed_saved = {}
+    with pytest.raises(ElasticCalibrationRestartRequired):
+        resumed.calibrate(
+            surface,
+            checkpoint=CalibrationCheckpoint(saved["catalog"], frozenset()),
+            checkpoint_callback=lambda catalog, witnesses: resumed_saved.update(
+                catalog=catalog, witnesses=set(witnesses)
+            ),
+            max_new_rows_per_process=1,
+        )
+
+    assert set(resumed_saved["catalog"]) == {piecewise, full}
+    assert resumed_saved["catalog"][full] == _complete_row()
     assert owner._run_elastic_full_restore_wave.call_count == 2
     balanced_mock.assert_called_once_with(k=3, x=38, m=76)
 

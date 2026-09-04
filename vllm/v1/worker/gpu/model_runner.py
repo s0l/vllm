@@ -2718,7 +2718,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         wrappers while the old external loan is still mapped.  Pinned HOT
         entries remain resident and are returned as the minimum external loan.
         """
-        working_set.finish_idle_step()
+        working_set.prepare_idle_reclaim_before_post_consensus()
         self._elastic_pre_idle_evicted_graph_bytes = (
             working_set.evict_unpinned_for_idle(transaction_id)
         )
@@ -2782,6 +2782,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Resolve it before the branch so startup profiling cannot observe an
         # unbound local.
         elastic_plan = scheduler_output.elastic_step_plan
+        elastic_equal_kv_noop_validated = False
         is_synthetic_warmup = scheduler_output.is_synthetic_warmup
         if (
             not dummy_run
@@ -3006,6 +3007,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                 "ELASTIC_EXECUTION_PLAN_MISMATCH: explicit compiled "
                                 f"route is not executable: owner={owner!r}"
                             )
+                    elastic_equal_kv_noop_validated = (
+                        self.elastic_kv_controller.validate_equal_scheduler_step(
+                            scheduler_output.elastic_kv_transition,
+                            scheduler_output.elastic_external_memory_bytes,
+                        )
+                    )
                 except Exception as error:
                     # Every deterministic identity/read-back failure in this
                     # pre-mutation block must enter the same CPU-group vote.
@@ -3141,10 +3148,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 or scheduler_output.elastic_mm_activation_loan_bytes > 0
             )
             with record_function_or_nullcontext("ag2.elastic_kv_transition"):
-                self._apply_next_elastic_kv_step(
-                    transition,
-                    requested_external,
-                )
+                if (
+                    elastic_equal_kv_noop_validated
+                    and transition is None
+                    and requested_external
+                    == scheduler_output.elastic_external_memory_bytes
+                ):
+                    # The local backing layout joined the already-required
+                    # pre-mutation all-rank vote above. Re-entering apply()
+                    # would perform two device collectives and synchronizing
+                    # scalar reads only to rediscover that nothing changed.
+                    self._elastic_retained_transition_floor_bytes = 0
+                else:
+                    self._apply_next_elastic_kv_step(
+                        transition,
+                        requested_external,
+                    )
             elastic_transition_applied = True
             if measurement_required:
                 self._begin_elastic_step_measurement()

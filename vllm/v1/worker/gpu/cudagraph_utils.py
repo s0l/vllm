@@ -504,6 +504,13 @@ class DynamicGraphWorkingSet:
         self._rank_vote_gathered: torch.Tensor | None = None
         self._rank_consensus_calls: dict[str, int] = {}
         self._rank_consensus_ns: dict[str, int] = {}
+        self._rank_consensus_reuses: dict[str, int] = {}
+        self._accepted_decode_epoch: str | None = None
+        self._accepted_decode_observer: tuple[str, str | None] | None = None
+        self._active_step_plan_fingerprint: str | None = None
+        self._active_step_decode_epoch: str | None = None
+        self._active_step_decode_observer: tuple[str, str | None] | None = None
+        self._active_step_reuses_consensus = False
         if managers and all(
             isinstance(manager, CudaGraphManager) for manager in managers
         ):
@@ -976,6 +983,46 @@ class DynamicGraphWorkingSet:
             for phase, calls in self._rank_consensus_calls.items()
         }
 
+    def rank_consensus_reuse_snapshot(self) -> dict[str, int]:
+        """Return phase -> skipped collective count for perf receipts."""
+        return dict(self._rank_consensus_reuses)
+
+    @staticmethod
+    def _reusable_decode_epoch(plan: ElasticStepPlan) -> str | None:
+        """Return a stable epoch only for mutation-free text decode."""
+        if not plan.reusable_decode_consensus_epoch:
+            return None
+        return plan.execution_epoch_fingerprint
+
+    def _invalidate_decode_consensus_epoch(self) -> None:
+        self._accepted_decode_epoch = None
+        self._accepted_decode_observer = None
+        self._active_step_decode_observer = None
+
+    def _record_consensus_reuse(self, phase: str) -> None:
+        reuses = self._rank_consensus_reuses.get(phase, 0) + 1
+        self._rank_consensus_reuses[phase] = reuses
+        if reuses == 1 or reuses % 64 == 0:
+            logger.info(
+                "AG2 elastic rank-consensus reuse: phase=%s skips=%d",
+                phase,
+                reuses,
+            )
+
+    def _raise_reused_epoch_drift(self, detail: str) -> None:
+        self._invalidate_decode_consensus_epoch()
+        raise RuntimeError(
+            "ELASTIC_STEADY_EPOCH_LOCAL_DRIFT: an already unanimous decode "
+            f"epoch diverged locally; runtime restart is required: {detail}"
+        )
+
+    def _raise_active_step_plan_drift(self, detail: str) -> None:
+        self._invalidate_decode_consensus_epoch()
+        raise RuntimeError(
+            "ELASTIC_ACTIVE_STEP_PLAN_DRIFT: the post-mutation boundary no "
+            f"longer matches its admitted plan; runtime restart is required: {detail}"
+        )
+
     def _require_rank_consensus_impl(
         self,
         plan: ElasticStepPlan,
@@ -985,10 +1032,9 @@ class DynamicGraphWorkingSet:
     ) -> str:
         """Make every rank accept or reject before any CUDA/KV mutation.
 
-        The compact vote is mandatory even when the manifest fingerprint
-        repeats.  A rank-local residency or request-state error is not known to
-        peers, so conditionally entering this collective would either strand
-        them or let them mutate a plan rejected elsewhere.
+        Callers decide whether a previously unanimous steady-decode epoch can
+        reuse its boundary. Whenever this method is entered, the compact vote
+        remains mandatory and converges every rank-local error.
         """
         local_error = validation_error
         try:
@@ -1139,7 +1185,27 @@ class DynamicGraphWorkingSet:
             local_error = (
                 plan_error if local_error is None else f"{local_error}; {plan_error}"
             )
-        self.require_rank_consensus(plan, validation_error=local_error)
+        decode_epoch = self._reusable_decode_epoch(plan)
+        reuse_consensus = plan.reuse_rank_consensus
+        if reuse_consensus:
+            if decode_epoch != self._accepted_decode_epoch:
+                self._raise_reused_epoch_drift(
+                    "scheduler requested reuse without the matching locally "
+                    f"accepted epoch: scheduler={decode_epoch!r} "
+                    f"worker={self._accepted_decode_epoch!r}"
+                )
+            if local_error is not None:
+                self._raise_reused_epoch_drift(local_error)
+            self._record_consensus_reuse("pre_mutation")
+        else:
+            # Crossing any non-identical or non-decode boundary invalidates the
+            # old proof before the new all-rank vote.
+            self._invalidate_decode_consensus_epoch()
+            self.require_rank_consensus(plan, validation_error=local_error)
+        self._active_step_plan_fingerprint = plan.fingerprint
+        self._active_step_decode_epoch = decode_epoch
+        self._active_step_decode_observer = None
+        self._active_step_reuses_consensus = reuse_consensus
         self.begin_step()
         self._apply_validated_plan(plan)
 
@@ -1157,14 +1223,35 @@ class DynamicGraphWorkingSet:
         materialization can expose rank-local request-state drift only after
         the admitted plan has already crossed its mutation boundary.
         """
+        if plan.fingerprint != self._active_step_plan_fingerprint:
+            self._raise_active_step_plan_drift(
+                "post-materialization plan differs from the admitted step"
+            )
+        observer = (phase, observer_fingerprint)
+        if self._active_step_reuses_consensus:
+            if validation_error is not None:
+                self._raise_reused_epoch_drift(validation_error)
+            if observer != self._accepted_decode_observer:
+                self._raise_reused_epoch_drift(
+                    "post-materialization observer differs from the accepted "
+                    f"boundary: accepted={self._accepted_decode_observer!r} "
+                    f"observed={observer!r}"
+                )
+            self._record_consensus_reuse(phase)
+            return plan.fingerprint
         try:
-            return self.require_rank_consensus(
+            result = self.require_rank_consensus(
                 plan,
                 validation_error=validation_error,
                 observer_fingerprint=observer_fingerprint,
                 phase=phase,
             )
+            if self._active_step_decode_epoch is not None:
+                # Publish only after model execution reaches finish_step().
+                self._active_step_decode_observer = observer
+            return result
         except ElasticExecutionPlanMismatch as error:
+            self._invalidate_decode_consensus_epoch()
             raise RuntimeError(
                 "ELASTIC_POST_MUTATION_OBSERVER_MISMATCH: all-rank input "
                 "materialization vote rejected before model collectives; "
@@ -1195,7 +1282,18 @@ class DynamicGraphWorkingSet:
     def finish_step(self) -> int:
         for manager in self.managers:
             manager.finish_dynamic_step()
+        if (
+            not self._active_step_reuses_consensus
+            and self._active_step_decode_epoch is not None
+            and self._active_step_decode_observer is not None
+        ):
+            self._accepted_decode_epoch = self._active_step_decode_epoch
+            self._accepted_decode_observer = self._active_step_decode_observer
         self._planned_capture_order = ()
+        self._active_step_plan_fingerprint = None
+        self._active_step_decode_epoch = None
+        self._active_step_decode_observer = None
+        self._active_step_reuses_consensus = False
         return self.resident_bytes
 
     def acquire_leases(self, transaction_id: str) -> None:
@@ -1264,6 +1362,7 @@ class DynamicGraphWorkingSet:
         authoritative identity for every subsequently admitted transaction.
         Rebinding is deliberately legal only while residency is still empty.
         """
+        self._invalidate_decode_consensus_epoch()
         for manager in self.managers:
             manager.rebind_runtime_generation(generation.value)
 
@@ -1277,6 +1376,33 @@ class DynamicGraphWorkingSet:
         external-memory floor.
         """
         self.finish_step()
+        self._invalidate_decode_consensus_epoch()
+        return self._release_idle_allocator_cache()
+
+    def prepare_idle_reclaim_before_post_consensus(self) -> int:
+        """Settle request-free owners without ending the admitted transaction.
+
+        Administrative X0 must finish and evict Graph owners before expanding
+        KV, but its post-state all-rank vote still belongs to the same admitted
+        plan. Keep that active plan identity until the ordinary final
+        ``finish_step`` while invalidating any previously reusable decode
+        boundary.
+        """
+        if (
+            self._active_step_plan_fingerprint is None
+            or self._active_step_decode_epoch is not None
+            or self._active_step_reuses_consensus
+        ):
+            raise RuntimeError(
+                "pre-consensus idle reclaim requires an active non-decode step"
+            )
+        for manager in self.managers:
+            manager.finish_dynamic_step()
+        self._invalidate_decode_consensus_epoch()
+        return self._release_idle_allocator_cache()
+
+    def _release_idle_allocator_cache(self) -> int:
+        """Release allocator cache after all current Graph owners are settled."""
         if not self.managers:
             return 0
         device = self.managers[0].device

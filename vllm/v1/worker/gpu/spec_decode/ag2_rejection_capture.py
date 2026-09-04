@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 import torch
 
-_SCHEMA = "ag2-rejection-capture-v2"
+_SCHEMA = "ag2-rejection-capture-v3"
 
 
 class Ag2RejectionCapture:

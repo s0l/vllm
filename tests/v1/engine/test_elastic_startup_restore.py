@@ -1055,6 +1055,9 @@ def test_auto_calibration_records_restartable_checkpoint(tmp_path, monkeypatch):
     monkeypatch.setenv("AG2_VLLM_ELASTIC_CALIBRATION_SURFACE", str(surface))
     monkeypatch.setenv("AG2_VLLM_ELASTIC_CALIBRATION_RECEIPT", str(receipt_path))
     monkeypatch.setenv("AG2_VLLM_ELASTIC_CALIBRATION_MAX_NEW_ROWS_PER_PROCESS", "8")
+    monkeypatch.setenv(
+        "AG2_VLLM_ELASTIC_CALIBRATION_MAX_PRODUCER_EPOCHS_PER_PROCESS", "1"
+    )
     monkeypatch.setattr(envs, "VLLM_CACHE_ROOT", str(tmp_path))
     monkeypatch.setattr(
         elastic_catalog,
@@ -1081,6 +1084,7 @@ def test_auto_calibration_records_restartable_checkpoint(tmp_path, monkeypatch):
 
     def calibrate(*_args, **kwargs):
         assert kwargs["max_new_rows_per_process"] == 8
+        assert kwargs["max_producer_epochs_per_process"] == 1
         seen_checkpoints.append(kwargs["checkpoint_payload"])
         kwargs["checkpoint_callback"](checkpoint)
         raise elastic_calibrator.ElasticCalibrationRestartRequired("epoch complete")

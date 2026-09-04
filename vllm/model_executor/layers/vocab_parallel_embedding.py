@@ -538,9 +538,9 @@ class VocabParallelEmbedding(PluggableLayer):
                 output = tensor_model_parallel_all_reduce(comm_output)
                 return output.view(output_parallel.dtype)
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-            # Reduce across all the model parallel GPUs.
-            return tensor_model_parallel_embedding_all_reduce(output_parallel)
-        return output_parallel
+        # Both fused and unfused embedding lookups produce rank-local partials.
+        # Preserve the phase-stable Exp22 reduction contract for both paths.
+        return tensor_model_parallel_embedding_all_reduce(output_parallel)
 
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings}"

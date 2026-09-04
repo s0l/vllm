@@ -3658,6 +3658,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self._dcp_prefill_captured_wrappers: dict[
             int, BatchDCPPrefillWrapper | BatchDCPPseudoPrefillWrapper
         ] = {}
+        self._static_cudagraph_batch_sizes = frozenset(
+            vllm_config.compilation_config.cudagraph_capture_sizes or ()
+        )
         self._dcp_prefill_qo_indptr_buffer: torch.Tensor | None = None
         self._dcp_prefill_context_int_workspace: torch.Tensor | None = None
         self._dcp_prefill_new_tokens_int_workspace: torch.Tensor | None = None
@@ -4731,6 +4734,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         target/MTP-prefill wrapper identity remains valid until the last
         consumer is gone.
         """
+        static_batch_sizes = self._static_cudagraph_batch_sizes
+        protected_request_batch_sizes = keep_request_batch_sizes | static_batch_sizes
+        protected_token_batch_sizes = keep_token_batch_sizes | static_batch_sizes
         request_wrapper_maps = (
             self._dcp_prefill_wrappers_cudagraph,
             self._dcp_pseudo_prefill_wrappers_cudagraph,
@@ -4740,16 +4746,16 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         removed_ids: set[int] = set()
         for wrappers in request_wrapper_maps:
             for batch_size in tuple(wrappers):
-                if batch_size in keep_request_batch_sizes:
+                if batch_size in protected_request_batch_sizes:
                     continue
                 removed_ids.add(id(wrappers.pop(batch_size)))
         for wrappers in token_wrapper_maps:
             for batch_size in tuple(wrappers):
-                if batch_size in keep_token_batch_sizes:
+                if batch_size in protected_token_batch_sizes:
                     continue
                 removed_ids.add(id(wrappers.pop(batch_size)))
         for form_key in tuple(self._dcp_batched_decode_wrappers_cudagraph):
-            if form_key.physical_rows in keep_request_batch_sizes:
+            if form_key.physical_rows in protected_request_batch_sizes:
                 continue
             wrapper = self._dcp_batched_decode_wrappers_cudagraph.pop(form_key)
             wrapper.retire_graph_lease()

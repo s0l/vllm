@@ -311,7 +311,19 @@ def cp_lse_ag_out_rs(
         seq_lens=seq_lens,
         query_start_loc=query_start_loc,
     )
-    out = cp_group.reduce_scatter(out, dim=1)
+    max_native_rows = envs.VLLM_DCP_NATIVE_RS_MAX_ROWS
+    if max_native_rows < 0:
+        raise ValueError("VLLM_DCP_NATIVE_RS_MAX_ROWS must be non-negative")
+    use_native_reduce_scatter = (
+        max_native_rows > 0
+        and out.dim() == 3
+        and out.shape[0] <= max_native_rows
+        and out.shape[1] % cp_group.world_size == 0
+    )
+    if use_native_reduce_scatter:
+        out = cp_group.reduce_scatter(out, dim=1)
+    else:
+        out = cp_group.reduce_scatter_chunked(out, dim=1)
 
     if return_lse:
         cp_num_heads = lse.shape[1] // cp_group.world_size

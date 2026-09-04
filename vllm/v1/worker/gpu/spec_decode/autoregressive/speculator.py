@@ -42,6 +42,16 @@ from vllm.v1.worker.utils import AttentionGroup, get_uniform_decode_token_count
 logger = init_logger(__name__)
 
 
+def _ag2_mtp_layer_trace_shape_from_env() -> tuple[int, int]:
+    rows = int(os.environ.get("AG2_VLLM_MTP_LAYER_CAPTURE_ROWS", "8"))
+    history_tokens = int(
+        os.environ.get("AG2_VLLM_MTP_LAYER_CAPTURE_HISTORY_TOKENS", "640")
+    )
+    if rows < 1 or history_tokens < 1:
+        raise ValueError("AG2 MTP layer capture shape must be positive")
+    return rows, history_tokens
+
+
 def _resolve_prefill_cudagraph_mode(
     configured_mode: CUDAGraphMode,
     attention_support: AttentionCGSupport,
@@ -87,6 +97,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         self.inputs_embeds: torch.Tensor | None = None
 
+        if self._ag2_mtp_layer_capture is not None:
+            self._ag2_current_positions = torch.full(
+                (self.max_num_reqs,), -1, dtype=torch.int64, device=device
+            )
+
         if self._ag2_draft_capture is not None:
             steps = self.num_speculative_steps
             shape = (steps, self.max_num_reqs)
@@ -103,9 +118,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self._ag2_current_input_ids = torch.full(
                 (self.max_num_reqs,), -1, dtype=torch.int64, device=device
             )
-            self._ag2_current_positions = torch.full(
-                (self.max_num_reqs,), -1, dtype=torch.int64, device=device
-            )
+            if self._ag2_mtp_layer_capture is None:
+                self._ag2_current_positions = torch.full(
+                    (self.max_num_reqs,), -1, dtype=torch.int64, device=device
+                )
             self._ag2_step_input_hidden = torch.zeros(
                 hidden_shape, dtype=self.dtype, device=device
             )
@@ -141,20 +157,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 device=self.device,
             )
 
-        if self._ag2_draft_capture is None:
-            return
-        if not hasattr(self.model, "ag2_enable_top_token_trace"):
-            raise RuntimeError(
-                "AG2 draft capture requires local-argmax provenance support"
-            )
-        self.model.ag2_enable_top_token_trace(self.max_num_reqs)
+        if self._ag2_draft_capture is not None:
+            if not hasattr(self.model, "ag2_enable_top_token_trace"):
+                raise RuntimeError(
+                    "AG2 draft capture requires local-argmax provenance support"
+                )
+            self.model.ag2_enable_top_token_trace(self.max_num_reqs)
         if self._ag2_mtp_layer_capture is not None:
             if not hasattr(self.model, "ag2_enable_mtp_layer_trace"):
                 raise RuntimeError("AG2 MTP layer capture requires Qwen trace support")
-            # x5 dispatches through the eight-row FULL CUDA Graph. Wider
-            # startup capture shapes retain fail-closed sentinels and are not
-            # persisted by the bounded five-request diagnostic.
-            self.model.ag2_enable_mtp_layer_trace(rows=8, history_tokens=640)
+            rows, history_tokens = _ag2_mtp_layer_trace_shape_from_env()
+            self.model.ag2_enable_mtp_layer_trace(
+                rows=rows, history_tokens=history_tokens
+            )
 
     # Lifecycle hooks for model-specific optimizations. Subclasses override
     # the ones they need. These fire in both `capture` and `propose` so that
@@ -902,6 +917,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         sample_src_positions = positions + 1
         idx_mapping = self.idx_mapping[:num_reqs]
 
+        if (
+            self._ag2_draft_capture is not None
+            or self._ag2_mtp_layer_capture is not None
+        ):
+            self._ag2_current_positions[:num_reqs].copy_(positions)
         if self._ag2_draft_capture is not None:
             self._ag2_current_input_hidden[:num_reqs].copy_(
                 self.hidden_states[last_token_indices]
@@ -909,7 +929,6 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self._ag2_current_input_ids[:num_reqs].copy_(
                 self.input_buffers.input_ids[last_token_indices]
             )
-            self._ag2_current_positions[:num_reqs].copy_(positions)
 
         last_hidden_states, hidden_states, mtp_trace = self._run_model(
             num_tokens,
@@ -1113,6 +1132,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         idx_mapping = self.idx_mapping[:num_reqs]
         positions = self.input_buffers.positions[:num_reqs]
+        if (
+            self._ag2_draft_capture is not None
+            or self._ag2_mtp_layer_capture is not None
+        ):
+            self._ag2_current_positions[:num_reqs].copy_(positions)
         if self._ag2_draft_capture is not None:
             self._ag2_current_input_hidden[:num_reqs].copy_(
                 self.hidden_states[:num_reqs]
@@ -1120,7 +1144,6 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self._ag2_current_input_ids[:num_reqs].copy_(
                 self.input_buffers.input_ids[:num_reqs]
             )
-            self._ag2_current_positions[:num_reqs].copy_(positions)
         # Run the draft model forward pass.
         last_hidden_states, hidden_states, mtp_trace = self._run_model(
             num_tokens_padded,

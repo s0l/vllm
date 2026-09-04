@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Controls for the research-only FlashInfer DCP prefill CUDA Graph lane."""
 
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 
@@ -24,6 +26,46 @@ def _builder(*, enabled: bool = True) -> FlashInferMetadataBuilder:
     builder._dcp_pseudo_decode_query_len = 3
     builder.use_dcp = True
     return builder
+
+
+def test_dynamic_trim_preserves_static_cudagraph_wrappers():
+    builder = _builder()
+    static_prefill = object()
+    dynamic_prefill = object()
+    static_decode = MagicMock()
+    dynamic_decode = MagicMock()
+    static_form = MagicMock(physical_rows=4)
+    dynamic_form = MagicMock(physical_rows=8)
+    builder._static_cudagraph_batch_sizes = frozenset({1, 4})
+    builder._dcp_prefill_wrappers_cudagraph = {
+        1: static_prefill,
+        8: dynamic_prefill,
+    }
+    builder._dcp_pseudo_prefill_wrappers_cudagraph = {}
+    builder._dcp_prefill_captured_wrappers = {
+        1: static_prefill,
+        8: dynamic_prefill,
+    }
+    builder._decode_wrappers_cudagraph = {4: static_decode, 8: dynamic_decode}
+    builder._dcp_batched_decode_wrappers_cudagraph = {
+        static_form: static_decode,
+        dynamic_form: dynamic_decode,
+    }
+
+    removed = builder.trim_dynamic_cudagraph_wrappers(
+        keep_request_batch_sizes=frozenset(),
+        keep_token_batch_sizes=frozenset(),
+    )
+
+    assert removed == 2
+    assert builder._dcp_prefill_wrappers_cudagraph == {1: static_prefill}
+    assert builder._dcp_prefill_captured_wrappers == {1: static_prefill}
+    assert builder._decode_wrappers_cudagraph == {4: static_decode}
+    assert builder._dcp_batched_decode_wrappers_cudagraph == {
+        static_form: static_decode
+    }
+    static_decode.retire_graph_lease.assert_not_called()
+    dynamic_decode.retire_graph_lease.assert_called_once_with()
 
 
 def test_dcp_overlapping_gqa_head_select_validates_before_cuda_launch():

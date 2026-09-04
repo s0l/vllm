@@ -175,7 +175,7 @@ def test_idle_x0_settles_graphs_and_keeps_pinned_floor_before_kv_return():
 
     assert runner._prepare_dynamic_graph_idle_kv_return(working_set, "x0-17") == 42
 
-    working_set.finish_idle_step.assert_called_once_with()
+    working_set.prepare_idle_reclaim_before_post_consensus.assert_called_once_with()
     working_set.evict_unpinned_for_idle.assert_called_once_with("x0-17")
     runner._trim_dynamic_attention_cudagraph_state.assert_called_once_with(working_set)
     working_set.reconcile_retained_cleanup.assert_called_once_with(41)
@@ -193,7 +193,7 @@ def test_idle_x0_preserves_global_workspace_while_pinned_graph_is_hot():
 
     assert runner._prepare_dynamic_graph_idle_kv_return(working_set, "x0-18") == 42
 
-    working_set.finish_idle_step.assert_called_once_with()
+    working_set.prepare_idle_reclaim_before_post_consensus.assert_called_once_with()
     working_set.evict_unpinned_for_idle.assert_called_once_with("x0-18")
     working_set.reconcile_retained_cleanup.assert_called_once_with(41)
     runner._clear_elastic_cublas_workspaces.assert_not_called()

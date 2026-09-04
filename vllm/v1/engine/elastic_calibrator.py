@@ -365,12 +365,16 @@ def parse_calibration_checkpoint(
     fingerprint: str,
     surface_sha256: str | None,
 ) -> CalibrationCheckpoint:
-    """Validate identity-bound complete rows from an earlier process epoch."""
+    """Validate identity-bound observations from an earlier process epoch."""
     if payload is None:
         return CalibrationCheckpoint({}, frozenset())
     if not isinstance(payload, dict):
         raise RuntimeError("elastic calibration checkpoint is malformed")
-    if payload.get("schema") != "ag2-elastic-calibration-checkpoint-v1":
+    schema = payload.get("schema")
+    if schema not in {
+        "ag2-elastic-calibration-checkpoint-v1",
+        "ag2-elastic-calibration-checkpoint-v2",
+    }:
         raise RuntimeError("elastic calibration checkpoint has unsupported schema")
     if payload.get("fingerprint") != fingerprint:
         raise RuntimeError("elastic calibration checkpoint fingerprint differs")
@@ -449,18 +453,69 @@ def parse_calibration_checkpoint(
                 raise RuntimeError(
                     "elastic calibration checkpoint residency map is invalid"
                 )
-            normalized["resident_key_bytes"] = tuple(
+            normalized_residency = tuple(
                 (entry[0], entry[1]) for entry in resident_key_bytes
             )
-        if not elastic_graph_catalog_row_complete(
+            if (
+                tuple(sorted(normalized_residency)) != normalized_residency
+                or len({identity for identity, _value in normalized_residency})
+                != len(normalized_residency)
+                or sum(value for _identity, value in normalized_residency)
+                > normalized["resident_bytes"]
+            ):
+                raise RuntimeError(
+                    "elastic calibration checkpoint residency map is inconsistent"
+                )
+            normalized["resident_key_bytes"] = normalized_residency
+        complete = elastic_graph_catalog_row_complete(
             key,
             normalized,
             representation="bounded_exact_hotset",
-        ):
+        )
+        cold_observations = normalized["cold_observations"]
+        hot_observations = normalized["hot_observations"]
+        if schema == "ag2-elastic-calibration-checkpoint-v1" and not complete:
             raise RuntimeError("elastic calibration checkpoint contains incomplete row")
+        if schema == "ag2-elastic-calibration-checkpoint-v2" and (
+            cold_observations < 1
+            or normalized["cold_peak_bytes"] < 1
+            or normalized["resident_bytes"] < 1
+            or normalized["floor_bytes"] > normalized["resident_bytes"]
+            or normalized["resident_bytes"]
+            > max(normalized["cold_peak_bytes"], normalized["hot_peak_bytes"])
+            or normalized["cold_stable_replays"] > max(0, cold_observations - 1)
+            or normalized["hot_stable_replays"] > max(0, hot_observations - 1)
+            or bool(hot_observations) != bool(normalized["hot_peak_bytes"])
+        ):
+            raise RuntimeError(
+                "elastic calibration checkpoint row observations are inconsistent"
+            )
         catalog[key] = normalized
-    if payload.get("completed_shapes") != len(catalog):
+    completed_shapes = sum(
+        elastic_graph_catalog_row_complete(
+            key,
+            row,
+            representation="bounded_exact_hotset",
+        )
+        for key, row in catalog.items()
+    )
+    declared_completed = payload.get("completed_shapes")
+    if (
+        isinstance(declared_completed, bool)
+        or not isinstance(declared_completed, int)
+        or declared_completed != completed_shapes
+    ):
         raise RuntimeError("elastic calibration checkpoint row count differs")
+    if schema == "ag2-elastic-calibration-checkpoint-v2":
+        declared_observed = payload.get("observed_shapes")
+        if (
+            isinstance(declared_observed, bool)
+            or not isinstance(declared_observed, int)
+            or declared_observed != len(catalog)
+        ):
+            raise RuntimeError(
+                "elastic calibration checkpoint observation count differs"
+            )
 
     raw_witnesses = payload.get("mixed_query_witnesses")
     if not isinstance(raw_witnesses, list):
@@ -506,17 +561,30 @@ def calibration_checkpoint_payload(
     process_epochs: int,
     calibration_wall_seconds: float,
 ) -> dict[str, Any]:
-    """Serialize only accepted evidence; incomplete rows never cross epochs."""
+    """Serialize validated observations across clean process epochs."""
+    observed = {
+        key: dict(row)
+        for key, row in catalog.items()
+        if row.get("cold_observations", 0) > 0
+    }
+    completed_shapes = sum(
+        elastic_graph_catalog_row_complete(
+            key,
+            row,
+            representation="bounded_exact_hotset",
+        )
+        for key, row in observed.items()
+    )
     return {
-        "schema": "ag2-elastic-calibration-checkpoint-v1",
+        "schema": "ag2-elastic-calibration-checkpoint-v2",
         "fingerprint": fingerprint,
         "surface_sha256": surface_sha256,
         "process_epochs": process_epochs,
         "calibration_wall_seconds": calibration_wall_seconds,
-        "completed_shapes": len(catalog),
+        "completed_shapes": completed_shapes,
+        "observed_shapes": len(observed),
         "rows": [
-            {"step_key": list(key), "row": dict(catalog[key])}
-            for key in sorted(catalog)
+            {"step_key": list(key), "row": observed[key]} for key in sorted(observed)
         ],
         "mixed_query_witnesses": [
             {"step_key": list(key), "query_len": query_len}
@@ -822,11 +890,18 @@ class ElasticCatalogCalibrator:
             | None
         ) = None,
         max_new_rows_per_process: int = 0,
+        max_producer_epochs_per_process: int = 0,
     ) -> dict[tuple[int, ...], dict[str, Any]]:
         if self.owner.is_pooling_model or self.owner.async_scheduling:
             raise RuntimeError("pre-READY calibration requires synchronous generation")
         if max_new_rows_per_process < 0:
             raise ValueError("calibration process row limit cannot be negative")
+        if max_producer_epochs_per_process < 0:
+            raise ValueError("calibration producer epoch limit cannot be negative")
+        if max_producer_epochs_per_process and checkpoint_callback is None:
+            raise ValueError(
+                "calibration producer epoch limit requires a checkpoint callback"
+            )
         previous_mode = self.scheduler._elastic_restore_mode
         previous_catalog = self.scheduler._elastic_graph_catalog
         working_catalog = {key: dict(row) for key, row in previous_catalog.items()}
@@ -853,8 +928,14 @@ class ElasticCatalogCalibrator:
                 representation="bounded_exact_hotset",
             )
         }
+        producer_epochs = 0
 
-        def checkpoint_progress(*, allow_restart: bool) -> None:
+        def checkpoint_progress(
+            *, allow_restart: bool, producer_completed: bool = False
+        ) -> None:
+            nonlocal producer_epochs
+            if producer_completed:
+                producer_epochs += 1
             complete = {
                 key: dict(working_catalog[key])
                 for key in surface.required
@@ -865,18 +946,28 @@ class ElasticCatalogCalibrator:
                 )
             }
             if checkpoint_callback is not None:
-                checkpoint_callback(complete, executed_mixed_witnesses)
+                observed = {
+                    key: dict(working_catalog[key])
+                    for key in surface.required
+                    if working_catalog.get(key, {}).get("cold_observations", 0) > 0
+                }
+                checkpoint_callback(observed, executed_mixed_witnesses)
             new_rows = len(set(complete) - initial_complete)
             if (
                 allow_restart
-                and max_new_rows_per_process
-                and new_rows >= max_new_rows_per_process
                 and len(complete) < len(surface.required)
+                and (
+                    (max_new_rows_per_process and new_rows >= max_new_rows_per_process)
+                    or (
+                        max_producer_epochs_per_process
+                        and producer_epochs >= max_producer_epochs_per_process
+                    )
+                )
             ):
                 raise ElasticCalibrationRestartRequired(
                     "bounded calibration process epoch completed: "
                     f"new_rows={new_rows} total_rows={len(complete)}/"
-                    f"{len(surface.required)}"
+                    f"{len(surface.required)} producer_epochs={producer_epochs}"
                 )
 
         try:
@@ -923,6 +1014,10 @@ class ElasticCatalogCalibrator:
                             f"expected={restore_full!r} actual={actual!r} "
                             f"admitted={admitted}"
                         )
+                    checkpoint_progress(
+                        allow_restart=True,
+                        producer_completed=True,
+                    )
                     if not self._complete(restore_prefill):
                         prompt_len = self.owner._elastic_restore_prefill_prompt_len()
                         prefill_actual, prefill_admitted = self._balanced_prefill_pair(
@@ -940,12 +1035,16 @@ class ElasticCatalogCalibrator:
                                 f"actual={prefill_actual!r} "
                                 f"admitted={prefill_admitted}"
                             )
+                        checkpoint_progress(
+                            allow_restart=True,
+                            producer_completed=True,
+                        )
                 if any(not self._complete(key) for key in surface.restore):
                     raise RuntimeError("calibration restore family did not stabilize")
                 checkpoint_progress(allow_restart=True)
-                # A process boundary may occur here. Persist the complete pair
-                # as one prerequisite so the next communicator never rebuilds
-                # a partial large restore family before jumping to a later row.
+                # A process boundary may occur after any successfully drained
+                # producer. Partial observations remain identity-bound and the
+                # complete pair is still required before later rows execute.
             mixed_by_key: dict[tuple[int, ...], list[int]] = {}
             for key, query_len in surface.mixed_query_witnesses:
                 mixed_by_key.setdefault(key, []).append(query_len)
@@ -973,7 +1072,10 @@ class ElasticCatalogCalibrator:
                             f"actual={mixed!r} admitted={mixed_admitted}"
                         )
                     executed_mixed_witnesses.add((key, query_len))
-                    checkpoint_progress(allow_restart=False)
+                    checkpoint_progress(
+                        allow_restart=True,
+                        producer_completed=True,
+                    )
                 for _ in range(4):
                     if self._complete(key):
                         break
@@ -1000,6 +1102,10 @@ class ElasticCatalogCalibrator:
                             "calibration contracted accepted surface: "
                             f"expected={key!r} actual={actual!r} admitted={admitted}"
                         )
+                    checkpoint_progress(
+                        allow_restart=True,
+                        producer_completed=True,
+                    )
                 if not self._complete(key):
                     raise RuntimeError(
                         f"calibration row did not stabilize: step_key={key!r}"
@@ -1064,6 +1170,7 @@ def calibrate_and_publish_catalog(
     checkpoint_payload: Any = None,
     checkpoint_callback: Callable[[dict[str, Any]], None] | None = None,
     max_new_rows_per_process: int = 0,
+    max_producer_epochs_per_process: int = 0,
 ) -> CalibrationResult:
     """Measure and atomically publish one exact-runtime catalog."""
     from vllm.v1.worker.elastic_catalog_tool import publish_measured_catalog
@@ -1129,6 +1236,7 @@ def calibrate_and_publish_catalog(
             checkpoint=checkpoint,
             checkpoint_callback=publish_checkpoint,
             max_new_rows_per_process=max_new_rows_per_process,
+            max_producer_epochs_per_process=max_producer_epochs_per_process,
         )
         calibrator.validate_capacity(surface, measured)
         total_wall_seconds = checkpoint.wall_seconds + time.monotonic() - started

@@ -134,6 +134,17 @@ def _auto_calibrate_missing_catalog(owner: Any) -> None:
         ) from error
     if process_limit < 0:
         raise RuntimeError("elastic calibration process row limit is invalid")
+    raw_producer_limit = os.environ.get(
+        "AG2_VLLM_ELASTIC_CALIBRATION_MAX_PRODUCER_EPOCHS_PER_PROCESS", "0"
+    )
+    try:
+        producer_limit = int(raw_producer_limit)
+    except ValueError as error:
+        raise RuntimeError(
+            "elastic calibration producer epoch limit is invalid"
+        ) from error
+    if producer_limit < 0:
+        raise RuntimeError("elastic calibration producer epoch limit is invalid")
     receipt: dict[str, Any] = {
         "schema": "ag2-elastic-auto-calibration-v1",
         "stage": "calibrating",
@@ -141,6 +152,7 @@ def _auto_calibrate_missing_catalog(owner: Any) -> None:
         "surface": str(resolved_surface),
         "surface_sha256": surface_sha256,
         "max_new_rows_per_process": process_limit,
+        "max_producer_epochs_per_process": producer_limit,
     }
     if checkpoint_payload is not None:
         receipt["checkpoint"] = checkpoint_payload
@@ -161,6 +173,7 @@ def _auto_calibrate_missing_catalog(owner: Any) -> None:
             checkpoint_payload=checkpoint_payload,
             checkpoint_callback=record_checkpoint,
             max_new_rows_per_process=process_limit,
+            max_producer_epochs_per_process=producer_limit,
         )
         catalog = load_elastic_graph_catalog(
             owner.vllm_config, scheduler.kv_cache_config

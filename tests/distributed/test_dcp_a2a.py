@@ -255,6 +255,76 @@ class TestLSEWeightedCombine:
         torch.testing.assert_close(masked_lse[1:5], torch.ones_like(masked_lse[1:5]))
         assert torch.isneginf(masked_lse[5:]).all()
 
+    @pytest.mark.parametrize(
+        ("max_native_rows", "num_rows", "expected_method"),
+        [
+            (0, 4, "chunked"),
+            (4, 4, "native"),
+            (4, 5, "chunked"),
+        ],
+    )
+    def test_ag_rs_selects_native_only_within_configured_row_limit(
+        self,
+        monkeypatch,
+        max_native_rows: int,
+        num_rows: int,
+        expected_method: str,
+    ):
+        import vllm.v1.attention.ops.dcp as dcp
+
+        class FakeGroup:
+            world_size = 2
+            rank_in_group = 0
+
+            def __init__(self):
+                self.called_method = None
+
+            def reduce_scatter(self, tensor, dim):
+                assert dim == 1
+                self.called_method = "native"
+                return tensor[:, :2]
+
+            def reduce_scatter_chunked(self, tensor, dim):
+                assert dim == 1
+                self.called_method = "chunked"
+                return tensor[:, :2]
+
+        monkeypatch.setenv("VLLM_DCP_NATIVE_RS_MAX_ROWS", str(max_native_rows))
+        monkeypatch.setattr(
+            dcp,
+            "_cp_lse_common",
+            lambda output, lse, *args, **kwargs: (output, lse),
+        )
+        group = FakeGroup()
+        output = torch.ones(num_rows, 4, 8)
+        lse = torch.ones(num_rows, 4)
+
+        actual = dcp.cp_lse_ag_out_rs(output, lse, group)
+
+        assert group.called_method == expected_method
+        assert actual.shape == (num_rows, 2, 8)
+
+    def test_ag_rs_rejects_negative_native_row_limit(self, monkeypatch):
+        import vllm.v1.attention.ops.dcp as dcp
+
+        class FakeGroup:
+            world_size = 2
+            rank_in_group = 0
+
+        monkeypatch.setenv("VLLM_DCP_NATIVE_RS_MAX_ROWS", "-1")
+        monkeypatch.setattr(
+            dcp,
+            "_cp_lse_common",
+            lambda output, lse, *args, **kwargs: (output, lse),
+        )
+
+        with pytest.raises(ValueError, match="must be non-negative"):
+            dcp.cp_lse_ag_out_rs(
+                torch.ones(1, 4, 8),
+                torch.ones(1, 4),
+                FakeGroup(),
+            )
+
     def test_mathematically_correct(self):
         """Verify mathematical correctness of LSE combination."""
         from vllm.v1.attention.ops.dcp import _lse_weighted_combine

@@ -19,37 +19,43 @@ from vllm.v1.core.elastic_graph import (
 
 ELASTIC_RUNTIME_GENERATION_SCHEMA_VERSION = 3
 
+_ELASTIC_RUNTIME_SOURCE_MODULES = (
+    "vllm.distributed.parallel_state",
+    "vllm.v1.attention.backends.flashinfer",
+    "vllm.v1.core.kv_cache_capacity",
+    "vllm.v1.core.kv_cache_coordinator",
+    "vllm.v1.core.elastic_graph",
+    "vllm.v1.core.sched.scheduler",
+    "vllm.v1.engine.core",
+    "vllm.v1.engine.elastic_calibrator",
+    "vllm.v1.sample.ops.topk_topp_sampler",
+    "vllm.v1.worker.elastic_catalog_tool",
+    "vllm.v1.worker.gpu.cudagraph_utils",
+    "vllm.v1.worker.gpu.elastic_gdn",
+    "vllm.v1.worker.gpu.mm.encoder_runner",
+    "vllm.v1.worker.gpu.model_runner",
+    "vllm.v1.worker.gpu.model_states.default",
+    "vllm.v1.worker.gpu.model_states.encoder_decoder",
+    "vllm.v1.worker.gpu.model_states.interface",
+    "vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils",
+    "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator",
+    "vllm.v1.worker.startup_plan",
+    # Effective Exp25/Qwen3.8 target and draft graph owners. Hash the model
+    # composition, shared attention implementation, MTP implementation, and
+    # fused primitives independently: any can change graph memory, launch
+    # topology, or draft/target numerics without changing VllmConfig.
+    "vllm.model_executor.models.qwen3_5",
+    "vllm.model_executor.models.qwen3_next",
+    "vllm.model_executor.models.qwen3_5_mtp",
+    "vllm.model_executor.layers.fused_qk_norm_rope",
+    "vllm.model_executor.layers.rotary_embedding",
+)
+
 
 def elastic_runtime_source_hashes() -> dict[str, str]:
     """Bind measurements to the Python implementation that owns the DAG."""
-    modules = (
-        "vllm.distributed.parallel_state",
-        "vllm.v1.attention.backends.flashinfer",
-        "vllm.v1.core.kv_cache_capacity",
-        "vllm.v1.core.kv_cache_coordinator",
-        "vllm.v1.core.elastic_graph",
-        "vllm.v1.core.sched.scheduler",
-        "vllm.v1.engine.core",
-        "vllm.v1.engine.elastic_calibrator",
-        "vllm.v1.sample.ops.topk_topp_sampler",
-        "vllm.v1.worker.elastic_catalog_tool",
-        "vllm.v1.worker.gpu.cudagraph_utils",
-        "vllm.v1.worker.gpu.elastic_gdn",
-        "vllm.v1.worker.gpu.mm.encoder_runner",
-        "vllm.v1.worker.gpu.model_runner",
-        "vllm.v1.worker.gpu.model_states.default",
-        "vllm.v1.worker.gpu.model_states.encoder_decoder",
-        "vllm.v1.worker.gpu.model_states.interface",
-        "vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils",
-        "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator",
-        "vllm.v1.worker.startup_plan",
-        # Effective Exp22/Qwen3.8 Graph inputs split TP text embedding from the
-        # rank-local multimodal merge. Bind that model-specific DAG owner until
-        # runtime identity derives the loaded model module dynamically.
-        "vllm.model_executor.models.qwen3_5",
-    )
     result: dict[str, str] = {}
-    for module_name in modules:
+    for module_name in _ELASTIC_RUNTIME_SOURCE_MODULES:
         spec = importlib.util.find_spec(module_name)
         path = spec.origin if spec is not None else None
         if path is None:

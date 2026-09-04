@@ -898,6 +898,7 @@ class ElasticStepPlan:
     current_dispatch: tuple[OwnerDispatch, ...] = ()
     successor_keys: tuple[PhysicalReplayKey, ...] = ()
     maintenance_execution: ElasticMaintenanceExecution | None = None
+    reuse_rank_consensus: bool = False
 
     def __post_init__(self) -> None:
         if not self.transaction_id:
@@ -987,10 +988,63 @@ class ElasticStepPlan:
             raise ValueError("successor residency mixes runtime generations")
         if len(set(self.successor_keys)) != len(self.successor_keys):
             raise ValueError("successor residency contains duplicate keys")
+        if self.reuse_rank_consensus and not self.reusable_decode_consensus_epoch:
+            raise ValueError(
+                "rank consensus reuse requires mutation-free HOT text decode"
+            )
+
+    @property
+    def reusable_decode_consensus_epoch(self) -> bool:
+        """Whether this plan can reuse a scheduler-declared rank boundary."""
+        manifest = self.execution_manifest
+        return bool(
+            self.kind == ElasticPlanKind.USER
+            and manifest is not None
+            and not any(manifest.per_request_is_prefilling)
+            and not manifest.scheduled_encoder_inputs
+            and not manifest.active_lora_ids
+            and self.kv_transition is None
+            and not self.cold_misses
+            and not self.victim_keys
+            and not self.capture_order
+            and all(
+                dispatch.representation == DispatchRepresentation.HOT_GRAPH
+                for dispatch in self.current_dispatch
+            )
+        )
 
     @cached_property
     def fingerprint(self) -> str:
         return _fingerprint(asdict(self))
+
+    @cached_property
+    def execution_epoch_fingerprint(self) -> str:
+        """Stable execution identity shared by consecutive decode steps.
+
+        A transaction id identifies one scheduler/worker mutation and lease
+        lifetime; it intentionally changes every step. Admission byte ledgers
+        are scheduler evidence and are not consumed by a HOT USER worker step.
+        The epoch therefore binds every worker-consumed state and execution
+        field while leaving transaction and advisory byte accounting outside.
+        """
+        payload = {
+            "generation": self.generation,
+            "kind": self.kind,
+            "physical_keys": self.physical_keys,
+            "hot_hits": self.hot_hits,
+            "cold_misses": self.cold_misses,
+            "protected_keys": self.protected_keys,
+            "victim_keys": self.victim_keys,
+            "reclaim_groups": self.reclaim_groups,
+            "capture_order": self.capture_order,
+            "kv_transition": self.kv_transition,
+            "defer_reason": self.defer_reason,
+            "execution_manifest": self.execution_manifest,
+            "current_dispatch": self.current_dispatch,
+            "successor_keys": self.successor_keys,
+            "maintenance_execution": self.maintenance_execution,
+        }
+        return _fingerprint(payload)
 
 
 def _fingerprint(value: Any) -> str:

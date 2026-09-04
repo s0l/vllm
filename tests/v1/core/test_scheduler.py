@@ -13422,9 +13422,12 @@ def test_elastic_fully_hot_owner_set_uses_exact_hot_replay_envelope():
 
     # Calibration measures a HOT witness with a broad execution loan, but the
     # already-HOT physical owner set must not be relabelled as a new capture.
+    # Its finite-wave preflight still includes the one measured workspace unit
+    # needed by the first real replay after request-free maintenance.
     scheduler._elastic_restore_mode = True
+    scheduler._elastic_admission_controller.last_maintenance_step_key = step_key
     assert scheduler._estimate_elastic_graph_step_bytes(step_key) == (
-        1612709888,
+        1646264320,
         False,
     )
 

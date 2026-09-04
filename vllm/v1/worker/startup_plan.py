@@ -62,6 +62,53 @@ GRAPH_RECIPE_SCHEMA_VERSION = 2
 ELASTIC_CAPTURE_STATE_ABI = "dynamic-capture-state-v1"
 BOUNDED_PIECEWISE_REPLAY_CONTRACT = "cold_capture_bounds_same_key_hot-v1"
 
+# Environment switches below change persistent workspaces, temporary peaks,
+# CUDA Graph coverage, or the collective/attention implementation exercised by
+# memory profiling.  They are therefore part of the cached KV-budget identity,
+# even when VllmConfig.compute_hash() is unchanged.
+STARTUP_PROFILE_ENV_NAMES = (
+    "AG2_VLLM_DCP_ABSOLUTE_PREFILL_SEGMENT_SIZE",
+    "AG2_VLLM_DCP_ABSOLUTE_SEGMENT_PREFILL",
+    "AG2_VLLM_DCP_CANONICAL_PAGED_FIXED_SPLIT_SIZE",
+    "AG2_VLLM_DCP_CANONICAL_PAGED_MASK_MAX_BITS",
+    "AG2_VLLM_DCP_CANONICAL_PAGED_PREFILL",
+    "AG2_VLLM_DCP_PREFILL_MATCH_FP8_NEW_TOKENS",
+    "AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH",
+    "AG2_VLLM_FLASHINFER_DCP_CONTEXT_FIXED_SPLIT_SIZE",
+    "AG2_VLLM_FLASHINFER_DCP_PREFILL_CUDAGRAPH",
+    "AG2_VLLM_FLASHINFER_DCP_PREFILL_NO_SPLIT",
+    "AG2_VLLM_FLASHINFER_DCP_RAGGED_FIXED_SPLIT_SIZE",
+    "AG2_VLLM_FLASHINFER_LOG2_LSE_MERGE",
+    "AG2_VLLM_FLASHINFER_Q1_DISABLE_SPLIT_KV",
+    "AG2_VLLM_FLASHINFER_Q1_FIXED_SPLIT_SIZE",
+    "AG2_VLLM_MTP_BF16_GATE_UP_SCRATCH",
+    "AG2_VLLM_MTP_DCP_BATCHED_DECODE",
+    "AG2_VLLM_MTP_DCP_BATCHED_DISABLE_SPLIT_KV",
+    "AG2_VLLM_MTP_DCP_BATCHED_FIXED_SPLIT_SIZE",
+    "AG2_VLLM_MTP_DCP_BATCHED_WORKSPACE_MIB",
+    "AG2_VLLM_MTP_DCP_MATCH_FP8_NEW_TOKENS",
+    "AG2_VLLM_MTP_DCP_PSEUDO_DECODE",
+    "AG2_VLLM_MTP_DCP_SEQUENTIAL_DECODE",
+    "AG2_VLLM_MTP_DCP_SEQUENTIAL_FIXED_SPLIT_SIZE",
+    "AG2_VLLM_MTP_DEVICE_CE",
+    "AG2_VLLM_NVFP4_BATCH_INVARIANT",
+    "AG2_VLLM_SHARED_LMHEAD_FP8",
+    "AG2_VLLM_TP3_EMBEDDING_NCCL",
+    "AG2_VLLM_TP3_EXACT_OWNER_MIN_ROWS",
+    "AG2_VLLM_TP3_OWNER_MIN_ROWS",
+    "AG2_VLLM_TP3_OWNER_PREQUANT",
+    "AG2_VLLM_TP3_PIECEWISE_DEVICE_CE",
+    "AG2_VLLM_TP3_PIECEWISE_DEVICE_CE_PACKED",
+    "AG2_VLLM_TP3_PREFILL_CANONICAL_REDUCE",
+    "AG2_VLLM_TP3_UNIFIED_EXACT_BACKEND",
+    "AG2_VLLM_TP3_UNIFIED_EXACT_REDUCE",
+    "VLLM_DCP_NATIVE_RS_MAX_ROWS",
+    "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS",
+    "VLLM_TP3_CE_REDUCE",
+    "VLLM_USE_FLASHINFER_SAMPLER",
+    "VLLM_USE_V2_MODEL_RUNNER",
+)
+
 
 def _startup_profile_source_hashes() -> dict[str, str]:
     """Bind a persisted KV byte count to its authoritative producers."""
@@ -114,18 +161,13 @@ def compute_plan_fingerprint(
         "torch": torch.__version__,
         "cuda": torch.version.cuda or "",
         "profile_source_hashes": _startup_profile_source_hashes(),
+        # Model and execution-DAG changes can alter temporary and captured
+        # memory even when the serialized VllmConfig is unchanged. Reuse the
+        # same bounded source inventory as elastic Graph identity so a stale
+        # KV/profile plan cannot survive such a change.
+        "runtime_source_hashes": elastic_runtime_source_hashes(),
         "profile_env": {
-            name: os.environ.get(name, "")
-            for name in (
-                "AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH",
-                "AG2_VLLM_MTP_BF16_GATE_UP_SCRATCH",
-                "AG2_VLLM_NVFP4_BATCH_INVARIANT",
-                "AG2_VLLM_SHARED_LMHEAD_FP8",
-                "AG2_VLLM_TP3_OWNER_PREQUANT",
-                "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS",
-                "VLLM_USE_FLASHINFER_SAMPLER",
-                "VLLM_USE_V2_MODEL_RUNNER",
-            )
+            name: os.environ.get(name, "") for name in STARTUP_PROFILE_ENV_NAMES
         },
         "rank": rank,
         "world_size": world_size,

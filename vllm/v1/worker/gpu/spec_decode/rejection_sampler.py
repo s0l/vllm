@@ -215,14 +215,48 @@ class RejectionSampler:
         num_logits: int,
     ) -> dict[str, object]:
         """Snapshot every persistent input consumed by target sampling."""
+        del num_logits  # Kept in the observer ABI for old diagnostic callers.
         state_idx = state_idx.long()
         state_idx_cpu = state_idx.detach().cpu()
+        state_idx_np = state_idx_cpu.numpy()
         states = self.sampler.sampling_states
         penalties = self.sampler.penalties_state
         req_states = self.sampler.req_states
+        thinking = self.sampler.thinking_budget_state
         total_len = req_states.total_len.gpu[state_idx].detach().cpu()
         max_total_len = int(total_len.max().item()) if total_len.numel() else 0
-        use_penalty = penalties.use_penalty[state_idx_cpu.numpy()].copy()
+        use_penalty = penalties.use_penalty[state_idx_np].copy()
+        if thinking.enabled:
+            thinking_use_budget = torch.from_numpy(
+                thinking.use_thinking_budget[state_idx_np].copy()
+            )
+            thinking_token_budget = (
+                thinking.thinking_token_budget.gpu[state_idx].detach().cpu()
+            )
+            thinking_cached_last_start = (
+                thinking.cached_last_start[state_idx].detach().cpu()
+            )
+            thinking_cached_last_end = (
+                thinking.cached_last_end[state_idx].detach().cpu()
+            )
+            thinking_cached_scan_pos = (
+                thinking.cached_scan_pos[state_idx].detach().cpu()
+            )
+            thinking_start_token_ids = thinking.reasoning_start_token_ids.detach().cpu()
+            thinking_natural_end_token_ids = (
+                thinking.natural_reasoning_end_token_ids.detach().cpu()
+            )
+            thinking_end_token_ids = thinking.reasoning_end_token_ids.detach().cpu()
+        else:
+            num_reqs = state_idx.numel()
+            thinking_use_budget = torch.zeros(num_reqs, dtype=torch.bool)
+            thinking_token_budget = torch.full((num_reqs,), -1, dtype=torch.int32)
+            thinking_cached_last_start = torch.full((num_reqs,), -1, dtype=torch.int32)
+            thinking_cached_last_end = torch.full((num_reqs,), -1, dtype=torch.int32)
+            thinking_cached_scan_pos = torch.zeros(num_reqs, dtype=torch.int32)
+            thinking_start_token_ids = torch.empty(0, dtype=torch.int32)
+            thinking_natural_end_token_ids = torch.empty(0, dtype=torch.int32)
+            thinking_end_token_ids = torch.empty(0, dtype=torch.int32)
         payload: dict[str, object] = {
             "state_idx": state_idx_cpu,
             "temperature": states.temperature.gpu[state_idx].detach().cpu(),
@@ -254,14 +288,15 @@ class RejectionSampler:
             "all_token_ids": req_states.all_token_ids.gpu[state_idx, :max_total_len]
             .detach()
             .cpu(),
-            "thinking_state": self.sampler.thinking_budget_state.state.gpu[state_idx]
-            .detach()
-            .cpu(),
-            "thinking_forced_tokens": self.sampler.thinking_budget_state.forced_tokens[
-                :num_logits
-            ]
-            .detach()
-            .cpu(),
+            "thinking_budget_enabled": thinking.enabled,
+            "thinking_use_budget": thinking_use_budget,
+            "thinking_token_budget": thinking_token_budget,
+            "thinking_cached_last_start": thinking_cached_last_start,
+            "thinking_cached_last_end": thinking_cached_last_end,
+            "thinking_cached_scan_pos": thinking_cached_scan_pos,
+            "thinking_start_token_ids": thinking_start_token_ids,
+            "thinking_natural_end_token_ids": thinking_natural_end_token_ids,
+            "thinking_end_token_ids": thinking_end_token_ids,
         }
         if bool(use_penalty.any()):
             payload["prompt_bin_mask"] = penalties.prompt_bin_mask[state_idx]

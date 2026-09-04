@@ -1283,6 +1283,79 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
             apply.assert_called_once_with((7, 5), 16)
             self.assertEqual(reconcile.call_count, 1)
 
+    def test_v2_equal_scheduler_step_validates_exact_backing_layout(self):
+        controller = ElasticKVController(torch.device("cpu"))
+        attention = _Owner(16)
+        gdn = _Owner(8)
+        controller.backings = {
+            "elastic-attention-0": attention,
+            "elastic-gdn": gdn,
+        }
+        controller.geometry = {
+            "elastic-attention-0": 4,
+            "elastic-gdn": 4,
+        }
+        controller.configure_physical_budget(24, 4, (4, 2))
+
+        state_before = dict(controller.__dict__)
+        self.assertTrue(controller.validate_equal_scheduler_step(None, 0))
+        self.assertEqual(controller.__dict__, state_before)
+        self.assertFalse(controller.validate_equal_scheduler_step((4, 2), 0))
+        self.assertFalse(controller.validate_equal_scheduler_step(None, 4))
+        self.assertFalse(controller.validate_equal_scheduler_step(None, -1))
+
+        controller._external_memory_bytes = 1
+        self.assertFalse(controller.validate_equal_scheduler_step(None, 2))
+
+    def test_v2_equal_scheduler_step_requires_configured_budget(self):
+        controller = ElasticKVController(torch.device("cpu"))
+        controller.backings = {"elastic-attention-0": _Owner(16)}
+        controller.geometry = {"elastic-attention-0": 4}
+        controller._logical_transition = (4, 0)
+
+        state_before = dict(controller.__dict__)
+        self.assertFalse(controller.validate_equal_scheduler_step(None, 0))
+        self.assertEqual(controller.__dict__, state_before)
+
+    def test_v2_equal_scheduler_step_validates_all_attention_backings(self):
+        controller = ElasticKVController(torch.device("cpu"))
+        controller.backings = {
+            "elastic-attention-0": _Owner(16),
+            "elastic-attention-1": _Owner(16),
+            "elastic-gdn": _Owner(8),
+        }
+        controller.geometry = {
+            "elastic-attention-0": 4,
+            "elastic-attention-1": 4,
+            "elastic-gdn": 4,
+        }
+        controller.configure_physical_budget(40, 4, (4, 2))
+
+        self.assertTrue(controller.validate_equal_scheduler_step(None, 0))
+        controller.backings["elastic-attention-1"].committed = 12
+        controller.backings["elastic-gdn"].committed = 12
+        with self.assertRaisesRegex(RuntimeError, "divergent backing geometry"):
+            controller.validate_equal_scheduler_step(None, 0)
+
+    def test_v2_equal_scheduler_step_rejects_local_backing_drift(self):
+        controller = ElasticKVController(torch.device("cpu"))
+        attention = _Owner(16)
+        gdn = _Owner(8)
+        controller.backings = {
+            "elastic-attention-0": attention,
+            "elastic-gdn": gdn,
+        }
+        controller.geometry = {
+            "elastic-attention-0": 4,
+            "elastic-gdn": 4,
+        }
+        controller.configure_physical_budget(24, 4, (4, 2))
+        attention.committed = 12
+        gdn.committed = 12
+
+        with self.assertRaisesRegex(RuntimeError, "divergent backing geometry"):
+            controller.validate_equal_scheduler_step(None, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

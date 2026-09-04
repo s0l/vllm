@@ -68,7 +68,7 @@ from vllm.model_executor.layers.quantization.utils.config_utils import (
     get_quark_ocp_mx_group_size,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Dynamic
-from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding, get_rope
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -626,14 +626,6 @@ class Qwen3NextAttention(nn.Module):
         # Fuse the gated split + QK-RMSNorm + (partial) NeoX RoPE + gate copy.
         mm_config = model_config.multimodal_config if model_config else None
         text_only = mm_config is None or mm_config.language_model_only
-        mrope_section = getattr(self.rotary_emb, "mrope_section", None)
-        supports_mrope = bool(
-            type(self.rotary_emb) is MRotaryEmbedding
-            and mrope_section
-            and len(mrope_section) == 3
-            and sum(mrope_section) == self.rotary_emb.rotary_dim // 2
-            and getattr(self.rotary_emb, "mrope_interleaved", False)
-        )
         supports_dtype = getattr(self.rotary_emb, "dtype", None) in (
             torch.float16,
             torch.bfloat16,
@@ -643,9 +635,23 @@ class Qwen3NextAttention(nn.Module):
             and getattr(self.rotary_emb, "is_neox_style", False)
             and current_platform.is_cuda()
             and supports_dtype
-            and (text_only or supports_mrope)
+            # Keep multimodal MRoPE on the established unfused path.  The
+            # fused MRoPE implementation uses a different BF16/FP32 arithmetic
+            # DAG, so tolerance-level kernel parity is insufficient for the
+            # draft/target argmax agreement required by speculative decoding.
+            and text_only
         )
         layer_idx = extract_layer_index(prefix)
+        is_mtp_layer = prefix.startswith("mtp.") or ".mtp." in prefix
+        if layer_idx == 3 or is_mtp_layer:
+            logger.info(
+                "Qwen full-attention QK dispatch: prefix=%s, "
+                "language_model_only=%s, rotary=%s, fused=%s",
+                prefix,
+                text_only,
+                type(self.rotary_emb).__name__,
+                self.use_fused_qk_norm_rope_gate,
+            )
         trace_layer = int(os.environ.get("AG2_VLLM_LAYER_TRACE_LAYER", "0"))
         self._ag2_full_attn_trace_enabled = (
             bool(os.environ.get("AG2_VLLM_LAYER0_TRACE_OUTPUT"))
