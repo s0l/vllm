@@ -264,6 +264,73 @@ def test_catalog_identity_ignores_serving_load_policy(plan_env):
     assert discovery == serving
 
 
+def test_catalog_identity_separates_runtime_policy_from_physical_sources(plan_env):
+    from vllm.v1.core import elastic_runtime
+
+    config = _plan_worker().vllm_config
+    kv = SimpleNamespace(
+        num_blocks=64,
+        elastic_attention_stride=86_900_736,
+        elastic_gdn_stride=19_611_648,
+        elastic_mapping_quantum=2 << 20,
+        elastic_gdn_initial_blocks=4,
+        elastic_gdn_blocks_per_request=3,
+        elastic_rank_primary_mapped_bytes=(4, 5, 6),
+        elastic_rank_gdn_mapped_bytes=(7, 8, 9),
+        elastic_graph_execution_policy=None,
+    )
+    excluded = {
+        "vllm.v1.core.sched.scheduler",
+        "vllm.v1.worker.elastic_catalog_tool",
+        "vllm.v1.worker.startup_plan",
+    }
+    assert excluded.isdisjoint(elastic_runtime._ELASTIC_PHYSICAL_CATALOG_SOURCE_MODULES)
+    assert excluded.issubset(elastic_runtime._ELASTIC_RUNTIME_SOURCE_MODULES)
+
+    with patch.object(
+        startup_plan,
+        "elastic_catalog_physical_source_hashes",
+        return_value={"physical": "stable"},
+    ):
+        catalog = startup_plan.compute_elastic_graph_catalog_fingerprint(config, kv)
+        with patch.object(
+            startup_plan,
+            "elastic_runtime_source_hashes",
+            return_value={"runtime-policy": "changed"},
+        ):
+            assert (
+                startup_plan.compute_elastic_graph_catalog_fingerprint(config, kv)
+                == catalog
+            )
+
+    with patch.object(
+        startup_plan,
+        "elastic_catalog_physical_source_hashes",
+        return_value={"physical": "changed"},
+    ):
+        assert (
+            startup_plan.compute_elastic_graph_catalog_fingerprint(config, kv)
+            != catalog
+        )
+
+
+def test_automatic_catalog_calibration_requires_explicit_maintenance_role(
+    monkeypatch,
+):
+    from vllm.v1.core.elastic_runtime import elastic_auto_calibration_enabled
+
+    monkeypatch.delenv("AG2_VLLM_ELASTIC_AUTO_CALIBRATE", raising=False)
+    monkeypatch.delenv("AG2_VLLM_ELASTIC_CALIBRATION_ROLE", raising=False)
+    assert elastic_auto_calibration_enabled() is False
+
+    monkeypatch.setenv("AG2_VLLM_ELASTIC_AUTO_CALIBRATE", "1")
+    with pytest.raises(RuntimeError, match="maintenance-only"):
+        elastic_auto_calibration_enabled()
+
+    monkeypatch.setenv("AG2_VLLM_ELASTIC_CALIBRATION_ROLE", "maintenance")
+    assert elastic_auto_calibration_enabled() is True
+
+
 def test_catalog_identity_ignores_unmapped_budget_slack(plan_env):
     config = _plan_worker().vllm_config
     kv = SimpleNamespace(

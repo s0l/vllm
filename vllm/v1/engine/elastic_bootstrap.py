@@ -354,7 +354,12 @@ def complete_elastic_startup(owner: Any) -> str:
         try:
             if not scheduler._elastic_graph_catalog:
                 if not getattr(scheduler, "_elastic_auto_calibrate", False):
-                    raise RuntimeError("required elastic Graph catalog is absent")
+                    raise RuntimeError(
+                        "required elastic CUDA Graph catalog is absent; serving "
+                        "will not calibrate implicitly. Run an explicit "
+                        "maintenance calibration job with an accepted surface, "
+                        "then restart serving with auto calibration disabled"
+                    )
                 _auto_calibrate_missing_catalog(owner)
             representation = scheduler._elastic_graph_catalog_coverage.get(
                 "representation", "pinned_full_family"

@@ -39,6 +39,7 @@ from vllm.v1.core.elastic_catalog import (
     validate_elastic_catalog_key_inventory,
 )
 from vllm.v1.core.elastic_runtime import (
+    elastic_catalog_physical_source_hashes,
     elastic_profile_config_factors,
     elastic_runtime_source_hashes,
 )
@@ -240,7 +241,7 @@ def compute_elastic_graph_catalog_fingerprint(
                 "VLLM_USE_FLASHINFER_SAMPLER",
             )
         },
-        "runtime_source_hashes": elastic_runtime_source_hashes(),
+        "physical_source_hashes": elastic_catalog_physical_source_hashes(),
         "world_size": vllm_config.parallel_config.world_size,
         "num_blocks": kv_cache_config.num_blocks,
         "attention_stride": kv_cache_config.elastic_attention_stride,

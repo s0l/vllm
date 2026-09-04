@@ -871,6 +871,25 @@ def test_complete_elastic_startup_auto_calibrates_miss_before_restore(
     assert events == ["calibrate", "restore", "publish"]
 
 
+def test_complete_elastic_startup_catalog_miss_fails_once_and_shuts_down() -> None:
+    events = []
+    owner = SimpleNamespace(
+        scheduler=SimpleNamespace(
+            elastic_on_demand_graphs=True,
+            _elastic_require_catalog=True,
+            _elastic_auto_calibrate=False,
+            _elastic_graph_catalog={},
+        ),
+        _synchronize_elastic_startup_residency=lambda: events.append("publish"),
+        _shutdown_failed_elastic_startup=lambda: events.append("shutdown"),
+    )
+
+    with pytest.raises(RuntimeError, match="will not calibrate implicitly"):
+        elastic_bootstrap.complete_elastic_startup(owner)
+
+    assert events == ["shutdown"]
+
+
 def test_complete_elastic_startup_auto_calibration_failure_shuts_down(
     monkeypatch,
 ) -> None:

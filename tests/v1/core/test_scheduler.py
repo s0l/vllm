@@ -43,6 +43,7 @@ from vllm.v1.core.elastic_graph import (
     ReclaimGroup,
     RuntimeGeneration,
     SemanticGraphStep,
+    build_execution_manifest,
     resolve_step_physical_keys,
 )
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
@@ -7673,20 +7674,21 @@ def test_bounded_k3_decode_canonical_owner_matrix_covers_every_tail_x():
     assert qlen1_tail == (1, 3, 16, 16, 1)
 
 
-def test_live_k3_cohort_keeps_its_physical_carrier_until_drain():
+def test_live_k3_cohort_retains_carrier_without_oversizing_tail_execution():
     scheduler = _new_elastic_scheduler()
     scheduler.scheduler_config = Mock(max_num_batched_tokens=4096, max_num_seqs=40)
     scheduler._elastic_graph_execution_policy = _current_q4_piecewise_policy()
     scheduler._elastic_graph_catalog_coverage = {"decode_max_x": 40}
     scheduler._elastic_admission_controller.step_key = (0, 3, 7, 16, 0)
     scheduler._elastic_graph_carrier_step_key = (0, 3, 16, 64, 4)
+    _publish_elastic_step_hot(scheduler, (0, 3, 16, 64, 4))
     scheduler.running = [object() for _ in range(7)]
     scheduler.waiting = deque()
     scheduler.skipped_waiting = deque()
 
     assert scheduler._canonical_elastic_graph_step_key(
         {str(index): 4 for index in range(7)}, 3, True
-    ) == (0, 3, 16, 64, 4)
+    ) == (0, 3, 8, 32, 4)
     assert scheduler._canonical_elastic_graph_step_key(
         {str(index): token_count for index, token_count in enumerate((4, 3, 2, 1))},
         3,
@@ -7694,17 +7696,29 @@ def test_live_k3_cohort_keeps_its_physical_carrier_until_drain():
     ) == (0, 3, 4, 16, 0)
     assert scheduler._canonical_elastic_graph_step_key(
         {str(index): 1 for index in range(3)}, 3, True
-    ) == (1, 3, 16, 16, 1)
+    ) == (1, 3, 4, 4, 1)
 
-    # A waiting-only handoff is still the same active cohort and must not
-    # recapture a smaller owner set between request batches.
+    execution_key = (0, 3, 8, 32, 4)
+    current, successor, protected = scheduler._elastic_step_residency_intent(
+        execution_key
+    )
+    retained = scheduler._resolve_elastic_step_physical_keys((0, 3, 16, 64, 4))
+    assert all(key.physical_num_reqs == 8 for key in current)
+    assert set(retained).issubset(successor)
+    assert set(retained).issubset(protected)
+    scheduler._commit_elastic_graph_carrier_step_key(execution_key)
+    scheduler._commit_elastic_graph_carrier_step_key((1, 3, 4, 4, 1))
+    assert scheduler._elastic_graph_carrier_step_key == (0, 3, 16, 64, 4)
+
+    # A waiting-only handoff retains the old HOT owner set without dispatching
+    # the new semantic request through the oversized carrier.
     scheduler.running = []
     scheduler.waiting = deque((object(),))
     assert scheduler._canonical_elastic_graph_step_key({"handoff": 4}, 3, True) == (
         0,
         3,
-        16,
-        64,
+        1,
+        4,
         4,
     )
 
@@ -7718,6 +7732,59 @@ def test_live_k3_cohort_keeps_its_physical_carrier_until_drain():
         4,
         4,
     )
+
+
+def test_tail_plan_dispatches_small_bucket_while_leasing_large_carrier():
+    generation = RuntimeGeneration("tail-execution-residency-split")
+    scheduler = _new_elastic_scheduler(generation)
+    scheduler.scheduler_config = Mock(max_num_batched_tokens=4096, max_num_seqs=40)
+    scheduler._elastic_graph_execution_policy = _current_q4_piecewise_policy()
+    scheduler._elastic_graph_catalog_coverage = {"decode_max_x": 40}
+    current_key = (0, 3, 4, 16, 4)
+    carrier_key = (0, 3, 32, 128, 4)
+    scheduler._elastic_graph_carrier_step_key = carrier_key
+    _publish_elastic_step_hot(scheduler, current_key)
+    _publish_elastic_step_hot(scheduler, carrier_key)
+
+    current, successor, physical = scheduler._elastic_step_residency_intent(current_key)
+    manifest, dispatch = build_execution_manifest(
+        step_key=current_key,
+        request_ids=tuple(f"request-{index}" for index in range(4)),
+        per_request_query_lens=(4,) * 4,
+        per_request_is_prefilling=(False,) * 4,
+        scheduled_draft_rows=(3,) * 4,
+        requested_output_k=3,
+        executed_drafter_k=3,
+        phase="decode",
+        generation=generation,
+        policy=scheduler._elastic_graph_execution_policy,
+        max_num_batched_tokens=4096,
+        physical_keys=current,
+    )
+    plan = scheduler._elastic_admission_controller.plan(
+        "tail-user-plan",
+        physical,
+        request_bytes=0,
+        available_bytes=4096,
+    )
+    plan = dataclasses.replace(
+        plan,
+        execution_manifest=manifest,
+        current_dispatch=dispatch,
+        successor_keys=successor,
+        protected_keys=tuple(key for key in physical if key not in set(current)),
+    )
+    retained = set(scheduler._resolve_elastic_step_physical_keys(carrier_key))
+
+    assert plan.kind == ElasticPlanKind.USER
+    assert all(
+        item.invocation.semantic_num_reqs == 4
+        and item.invocation.physical_num_reqs == 4
+        for item in plan.current_dispatch
+    )
+    assert {item.physical_key for item in plan.current_dispatch} == set(current)
+    assert retained.issubset(plan.physical_keys)
+    assert retained.issubset(plan.protected_keys)
 
 
 @pytest.mark.parametrize(
@@ -7776,20 +7843,21 @@ def test_mixed_carrier_closure_and_qlen1_tail_share_bounded_x_inventory():
             4,
         )
 
-        # Cancellation and waiting-only handoff retain the same bounded
-        # carrier; neither can resurrect an exact non-bucket FULL X.
+        # Cancellation and waiting-only handoff execute through the smallest
+        # bounded bucket. Residency retention is tested independently above.
         tail_x = max(1, semantic_x - 1)
+        tail_physical_x = next(x for x in inventory if x >= tail_x)
         scheduler.running = [object() for _ in range(tail_x)]
         assert scheduler._canonical_elastic_graph_step_key(
             {str(index): 1 for index in range(tail_x)}, 3, True
-        ) == (1, 3, physical_x, physical_x, 1)
+        ) == (1, 3, tail_physical_x, tail_physical_x, 1)
         scheduler.running = []
         scheduler.waiting = deque((object(),))
         assert scheduler._canonical_elastic_graph_step_key({"handoff": 1}, 3, True) == (
             1,
             3,
-            physical_x,
-            physical_x,
+            1,
+            1,
             1,
         )
         scheduler.waiting.clear()
@@ -7800,7 +7868,7 @@ def test_mixed_carrier_closure_and_qlen1_tail_share_bounded_x_inventory():
     scheduler.running = [object() for _ in range(3)]
     assert scheduler._canonical_elastic_graph_step_key(
         {str(index): 1 for index in range(3)}, 3, True
-    ) == (1, 3, 8, 8, 1)
+    ) == (1, 3, 4, 4, 1)
 
 
 def test_sealed_runtime_executes_smallest_bucket_and_retains_terminal_carrier() -> None:
@@ -7971,7 +8039,7 @@ def test_elastic_carrier_closure_preserves_pure_decode_tail_phase():
     ]
 
 
-def test_elastic_carrier_growth_replaces_closure_and_retains_tail_until_drain():
+def test_elastic_carrier_growth_retains_residency_but_shrinks_tail_execution():
     scheduler = _new_elastic_scheduler()
     scheduler.scheduler_config = Mock(max_num_batched_tokens=4096, max_num_seqs=40)
     scheduler._elastic_graph_execution_policy = _current_q4_piecewise_policy()
@@ -7989,11 +8057,15 @@ def test_elastic_carrier_growth_replaces_closure_and_retains_tail_until_drain():
 
     scheduler._commit_elastic_graph_carrier_step_key((1, 0, 40, 40, 1))
     assert scheduler._elastic_graph_carrier_step_key == (0, 3, 40, 160, 4)
+    scheduler._commit_elastic_graph_carrier_step_key((1, 3, 40, 40, 1))
+    assert scheduler._elastic_graph_carrier_step_key == (0, 3, 40, 160, 4)
 
     scheduler.running = [object() for _ in range(5)]
     assert scheduler._canonical_elastic_graph_step_key(
         {str(index): 4 for index in range(5)}, 3, True
-    ) == (0, 3, 40, 160, 4)
+    ) == (0, 3, 8, 32, 4)
+    scheduler._commit_elastic_graph_carrier_step_key((0, 3, 8, 32, 4))
+    assert scheduler._elastic_graph_carrier_step_key == (0, 3, 40, 160, 4)
 
     scheduler.running = []
     assert scheduler._canonical_elastic_graph_step_key({"new": 4}, 3, True) == (

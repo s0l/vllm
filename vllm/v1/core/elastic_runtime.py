@@ -51,11 +51,29 @@ _ELASTIC_RUNTIME_SOURCE_MODULES = (
     "vllm.model_executor.layers.rotary_embedding",
 )
 
+# A serving/runtime generation protects scheduler-worker protocol and mutable
+# state, so it intentionally follows the complete source inventory above.  A
+# measured catalog has a narrower consumed contract: physical CUDA Graph/KV
+# coexistence for explicit replay keys.  Scheduler admission and residency
+# policy may change while those rows remain valid; required-key, policy and
+# execution-manifest validation at load time still rejects a semantic surface
+# change.  Keep modules that own graph construction, model math, collectives,
+# calibration measurement, or physical memory here.
+_ELASTIC_PHYSICAL_CATALOG_SOURCE_MODULES = tuple(
+    module_name
+    for module_name in _ELASTIC_RUNTIME_SOURCE_MODULES
+    if module_name
+    not in {
+        "vllm.v1.core.sched.scheduler",
+        "vllm.v1.worker.elastic_catalog_tool",
+        "vllm.v1.worker.startup_plan",
+    }
+)
 
-def elastic_runtime_source_hashes() -> dict[str, str]:
-    """Bind measurements to the Python implementation that owns the DAG."""
+
+def _source_hashes(module_names: tuple[str, ...]) -> dict[str, str]:
     result: dict[str, str] = {}
-    for module_name in _ELASTIC_RUNTIME_SOURCE_MODULES:
+    for module_name in module_names:
         spec = importlib.util.find_spec(module_name)
         path = spec.origin if spec is not None else None
         if path is None:
@@ -65,6 +83,30 @@ def elastic_runtime_source_hashes() -> dict[str, str]:
         with open(path, "rb") as stream:
             result[module_name] = hashlib.sha256(stream.read()).hexdigest()
     return result
+
+
+def elastic_runtime_source_hashes() -> dict[str, str]:
+    """Bind runtime state to every Python owner in the elastic protocol."""
+    return _source_hashes(_ELASTIC_RUNTIME_SOURCE_MODULES)
+
+
+def elastic_catalog_physical_source_hashes() -> dict[str, str]:
+    """Bind catalog rows only to code that can change their physical cost."""
+    return _source_hashes(_ELASTIC_PHYSICAL_CATALOG_SOURCE_MODULES)
+
+
+def elastic_auto_calibration_enabled() -> bool:
+    """Admit automatic calibration only in an explicit maintenance job."""
+    requested = os.environ.get("AG2_VLLM_ELASTIC_AUTO_CALIBRATE", "0") == "1"
+    role = os.environ.get("AG2_VLLM_ELASTIC_CALIBRATION_ROLE", "")
+    if requested and role != "maintenance":
+        raise RuntimeError(
+            "automatic elastic calibration is maintenance-only; set "
+            "AG2_VLLM_ELASTIC_CALIBRATION_ROLE=maintenance in an explicit "
+            "calibration job, or disable AG2_VLLM_ELASTIC_AUTO_CALIBRATE "
+            "for serving"
+        )
+    return requested
 
 
 def elastic_profile_config_factors(vllm_config: VllmConfig) -> dict[str, Any]:

@@ -52,7 +52,10 @@ from vllm.v1.core.elastic_graph import (
     execution_manifest_phase_from_step_key,
     resolve_step_physical_keys,
 )
-from vllm.v1.core.elastic_runtime import compute_elastic_runtime_generation
+from vllm.v1.core.elastic_runtime import (
+    compute_elastic_runtime_generation,
+    elastic_auto_calibration_enabled,
+)
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -392,6 +395,7 @@ class Scheduler(SchedulerInterface):
         # its later verification steps, including while the current step is a
         # mixed/prefill shape.
         self._elastic_graph_carrier_step_key: tuple[int, ...] | None = None
+        self._elastic_last_execution_shape: tuple[int, int] | None = None
         # A sealed serving runtime reuses one terminal decode carrier for all
         # semantic cohorts up to MaxX. Calibration leaves this unset so every
         # declared exact shape remains independently measurable.
@@ -400,18 +404,16 @@ class Scheduler(SchedulerInterface):
         self._elastic_serving_carrier_resident_bytes = 0
         if os.environ.get("AG2_VLLM_ELASTIC_CALIBRATION", "0") == "1":
             raise RuntimeError(
-                "AG2_VLLM_ELASTIC_CALIBRATION is obsolete; normal startup "
-                "calibrates a catalog miss when "
-                "AG2_VLLM_ELASTIC_AUTO_CALIBRATE=1 and "
-                "AG2_VLLM_ELASTIC_CALIBRATION_SURFACE is set"
+                "AG2_VLLM_ELASTIC_CALIBRATION is obsolete; use an explicit "
+                "maintenance job with AG2_VLLM_ELASTIC_AUTO_CALIBRATE=1, "
+                "AG2_VLLM_ELASTIC_CALIBRATION_ROLE=maintenance and an "
+                "accepted AG2_VLLM_ELASTIC_CALIBRATION_SURFACE"
             )
         self._elastic_restore_mode = False
         self._elastic_require_catalog = (
             os.environ.get("AG2_VLLM_ELASTIC_REQUIRE_CATALOG", "0") == "1"
         )
-        self._elastic_auto_calibrate = (
-            os.environ.get("AG2_VLLM_ELASTIC_AUTO_CALIBRATE", "0") == "1"
-        )
+        self._elastic_auto_calibrate = elastic_auto_calibration_enabled()
         self._elastic_graph_catalog: dict[tuple[int, ...], dict[str, Any]] = {}
         self._elastic_graph_catalog_coverage: dict[str, Any] = {}
         if self.elastic_on_demand_graphs:
@@ -427,15 +429,6 @@ class Scheduler(SchedulerInterface):
                     load_elastic_graph_catalog_coverage(
                         self.vllm_config, kv_cache_config
                     ),
-                )
-            if (
-                self._elastic_require_catalog
-                and not self._elastic_graph_catalog
-                and not self._elastic_auto_calibrate
-            ):
-                raise RuntimeError(
-                    "elastic CUDA Graph catalog is empty; enable automatic "
-                    "pre-READY calibration and provide an accepted surface"
                 )
         self._elastic_graph_idle_cleanup_timeout_s = 5.0
         self._elastic_last_graph_admission_rejection: tuple[object, ...] | None = None
@@ -2904,6 +2897,7 @@ class Scheduler(SchedulerInterface):
         self.current_step += 1
         if not self.running and not self.waiting and not self.skipped_waiting:
             self._elastic_graph_carrier_step_key = None
+            self._elastic_last_execution_shape = None
             # A completed GRAPH_ONLY capture remains HOT, but an orphaned USER
             # binding has no request lifecycle left to consume it.
             self._elastic_deferred_mm_wave = None
@@ -4842,28 +4836,10 @@ class Scheduler(SchedulerInterface):
         restore_mode = getattr(self, "_elastic_restore_mode", False)
         if semantic.phase == "decode" and not restore_mode:
             physical_x = self._elastic_short_decode_physical_x(semantic.num_reqs)
-        # A uniform decode cohort may retain a larger declared physical X;
-        # masks and output cropping preserve its semantic request count. Mixed
-        # work has no such single-query contract and therefore keeps exact X.
-        # Successor residency is derived separately below and must never leak
-        # its carrier cardinality into current execution.
-        current_key = getattr(self, "_elastic_graph_carrier_step_key", None)
-        if (
-            semantic.phase == "decode"
-            and not restore_mode
-            and (
-                getattr(self, "running", ())
-                or getattr(self, "waiting", ())
-                or getattr(self, "skipped_waiting", ())
-            )
-            and current_key is not None
-            and current_key[1] == semantic.num_spec_tokens
-            and current_key[2] >= semantic.num_reqs
-        ):
-            physical_x = max(
-                physical_x,
-                self._elastic_short_decode_physical_x(current_key[2]),
-            )
+        # Residency may retain a larger cohort carrier until drain, but current
+        # execution always uses the smallest declared bucket covering semantic
+        # X. _elastic_step_residency_intent() protects the retained carrier
+        # without making it a dispatch candidate.
         if semantic.phase == "decode" and target_mode == "FULL":
             return (
                 1,
@@ -4985,7 +4961,7 @@ class Scheduler(SchedulerInterface):
     def _commit_elastic_graph_carrier_step_key(
         self, execution_step_key: tuple[int, ...] | None
     ) -> None:
-        """Commit a speculative carrier without letting transient K0 replace it."""
+        """Commit the speculative residency high-water mark until drain."""
         if execution_step_key is None:
             return
         current = getattr(self, "_elastic_graph_carrier_step_key", None)
@@ -4994,9 +4970,31 @@ class Scheduler(SchedulerInterface):
             # speculative carrier.  K0 runtimes have no such owner and commit
             # their target carrier normally.
             return
-        self._elastic_graph_carrier_step_key = (
-            self._elastic_graph_carrier_closure_step_key(execution_step_key)
-        )
+        candidate = self._elastic_graph_carrier_closure_step_key(execution_step_key)
+        assert candidate is not None
+        if (
+            current is not None
+            and current[1] == candidate[1]
+            and current[2] >= candidate[2]
+        ):
+            # A smaller execution bucket and transient q=1 tail must not shrink
+            # or replace the q=K+1 residency closure. The scheduler clears this
+            # high-water state only after the complete request epoch drains.
+            current_query_len = current[1] + 1
+            candidate_query_len = candidate[1] + 1
+            current_is_closure = (
+                current[4] == current_query_len
+                and current[3] == current[2] * current_query_len
+            )
+            candidate_is_closure = (
+                candidate[4] == candidate_query_len
+                and candidate[3] == candidate[2] * candidate_query_len
+            )
+            if current[2] > candidate[2] or (
+                current_is_closure and not candidate_is_closure
+            ):
+                return
+        self._elastic_graph_carrier_step_key = candidate
 
     def _resolve_elastic_step_physical_keys(
         self, step_key: tuple[int, ...] | None
@@ -5093,11 +5091,33 @@ class Scheduler(SchedulerInterface):
                 and entry.hot
             )
         )
+        retained_carrier = tuple(
+            key
+            for key in self._resolve_elastic_step_physical_keys(
+                getattr(self, "_elastic_graph_carrier_step_key", None)
+            )
+            if key not in current_set
+            and (
+                (entry := self._elastic_admission_controller.entries.get(key))
+                is not None
+                and entry.hot
+            )
+        )
         successor_intent = tuple(dict.fromkeys((*successor, *serving_carrier)))
+        successor_intent = tuple(dict.fromkeys((*successor_intent, *retained_carrier)))
         return (
             current,
             successor_intent,
-            tuple(dict.fromkeys((*current, *protected_successor, *serving_carrier))),
+            tuple(
+                dict.fromkeys(
+                    (
+                        *current,
+                        *protected_successor,
+                        *serving_carrier,
+                        *retained_carrier,
+                    )
+                )
+            ),
         )
 
     def _elastic_successor_primary_headroom(
@@ -8117,9 +8137,25 @@ class Scheduler(SchedulerInterface):
             else None
         )
         if scheduler_output.total_num_scheduled_tokens > 0:
-            self._commit_elastic_graph_carrier_step_key(
-                scheduler_output.elastic_graph_step_key
-            )
+            execution_step_key = scheduler_output.elastic_graph_step_key
+            if execution_step_key is not None:
+                execution_shape = (
+                    len(scheduler_output.num_scheduled_tokens),
+                    execution_step_key[2],
+                )
+                if execution_shape != getattr(
+                    self, "_elastic_last_execution_shape", None
+                ):
+                    logger.info(
+                        "AG2 elastic execution transition: semantic_x=%d "
+                        "physical_x=%d step_key=%s retained_carrier=%s",
+                        execution_shape[0],
+                        execution_shape[1],
+                        execution_step_key,
+                        self._elastic_graph_carrier_step_key,
+                    )
+                    self._elastic_last_execution_shape = execution_shape
+            self._commit_elastic_graph_carrier_step_key(execution_step_key)
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
