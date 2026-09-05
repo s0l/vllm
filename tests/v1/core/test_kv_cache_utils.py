@@ -2019,6 +2019,18 @@ def test_elastic_external_memory_borrows_and_returns_attention_tail():
     )
     assert coordinator.elastic_external_memory_bytes == 600
 
+    # Returning the Graph loan can admit a wider attention requirement without
+    # growing GDN. Preview must price that destination, without applying it.
+    mapped_before = coordinator.block_pool.active_num_gpu_blocks
+    return_plan = coordinator.plan_elastic_admission_wave((6,), external_memory_bytes=0)
+    assert return_plan is not None
+    assert return_plan.max_requests == 1
+    assert coordinator.block_pool.active_num_gpu_blocks == mapped_before
+    assert coordinator.elastic_external_memory_bytes == 600
+    assert coordinator.apply_elastic_admission_wave((6,), external_memory_bytes=0) == 1
+    assert coordinator.block_pool.get_num_free_blocks() >= 6
+    assert coordinator.elastic_external_memory_bytes == 0
+
 
 def test_elastic_wave_restores_external_loan_when_gdn_commit_fails():
     coordinator = object.__new__(HybridKVCacheCoordinator)

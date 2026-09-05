@@ -1243,6 +1243,42 @@ def test_worker_validates_q1_manifest_before_any_graph_mutation() -> None:
             phase="mixed",
             max_num_batched_tokens=4096,
         )
+    # Corrupt the transport payload after construction: worker verification
+    # must not accept a retained MTP key simply because the plan supplied it.
+    foreign_mtp = next(
+        key
+        for key in resolve_step_physical_keys(
+            (0, 3, 8, 32, 4), generation, 4096, policy=policy
+        )
+        if key.logical.owner == "mtp_decode"
+    )
+    corrupted_plan = copy(plan)
+    object.__setattr__(
+        corrupted_plan,
+        "current_dispatch",
+        tuple(
+            replace(item, physical_key=foreign_mtp)
+            if item.invocation.owner == "mtp_decode"
+            else item
+            for item in plan.current_dispatch
+        ),
+    )
+    with pytest.raises(
+        gpu_cudagraph_utils.ElasticExecutionPlanMismatch,
+        match="current physical key differs",
+    ):
+        working_set.validate_execution_manifest(
+            corrupted_plan,
+            step_key=step_key,
+            request_ids=("request-0",),
+            per_request_query_lens=(1,),
+            per_request_is_prefilling=(True,),
+            scheduled_draft_rows=(0,),
+            requested_output_k=3,
+            executed_drafter_k=3,
+            phase="mixed",
+            max_num_batched_tokens=4096,
+        )
     for owner in working_set.managers:
         owner.evict_physical_key.assert_not_called()
         owner.queue_physical_key.assert_not_called()

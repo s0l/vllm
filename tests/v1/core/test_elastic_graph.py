@@ -270,14 +270,15 @@ def test_variable_decode_uses_piecewise_manifest_lane() -> None:
     )
 
 
-def test_manifest_preserves_semantic_x_with_owner_specific_terminal_carrier() -> None:
+@pytest.mark.parametrize("foreign_x", [1, 39])
+def test_manifest_rejects_foreign_mtp_carrier_as_current_execution(foreign_x) -> None:
     policy = execution_manifest_policy()
     step_key = (0, 3, 12, 16, 0)
     exact = resolve_step_physical_keys(step_key, GENERATION, 4096, policy=policy)
     terminal_mtp = next(
         key
         for key in resolve_step_physical_keys(
-            (1, 3, 39, 39, 1), GENERATION, 4096, policy=policy
+            (1, 3, foreign_x, foreign_x, 1), GENERATION, 4096, policy=policy
         )
         if key.logical.owner == "mtp_decode"
     )
@@ -285,34 +286,21 @@ def test_manifest_preserves_semantic_x_with_owner_specific_terminal_carrier() ->
         terminal_mtp if key.logical.owner == "mtp_decode" else key for key in exact
     )
 
-    manifest, dispatch = build_execution_manifest(
-        step_key=step_key,
-        request_ids=tuple(f"request-{index}" for index in range(12)),
-        per_request_query_lens=(1,) * 12,
-        per_request_is_prefilling=(True,) * 12,
-        scheduled_draft_rows=(0,) * 12,
-        requested_output_k=3,
-        executed_drafter_k=3,
-        phase="mixed",
-        generation=GENERATION,
-        policy=policy,
-        max_num_batched_tokens=4096,
-        physical_keys=physical,
-    )
-
-    assert len(manifest.request_ids) == 12
-    by_owner = {item.owner: item for item in manifest.invocations}
-    assert by_owner["target"].physical_num_reqs == 12
-    assert by_owner["mtp_prefill"].physical_num_reqs == 12
-    assert by_owner["mtp_decode"].physical_num_reqs == 39
-    assert (
-        next(
-            item.physical_key
-            for item in dispatch
-            if item.invocation.owner == "mtp_decode"
+    with pytest.raises(ElasticGraphError, match="current physical key differs"):
+        build_execution_manifest(
+            step_key=step_key,
+            request_ids=tuple(f"request-{index}" for index in range(12)),
+            per_request_query_lens=(1,) * 12,
+            per_request_is_prefilling=(True,) * 12,
+            scheduled_draft_rows=(0,) * 12,
+            requested_output_k=3,
+            executed_drafter_k=3,
+            phase="mixed",
+            generation=GENERATION,
+            policy=policy,
+            max_num_batched_tokens=4096,
+            physical_keys=physical,
         )
-        == terminal_mtp
-    )
 
 
 def test_manifest_rejects_terminal_override_for_non_mtp_owner() -> None:
@@ -329,7 +317,7 @@ def test_manifest_rejects_terminal_override_for_non_mtp_owner() -> None:
 
     with pytest.raises(
         ElasticGraphError,
-        match="only MTP decode may use a larger terminal physical carrier",
+        match="current physical key differs",
     ):
         build_execution_manifest(
             step_key=step_key,

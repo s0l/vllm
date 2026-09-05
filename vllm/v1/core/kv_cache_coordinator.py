@@ -750,12 +750,10 @@ class KVCacheCoordinator(ABC):
             if desired_gdn > pool.num_gpu_blocks:
                 continue
 
-            desired_attention = (
-                self.block_pool.active_num_gpu_blocks
-                if missing_gdn == 0 and not external_memory_bytes
-                else self._elastic_attention_capacity(
-                    desired_gdn, external_memory_bytes
-                )
+            # A prospective loan return can grow attention capacity even when
+            # the GDN pool already covers the next wave.
+            desired_attention = self._elastic_attention_capacity(
+                desired_gdn, external_memory_bytes
             )
             # Preserve every candidate's conservative full-sequence primary
             # requirement in addition to null/currently referenced blocks.

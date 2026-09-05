@@ -7734,14 +7734,20 @@ def test_live_k3_cohort_retains_carrier_without_oversizing_tail_execution():
     )
 
 
-def test_tail_plan_dispatches_small_bucket_while_leasing_large_carrier():
+@pytest.mark.parametrize(
+    ("semantic_x", "physical_x", "retained_x"),
+    [(4, 4, 32), (3, 4, 16), (1, 1, 8), (11, 16, 4), (25, 32, 8)],
+)
+def test_form_plan_dispatches_current_bucket_while_leasing_retained_carrier(
+    semantic_x, physical_x, retained_x
+):
     generation = RuntimeGeneration("tail-execution-residency-split")
     scheduler = _new_elastic_scheduler(generation)
     scheduler.scheduler_config = Mock(max_num_batched_tokens=4096, max_num_seqs=40)
     scheduler._elastic_graph_execution_policy = _current_q4_piecewise_policy()
     scheduler._elastic_graph_catalog_coverage = {"decode_max_x": 40}
-    current_key = (0, 3, 4, 16, 4)
-    carrier_key = (0, 3, 32, 128, 4)
+    current_key = (0, 3, physical_x, physical_x * 4, 4)
+    carrier_key = (0, 3, retained_x, retained_x * 4, 4)
     scheduler._elastic_graph_carrier_step_key = carrier_key
     _publish_elastic_step_hot(scheduler, current_key)
     _publish_elastic_step_hot(scheduler, carrier_key)
@@ -7749,10 +7755,10 @@ def test_tail_plan_dispatches_small_bucket_while_leasing_large_carrier():
     current, successor, physical = scheduler._elastic_step_residency_intent(current_key)
     manifest, dispatch = build_execution_manifest(
         step_key=current_key,
-        request_ids=tuple(f"request-{index}" for index in range(4)),
-        per_request_query_lens=(4,) * 4,
-        per_request_is_prefilling=(False,) * 4,
-        scheduled_draft_rows=(3,) * 4,
+        request_ids=tuple(f"request-{index}" for index in range(semantic_x)),
+        per_request_query_lens=(4,) * semantic_x,
+        per_request_is_prefilling=(False,) * semantic_x,
+        scheduled_draft_rows=(3,) * semantic_x,
         requested_output_k=3,
         executed_drafter_k=3,
         phase="decode",
@@ -7778,8 +7784,8 @@ def test_tail_plan_dispatches_small_bucket_while_leasing_large_carrier():
 
     assert plan.kind == ElasticPlanKind.USER
     assert all(
-        item.invocation.semantic_num_reqs == 4
-        and item.invocation.physical_num_reqs == 4
+        item.invocation.semantic_num_reqs == semantic_x
+        and item.invocation.physical_num_reqs == physical_x
         for item in plan.current_dispatch
     )
     assert {item.physical_key for item in plan.current_dispatch} == set(current)
@@ -8075,6 +8081,27 @@ def test_elastic_carrier_growth_retains_residency_but_shrinks_tail_execution():
         4,
         4,
     )
+
+
+def test_form_transitions_follow_work_at_fixed_request_count():
+    scheduler = _new_elastic_scheduler()
+    scheduler.scheduler_config = Mock(max_num_batched_tokens=4096, max_num_seqs=40)
+    scheduler._elastic_graph_execution_policy = _current_q4_piecewise_policy()
+    scheduler._elastic_graph_catalog_coverage = {"decode_max_x": 40}
+    scheduler._elastic_graph_carrier_step_key = (0, 3, 32, 128, 4)
+    for counts, pure_decode, expected in [
+        ((1024, 4), False, (0, 3, 2, 2048, 0)),
+        ((4, 4), True, (0, 3, 2, 8, 4)),
+        ((1, 1), True, (1, 3, 2, 2, 1)),
+        ((4, 1024), False, (0, 3, 2, 2048, 0)),
+        ((4, 4), True, (0, 3, 2, 8, 4)),
+    ]:
+        actual = scheduler._canonical_elastic_graph_step_key(
+            dict(zip(("a", "b"), counts)), 3, pure_decode
+        )
+        assert actual == expected
+        scheduler._commit_elastic_graph_carrier_step_key(actual)
+        assert scheduler._elastic_graph_carrier_step_key == (0, 3, 32, 128, 4)
 
 
 def test_mixed_execution_resolves_complete_stable_carrier_owner_set():
@@ -8454,6 +8481,7 @@ def _make_elastic_running_text_wave_scheduler(num_reqs: int = 8) -> Scheduler:
     scheduler.current_step = 7
     scheduler.max_model_len = 262144
     scheduler.num_sampled_tokens_per_step = 1
+    scheduler.num_prefill_lookahead = 1
     scheduler.need_mamba_block_aligned_split = False
     scheduler.num_spec_tokens = 3
     scheduler.dynamic_sd_lookup = None
@@ -8550,6 +8578,114 @@ def test_running_text_wave_prepares_one_final_shape_maintenance():
     assert key == (1, 3, 8, 32, 4)
     assert prepared_maintenance is True
     scheduler._can_fund_elastic_graph_step.assert_called_once()
+
+
+@pytest.mark.parametrize(("source_x", "destination_x"), [(32, 16), (4, 8)])
+@pytest.mark.parametrize(
+    "blocker", [None, "inflight", "capacity", "unknown", "lease", "loan"]
+)
+def test_running_cold_form_pressure_reclaim_makes_progress(
+    source_x, destination_x, blocker
+):
+    """A quiescent wave must not wait forever for optional pinned residency."""
+    scheduler = _make_elastic_running_text_wave_scheduler(num_reqs=destination_x)
+    scheduler._elastic_graph_execution_policy = _current_q4_piecewise_policy()
+    controller = scheduler._elastic_admission_controller
+    source = (0, 3, source_x, source_x * 4, 4)
+    destination = (0, 3, destination_x, destination_x * 4, 4)
+    scheduler._elastic_graph_carrier_step_key = source
+    terminal = scheduler._resolve_elastic_step_physical_keys((1, 3, 40, 40, 1))[-1]
+    scheduler._elastic_serving_carrier_keys = (terminal,)
+    controller.publish_hot(terminal, GraphPrice(20, 20, "terminal"), pinned=True)
+    for key in scheduler._resolve_elastic_step_physical_keys(source):
+        controller.publish_hot(key, GraphPrice(30, 30, key.identity), pinned=True)
+    controller.resident_bytes = 120
+    controller.floor_bytes = 10
+    controller.transition_floor_bytes = 10
+    controller.record_capture_envelope(
+        scheduler._elastic_graph_owner_key(destination), (100, 10, 0)
+    )
+    scheduler._elastic_graph_catalog = {}
+    coordinator = scheduler.kv_cache_manager.coordinator
+    coordinator.elastic_external_memory_bytes = 120
+    coordinator.max_elastic_external_memory.return_value = 150
+    coordinator.normalize_elastic_external_memory.side_effect = lambda n: n
+    if blocker == "capacity":
+        coordinator.max_elastic_external_memory.return_value = 129
+    elif blocker == "unknown":
+        controller.capture_envelopes.clear()
+    elif blocker == "lease":
+        user = controller.plan(
+            "inflight",
+            (terminal, *controller.entries),
+            request_bytes=0,
+            available_bytes=1000,
+        )
+        controller.commit_user(user)
+    elif blocker == "loan":
+        controller.reserve_loan(source, 120)
+    entries = dict(controller.entries)
+
+    # Neither a pinned graph nor a retained high-water graph is an ordinary
+    # LRU victim. The old implementation returned (None, False) forever.
+    key, maintenance = scheduler._preflight_elastic_running_text_wave(
+        token_budget=4096,
+        prefill_chunk_cap=0,
+        defer_prefills=False,
+        physical_quiescent=blocker != "inflight",
+    )
+
+    if blocker is not None:
+        assert key is None and not maintenance
+        assert controller.pending_maintenance_plan is None
+        assert dict(controller.entries) == entries
+        coordinator.set_elastic_external_memory.assert_not_called()
+        return
+    assert key is None and maintenance
+    reclaim = controller.pending_maintenance_plan
+    assert reclaim is not None and reclaim.kind == ElasticPlanKind.PRESSURE_RECLAIM
+    assert reclaim.protected_keys == (terminal,)
+    assert set(reclaim.victim_keys) == set(
+        scheduler._resolve_elastic_step_physical_keys(source)
+    )
+    assert dict(controller.entries) == entries
+    coordinator.set_elastic_external_memory.assert_not_called()
+    scheduler._reserve_elastic_admission.assert_not_called()
+    # Existing worker receipt synchronization supplies this boundary. Reclaim
+    # has no USER consumer, then the unchanged RUNNING cohort can prepare its
+    # exact cold destination instead of inheriting the source execution M.
+    controller.begin_reclaim(reclaim)
+    controller.synchronize_hot(((terminal, entries[terminal].price, True, 0),))
+    controller.clear_maintenance()
+    controller.resident_bytes = 30
+    coordinator.elastic_external_memory_bytes = 30
+    key, maintenance = scheduler._preflight_elastic_running_text_wave(
+        token_budget=4096,
+        prefill_chunk_cap=0,
+        defer_prefills=False,
+        physical_quiescent=True,
+    )
+    assert key == destination and maintenance
+    capture = controller.pending_maintenance_plan
+    assert capture is not None and capture.kind == ElasticPlanKind.MAINTENANCE
+    assert set(capture.cold_misses) == set(
+        scheduler._resolve_elastic_step_physical_keys(destination)
+    )
+    controller.clear_maintenance()
+    for physical_key in capture.cold_misses:
+        controller.publish_hot(
+            physical_key, GraphPrice(30, 30, physical_key.identity), pinned=True
+        )
+    controller.resident_bytes = 120
+    coordinator.elastic_external_memory_bytes = 120
+    key, maintenance = scheduler._preflight_elastic_running_text_wave(
+        token_budget=4096,
+        prefill_chunk_cap=0,
+        defer_prefills=False,
+        physical_quiescent=True,
+    )
+    assert key == destination and not maintenance
+    assert controller.pending_maintenance_plan is None
 
 
 def test_running_text_wave_prices_full_future_kv_and_gdn_before_allocation():

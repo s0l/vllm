@@ -2305,14 +2305,26 @@ class Scheduler(SchedulerInterface):
             return None, False
         if joint_waiting_count:
             return resolve_failed_joint()
-        logger.debug(
-            "Complete RUNNING text wave deferred before KV mutation: "
-            "required_bytes=%d available_bytes=%d step_key=%r reason=%s",
-            required_external,
-            available_external,
+        defer_identity = (
             final_key,
             getattr(self, "_elastic_last_defer_reason", None),
+            required_external,
+            available_external,
         )
+        if defer_identity != getattr(self, "_elastic_last_wave_defer", None):
+            self._elastic_last_wave_defer = defer_identity
+            logger.warning(
+                "Complete RUNNING wave deferred before KV mutation: "
+                "step_key=%r reason=%s required_bytes=%d available_bytes=%d "
+                "resident_bytes=%d floor_bytes=%d pending_loans=%d "
+                "physical_quiescent=%s retained_carrier=%r",
+                *defer_identity,
+                self._elastic_admission_controller.resident_bytes,
+                self._elastic_admission_controller.floor_bytes,
+                len(self._elastic_admission_controller.pending_loans),
+                physical_quiescent,
+                getattr(self, "_elastic_graph_carrier_step_key", None),
+            )
         if deferred_mm_wave is not None:
             self._elastic_deferred_mm_wave = None
             clear_joint_identity()
@@ -2323,7 +2335,68 @@ class Scheduler(SchedulerInterface):
                 defer_prefills=defer_prefills,
                 physical_quiescent=physical_quiescent,
             )
+        if not prospective_encoder_inputs and self._prepare_elastic_cold_form_reclaim(
+            final_key,
+            available_external=available_external,
+            physical_quiescent=physical_quiescent,
+        ):
+            return None, True
         return None, False
+
+    def _prepare_elastic_cold_form_reclaim(
+        self,
+        step_key: tuple[int, ...],
+        *,
+        available_external: int,
+        physical_quiescent: bool,
+    ) -> bool:
+        """Retire optional residency when it prevents a priced RUNNING wave.
+
+        This is a request-free transaction, not a shape fallback. The next
+        tick reprices the same work against the worker's post-reclaim receipt.
+        """
+        controller = self._elastic_admission_controller
+        if (
+            not physical_quiescent
+            or getattr(self, "_elastic_restore_mode", False)
+            or controller.pending_loans
+            or controller.pending_maintenance_plan is not None
+            or getattr(self, "_elastic_last_defer_reason", None)
+            != "insufficient_reclaimable_graph_and_kv_bytes"
+        ):
+            return False
+        destination, cold = self._estimate_elastic_graph_step_bytes(step_key)
+        if not cold or destination <= 0:
+            return False
+        # Do not assume allocator slack or future KV compaction. The same
+        # pinned-KV capacity must fund the destination and mandatory carrier.
+        # Omitting sharing here is conservative and avoids treating optional
+        # source entries as if they survived the administrative teardown.
+        post_reclaim_bound = controller.compose_destination_capture_loan(
+            current_residency_bytes=self._elastic_pressure_floor_external_bytes(),
+            destination_capture_endpoint_bytes=destination,
+        )
+        if post_reclaim_bound > available_external:
+            return False
+        reclaim = controller.plan_pressure_reclaim_all(
+            self._next_elastic_transaction_id(),
+            request_bytes=controller.resident_bytes,
+            available_bytes=available_external,
+            protected_keys=getattr(self, "_elastic_serving_carrier_keys", ()),
+        )
+        if reclaim.kind != ElasticPlanKind.PRESSURE_RECLAIM:
+            return False
+        controller.arm_maintenance(reclaim, None)
+        logger.info(
+            "Elastic cold form recovery: step_key=%r post_reclaim_bound=%d "
+            "available_bytes=%d victims=%d protected=%d",
+            step_key,
+            post_reclaim_bound,
+            available_external,
+            len(reclaim.victim_keys),
+            len(reclaim.protected_keys),
+        )
+        return True
 
     def _preflight_elastic_waiting_text_wave(
         self,
@@ -8141,18 +8214,31 @@ class Scheduler(SchedulerInterface):
             if execution_step_key is not None:
                 execution_shape = (
                     len(scheduler_output.num_scheduled_tokens),
-                    execution_step_key[2],
+                    execution_step_key,
+                    tuple(
+                        (
+                            dispatch.invocation.owner,
+                            dispatch.invocation.physical_num_reqs,
+                            dispatch.invocation.physical_num_tokens,
+                            dispatch.invocation.uniform_query_len,
+                            dispatch.representation.value,
+                        )
+                        for dispatch in completed_plan.current_dispatch
+                    )
+                    if completed_plan is not None
+                    else (),
                 )
                 if execution_shape != getattr(
                     self, "_elastic_last_execution_shape", None
                 ):
                     logger.info(
                         "AG2 elastic execution transition: semantic_x=%d "
-                        "physical_x=%d step_key=%s retained_carrier=%s",
+                        "physical_x=%d step_key=%s retained_carrier=%s owners=%s",
                         execution_shape[0],
-                        execution_shape[1],
+                        execution_step_key[2],
                         execution_step_key,
                         self._elastic_graph_carrier_step_key,
+                        execution_shape[2],
                     )
                     self._elastic_last_execution_shape = execution_shape
             self._commit_elastic_graph_carrier_step_key(execution_step_key)

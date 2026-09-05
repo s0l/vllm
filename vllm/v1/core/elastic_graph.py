@@ -1435,18 +1435,11 @@ def build_execution_manifest(
             raise ElasticGraphError("current physical owner set has stale generation")
         policy.owner_policy(key.logical.owner).validate_physical_key(key)
         exact_key = exact_by_owner[key.logical.owner]
-        if key == exact_key:
-            continue
-        if (
-            key.logical.owner != "mtp_decode"
-            or exact_key.logical.owner != "mtp_decode"
-            or key.logical.mode != "FULL"
-            or key.logical.uniform_query_len != 1
-            or key.logical.token_bucket != key.physical_num_reqs
-            or key.physical_num_reqs < exact_key.physical_num_reqs
-        ):
+        if key != exact_key:
             raise ElasticGraphError(
-                "only MTP decode may use a larger terminal physical carrier"
+                "current physical key differs from the execution step: "
+                f"owner={key.logical.owner} expected={exact_key.identity} "
+                f"actual={key.identity}"
             )
     keys_by_owner = {key.logical.owner: key for key in current_keys}
     if len(keys_by_owner) != len(current_keys):
