@@ -2,6 +2,8 @@
 """Cross-layer regression controls for elastic startup and settlement."""
 
 from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -66,7 +68,7 @@ def test_real_elastic_scheduler_constructor_uses_configured_width(monkeypatch):
     assert max(scheduler._elastic_short_decode_inventory) == 16
 
 
-def test_real_elastic_scheduler_constructor_fails_closed_without_catalog(
+def test_real_elastic_scheduler_startup_fails_closed_without_catalog(
     monkeypatch,
 ):
     monkeypatch.setattr(current_platform, "device_type", "cpu")
@@ -77,13 +79,24 @@ def test_real_elastic_scheduler_constructor_fails_closed_without_catalog(
     )
     monkeypatch.setattr(startup_plan, "load_elastic_graph_catalog", lambda *_: {})
     monkeypatch.setenv("AG2_VLLM_ELASTIC_REQUIRE_CATALOG", "1")
+    monkeypatch.setenv("AG2_VLLM_ELASTIC_AUTO_CALIBRATE", "0")
+    scheduler = create_scheduler(
+        max_num_seqs=16,
+        additional_config={"elastic_gdn_backing": True},
+        elastic_graph_execution_policy=_execution_policy().to_payload(),
+    )
+    from vllm.v1.engine.elastic_bootstrap import complete_elastic_startup
 
-    with pytest.raises(RuntimeError, match="enable automatic pre-READY calibration"):
-        create_scheduler(
-            max_num_seqs=16,
-            additional_config={"elastic_gdn_backing": True},
-            elastic_graph_execution_policy=_execution_policy().to_payload(),
-        )
+    shutdown, publish = MagicMock(), MagicMock()
+    owner = SimpleNamespace(
+        scheduler=scheduler,
+        _shutdown_failed_elastic_startup=shutdown,
+        _synchronize_elastic_startup_residency=publish,
+    )
+    with pytest.raises(RuntimeError, match="will not calibrate implicitly"):
+        complete_elastic_startup(owner)
+    shutdown.assert_called_once_with()
+    publish.assert_not_called()
 
 
 def test_real_elastic_scheduler_rejects_obsolete_calibration_switch(monkeypatch):
@@ -96,7 +109,7 @@ def test_real_elastic_scheduler_rejects_obsolete_calibration_switch(monkeypatch)
     monkeypatch.setattr(startup_plan, "load_elastic_graph_catalog", lambda *_: {})
     monkeypatch.setenv("AG2_VLLM_ELASTIC_CALIBRATION", "1")
 
-    with pytest.raises(RuntimeError, match="normal startup calibrates a catalog miss"):
+    with pytest.raises(RuntimeError, match="explicit maintenance job"):
         create_scheduler(
             max_num_seqs=16,
             additional_config={"elastic_gdn_backing": True},

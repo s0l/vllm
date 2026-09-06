@@ -3809,6 +3809,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if inputs_embeds is not None and not requires_raw_input_tokens(self.model):
                 input_ids = None
 
+        if elastic_plan is not None and not dummy_run:
+            assert working_set is not None
+            working_set.validate_post_materialization_completion()
+
         if self.is_encoder_only:
             output = make_empty_encoder_model_runner_output(scheduler_output)
             output.ec_connector_output = ec_connector_output

@@ -85,7 +85,16 @@ def test_elastic_runtime_identity_covers_qwen3_5_graph_owners():
         "vllm.model_executor.models.qwen3_5_mtp",
         "vllm.model_executor.layers.fused_qk_norm_rope",
         "vllm.model_executor.layers.rotary_embedding",
+        "vllm.v1.worker.gpu.attn_utils",
+        "vllm.v1.worker.gpu.spec_decode.speculator",
+        "vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator",
     } <= owners
+
+    assert {
+        "vllm.v1.worker.gpu.attn_utils",
+        "vllm.v1.worker.gpu.spec_decode.speculator",
+        "vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator",
+    } <= set(elastic_runtime._ELASTIC_PHYSICAL_CATALOG_SOURCE_MODULES)
 
     hashes = elastic_runtime.elastic_runtime_source_hashes()
     assert owners == hashes.keys()

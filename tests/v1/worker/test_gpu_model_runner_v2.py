@@ -19,6 +19,56 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 
+@pytest.mark.parametrize(
+    "dbo,async_scheduling", [(False, False), (True, False), (False, True)]
+)
+def test_multi_module_mtp_shares_only_sequential_kernel_scratch(
+    monkeypatch, dbo, async_scheduling
+):
+    from vllm.v1.worker.gpu.spec_decode import speculator as module
+    from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
+        MultiModuleMTPSpeculator,
+    )
+
+    class Builder:
+        def __init__(self, size):
+            self.scratch = bytearray(size)
+            self.metadata = object()
+
+        def get_workspace_buffer_size(self):
+            return len(self.scratch)
+
+        def share_persistent_kernel_scratch_from(self, source):
+            assert len(source.scratch) >= len(self.scratch)
+            self.scratch = source.scratch
+
+    def group(builder):
+        return SimpleNamespace(get_metadata_builder=lambda index: builder)
+
+    source, smaller_source, draft = Builder(64), Builder(8), Builder(32)
+    original_scratch, metadata = draft.scratch, draft.metadata
+    target_groups = [[group(smaller_source), group(source)]]
+    draft_groups = [[group(draft)]]
+    monkeypatch.setattr(
+        module, "init_attn_backend", lambda *a, **k: (draft_groups, None, [])
+    )
+    spec = object.__new__(MultiModuleMTPSpeculator)
+    spec.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(enable_dbo=dbo),
+        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+    )
+    spec.device = torch.device("cpu")
+    spec.draft_attn_layer_names = {"draft"}
+    module.DraftModelSpeculator.set_attn(spec, None, None, None, None, target_groups)
+    assert draft.scratch is (
+        original_scratch if dbo or async_scheduling else source.scratch
+    )
+    assert draft.metadata is metadata
+    assert spec.attn_groups is draft_groups
+    assert spec.target_attn_groups is target_groups
+    assert not module.DraftModelSpeculator.share_target_attention_scratch
+
+
 def test_v2_static_owner_contract_and_signature_are_explicit():
     assert hasattr(GPUModelRunner, "prepare_static_attn_owners_for_kv_sizing")
 

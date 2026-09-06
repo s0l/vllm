@@ -572,6 +572,20 @@ def reconstruct_serializable_fn_from_mega_artifact(
 
 def _ag2_downstream_compile_factors() -> dict[str, str]:
     """Return downstream env values that can alter the compiled graph."""
+    # Catalog selection and maintenance IO have no compiled-model consumer.
+    # Keep the exclusion explicit: a future AG2 flag is not safe by prefix.
+    catalog_control_only = {
+        "AG2_VLLM_ELASTIC_REQUIRE_CATALOG",
+        "AG2_VLLM_ELASTIC_AUTO_CALIBRATE",
+        "AG2_VLLM_ELASTIC_CATALOG_PATH",
+        "AG2_VLLM_ELASTIC_CALIBRATION_ROLE",
+        "AG2_VLLM_ELASTIC_CALIBRATION_SURFACE",
+        "AG2_VLLM_ELASTIC_CALIBRATION_RECEIPT",
+        "AG2_VLLM_ELASTIC_CALIBRATION_REQUEST",
+        "AG2_VLLM_ELASTIC_CALIBRATION_SEED_CATALOG",
+        "AG2_VLLM_ELASTIC_CALIBRATION_MAX_NEW_ROWS_PER_PROCESS",
+        "AG2_VLLM_ELASTIC_CALIBRATION_MAX_PRODUCER_EPOCHS_PER_PROCESS",
+    }
     # These values affect only scheduler arrival/admission state. Keeping them
     # in the model AOT identity recompiles numerically identical target/MTP
     # graphs whenever a burst window changes, and can turn a scheduler-only
@@ -589,7 +603,9 @@ def _ag2_downstream_compile_factors() -> dict[str, str]:
     }
     factors: dict[str, str] = {}
     for name, value in sorted(os.environ.items()):
-        if not name.startswith(("AG2_VLLM_", "VLLM_TP3_")):
+        if name in catalog_control_only or not name.startswith(
+            ("AG2_VLLM_", "VLLM_TP3_")
+        ):
             continue
         factors[name] = scheduler_only_defaults.get(name, value)
     return factors

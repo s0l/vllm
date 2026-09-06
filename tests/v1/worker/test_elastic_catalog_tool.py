@@ -590,8 +590,24 @@ def test_current_catalog_structure_accepts_capped_non_power_of_two_boundary():
 
 
 def test_publish_measured_catalog_is_atomic_and_complete(tmp_path, monkeypatch):
-    from vllm.v1.core import elastic_graph
+    from vllm.v1.core import elastic_graph, elastic_price_identity
     from vllm.v1.worker import startup_plan
+
+    # This fixture tests atomic publication/coverage with a synthetic policy;
+    # descriptor binding is exercised through the real loader and identity tests.
+    monkeypatch.setattr(
+        startup_plan, "elastic_catalog_owner_generation", lambda *_: "source"
+    )
+    monkeypatch.setattr(
+        startup_plan,
+        "compute_elastic_graph_price_identity",
+        lambda *_: elastic_price_identity.price_identity({"fixture": "atomic"}),
+    )
+    monkeypatch.setattr(
+        elastic_price_identity,
+        "remap_catalog_resident_keys",
+        lambda rows, **_kwargs: rows,
+    )
 
     policy = SimpleNamespace(
         fingerprint="policy",

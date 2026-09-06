@@ -23,6 +23,24 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 pytestmark = pytest.mark.cpu_test
 
 
+def test_complete_phase_sequence_is_checked_before_model_forward():
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(GPUModelRunner.execute_model)))
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    lines = lambda name: [
+        node.lineno
+        for node in calls
+        if isinstance(node.func, ast.Attribute) and node.func.attr == name
+    ]
+    checked = lines("validate_post_materialization_completion")
+    forwards = lines("forward_start") + lines("run_fullgraph")
+    assert len(checked) == 1
+    assert forwards and checked[0] < min(forwards)
+
+
 def test_local_staging_failure_still_enters_post_materialization_vote():
     prepare_inputs = Mock(side_effect=RuntimeError("rank-local copy failed"))
     working_set = Mock()

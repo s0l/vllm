@@ -1780,18 +1780,25 @@ class Scheduler(SchedulerInterface):
                     requirements=running_requirements,
                 ):
                     return running_key, True
-            logger.debug(
-                "RUNNING-only fallback deferred after joint-wave rejection: "
-                "required_bytes=%d available_bytes=%d step_key=%r reason=%s",
-                running_required,
-                running_available,
+            self._observe_elastic_running_wave_defer(
                 running_key,
-                getattr(self, "_elastic_last_defer_reason", None),
+                required_external=running_required,
+                available_external=running_available,
+                physical_quiescent=physical_quiescent,
             )
+            if (
+                not running_wave_encoder_inputs
+                and self._prepare_elastic_cold_form_reclaim(
+                    running_key,
+                    available_external=running_available,
+                    physical_quiescent=physical_quiescent,
+                )
+            ):
+                return None, True
             return None, False
 
         def resolve_failed_joint() -> tuple[tuple[int, ...] | None, bool]:
-            """Preserve RUNNING first; reclaim only if it also cannot proceed."""
+            """Widen admission at a safe boundary, otherwise preserve RUNNING."""
             if deferred_mm_wave is not None:
                 self._elastic_deferred_mm_wave = None
                 clear_joint_identity()
@@ -1815,18 +1822,10 @@ class Scheduler(SchedulerInterface):
             self._clear_pre_mutation_serving_maintenance(
                 reason="joint_wave_rejected_before_running_retry"
             )
-            running_result = retry_running_only()
-            if running_result[0] is not None or running_result[1]:
-                return running_result
-            # A failed RUNNING maintenance reservation can leave a provisional
-            # pre-mutation plan.  It has no consumer and cannot be carried into
-            # an optional WAITING reclaim transaction.
-            if self._elastic_admission_controller.pending_maintenance_plan is not None:
-                self._clear_pre_mutation_serving_maintenance(
-                    reason="running_retry_rejected_before_waiting_reclaim"
-                )
-            else:
-                self._rollback_elastic_admission()
+            # RUNNING-only progress is not proof that retained Graph state
+            # should indefinitely exclude a fundable WAITING cohort. The
+            # existing reclaim planner proves capacity improvement and owns
+            # physical-quiescence/lease/loan checks before any mutation.
             joint_waiting_primary = tuple(
                 self.kv_cache_manager.estimate_uncached_full_sequence_requirements(
                     request
@@ -1837,10 +1836,20 @@ class Scheduler(SchedulerInterface):
                 joint_waiting_primary,
                 physical_quiescent=physical_quiescent,
             ):
-                # Reclaim is request-free and will re-evaluate the queue on the
-                # next tick; it must not retain a stale candidate identity.
                 clear_joint_identity()
                 return None, True
+            running_result = retry_running_only()
+            if running_result[0] is not None or running_result[1]:
+                return running_result
+            # A failed RUNNING maintenance reservation can leave a provisional
+            # pre-mutation plan. It has no consumer and must not survive this
+            # rejected wave.
+            if self._elastic_admission_controller.pending_maintenance_plan is not None:
+                self._clear_pre_mutation_serving_maintenance(
+                    reason="running_retry_rejected_before_waiting_reclaim"
+                )
+            else:
+                self._rollback_elastic_admission()
             return None, False
 
         selected_joint_prefix = False
@@ -2305,8 +2314,41 @@ class Scheduler(SchedulerInterface):
             return None, False
         if joint_waiting_count:
             return resolve_failed_joint()
-        defer_identity = (
+        self._observe_elastic_running_wave_defer(
             final_key,
+            required_external=required_external,
+            available_external=available_external,
+            physical_quiescent=physical_quiescent,
+        )
+        if deferred_mm_wave is not None:
+            self._elastic_deferred_mm_wave = None
+            clear_joint_identity()
+            self._rollback_elastic_admission()
+            return self._preflight_elastic_running_text_wave(
+                token_budget=token_budget,
+                prefill_chunk_cap=prefill_chunk_cap,
+                defer_prefills=defer_prefills,
+                physical_quiescent=physical_quiescent,
+            )
+        if not prospective_encoder_inputs and self._prepare_elastic_cold_form_reclaim(
+            final_key,
+            available_external=available_external,
+            physical_quiescent=physical_quiescent,
+        ):
+            return None, True
+        return None, False
+
+    def _observe_elastic_running_wave_defer(
+        self,
+        step_key: tuple[int, ...],
+        *,
+        required_external: int,
+        available_external: int,
+        physical_quiescent: bool,
+    ) -> None:
+        """Report the same deduplicated funding boundary on both RUNNING paths."""
+        defer_identity = (
+            step_key,
             getattr(self, "_elastic_last_defer_reason", None),
             required_external,
             available_external,
@@ -2325,23 +2367,6 @@ class Scheduler(SchedulerInterface):
                 physical_quiescent,
                 getattr(self, "_elastic_graph_carrier_step_key", None),
             )
-        if deferred_mm_wave is not None:
-            self._elastic_deferred_mm_wave = None
-            clear_joint_identity()
-            self._rollback_elastic_admission()
-            return self._preflight_elastic_running_text_wave(
-                token_budget=token_budget,
-                prefill_chunk_cap=prefill_chunk_cap,
-                defer_prefills=defer_prefills,
-                physical_quiescent=physical_quiescent,
-            )
-        if not prospective_encoder_inputs and self._prepare_elastic_cold_form_reclaim(
-            final_key,
-            available_external=available_external,
-            physical_quiescent=physical_quiescent,
-        ):
-            return None, True
-        return None, False
 
     def _prepare_elastic_cold_form_reclaim(
         self,
@@ -3965,6 +3990,7 @@ class Scheduler(SchedulerInterface):
                                 prospective_step_key,
                             )
                         self._elastic_last_graph_admission_rejection = rejection
+                        calibration_wave_stop_reason = "graph_funding_rejected"
                         break
                     self._elastic_last_graph_admission_rejection = None
 
@@ -4314,10 +4340,14 @@ class Scheduler(SchedulerInterface):
             and num_scheduled_tokens
             and elastic_graph_step_key != calibration_execution_step_key
         ):
+            diagnostic = self._elastic_restore_admission_diagnostic(
+                calibration_wave_stop_reason, token_budget, num_scheduled_tokens
+            )
             raise RuntimeError(
                 "prepared elastic restore execution changed before commit: "
                 f"prepared={calibration_execution_step_key!r} "
-                f"commit={elastic_graph_step_key!r}"
+                f"commit={elastic_graph_step_key!r} "
+                f"admission={diagnostic!r}"
             )
         if (
             elastic_preplanned_running_step_key is not None
@@ -5907,9 +5937,7 @@ class Scheduler(SchedulerInterface):
                 # replay, so resident_bytes alone would underfund the first
                 # real HOT hit.  A sealed exact row's HOT measurement is the
                 # consumed-path price for this already-resident owner set.
-                hot_envelope = self._elastic_admission_controller.measured_bytes.get(
-                    step_key, 0
-                )
+                hot_envelope = self._elastic_hot_replay_envelope(step_key)
                 first_replay_workspace = (
                     self._elastic_admission_controller.cublas_workspace_bytes
                     if self._elastic_admission_controller.last_maintenance_step_key
@@ -5985,6 +6013,47 @@ class Scheduler(SchedulerInterface):
             self._elastic_piecewise_physical_floor_bytes(step_key),
         )
         return desired_external, True
+
+    def _elastic_catalog_prices_are_sealed(self) -> bool:
+        """Serving consumes isolated prices; live union receipts are not prices.
+
+        Activation validates this source digest before accepting any rows.
+        Explicit calibration may still collect new isolated witnesses, while
+        unsealed diagnostic schedulers retain their measurement lifecycle.
+        """
+        return bool(
+            not getattr(self, "_elastic_restore_mode", False)
+            and getattr(self, "_elastic_graph_catalog_coverage", {}).get(
+                "_catalog_source_sha256"
+            )
+        )
+
+    def _elastic_hot_replay_envelope(self, step_key: tuple[int, ...]) -> int:
+        """Resolve an aggregate HOT price for the identical physical owner set.
+
+        Logical prefill M may change while compiled target/prefill paths own
+        no graph and the sole FULL draft owner stays identical. A missing
+        logical row is not missing physical evidence. Do not sum owner prices
+        or substitute a cold peak: shared replay workspace belongs to the
+        independently measured aggregate HOT endpoint.
+        """
+        measured = self._elastic_admission_controller.measured_bytes
+        if step_key in measured:
+            return measured[step_key]
+        requested = frozenset(self._resolve_elastic_step_physical_keys(step_key))
+        if not requested:
+            return 0
+        return max(
+            (
+                int(row.get("hot_peak_bytes", 0))
+                for catalog_key, row in getattr(
+                    self, "_elastic_graph_catalog", {}
+                ).items()
+                if frozenset(self._resolve_elastic_step_physical_keys(catalog_key))
+                == requested
+            ),
+            default=0,
+        )
 
     def _can_fund_elastic_graph_step(
         self,
@@ -6172,11 +6241,8 @@ class Scheduler(SchedulerInterface):
                     reason="mm_cold_transition_replanned"
                 )
                 pending_plan = None
-            hot_endpoint_bytes = int(
-                self._elastic_admission_controller.measured_bytes.get(
-                    residency_step_key, 0
-                )
-            )
+            assert residency_step_key is not None
+            hot_endpoint_bytes = self._elastic_hot_replay_envelope(residency_step_key)
             if cold_unknown or hot_endpoint_bytes <= 0:
                 if not preview_only:
                     self._elastic_last_defer_reason = "missing_hot_mm_replay_envelope"
@@ -6640,7 +6706,7 @@ class Scheduler(SchedulerInterface):
                 f"step_key={step_key!r} "
                 f"current_step_key={self._elastic_admission_controller.step_key!r}"
             )
-        if capture_envelope_planned:
+        if capture_envelope_planned and not self._elastic_catalog_prices_are_sealed():
             # Admission is already fail-closed above. Publish the normalized
             # provisional envelope immediately so async duplicates can share
             # it. Settlement must replace both its bytes and floor with worker
@@ -7336,7 +7402,11 @@ class Scheduler(SchedulerInterface):
         graph_observation_peak_bytes = (
             worker_resident_bytes if mm_activation_loan_bytes else worker_peak_bytes
         )
-        if residency_step_key is not None and not compiled_only_step:
+        if (
+            residency_step_key is not None
+            and not compiled_only_step
+            and not self._elastic_catalog_prices_are_sealed()
+        ):
             owner_key = self._elastic_graph_owner_key(residency_step_key)
             assert owner_key is not None
             catalog = getattr(self, "_elastic_graph_catalog", None)
@@ -7454,12 +7524,22 @@ class Scheduler(SchedulerInterface):
                     row["cold_stable_replays"],
                 )
             else:
+                # HOT and COLD prices describe the KV loan, not total CUDA
+                # high-water. A completed replay may also use allocator/driver
+                # slack outside KV; residency and MM overrun guards above
+                # remain authoritative before publishing this envelope.
+                physical_envelope = max(
+                    graph_observation_peak_bytes,
+                    worker_resident_bytes,
+                    worker_floor_bytes,
+                )
+                measured_envelope = (
+                    min(physical_envelope, granted_bytes)
+                    if max(worker_resident_bytes, worker_floor_bytes) <= granted_bytes
+                    else physical_envelope
+                )
                 observed_hot_envelope = coordinator.normalize_elastic_external_memory(
-                    max(
-                        graph_observation_peak_bytes,
-                        worker_resident_bytes,
-                        worker_floor_bytes,
-                    )
+                    measured_envelope
                 )
                 prior_hot_peak = row["hot_peak_bytes"]
                 row["hot_observations"] = row.get("hot_observations", 0) + 1
@@ -7541,9 +7621,11 @@ class Scheduler(SchedulerInterface):
                     row["hot_observations"],
                     row["hot_stable_replays"],
                 )
-            if was_cold_capture:
-                assert residency_step_key is not None
-                self._elastic_admission_controller.finish_recapture(residency_step_key)
+        # Capture settlement is a runtime lifecycle event even when its
+        # cumulative receipt must not rewrite a sealed isolated price.
+        if was_cold_capture:
+            assert residency_step_key is not None
+            self._elastic_admission_controller.finish_recapture(residency_step_key)
         self._elastic_admission_controller.publish_physical_accounting(
             resident_bytes=worker_resident_bytes,
             floor_bytes=worker_floor_bytes,
@@ -8669,6 +8751,56 @@ class Scheduler(SchedulerInterface):
             RequestStatus.WAITING_FOR_REMOTE_KVS,
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
+
+    def _elastic_restore_admission_diagnostic(
+        self,
+        stop_reason: str | None,
+        token_budget: int,
+        scheduled_tokens: dict[str, int],
+    ) -> dict[str, object]:
+        """Snapshot a failed maintenance commit without mutating admission."""
+        coordinator = self.kv_cache_manager.coordinator
+        primary = coordinator.block_pool
+        gdn = coordinator.mamba_block_pool
+
+        def pool_state(pool):
+            if pool is None:
+                return None
+            return {
+                "active": pool.active_num_gpu_blocks,
+                "free": pool.get_num_free_blocks(),
+                "referenced_ids": tuple(
+                    block.block_id for block in pool.blocks if block.ref_cnt
+                ),
+            }
+
+        controller = self._elastic_admission_controller
+        return {
+            "stop_reason": stop_reason,
+            "remaining_token_budget": token_budget,
+            "cap": self.max_num_running_reqs,
+            "running": len(self.running),
+            "waiting": len(self.waiting),
+            "skipped_waiting": len(self.skipped_waiting),
+            "scheduled_tokens": dict(scheduled_tokens),
+            "preemptions": tuple(
+                (request_id, request.num_preemptions)
+                for request_id, request in self.requests.items()
+                if request.num_preemptions
+            ),
+            "primary": pool_state(primary),
+            "gdn": pool_state(gdn),
+            "watermark": self.kv_cache_manager.watermark_blocks,
+            "external_bytes": coordinator.elastic_external_memory_bytes,
+            "resident_bytes": controller.resident_bytes,
+            "pending_grant": controller.max_pending_grant(),
+            "graph_rejection": self._elastic_last_graph_admission_rejection,
+            "allocation_rejection": self.kv_cache_manager.last_allocation_rejection,
+            "capacity_rejection": coordinator.last_elastic_rejection,
+            "defer_reason": getattr(self, "_elastic_last_defer_reason", None),
+            "deferred_frees": len(self.deferred_frees),
+            "step_seq": (self.sched_step_seq, self.processed_step_seq),
+        }
 
     def _has_prepared_elastic_waiting_admission(
         self,

@@ -1804,6 +1804,82 @@ def test_separate_gdn_pool_admission_is_pool_aware(pool_blocks, admitted):
     assert (blocks is not None) is admitted
 
 
+@pytest.mark.parametrize("width", [7, 38])
+def test_elastic_mixed_repeated_admission_reuses_freed_cohort_blocks(width):
+    """Replay the allocation boundary, independent of Graph/sampling code."""
+    from .utils import create_requests
+
+    block_size = 2496
+    mamba_spec = MambaSpec(
+        block_size=block_size,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        separate_pool=True,
+        separate_pool_num_blocks=193,
+    )
+    config = KVCacheConfig(
+        num_blocks=69,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            *(KVCacheGroupSpec([f"gdn-{i}"], mamba_spec) for i in range(3)),
+        ],
+        elastic_attention_stride=86900736,
+        elastic_gdn_stride=19611648,
+        elastic_mapping_quantum=2 << 20,
+        elastic_gdn_initial_blocks=4,
+        elastic_gdn_blocks_per_request=3,
+        elastic_budget_bytes=6139685684,
+    )
+    manager = KVCacheManager(
+        kv_cache_config=config,
+        max_model_len=262144,
+        scheduler_block_size=block_size,
+        hash_block_size=block_size,
+        enable_caching=True,
+    )
+    coordinator = manager.coordinator
+    assert coordinator.set_elastic_external_memory(182452224)
+    assert coordinator.apply_elastic_admission_wave((1,) * width) == width
+    base = create_requests(width, num_tokens=2, block_size=block_size)
+    for request in base:
+        assert manager.allocate_slots(request, 2) is not None
+    pool = coordinator.mamba_block_pool
+    assert pool is not None
+    for repeat in range(3):
+        request = create_requests(
+            1,
+            num_tokens=872,
+            block_size=block_size,
+            req_ids=[f"mixed-{repeat}"],
+        )[0]
+        requirements = manager.estimate_uncached_full_sequence_requirements(request)
+        assert coordinator.apply_elastic_admission_wave((requirements.primary,)) == 1
+        available = coordinator.max_elastic_external_memory(
+            minimum_free_primary_blocks=requirements.primary,
+            gdn_blocks=coordinator.elastic_gdn_blocks_after_allocation(
+                requirements.mamba
+            ),
+        )
+        assert available >= 182452224
+        assert manager.allocate_slots(request, 872) is not None
+        manager.free(request)
+        assert pool.active_num_gpu_blocks - pool.get_num_free_blocks() == 1 + 3 * width
+    for request in base:
+        manager.free(request)
+    coordinator.rebalance_elastic_capacity()
+    assert pool.active_num_gpu_blocks == 4
+
+
 def test_elastic_gdn_capacity_transaction_and_rebalance():
     block_size = 4
     mamba_spec = MambaSpec(

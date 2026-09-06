@@ -5,6 +5,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +35,69 @@ def rebind_catalog(
         destination_fingerprint=destination_fingerprint,
         reason=reason,
     )
+
+
+def migrate_price_catalog(source: Path, destination: Path, review_path: Path) -> Path:
+    """Migrate a reviewed legacy envelope without changing any measured byte."""
+    from vllm.v1.core.elastic_catalog import (
+        load_sealed_catalog_with_digest,
+        write_json_exclusive,
+    )
+    from vllm.v1.core.elastic_graph import GraphExecutionPolicy
+    from vllm.v1.core.elastic_price_identity import (
+        PRICE_OWNER_GENERATION,
+        remap_catalog_resident_keys,
+        validate_price_identity,
+    )
+
+    payload, source_sha = load_sealed_catalog_with_digest(
+        source, require_migration=False
+    )
+    review_bytes = review_path.read_bytes()
+    review = json.loads(review_bytes)
+    if (
+        not isinstance(review, dict)
+        or review.get("schema") != "elastic-price-migration-review-v1"
+        or review.get("source_sha256") != source_sha
+        or review.get("contract") != "same-physical-price-envelope-v1"
+        or not isinstance(review.get("source_generation"), str)
+        or not review["source_generation"]
+        or not isinstance(review.get("evidence"), dict)
+        or not review["evidence"]
+    ):
+        raise RuntimeError(
+            "price migration requires an exact-source compatibility review"
+        )
+    for evidence_path, digest in review["evidence"].items():
+        if hashlib.sha256(Path(evidence_path).read_bytes()).hexdigest() != digest:
+            raise RuntimeError("price migration review evidence changed")
+    identity = validate_price_identity(review.get("destination_price_identity"))
+    if (
+        source.resolve() == destination.resolve()
+        or review_path.resolve() == destination.resolve()
+    ):
+        raise RuntimeError("price migration must not overwrite its source or review")
+    rows = {tuple(row["step_key"]): dict(row) for row in payload["shapes"]}
+    rebound = remap_catalog_resident_keys(
+        rows,
+        source_generation=review["source_generation"],
+        destination_generation=PRICE_OWNER_GENERATION,
+        max_num_batched_tokens=review["max_num_batched_tokens"],
+        compiled_piecewise_sizes=tuple(payload["coverage"]["compiled_piecewise_sizes"]),
+        policy=GraphExecutionPolicy.from_payload(payload["graph_execution_policy"]),
+    )
+    payload["shapes"] = [rebound[tuple(row["step_key"])] for row in payload["shapes"]]
+    payload["fingerprint"] = identity["fingerprint"]
+    payload["price_identity"] = identity
+    payload["resident_owner_generation"] = PRICE_OWNER_GENERATION
+    payload["price_migration"] = {
+        "source_sha256": source_sha,
+        "review_sha256": hashlib.sha256(review_bytes).hexdigest(),
+        "contract": review["contract"],
+        "evidence": review["evidence"],
+    }
+    write_json_exclusive(destination, payload)
+    return destination
 
 
 def publish_measured_catalog(
@@ -157,6 +223,21 @@ def publish_measured_catalog(
 
     policy = startup_plan._effective_graph_execution_policy(kv_cache_config)
     compiled = configured_compiled_piecewise_sizes(vllm_config)
+    from vllm.v1.core.elastic_price_identity import (
+        PRICE_OWNER_GENERATION,
+        remap_catalog_resident_keys,
+    )
+
+    catalog = remap_catalog_resident_keys(
+        catalog,
+        source_generation=startup_plan.elastic_catalog_owner_generation(
+            vllm_config, kv_cache_config
+        ),
+        destination_generation=PRICE_OWNER_GENERATION,
+        max_num_batched_tokens=max_num_batched_tokens,
+        compiled_piecewise_sizes=tuple(compiled),
+        policy=policy,
+    )
     terminal_query_len = decode_k + 1
     terminal_verification = (
         int(policy.mode_for("target", terminal_query_len) == "FULL"),
@@ -331,6 +412,10 @@ def publish_measured_catalog(
     payload = {
         "schema": ELASTIC_GRAPH_CATALOG_SCHEMA_VERSION,
         "fingerprint": fingerprint,
+        "price_identity": startup_plan.compute_elastic_graph_price_identity(
+            vllm_config, kv_cache_config
+        ),
+        "resident_owner_generation": PRICE_OWNER_GENERATION,
         "sealed": True,
         "finalized_offline": True,
         "coverage": coverage,
@@ -338,8 +423,12 @@ def publish_measured_catalog(
         "complete_shapes": len(shapes),
         "shapes": shapes,
     }
-    destination = (
-        output_root
+    selected_path = os.environ.get("AG2_VLLM_ELASTIC_CATALOG_PATH")
+    if selected_path and not Path(selected_path).is_absolute():
+        raise RuntimeError("explicit elastic catalog path must be absolute")
+    destination = Path(
+        selected_path
+        or output_root
         / "elastic_graph_catalog"
         / f"elastic_graph_catalog_{fingerprint}.json"
     )
@@ -353,8 +442,20 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--destination-fingerprint")
     parser.add_argument("--reason")
+    parser.add_argument("--price-migration-review", type=Path)
+    parser.add_argument("--destination", type=Path)
     args = parser.parse_args()
-    if args.destination_fingerprint:
+    if args.price_migration_review:
+        if args.destination is None or args.destination_fingerprint or args.reason:
+            parser.error(
+                "price migration requires --destination, without legacy rebind options"
+            )
+        result = migrate_price_catalog(
+            args.source, args.destination, args.price_migration_review
+        )
+    elif args.destination is not None:
+        parser.error("--destination requires --price-migration-review")
+    elif args.destination_fingerprint:
         if args.reason is None:
             parser.error("--reason is required with --destination-fingerprint")
         result = rebind_catalog(

@@ -506,10 +506,12 @@ class DynamicGraphWorkingSet:
         self._rank_consensus_ns: dict[str, int] = {}
         self._rank_consensus_reuses: dict[str, int] = {}
         self._accepted_decode_epoch: str | None = None
-        self._accepted_decode_observer: tuple[str, str | None] | None = None
+        self._accepted_decode_observers: tuple[tuple[str, str | None], ...] | None = (
+            None
+        )
         self._active_step_plan_fingerprint: str | None = None
         self._active_step_decode_epoch: str | None = None
-        self._active_step_decode_observer: tuple[str, str | None] | None = None
+        self._active_step_decode_observers: tuple[tuple[str, str | None], ...] = ()
         self._active_step_reuses_consensus = False
         if managers and all(
             isinstance(manager, CudaGraphManager) for manager in managers
@@ -996,8 +998,8 @@ class DynamicGraphWorkingSet:
 
     def _invalidate_decode_consensus_epoch(self) -> None:
         self._accepted_decode_epoch = None
-        self._accepted_decode_observer = None
-        self._active_step_decode_observer = None
+        self._accepted_decode_observers = None
+        self._active_step_decode_observers = ()
 
     def _record_consensus_reuse(self, phase: str) -> None:
         reuses = self._rank_consensus_reuses.get(phase, 0) + 1
@@ -1204,7 +1206,7 @@ class DynamicGraphWorkingSet:
             self.require_rank_consensus(plan, validation_error=local_error)
         self._active_step_plan_fingerprint = plan.fingerprint
         self._active_step_decode_epoch = decode_epoch
-        self._active_step_decode_observer = None
+        self._active_step_decode_observers = ()
         self._active_step_reuses_consensus = reuse_consensus
         self.begin_step()
         self._apply_validated_plan(plan)
@@ -1231,12 +1233,15 @@ class DynamicGraphWorkingSet:
         if self._active_step_reuses_consensus:
             if validation_error is not None:
                 self._raise_reused_epoch_drift(validation_error)
-            if observer != self._accepted_decode_observer:
+            accepted = self._accepted_decode_observers or ()
+            index = len(self._active_step_decode_observers)
+            if index >= len(accepted) or observer != accepted[index]:
                 self._raise_reused_epoch_drift(
                     "post-materialization observer differs from the accepted "
-                    f"boundary: accepted={self._accepted_decode_observer!r} "
+                    f"boundary: index={index} accepted={accepted!r} "
                     f"observed={observer!r}"
                 )
+            self._active_step_decode_observers += (observer,)
             self._record_consensus_reuse(phase)
             return plan.fingerprint
         try:
@@ -1248,7 +1253,7 @@ class DynamicGraphWorkingSet:
             )
             if self._active_step_decode_epoch is not None:
                 # Publish only after model execution reaches finish_step().
-                self._active_step_decode_observer = observer
+                self._active_step_decode_observers += (observer,)
             return result
         except ElasticExecutionPlanMismatch as error:
             self._invalidate_decode_consensus_epoch()
@@ -1257,6 +1262,19 @@ class DynamicGraphWorkingSet:
                 "materialization vote rejected before model collectives; "
                 "rank diagnostics are attached as the chained cause"
             ) from error
+
+    def validate_post_materialization_completion(self) -> None:
+        """Reject an incomplete reused phase sequence before model forward."""
+        if (
+            self._active_step_reuses_consensus
+            and self._accepted_decode_epoch is not None
+            and self._active_step_decode_observers != self._accepted_decode_observers
+        ):
+            self._raise_reused_epoch_drift(
+                "post-materialization observer sequence is incomplete: "
+                f"accepted={self._accepted_decode_observers!r} "
+                f"observed={self._active_step_decode_observers!r}"
+            )
 
     def discard_failed_capture(self, plan: ElasticStepPlan) -> None:
         """Remove only destinations created by a failed capture transaction."""
@@ -1280,19 +1298,20 @@ class DynamicGraphWorkingSet:
         )
 
     def finish_step(self) -> int:
+        self.validate_post_materialization_completion()
         for manager in self.managers:
             manager.finish_dynamic_step()
         if (
             not self._active_step_reuses_consensus
             and self._active_step_decode_epoch is not None
-            and self._active_step_decode_observer is not None
+            and self._active_step_decode_observers
         ):
             self._accepted_decode_epoch = self._active_step_decode_epoch
-            self._accepted_decode_observer = self._active_step_decode_observer
+            self._accepted_decode_observers = self._active_step_decode_observers
         self._planned_capture_order = ()
         self._active_step_plan_fingerprint = None
         self._active_step_decode_epoch = None
-        self._active_step_decode_observer = None
+        self._active_step_decode_observers = ()
         self._active_step_reuses_consensus = False
         return self.resident_bytes
 
@@ -2665,7 +2684,14 @@ class CudaGraphManager:
                 "required physical CUDA Graph is cooling down after capture failure: "
                 f"owner={self.dynamic_graph_owner} descriptor={desc}"
             )
-        if self._dynamic_pending is not None and self._dynamic_pending != desc:
+        # A retained HOT carrier adds no capture. Queueing it after the one
+        # COLD destination must be equivalent to the reverse order; only a
+        # second distinct non-HOT destination conflicts with pending capture.
+        if (
+            self._dynamic_pending is not None
+            and self._dynamic_pending != desc
+            and (entry is None or entry.state != DynamicGraphResidency.HOT)
+        ):
             raise RuntimeError(
                 "one manager received multiple simultaneous cold physical keys"
             )
@@ -3647,7 +3673,11 @@ class CudaGraphManager:
                             self.vllm_config.parallel_config.rank,
                             desc,
                         )
-                        with torch.cuda.graph(graph, self.pool):
+                        # Match PIECEWISE: FULL must consume the declared
+                        # capture context, not PyTorch's implicit side stream.
+                        with torch.cuda.graph(
+                            graph, self.pool, stream=torch.cuda.current_stream()
+                        ):
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid
                             # unjoined stream error. The last layer's start_prefetch
@@ -5090,6 +5120,12 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
         runner.kv_caches.clear()
     if hasattr(runner, "attn_groups"):
         runner.attn_groups.clear()
+    # Draft builders are independently constructed by set_attn. Keeping them
+    # here pins the profiling scratch until final KV initialization, after the
+    # production KV budget has already been published.
+    speculator = getattr(runner, "speculator", None)
+    if speculator is not None and hasattr(speculator, "attn_groups"):
+        speculator.attn_groups.clear()
     if hasattr(runner, "kv_cache_config"):
         del runner.kv_cache_config
     # Dropping the manager releases the profiling graphs and throwaway pool.

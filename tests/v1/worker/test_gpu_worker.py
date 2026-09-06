@@ -10,7 +10,7 @@ import vllm.envs as envs
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker import gpu_worker, startup_plan
 from vllm.v1.worker.gpu_worker import (
-    _charge_static_owners_to_kv_budget,
+    _reconcile_pre_kv_physical_budget,
     _startup_kv_memory_deductions,
     _startup_plan_kv_budget,
     maybe_rocm_profiling_fallback,
@@ -22,27 +22,50 @@ from vllm.v1.worker.startup_plan import (
 
 
 @pytest.mark.parametrize(
-    ("profiled", "static", "allocator_domain", "expected"),
+    ("profiled", "profile_free", "prepared_free", "expected"),
     [
-        (6_000, 500, 300, 5_200),
-        (6_000, 0, 0, 6_000),
-        (500, 100, 600, 0),
+        (6_000, 8_000, 7_200, 5_200),
+        (6_000, 8_000, 8_000, 6_000),
+        (6_000, 8_000, 8_500, 6_000),
+        (500, 8_000, 7_300, 0),
+        (-100, 8_000, 8_000, 0),
     ],
 )
-def test_charge_static_owners_to_kv_budget(
+def test_pre_kv_physical_budget_charges_only_endpoint_consumption(
     profiled: int,
-    static: int,
-    allocator_domain: int,
+    profile_free: int,
+    prepared_free: int,
     expected: int,
 ):
     assert (
-        _charge_static_owners_to_kv_budget(
+        _reconcile_pre_kv_physical_budget(
             profiled,
-            static,
-            allocator_domain,
+            profile_free,
+            prepared_free,
         )
         == expected
     )
+
+
+@pytest.mark.parametrize("endpoints", [(-1, 0), (0, -1)])
+def test_pre_kv_budget_rejects_invalid_physical_endpoint(endpoints):
+    with pytest.raises(ValueError, match="nonnegative"):
+        _reconcile_pre_kv_physical_budget(100, *endpoints)
+
+
+@pytest.mark.parametrize("cached_reuse", [0, 128, 512])
+def test_pre_kv_budget_conserves_physical_pages_when_owners_reuse_cache(cached_reuse):
+    total, excluded, resident, cached, transient = 16_000, 1_000, 7_000, 512, 400
+    owner = 512
+    profile_free = total - resident - cached
+    profiled = profile_free - excluded - transient
+    prepared_free = profile_free - (owner - cached_reuse)
+    budget = _reconcile_pre_kv_physical_budget(profiled, profile_free, prepared_free)
+    # Independent final-state accounting: reused pages move from cached to live,
+    # rather than appearing as a second allocation outside the physical budget.
+    final_live = resident + owner
+    final_cached = cached - cached_reuse
+    assert budget + final_live + final_cached + excluded + transient == total
 
 
 def test_startup_plan_persists_the_consumed_kv_budget_contract():
@@ -98,7 +121,7 @@ def _plan_worker(
     )
     return SimpleNamespace(
         vllm_config=SimpleNamespace(
-            compute_hash=lambda: config_hash,
+            compute_hash=lambda **_kwargs: config_hash,
             scheduler_config=scheduler_config,
             model_config=SimpleNamespace(multimodal_config=multimodal_config),
             parallel_config=SimpleNamespace(world_size=3),
@@ -121,6 +144,13 @@ def _plan_platform(name="NVIDIA H100 PCIe"):
 @pytest.fixture
 def plan_env(monkeypatch: pytest.MonkeyPatch, tmp_path):
     """Enable the startup plan, isolated under a tmp cache root."""
+    from vllm.v1.core import elastic_price_identity
+
+    monkeypatch.setattr(
+        elastic_price_identity,
+        "native_price_provenance",
+        lambda: {"fixture-native": "unchanged"},
+    )
     monkeypatch.setenv("VLLM_ENABLE_STARTUP_PLAN", "1")
     monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
     monkeypatch.setattr(envs, "VLLM_ENABLE_STARTUP_PLAN", True)
@@ -225,7 +255,7 @@ def test_elastic_identities_include_profile_config(plan_env):
         assert loan_generation != elastic_runtime.compute_elastic_runtime_generation(
             base
         )
-        assert loan_catalog != startup_plan.compute_elastic_graph_catalog_fingerprint(
+        assert loan_catalog == startup_plan.compute_elastic_graph_catalog_fingerprint(
             base, kv
         )
 
@@ -367,7 +397,7 @@ def test_catalog_identity_ignores_unmapped_budget_slack(plan_env):
     )
     assert (
         startup_plan.compute_elastic_graph_catalog_fingerprint(config, mapped_change)
-        != base
+        == base
     )
 
 

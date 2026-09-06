@@ -181,6 +181,42 @@ def test_worker_rejects_forbidden_full_before_state_and_recovers() -> None:
     assert manager._dynamic_pending == descriptor
 
 
+@pytest.mark.parametrize("hot_first", [False, True])
+def test_hot_retained_owner_does_not_conflict_with_one_cold_key(hot_first):
+    manager = object.__new__(gpu_cudagraph_utils.CudaGraphManager)
+    manager.dynamic_graph_owner = "target"
+    manager.runtime_generation = "hot-cold-queue"
+    manager.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+    manager.full_decode_query_lens = {1}
+    manager.decode_query_len = 1
+    manager.compiled_piecewise_sizes = frozenset()
+    manager.tp3_owner_prequant = False
+    manager._dynamic_step_planned = False
+    manager.last_dynamic_capture_rejection = None
+    manager._dynamic_step_candidates = set()
+    manager._dynamic_epoch = 0
+    manager._dynamic_graph_entries = {}
+    manager.dynamic_graph_hotset_cap_bytes = 1
+    manager._dynamic_pending = None
+    generation = RuntimeGeneration(manager.runtime_generation)
+    hot = resolve_step_physical_keys((1, 0, 39, 39, 1), generation, 4096)[0]
+    cold = resolve_step_physical_keys((1, 0, 1, 1, 1), generation, 4096)[0]
+    other_cold = resolve_step_physical_keys((1, 0, 2, 2, 1), generation, 4096)[0]
+    hot_desc = manager.queue_physical_key(hot)
+    manager._dynamic_graph_entries[hot_desc].state = (
+        gpu_cudagraph_utils.DynamicGraphResidency.HOT
+    )
+    manager._dynamic_pending = None
+    for key in ((hot, cold) if hot_first else (cold, hot)):
+        manager.queue_physical_key(key)
+    assert manager._dynamic_pending == manager._descriptor_for_physical_key(cold)
+    assert manager.is_physical_key_hot(hot)
+    before = (manager._dynamic_pending, manager._dynamic_epoch)
+    with pytest.raises(RuntimeError, match="multiple simultaneous cold"):
+        manager.queue_physical_key(other_cold)
+    assert before == (manager._dynamic_pending, manager._dynamic_epoch)
+
+
 def test_bounded_decode_descriptor_matches_semantic_tail_only() -> None:
     manager = object.__new__(gpu_cudagraph_utils.CudaGraphManager)
     manager.dynamic_graph_owner = "target"
@@ -510,9 +546,13 @@ def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
 
     @contextmanager
     def fake_graph_capture(*args, **kwargs):
-        yield SimpleNamespace(stream=MagicMock())
+        yield SimpleNamespace(stream=capture_stream)
 
     fake_offloader = MagicMock()
+    capture_stream = MagicMock()
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.torch.cuda, "current_stream", lambda: capture_stream
+    )
     monkeypatch.setattr(gpu_cudagraph_utils.torch.cuda, "synchronize", lambda *_: None)
 
     def cuda_graph_enter(*args, **kwargs):
@@ -1423,6 +1463,77 @@ def test_identical_steady_decode_reuses_unanimous_boundary(
     managers[0].queue_physical_key.assert_called_once()
     managers[1].queue_physical_key.assert_not_called()
     managers[2].queue_physical_key.assert_not_called()
+
+
+def test_multiphase_decode_reuses_each_unanimous_boundary(monkeypatch):
+    working_set, _managers, plan = _worker_consensus_fixture()
+    vote = MagicMock(return_value="accepted")
+    monkeypatch.setattr(working_set, "require_rank_consensus", vote)
+    phases = (("post_materialization", "stable"), ("post_mm_embedding", None))
+    working_set.begin_admitted_step(plan)
+    for phase, observer in phases:
+        working_set.require_post_materialization_consensus(
+            plan, phase=phase, observer_fingerprint=observer
+        )
+    working_set.finish_step()
+    assert vote.call_count == 3
+    repeated = replace(plan, transaction_id="media-2", reuse_rank_consensus=True)
+    working_set.begin_admitted_step(repeated)
+    for phase, observer in phases:
+        working_set.require_post_materialization_consensus(
+            repeated, phase=phase, observer_fingerprint=observer
+        )
+    working_set.validate_post_materialization_completion()
+    working_set.finish_step()
+    assert vote.call_count == 3
+
+
+@pytest.mark.parametrize(
+    "observed",
+    [
+        (),
+        (("post_materialization", "stable"),),
+        (("post_mm_embedding", None), ("post_materialization", "stable")),
+        (
+            ("post_materialization", "stable"),
+            ("post_mm_embedding", None),
+            ("post_mm_embedding", None),
+        ),
+        (("post_materialization", "changed"), ("post_mm_embedding", None)),
+    ],
+)
+def test_multiphase_reuse_rejects_drift_and_recovers(monkeypatch, observed):
+    working_set, _managers, plan = _worker_consensus_fixture()
+    vote = MagicMock(return_value="accepted")
+    monkeypatch.setattr(working_set, "require_rank_consensus", vote)
+    phases = (("post_materialization", "stable"), ("post_mm_embedding", None))
+    working_set.begin_admitted_step(plan)
+    for phase, observer in phases:
+        working_set.require_post_materialization_consensus(
+            plan, phase=phase, observer_fingerprint=observer
+        )
+    working_set.finish_step()
+    repeated = replace(plan, transaction_id="media-2", reuse_rank_consensus=True)
+    working_set.begin_admitted_step(repeated)
+    with pytest.raises(RuntimeError, match="ELASTIC_STEADY_EPOCH_LOCAL_DRIFT"):
+        for phase, observer in observed:
+            working_set.require_post_materialization_consensus(
+                repeated, phase=phase, observer_fingerprint=observer
+            )
+        working_set.validate_post_materialization_completion()
+    assert vote.call_count == 3
+    assert working_set._accepted_decode_epoch is None
+    working_set.finish_step()  # Failed-step cleanup must not mask the first error.
+    recovered = replace(plan, transaction_id="media-3", reuse_rank_consensus=False)
+    working_set.begin_admitted_step(recovered)
+    for phase, observer in phases:
+        working_set.require_post_materialization_consensus(
+            recovered, phase=phase, observer_fingerprint=observer
+        )
+    working_set.validate_post_materialization_completion()
+    working_set.finish_step()
+    assert vote.call_count == 6
+    assert working_set._accepted_decode_observers == phases
 
 
 def test_changed_decode_epoch_votes_again(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3577,13 +3688,13 @@ def test_pre_consensus_idle_reclaim_preserves_active_plan(monkeypatch):
 
     working_set = gpu_cudagraph_utils.DynamicGraphWorkingSet((manager,))
     working_set._accepted_decode_epoch = "previous-decode"
-    working_set._accepted_decode_observer = ("post_materialization", "stable")
+    working_set._accepted_decode_observers = (("post_materialization", "stable"),)
     working_set._active_step_plan_fingerprint = "active-reclaim"
 
     assert working_set.prepare_idle_reclaim_before_post_consensus() == 0
     assert working_set._active_step_plan_fingerprint == "active-reclaim"
     assert working_set._accepted_decode_epoch is None
-    assert working_set._accepted_decode_observer is None
+    assert working_set._accepted_decode_observers is None
     assert events == [
         "finish",
         ("synchronize", torch.device("cuda:2")),
@@ -3735,7 +3846,9 @@ def test_cancelled_dynamic_capture_revokes_grant_before_retry(monkeypatch):
     assert manager._dynamic_capture_granted_bytes == 0
 
 
-def test_piecewise_capture_uses_pcp_dummy_slot_mappings():
+def test_piecewise_capture_uses_pcp_dummy_slot_mappings(monkeypatch):
+    # This is a CPU slot-layout test, not a driver-backed pinned allocation test.
+    monkeypatch.setattr("vllm.v1.worker.gpu.input_batch.PIN_MEMORY", False)
     num_reqs = 32
     num_tokens = 56
     pcp_world_size = 2

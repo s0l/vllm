@@ -110,23 +110,26 @@ def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> 
     )
 
 
-def _charge_static_owners_to_kv_budget(
+def _reconcile_pre_kv_physical_budget(
     profiled_kv_bytes: int,
-    static_owner_bytes: int,
-    allocator_domain_bytes: int,
+    profile_free_bytes: int,
+    prepared_free_bytes: int,
 ) -> int:
-    """Charge bytes unavailable to elastic KV's custom allocator domain.
+    """Reconcile two physical endpoints without charging allocator bytes twice.
 
-    ``static_owner_bytes`` covers production owners created after profiling.
-    ``allocator_domain_bytes`` is free capacity stranded in live segments of
-    PyTorch's default allocator.  It remains reusable by later default-domain
-    CUDA Graph allocations, but independent elastic KV MemPools cannot borrow
-    it while constructing their VMM arenas.
+    The profiled budget already deducts driver-visible consumption and measured
+    transient headroom. Charge only additional physical consumption after graph
+    profiling teardown and production owner preparation. Cached allocations may
+    reuse already charged pages; allocated/reserved counters are not additive
+    with this physical ledger (especially with custom VMM pools).
+
+    A free-memory increase does not authorize exceeding the profiled budget:
+    its ownership is unknown and could belong to another process.
     """
-    return max(
-        profiled_kv_bytes - static_owner_bytes - allocator_domain_bytes,
-        0,
-    )
+    if min(profile_free_bytes, prepared_free_bytes) < 0:
+        raise ValueError("physical free-memory endpoints must be nonnegative")
+    additional_consumption = max(profile_free_bytes - prepared_free_bytes, 0)
+    return max(profiled_kv_bytes - additional_consumption, 0)
 
 
 def _startup_plan_kv_budget(
@@ -667,11 +670,14 @@ class Worker(WorkerBase):
             cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
         static_attn_owner_bytes = 0
+        free_before_static_owners = 0
         free_after_static_owners: int | None = None
         if elastic_dynamic_kv:
             # Graph profiling uses disposable builders. Recreate and retain
             # production owners before publishing the reserve-free elastic KV
             # capacity so no static allocation can appear after sizing.
+            torch.accelerator.synchronize()
+            free_before_static_owners = torch.accelerator.get_memory_info()[0]
             static_attn_owner_bytes = (
                 self.model_runner.prepare_static_attn_owners_for_kv_sizing()
             )
@@ -759,16 +765,22 @@ class Worker(WorkerBase):
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         if free_after_static_owners is not None:
             profiled_kv_cache_memory_bytes = self.available_kv_cache_memory_bytes
-            self.available_kv_cache_memory_bytes = _charge_static_owners_to_kv_budget(
+            self.available_kv_cache_memory_bytes = _reconcile_pre_kv_physical_budget(
                 profiled_kv_cache_memory_bytes,
-                static_attn_owner_bytes,
-                reserved_unallocated_after_static,
+                profile_result.after_profile.free_memory,
+                free_after_static_owners,
             )
             logger.info(
-                "KV retained-owner ledger: profiled=%s GiB, "
+                "KV physical-endpoint ledger: profiled=%s GiB, "
                 "static_attention_new=%.2f MiB, free_after_static=%s GiB, "
-                "default_allocator_nonborrowable=%s GiB, transient_headroom=%s GiB, "
-                "unrequested=%s GiB, final=%s GiB",
+                "allocator_reserved_unused_diagnostic=%s GiB, "
+                "transient_headroom=%s GiB, unrequested=%s GiB, final=%s GiB; "
+                "profile_free_bytes=%d before_owners_free_bytes=%d "
+                "prepared_free_bytes=%d static_owner_allocated_bytes=%d "
+                "profiled_kv_bytes=%d final_kv_bytes=%d "
+                "transient_headroom_bytes=%d unrequested_bytes=%d "
+                "profile_allocated_bytes=%d profile_reserved_bytes=%d "
+                "prepared_allocated_bytes=%d prepared_reserved_bytes=%d",
                 format_gib(profiled_kv_cache_memory_bytes),
                 static_attn_owner_bytes / (1 << 20),
                 format_gib(free_after_static_owners),
@@ -776,6 +788,18 @@ class Worker(WorkerBase):
                 format_gib(profile_result.transient_peak_headroom),
                 format_gib(unrequested_memory),
                 format_gib(self.available_kv_cache_memory_bytes),
+                profile_result.after_profile.free_memory,
+                free_before_static_owners,
+                free_after_static_owners,
+                static_attn_owner_bytes,
+                profiled_kv_cache_memory_bytes,
+                self.available_kv_cache_memory_bytes,
+                profile_result.transient_peak_headroom,
+                unrequested_memory,
+                profile_result.after_profile.torch_allocated,
+                profile_result.after_profile.torch_memory,
+                torch.accelerator.memory_allocated(),
+                torch.accelerator.memory_reserved(),
             )
         logger.debug(
             "Initial free memory: %s GiB; Requested memory: %f (util), %s GiB",

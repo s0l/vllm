@@ -20,16 +20,23 @@ from vllm.v1.core.elastic_graph import (
 ELASTIC_RUNTIME_GENERATION_SCHEMA_VERSION = 3
 
 _ELASTIC_RUNTIME_SOURCE_MODULES = (
+    "vllm.model_executor.warmup.flashinfer_autotune_cache",
+    "vllm.model_executor.warmup.kernel_warmup",
     "vllm.distributed.parallel_state",
+    "vllm.distributed.device_communicators.tp3_exact_reduce",
+    "vllm.distributed.device_communicators.tp3_ce_all_reduce",
     "vllm.v1.attention.backends.flashinfer",
     "vllm.v1.core.kv_cache_capacity",
     "vllm.v1.core.kv_cache_coordinator",
     "vllm.v1.core.elastic_graph",
+    "vllm.v1.core.elastic_price_identity",
     "vllm.v1.core.sched.scheduler",
     "vllm.v1.engine.core",
     "vllm.v1.engine.elastic_calibrator",
+    "vllm.v1.engine.elastic_bootstrap",
     "vllm.v1.sample.ops.topk_topp_sampler",
     "vllm.v1.worker.elastic_catalog_tool",
+    "vllm.v1.worker.gpu.attn_utils",
     "vllm.v1.worker.gpu.cudagraph_utils",
     "vllm.v1.worker.gpu.elastic_gdn",
     "vllm.v1.worker.gpu.mm.encoder_runner",
@@ -39,6 +46,8 @@ _ELASTIC_RUNTIME_SOURCE_MODULES = (
     "vllm.v1.worker.gpu.model_states.interface",
     "vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils",
     "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator",
+    "vllm.v1.worker.gpu.spec_decode.speculator",
+    "vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator",
     "vllm.v1.worker.startup_plan",
     # Effective Exp25/Qwen3.8 target and draft graph owners. Hash the model
     # composition, shared attention implementation, MTP implementation, and
@@ -67,6 +76,8 @@ _ELASTIC_PHYSICAL_CATALOG_SOURCE_MODULES = tuple(
         "vllm.v1.core.sched.scheduler",
         "vllm.v1.worker.elastic_catalog_tool",
         "vllm.v1.worker.startup_plan",
+        "vllm.v1.core.elastic_price_identity",
+        "vllm.v1.engine.elastic_bootstrap",
     }
 )
 
@@ -92,7 +103,16 @@ def elastic_runtime_source_hashes() -> dict[str, str]:
 
 def elastic_catalog_physical_source_hashes() -> dict[str, str]:
     """Bind catalog rows only to code that can change their physical cost."""
-    return _source_hashes(_ELASTIC_PHYSICAL_CATALOG_SOURCE_MODULES)
+    from vllm.v1.core.elastic_price_identity import source_semantic_digest
+
+    result = {}
+    for module_name in _ELASTIC_PHYSICAL_CATALOG_SOURCE_MODULES:
+        spec = importlib.util.find_spec(module_name)
+        if spec is None or spec.origin is None:
+            raise RuntimeError(f"cannot resolve physical price producer: {module_name}")
+        with open(spec.origin, encoding="utf-8") as stream:
+            result[module_name] = source_semantic_digest(stream.read())
+    return result
 
 
 def elastic_auto_calibration_enabled() -> bool:

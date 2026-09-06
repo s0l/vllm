@@ -1168,6 +1168,8 @@ def calibrate_and_publish_catalog(
     expected_fingerprint: str | None = None,
     surface_sha256: str | None = None,
     checkpoint_payload: Any = None,
+    checkpoint_generation: str | None = None,
+    seed_catalog_path: str | None = None,
     checkpoint_callback: Callable[[dict[str, Any]], None] | None = None,
     max_new_rows_per_process: int = 0,
     max_producer_epochs_per_process: int = 0,
@@ -1202,12 +1204,70 @@ def calibrate_and_publish_catalog(
         ),
         source_sha256=surface_sha256,
     )
+    if checkpoint_payload is None and seed_catalog_path is not None:
+        from vllm.v1.worker.startup_plan import (
+            load_elastic_graph_catalog,
+            load_elastic_graph_catalog_coverage,
+        )
+
+        seed_rows = load_elastic_graph_catalog(
+            owner.vllm_config, scheduler.kv_cache_config, catalog_path=seed_catalog_path
+        )
+        seed_coverage = load_elastic_graph_catalog_coverage(
+            owner.vllm_config, scheduler.kv_cache_config, catalog_path=seed_catalog_path
+        )
+        if getattr(seed_rows, "source_sha256", None) != seed_coverage.get(
+            "_catalog_source_sha256"
+        ):
+            raise RuntimeError("calibration seed changed during validation")
+        from vllm.v1.core.elastic_price_identity import select_compatible_price_seed
+
+        reusable, witnesses = select_compatible_price_seed(
+            seed_rows, seed_coverage, surface
+        )
+        checkpoint_payload = calibration_checkpoint_payload(
+            catalog=reusable,
+            mixed_query_witnesses=witnesses,
+            fingerprint=fingerprint,
+            surface_sha256=surface_sha256,
+            process_epochs=0,
+            calibration_wall_seconds=0.0,
+        )
+        checkpoint_generation = scheduler._elastic_admission_controller.generation.value
+        logger.info(
+            "Elastic calibration seed: reused=%d required=%d source_sha256=%s",
+            len(reusable),
+            len(surface.required),
+            seed_rows.source_sha256,
+        )
     checkpoint = parse_calibration_checkpoint(
         checkpoint_payload,
         surface=surface,
         fingerprint=fingerprint,
         surface_sha256=surface_sha256,
     )
+    if checkpoint_generation is not None and checkpoint.catalog:
+        from dataclasses import replace
+
+        from vllm.v1.core.elastic_graph import configured_compiled_piecewise_sizes
+        from vllm.v1.core.elastic_price_identity import remap_catalog_resident_keys
+
+        # A partial row may name a retained owner measured by a different row.
+        # Resolve the complete declared inventory, then retain only observations.
+        inventory = {key: checkpoint.catalog.get(key, {}) for key in surface.required}
+        rebound = remap_catalog_resident_keys(
+            inventory,
+            source_generation=checkpoint_generation,
+            destination_generation=scheduler._elastic_admission_controller.generation.value,
+            max_num_batched_tokens=owner.vllm_config.scheduler_config.max_num_batched_tokens,
+            compiled_piecewise_sizes=tuple(
+                configured_compiled_piecewise_sizes(owner.vllm_config)
+            ),
+            policy=policy,
+        )
+        checkpoint = replace(
+            checkpoint, catalog={key: rebound[key] for key in checkpoint.catalog}
+        )
     process_epoch = checkpoint.process_epochs + 1
 
     def publish_checkpoint(

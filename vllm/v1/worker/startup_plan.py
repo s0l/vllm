@@ -199,19 +199,24 @@ def _graph_recipe_path(fingerprint: str, owner: str) -> str:
 def compute_elastic_graph_catalog_fingerprint(
     vllm_config: VllmConfig, kv_cache_config: Any
 ) -> str:
-    """Identify a measured graph/KV coexistence surface.
+    """Identify physical prices; current placement is checked at restore."""
+    return compute_elastic_graph_price_identity(vllm_config, kv_cache_config)[
+        "fingerprint"
+    ]
 
-    Unlike a graph executable, the catalog is rank-safe scheduler evidence.
-    Bind it to the complete runtime config and the post-profile, worst-rank KV
-    geometry so a model, B, topology, CUDA build, or physical pool change
-    cannot silently reuse old measurements.
-    """
-    from vllm import __version__ as vllm_version
+
+def compute_elastic_graph_price_identity(
+    vllm_config: VllmConfig, kv_cache_config: Any
+) -> dict[str, Any]:
+    from vllm.v1.core.elastic_price_identity import (
+        flashinfer_price_tactics,
+        native_price_provenance,
+        price_identity,
+    )
 
     factors = {
         "schema": ELASTIC_GRAPH_CATALOG_SCHEMA_VERSION,
-        "vllm": vllm_version,
-        "vllm_config": vllm_config.compute_hash(),
+        "vllm_config": vllm_config.compute_hash(include_version=False),
         "profile_config": elastic_profile_config_factors(vllm_config),
         "torch": torch.__version__,
         "cuda": torch.version.cuda or "",
@@ -220,42 +225,48 @@ def compute_elastic_graph_catalog_fingerprint(
         "device_capability": str(current_platform.get_device_capability() or ""),
         "visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
         "physical_dag_env": {
-            name: os.environ.get(name, "")
-            for name in (
-                "AG2_VLLM_FLASHINFER_DCP_PREFILL_CUDAGRAPH",
-                "AG2_VLLM_ELASTIC_MM_ACTIVATION_LOAN_BYTES",
-                "AG2_VLLM_MTP_DCP_PSEUDO_DECODE",
-                "AG2_VLLM_MTP_DCP_BATCHED_DECODE",
-                "AG2_VLLM_MTP_DCP_BATCHED_FIXED_SPLIT_SIZE",
-                "AG2_VLLM_MTP_DCP_BATCHED_WORKSPACE_MIB",
-                "AG2_VLLM_MTP_DCP_SEQUENTIAL_DECODE",
-                "AG2_VLLM_TP3_EMBEDDING_NCCL",
-                "AG2_VLLM_TP3_EXACT_OWNER_MIN_ROWS",
-                "AG2_VLLM_TP3_OWNER_MIN_ROWS",
-                "AG2_VLLM_TP3_OWNER_PREQUANT",
-                "AG2_VLLM_TP3_UNIFIED_EXACT_BACKEND",
-                "AG2_VLLM_TP3_UNIFIED_EXACT_REDUCE",
-                "NCCL_ALGO",
-                "NCCL_PROTO",
-                "VLLM_TP3_CE_REDUCE",
-                "VLLM_USE_FLASHINFER_SAMPLER",
+            name: getattr(envs, name, os.environ.get(name, ""))
+            for name in sorted(
+                set(STARTUP_PROFILE_ENV_NAMES)
+                .difference(
+                    {
+                        "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS",
+                    }
+                )
+                .union(
+                    {
+                        "AG2_VLLM_FLASHINFER_DCP_PREFILL_CUDAGRAPH",
+                        "AG2_VLLM_MTP_DCP_PSEUDO_DECODE",
+                        "AG2_VLLM_MTP_DCP_BATCHED_DECODE",
+                        "AG2_VLLM_MTP_DCP_BATCHED_FIXED_SPLIT_SIZE",
+                        "AG2_VLLM_MTP_DCP_BATCHED_WORKSPACE_MIB",
+                        "AG2_VLLM_MTP_DCP_SEQUENTIAL_DECODE",
+                        "AG2_VLLM_TP3_EMBEDDING_NCCL",
+                        "AG2_VLLM_TP3_EXACT_OWNER_MIN_ROWS",
+                        "AG2_VLLM_TP3_OWNER_MIN_ROWS",
+                        "AG2_VLLM_TP3_OWNER_PREQUANT",
+                        "AG2_VLLM_TP3_UNIFIED_EXACT_BACKEND",
+                        "AG2_VLLM_TP3_UNIFIED_EXACT_REDUCE",
+                        "NCCL_ALGO",
+                        "NCCL_PROTO",
+                        "VLLM_TP3_CE_REDUCE",
+                        "VLLM_USE_FLASHINFER_SAMPLER",
+                        "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE",
+                    }
+                )
             )
         },
         "physical_source_hashes": elastic_catalog_physical_source_hashes(),
+        "native_provenance": native_price_provenance(),
+        "flashinfer_tactics": flashinfer_price_tactics(vllm_config),
+        "allocator_config": os.environ.get(
+            "PYTORCH_ALLOC_CONF", os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+        ),
         "world_size": vllm_config.parallel_config.world_size,
-        "num_blocks": kv_cache_config.num_blocks,
         "attention_stride": kv_cache_config.elastic_attention_stride,
         "gdn_stride": kv_cache_config.elastic_gdn_stride,
         "mapping_quantum": kv_cache_config.elastic_mapping_quantum,
-        "gdn_initial_blocks": kv_cache_config.elastic_gdn_initial_blocks,
         "gdn_blocks_per_request": kv_cache_config.elastic_gdn_blocks_per_request,
-        # Profiled free bytes can move by one mapping quantum between otherwise
-        # identical process epochs without changing any mapped KV region.  The
-        # catalog prices Graph executables against the consumed physical pools;
-        # bind those pools below, while startup admission revalidates them
-        # against the current raw budget before READY.
-        "rank_primary": kv_cache_config.elastic_rank_primary_mapped_bytes,
-        "rank_gdn": kv_cache_config.elastic_rank_gdn_mapped_bytes,
         "graph_execution_policy": getattr(
             kv_cache_config, "elastic_graph_execution_policy", None
         ),
@@ -267,18 +278,68 @@ def compute_elastic_graph_catalog_fingerprint(
         for name, value in factors.items()
     }
     logger.info(
-        "Elastic Graph catalog identity components: %s",
+        "Elastic Graph price identity components: %s",
         component_hashes,
     )
-    digest = hashlib.sha256(json.dumps(factors, sort_keys=True).encode()).hexdigest()
-    return digest[:16]
+    return price_identity(factors)
 
 
 def _elastic_graph_catalog_path(fingerprint: str) -> str:
+    selected = os.environ.get("AG2_VLLM_ELASTIC_CATALOG_PATH", "")
+    if selected:
+        if not os.path.isabs(selected):
+            raise RuntimeError("explicit elastic catalog path must be absolute")
+        return selected
     return os.path.join(
         envs.VLLM_CACHE_ROOT,
         "elastic_graph_catalog",
         f"elastic_graph_catalog_{fingerprint}.json",
+    )
+
+
+def elastic_catalog_owner_generation(
+    vllm_config: VllmConfig, kv_cache_config: Any
+) -> str:
+    from vllm.v1.core.elastic_graph import bind_runtime_generation_to_policy
+    from vllm.v1.core.elastic_runtime import compute_elastic_runtime_generation
+
+    return bind_runtime_generation_to_policy(
+        compute_elastic_runtime_generation(vllm_config),
+        _effective_graph_execution_policy(kv_cache_config),
+    )
+
+
+def _bind_catalog_price_owners(payload, rows, vllm_config, kv_cache_config):
+    from vllm.v1.core.elastic_graph import configured_compiled_piecewise_sizes
+    from vllm.v1.core.elastic_price_identity import (
+        PRICE_OWNER_GENERATION,
+        price_identity_differences,
+        remap_catalog_resident_keys,
+    )
+
+    identity = payload.get("price_identity")
+    if identity is None:
+        # Legacy catalogs remain readable only in their original namespace.
+        # The new price namespace can be entered only by explicit migration.
+        raise RuntimeError("legacy catalog requires explicit price-identity migration")
+    differences = price_identity_differences(
+        identity, compute_elastic_graph_price_identity(vllm_config, kv_cache_config)
+    )
+    if differences:
+        raise RuntimeError(f"elastic price compatibility mismatch: {differences}")
+    if payload.get("resident_owner_generation") != PRICE_OWNER_GENERATION:
+        raise RuntimeError("elastic catalog has no portable resident-owner identity")
+    return remap_catalog_resident_keys(
+        rows,
+        source_generation=PRICE_OWNER_GENERATION,
+        destination_generation=elastic_catalog_owner_generation(
+            vllm_config, kv_cache_config
+        ),
+        max_num_batched_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
+        compiled_piecewise_sizes=tuple(
+            configured_compiled_piecewise_sizes(vllm_config)
+        ),
+        policy=_effective_graph_execution_policy(kv_cache_config),
     )
 
 
@@ -376,7 +437,7 @@ def _validated_catalog_resident_key_bytes(
 
 
 def load_elastic_graph_catalog(
-    vllm_config: VllmConfig, kv_cache_config: Any
+    vllm_config: VllmConfig, kv_cache_config: Any, *, catalog_path: str | None = None
 ) -> dict[tuple[int, ...], dict[str, Any]]:
     """Load only identity-matched, complete cold+hot shape measurements."""
     if not envs.VLLM_ENABLE_STARTUP_PLAN:
@@ -388,13 +449,14 @@ def load_elastic_graph_catalog(
         configured_compiled_piecewise_sizes,
     )
 
-    path = _elastic_graph_catalog_path(fingerprint)
+    path = catalog_path or _elastic_graph_catalog_path(fingerprint)
     try:
         os.lstat(path)
     except FileNotFoundError:
         logger.warning(
-            "Elastic CUDA Graph catalog is absent for the effective runtime "
-            "identity: path=%s fingerprint=%s",
+            "Elastic CUDA Graph price catalog is absent: "
+            "reason=compatibility-unresolved path=%s fingerprint=%s; "
+            "absence is not a measurement decision",
             path,
             fingerprint,
         )
@@ -603,6 +665,9 @@ def load_elastic_graph_catalog(
             f"missing={sorted(required_step_keys.difference(result))!r} "
             f"extra={sorted(set(result).difference(required_step_keys))!r}"
         )
+    result.update(
+        _bind_catalog_price_owners(payload, result, vllm_config, kv_cache_config)
+    )
     logger.info(
         "Loaded elastic CUDA Graph catalog %s (%d complete shapes)",
         path,
@@ -612,7 +677,7 @@ def load_elastic_graph_catalog(
 
 
 def load_elastic_graph_catalog_coverage(
-    vllm_config: VllmConfig, kv_cache_config: Any
+    vllm_config: VllmConfig, kv_cache_config: Any, *, catalog_path: str | None = None
 ) -> dict[str, Any]:
     """Load the sealed product boundary paired with the price catalog.
 
@@ -628,7 +693,7 @@ def load_elastic_graph_catalog_coverage(
         DispatchRepresentation,
     )
 
-    path = _elastic_graph_catalog_path(fingerprint)
+    path = catalog_path or _elastic_graph_catalog_path(fingerprint)
     try:
         payload, source_sha256 = load_sealed_catalog_with_digest(
             path, require_migration=False

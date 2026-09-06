@@ -16,6 +16,28 @@ from vllm.v1.engine import elastic_bootstrap
 from vllm.v1.engine.core import EngineCore
 
 
+@pytest.fixture
+def maintenance_decision(tmp_path, monkeypatch):
+    from vllm.v1.worker import startup_plan
+
+    request = tmp_path / "measurement-request.json"
+    request.write_text(
+        json.dumps(
+            {
+                "schema": "elastic-measurement-request-v1",
+                "fingerprint": "1123456789abcdef",
+                "surface_sha256": "c" * 64,
+                "reason": "initial-measurement",
+                "evidence": "test decision",
+            }
+        )
+    )
+    monkeypatch.setenv("AG2_VLLM_ELASTIC_CALIBRATION_REQUEST", str(request))
+    monkeypatch.setattr(
+        startup_plan, "elastic_catalog_owner_generation", lambda *_: "test-generation"
+    )
+
+
 def receipt(
     generation: str = "restore-generation",
     *,
@@ -955,7 +977,7 @@ def test_complete_elastic_startup_classifies_bounded_restart_as_expected(
 
 
 def test_auto_calibration_seals_activates_and_records_receipt(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, maintenance_decision
 ) -> None:
     from vllm import envs
     from vllm.v1.core import elastic_catalog
@@ -1014,7 +1036,9 @@ def test_auto_calibration_seals_activates_and_records_receipt(
     assert receipt["surface_sha256"] == "c" * 64
 
 
-def test_auto_calibration_failure_receipt_does_not_activate(tmp_path, monkeypatch):
+def test_auto_calibration_failure_receipt_does_not_activate(
+    tmp_path, monkeypatch, maintenance_decision
+):
     from vllm import envs
     from vllm.v1.core import elastic_catalog
     from vllm.v1.engine import elastic_calibrator
@@ -1057,7 +1081,9 @@ def test_auto_calibration_failure_receipt_does_not_activate(tmp_path, monkeypatc
     assert receipt["surface_sha256"] == "c" * 64
 
 
-def test_auto_calibration_records_restartable_checkpoint(tmp_path, monkeypatch):
+def test_auto_calibration_records_restartable_checkpoint(
+    tmp_path, monkeypatch, maintenance_decision
+):
     from vllm import envs
     from vllm.v1.core import elastic_catalog
     from vllm.v1.engine import elastic_calibrator
@@ -1100,17 +1126,28 @@ def test_auto_calibration_records_restartable_checkpoint(tmp_path, monkeypatch):
     }
 
     seen_checkpoints = []
+    epoch_generation = ["first-generation"]
+    monkeypatch.setattr(
+        startup_plan, "elastic_catalog_owner_generation", lambda *_: epoch_generation[0]
+    )
+    seen_generations = []
 
     def calibrate(*_args, **kwargs):
         assert kwargs["max_new_rows_per_process"] == 8
         assert kwargs["max_producer_epochs_per_process"] == 1
         seen_checkpoints.append(kwargs["checkpoint_payload"])
+        seen_generations.append(kwargs["checkpoint_generation"])
+        # Until a fresh checkpoint is written, existing observations must
+        # retain their old generation even after a source-only restart.
+        persisted = json.loads(receipt_path.read_text())
+        assert persisted["resident_owner_generation"] == "first-generation"
         kwargs["checkpoint_callback"](checkpoint)
         raise elastic_calibrator.ElasticCalibrationRestartRequired("epoch complete")
 
     monkeypatch.setattr(elastic_calibrator, "calibrate_and_publish_catalog", calibrate)
 
     for _epoch in range(2):
+        epoch_generation[0] = "first-generation" if _epoch == 0 else "second-generation"
         with pytest.raises(
             elastic_calibrator.ElasticCalibrationRestartRequired,
             match="epoch complete",
@@ -1119,14 +1156,16 @@ def test_auto_calibration_records_restartable_checkpoint(tmp_path, monkeypatch):
 
     scheduler.activate_elastic_graph_catalog.assert_not_called()
     assert seen_checkpoints == [None, checkpoint]
+    assert seen_generations == ["first-generation", "first-generation"]
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["stage"] == "checkpointed"
     assert receipt["restart_required"] is True
     assert receipt["checkpoint"] == checkpoint
+    assert receipt["resident_owner_generation"] == "second-generation"
 
 
 def test_auto_calibration_rejects_existing_canonical_before_measurement(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, maintenance_decision
 ) -> None:
     from vllm import envs
     from vllm.v1.core import elastic_catalog

@@ -28,6 +28,68 @@ GLOBAL_POOL = "global-pool"
 THROWAWAY_POOL = "throwaway-pool"
 
 
+def test_full_capture_consumes_declared_stream_across_descriptors(monkeypatch):
+    stream = object()
+    captured_streams = []
+    contexts = []
+    context = SimpleNamespace(stream=stream)
+
+    @contextlib.contextmanager
+    def outer_capture(*, device, graph_capture_context):
+        assert graph_capture_context is context
+        contexts.append(graph_capture_context)
+        yield context
+
+    @contextlib.contextmanager
+    def capture(graph, pool, *, stream=None):
+        captured_streams.append(stream)
+        yield
+
+    monkeypatch.setattr(cgu, "graph_capture", outer_capture)
+    monkeypatch.setattr(cgu, "is_global_first_rank", lambda: False)
+    monkeypatch.setattr(cgu, "set_graph_pool_id", lambda _: None)
+    monkeypatch.setattr(
+        cgu,
+        "get_offloader",
+        lambda: SimpleNamespace(
+            sync_prev_onload=lambda: None, join_after_forward=lambda: None
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda **_: object())
+    monkeypatch.setattr(torch.cuda, "graph", capture)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _: None)
+    manager = cgu.CudaGraphManager.__new__(cgu.CudaGraphManager)
+    manager.defer_startup_graphs = True
+    manager.device = torch.device("cuda:0")
+    manager._get_dynamic_graph_capture_context = lambda: context
+    manager._capture_num_reqs = lambda desc: desc.num_reqs
+    manager.dynamic_graph_owner = "target"
+    manager.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(rank=0))
+    manager._p3_node_cutoff = None
+    manager._p3_node_prefix_counts = ()
+    manager._p3_graph_debug = False
+    manager.pool = THROWAWAY_POOL
+    manager.graphs = {}
+    calls = []
+    for size in (4, 8):
+        desc = cgu.BatchExecutionDescriptor(
+            cg_mode=CUDAGraphMode.FULL,
+            num_tokens=size,
+            num_reqs=size,
+            uniform_token_count=1,
+            num_active_loras=0,
+        )
+        manager.capture(
+            lambda desc, warmup: lambda mode: calls.append((desc, warmup, mode)),
+            capture_descs={CUDAGraphMode.FULL: [desc]},
+        )
+    assert captured_streams == [stream, stream]
+    assert contexts == [context, context]
+    assert len(calls) == 4
+    assert len(manager.graphs) == 2
+
+
 class _FakeCudaGraphManager:
     def __init__(
         self, needs_capture: bool, num_full_descs: int, piecewise_only: bool = False
@@ -441,6 +503,8 @@ def test_teardown_profiling_state_clears_mamba_align_metadata(monkeypatch):
     block_copy_owner = [object()]
     runner.kv_caches_for_block_copy = block_copy_owner
     runner.attn_groups = []
+    draft_owners = [object()]
+    runner.speculator = SimpleNamespace(attn_groups=draft_owners)
     runner.kv_cache_config = SimpleNamespace()
     runner.cudagraph_manager = object()
     runner.lora_config = None
@@ -455,4 +519,5 @@ def test_teardown_profiling_state_clears_mamba_align_metadata(monkeypatch):
     assert runner.model_state._mamba_group_ids == []
     assert runner.model_state._mamba_spec is None
     assert block_copy_owner == []
+    assert draft_owners == []
     assert not hasattr(runner, "kv_caches_for_block_copy")

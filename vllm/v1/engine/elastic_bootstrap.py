@@ -40,6 +40,25 @@ def _write_calibration_receipt(path: Path, payload: dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _require_measurement_request(fingerprint: str, surface_sha256: str) -> None:
+    from vllm.v1.core.elastic_price_identity import validate_calibration_request
+
+    request_path = os.environ.get("AG2_VLLM_ELASTIC_CALIBRATION_REQUEST", "")
+    try:
+        request = Path(request_path)
+        if not request_path or request.is_symlink() or not request.is_file():
+            raise ValueError("measurement request must be a regular file")
+        request_payload = json.loads(request.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise RuntimeError(
+            "calibration not authorized by a measurement decision; set "
+            "AG2_VLLM_ELASTIC_CALIBRATION_REQUEST after compatibility review"
+        ) from error
+    validate_calibration_request(
+        request_payload, fingerprint=fingerprint, surface_sha256=surface_sha256
+    )
+
+
 def _auto_calibrate_missing_catalog(owner: Any) -> None:
     from vllm import envs
     from vllm.v1.core.elastic_catalog import load_sealed_catalog_with_digest
@@ -69,11 +88,10 @@ def _auto_calibrate_missing_catalog(owner: Any) -> None:
     fingerprint = compute_elastic_graph_catalog_fingerprint(
         owner.vllm_config, scheduler.kv_cache_config
     )
-    canonical_destination = (
-        Path(envs.VLLM_CACHE_ROOT)
-        / "elastic_graph_catalog"
-        / f"elastic_graph_catalog_{fingerprint}.json"
-    )
+    _require_measurement_request(fingerprint, surface_sha256)
+    from vllm.v1.worker.startup_plan import _elastic_graph_catalog_path
+
+    canonical_destination = Path(_elastic_graph_catalog_path(fingerprint))
     try:
         canonical_destination.lstat()
     except FileNotFoundError:
@@ -103,7 +121,22 @@ def _auto_calibrate_missing_catalog(owner: Any) -> None:
             "elastic calibration surface, canonical catalog and receipt must "
             "resolve to three distinct paths"
         )
+    seed_path = os.environ.get("AG2_VLLM_ELASTIC_CALIBRATION_SEED_CATALOG", "")
+    if seed_path and Path(seed_path).resolve(strict=False) in {
+        resolved_surface,
+        resolved_canonical,
+        resolved_receipt,
+    }:
+        raise RuntimeError(
+            "calibration seed must be distinct from mutable destinations and surface"
+        )
     checkpoint_payload = None
+    from vllm.v1.worker.startup_plan import elastic_catalog_owner_generation
+
+    current_owner_generation = elastic_catalog_owner_generation(
+        owner.vllm_config, scheduler.kv_cache_config
+    )
+    checkpoint_generation = current_owner_generation
     if receipt_path.exists():
         if receipt_path.is_symlink() or not receipt_path.is_file():
             raise RuntimeError(
@@ -122,7 +155,16 @@ def _auto_calibrate_missing_catalog(owner: Any) -> None:
             or prior_receipt.get("surface_sha256") != surface_sha256
         ):
             raise RuntimeError("elastic calibration receipt identity differs")
+        if prior_receipt.get("stage") not in {"checkpointed", "calibrating"}:
+            raise RuntimeError(
+                "failed or terminal calibration requires a new reviewed decision"
+            )
         checkpoint_payload = prior_receipt.get("checkpoint")
+        checkpoint_generation = prior_receipt.get("resident_owner_generation")
+        if not isinstance(checkpoint_generation, str) or not checkpoint_generation:
+            raise RuntimeError(
+                "legacy calibration checkpoint needs explicit owner binding"
+            )
     raw_process_limit = os.environ.get(
         "AG2_VLLM_ELASTIC_CALIBRATION_MAX_NEW_ROWS_PER_PROCESS", "0"
     )
@@ -153,6 +195,7 @@ def _auto_calibrate_missing_catalog(owner: Any) -> None:
         "surface_sha256": surface_sha256,
         "max_new_rows_per_process": process_limit,
         "max_producer_epochs_per_process": producer_limit,
+        "resident_owner_generation": checkpoint_generation,
     }
     if checkpoint_payload is not None:
         receipt["checkpoint"] = checkpoint_payload
@@ -160,6 +203,7 @@ def _auto_calibrate_missing_catalog(owner: Any) -> None:
 
     def record_checkpoint(payload: dict[str, Any]) -> None:
         receipt["checkpoint"] = payload
+        receipt["resident_owner_generation"] = current_owner_generation
         receipt["stage"] = "calibrating"
         _write_calibration_receipt(receipt_path, receipt)
 
@@ -171,6 +215,11 @@ def _auto_calibrate_missing_catalog(owner: Any) -> None:
             expected_fingerprint=fingerprint,
             surface_sha256=surface_sha256,
             checkpoint_payload=checkpoint_payload,
+            checkpoint_generation=checkpoint_generation,
+            seed_catalog_path=os.environ.get(
+                "AG2_VLLM_ELASTIC_CALIBRATION_SEED_CATALOG"
+            )
+            or None,
             checkpoint_callback=record_checkpoint,
             max_new_rows_per_process=process_limit,
             max_producer_epochs_per_process=producer_limit,
@@ -356,9 +405,9 @@ def complete_elastic_startup(owner: Any) -> str:
                 if not getattr(scheduler, "_elastic_auto_calibrate", False):
                     raise RuntimeError(
                         "required elastic CUDA Graph catalog is absent; serving "
-                        "will not calibrate implicitly. Run an explicit "
-                        "maintenance calibration job with an accepted surface, "
-                        "then restart serving with auto calibration disabled"
+                        "will not calibrate implicitly. Resolve price compatibility "
+                        "and catalog location first; only proven producer changes "
+                        "or uncovered forms justify a reviewed measurement request"
                     )
                 _auto_calibrate_missing_catalog(owner)
             representation = scheduler._elastic_graph_catalog_coverage.get(

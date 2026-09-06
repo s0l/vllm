@@ -426,6 +426,10 @@ def rebind_finalized_catalog(
         require_migration=False,
     )
     source_fingerprint = rebound["fingerprint"]
+    if "price_identity" in rebound:
+        raise RuntimeError(
+            "price catalogs require compatibility migration, not fingerprint rebind"
+        )
     if source_fingerprint == destination_fingerprint:
         raise RuntimeError("catalog rebind destination equals its source fingerprint")
     rebound["fingerprint"] = destination_fingerprint

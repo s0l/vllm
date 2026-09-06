@@ -9,10 +9,34 @@ from vllm.v1.core.elastic_graph import (
     EXECUTION_MANIFEST_SCHEMA,
     GraphExecutionPolicy,
     OwnerGraphExecutionPolicy,
+    RuntimeGeneration,
+    resolve_step_physical_keys,
 )
+from vllm.v1.core.elastic_price_identity import PRICE_OWNER_GENERATION, price_identity
 from vllm.v1.worker import startup_plan
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.fixture(autouse=True)
+def price_platform_fixture(monkeypatch):
+    # These loader tests use synthetic configs; native/config fingerprint
+    # sensitivity is exercised separately by test_gpu_worker.
+    monkeypatch.setattr(
+        startup_plan,
+        "compute_elastic_graph_price_identity",
+        lambda *_: price_identity({"fixture": "loader"}),
+    )
+    monkeypatch.setattr(
+        startup_plan, "elastic_catalog_owner_generation", lambda *_: "loader-runtime"
+    )
+
+
+def _resident_owners(generation):
+    owners = resolve_step_physical_keys(
+        (1, 3, 1, 1, 1), RuntimeGeneration(generation), 4096, (), _catalog_policy()
+    )
+    return tuple(sorted(((owners[0].identity, 96), (owners[1].identity, 48))))
 
 
 def _catalog_policy() -> GraphExecutionPolicy:
@@ -201,7 +225,7 @@ def _write_catalog(tmp_path, *, sealed=True, fingerprint="0123456789abcdef"):
         "hot_peak_bytes": 192,
         "resident_bytes": 160,
         "floor_bytes": 16,
-        "resident_key_bytes": [["a" * 64, 96], ["b" * 64, 48]],
+        "resident_key_bytes": _resident_owners(PRICE_OWNER_GENERATION),
         "cold_observations": 2,
         "cold_stable_replays": 1,
         "hot_observations": 2,
@@ -263,6 +287,8 @@ def _write_catalog(tmp_path, *, sealed=True, fingerprint="0123456789abcdef"):
     }
     payload = {
         "schema": startup_plan.ELASTIC_GRAPH_CATALOG_SCHEMA_VERSION,
+        "price_identity": price_identity({"fixture": "loader"}),
+        "resident_owner_generation": PRICE_OWNER_GENERATION,
         "fingerprint": fingerprint,
         "sealed": sealed,
         "finalized_offline": True,
@@ -308,7 +334,7 @@ def test_exact_elastic_catalog_loads_complete_identity_matched_rows(
                 "hot_stable_replays",
             )
         }
-        | {"resident_key_bytes": (("a" * 64, 96), ("b" * 64, 48))}
+        | {"resident_key_bytes": _resident_owners("loader-runtime")}
     )
     assert len(loaded) == 1 + len(
         startup_plan.expected_semantic_token_witnesses(

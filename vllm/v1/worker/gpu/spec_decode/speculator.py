@@ -85,6 +85,10 @@ class BaseSpeculator(ABC):
 
 
 class DraftModelSpeculator(BaseSpeculator):
+    # Only sequential target/draft implementations may opt into kernel scratch
+    # sharing. Planning metadata always remains owned by each builder.
+    share_target_attention_scratch = False
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
         self.device = device
@@ -241,6 +245,32 @@ class DraftModelSpeculator(BaseSpeculator):
             self.device,
             active_layer_names=self.draft_attn_layer_names,
         )
+        if (
+            self.share_target_attention_scratch
+            and not self.vllm_config.parallel_config.enable_dbo
+            and not self.vllm_config.scheduler_config.async_scheduling
+        ):
+            target_builders = [
+                group.get_metadata_builder(0)
+                for groups in target_attn_groups
+                for group in groups
+            ]
+            for groups in self.attn_groups:
+                for group in groups:
+                    builder = group.get_metadata_builder(0)
+                    if not hasattr(builder, "share_persistent_kernel_scratch_from"):
+                        continue
+                    sources = [
+                        source
+                        for source in target_builders
+                        if type(source) is type(builder)
+                    ]
+                    if not sources:
+                        continue
+                    source = max(
+                        sources, key=lambda item: item.get_workspace_buffer_size()
+                    )
+                    builder.share_persistent_kernel_scratch_from(source)
         self.block_tables = block_tables
         # The target model runner's buffers and attention groups. Draft
         # prefill reuses the target model's attention metadata, so its

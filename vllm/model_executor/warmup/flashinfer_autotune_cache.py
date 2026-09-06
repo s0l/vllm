@@ -20,7 +20,9 @@ def flashinfer_autotune_cache_hash(runner: "GPUModelRunner") -> str:
     return hashlib.sha256(config_hash.encode()).hexdigest()
 
 
-def resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
+def resolve_flashinfer_autotune_file(
+    runner: "GPUModelRunner", *, create_parent: bool = True
+) -> Path:
     accepted_file = os.environ.get("AG2_FLASHINFER_ACCEPTED_AUTOTUNE_FILE", "")
     accepted_sha256 = os.environ.get("AG2_FLASHINFER_ACCEPTED_AUTOTUNE_SHA256", "")
     if bool(accepted_file) != bool(accepted_sha256):
@@ -60,7 +62,8 @@ def resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
         )
 
     output_dir = root / flashinfer_autotune_cache_hash(runner)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if create_parent:
+        output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir / "autotune_configs.json"
 
 

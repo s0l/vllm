@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
 import dataclasses
 import time
 from collections import deque
 from concurrent.futures import Future
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock, call
+from unittest.mock import Mock, call, patch
 
 import pytest
 import torch
@@ -8581,11 +8582,12 @@ def test_running_text_wave_prepares_one_final_shape_maintenance():
 
 
 @pytest.mark.parametrize(("source_x", "destination_x"), [(32, 16), (4, 8)])
+@pytest.mark.parametrize("with_waiting", [False, True])
 @pytest.mark.parametrize(
     "blocker", [None, "inflight", "capacity", "unknown", "lease", "loan"]
 )
 def test_running_cold_form_pressure_reclaim_makes_progress(
-    source_x, destination_x, blocker
+    source_x, destination_x, blocker, with_waiting
 ):
     """A quiescent wave must not wait forever for optional pinned residency."""
     scheduler = _make_elastic_running_text_wave_scheduler(num_reqs=destination_x)
@@ -8610,6 +8612,35 @@ def test_running_cold_form_pressure_reclaim_makes_progress(
     coordinator.elastic_external_memory_bytes = 120
     coordinator.max_elastic_external_memory.return_value = 150
     coordinator.normalize_elastic_external_memory.side_effect = lambda n: n
+    if with_waiting:
+        request = Mock(
+            request_id="optional-waiting",
+            status=RequestStatus.WAITING,
+            num_computed_tokens=0,
+            num_stale_output_tokens=0,
+            has_encoder_inputs=False,
+            force_non_speculative=False,
+            num_tokens=4,
+            num_prompt_tokens=4,
+            execution_prefill_len=4,
+        )
+        scheduler.waiting = [request]
+        scheduler.requests[request.request_id] = request
+        scheduler.kv_cache_manager.get_computed_blocks.return_value = (Mock(), 0, 0)
+        scheduler.kv_cache_manager.estimate_uncached_full_sequence_requirements.return_value = (  # noqa: E501
+            KVCacheBlockPoolRequirements(primary=7)
+        )
+        # The optional expansion cannot be admitted by reclaim; it must not
+        # remove the independently fundable RUNNING cold-form recovery path.
+        scheduler._prepare_elastic_waiting_deficit_reclaim = Mock(return_value=False)
+        can_fund = scheduler._can_fund_elastic_graph_step
+
+        def fund_running_only(key, **kwargs):
+            if key != destination:
+                return False, 1000, 150
+            return can_fund(key, **kwargs)
+
+        scheduler._can_fund_elastic_graph_step = fund_running_only
     if blocker == "capacity":
         coordinator.max_elastic_external_memory.return_value = 129
     elif blocker == "unknown":
@@ -8686,6 +8717,28 @@ def test_running_cold_form_pressure_reclaim_makes_progress(
     )
     assert key == destination and not maintenance
     assert controller.pending_maintenance_plan is None
+
+
+def test_running_wave_defer_observer_deduplicates_but_reports_new_budget():
+    scheduler = _make_elastic_running_text_wave_scheduler(num_reqs=1)
+    scheduler._elastic_last_defer_reason = "insufficient_reclaimable_graph_and_kv_bytes"
+    key = (0, 3, 1, 4, 4)
+    with patch("vllm.v1.core.sched.scheduler.logger.warning") as warning:
+        for available in (100, 100, 120):
+            scheduler._observe_elastic_running_wave_defer(
+                key,
+                required_external=200,
+                available_external=available,
+                physical_quiescent=True,
+            )
+        assert warning.call_count == 2
+        assert warning.call_args_list[0].args[1:5] == (
+            key,
+            scheduler._elastic_last_defer_reason,
+            200,
+            100,
+        )
+        assert warning.call_args_list[1].args[4] == 120
 
 
 def test_running_text_wave_prices_full_future_kv_and_gdn_before_allocation():
@@ -8837,7 +8890,7 @@ def test_running_text_wave_preserves_liveness_with_waiting_work():
     assert attempted[0].args[0] == joint_key
     assert attempted[-1].args[0] == running_key
     assert all(item.kwargs.get("preview_only") for item in attempted[:-1])
-    scheduler._prepare_elastic_waiting_deficit_reclaim.assert_not_called()
+    scheduler._prepare_elastic_waiting_deficit_reclaim.assert_called_once()
     scheduler._reserve_elastic_admission.assert_called_once()
     assert scheduler._reserve_elastic_admission.call_args.args[0] == running_key
     assert scheduler._elastic_preflight_joint_waiting_request_ids == ()
@@ -9620,7 +9673,8 @@ def test_running_waiting_joint_wave_reaches_graph_plan_after_idle_reclaim():
     )
 
 
-def test_running_x1_waiting_x38_preflight_requests_one_pressure_reclaim():
+@pytest.mark.parametrize("running_fits", [False, True])
+def test_running_x1_waiting_x38_preflight_requests_one_pressure_reclaim(running_fits):
     scheduler = _make_elastic_running_text_wave_scheduler(num_reqs=1)
     scheduler.max_num_running_reqs = 39
     waiting = [
@@ -9643,7 +9697,14 @@ def test_running_x1_waiting_x38_preflight_requests_one_pressure_reclaim():
     scheduler.kv_cache_manager.estimate_uncached_full_sequence_requirements.return_value = (  # noqa: E501
         KVCacheBlockPoolRequirements(primary=7)
     )
-    scheduler._can_fund_elastic_graph_step = Mock(return_value=(False, 200, 128))
+    running_key = scheduler._canonical_elastic_graph_step_key({"decode-0": 4}, 3, True)
+    scheduler._can_fund_elastic_graph_step = Mock(
+        side_effect=lambda key, **_kwargs: (
+            (True, 64, 128)
+            if running_fits and key == running_key
+            else (False, 200, 128)
+        )
+    )
     scheduler._prepare_elastic_waiting_deficit_reclaim = Mock(return_value=True)
 
     assert scheduler._preflight_elastic_running_text_wave(
@@ -10077,6 +10138,7 @@ def test_mixed_running_waiting_mm_wave_arms_one_exact_graph_only_capture():
 
 def _make_elastic_waiting_text_wave_scheduler(num_reqs: int = 8) -> Scheduler:
     scheduler = _new_elastic_scheduler()
+    scheduler.num_prefill_lookahead = 1
     scheduler.elastic_on_demand_graphs = True
     _clear_elastic_maintenance(scheduler)
     scheduler._elastic_admission_controller.resident_bytes = 0
@@ -13228,6 +13290,63 @@ def test_elastic_restore_hot_witness_reborrows_tail_for_coalesced_descriptor():
     )
 
 
+@pytest.mark.parametrize(
+    "peak, resident, expected_loan",
+    [(300, 174, 300), (344, 174, 332), (350, 350, None)],
+)
+def test_elastic_hot_price_records_kv_loan_not_total_cuda_peak(
+    peak, resident, expected_loan
+):
+    scheduler = _new_elastic_scheduler(RuntimeGeneration("hot-loan-unit"))
+    scheduler.elastic_on_demand_graphs = True
+    scheduler._elastic_restore_mode = True
+    key = (0, 3, 39, 1024, 0)
+    controller = scheduler._elastic_admission_controller
+    controller.step_key = key
+    controller.recapture_pending_key = None
+    _reset_elastic_loans(scheduler, (key, 332))
+    scheduler._elastic_graph_catalog = {
+        key: {
+            "cold_peak_bytes": 174,
+            "hot_peak_bytes": 174,
+            "resident_bytes": 174,
+            "floor_bytes": 0,
+            "cold_observations": 2,
+            "cold_stable_replays": 1,
+            "hot_observations": 2,
+            "hot_stable_replays": 1,
+        }
+    }
+    controller.capture_envelopes = {key: (174, 0, 0)}
+    controller.measured_bytes = {key: 174}
+    controller.resident_bytes = 174
+    scheduler.running = [object()] * 39
+    coordinator = Mock()
+    coordinator.elastic_external_memory_bytes = 332
+    coordinator.normalize_elastic_external_memory.side_effect = lambda value: value
+    coordinator.set_elastic_external_memory.return_value = True
+    scheduler.kv_cache_manager = Mock(coordinator=coordinator)
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {
+        **{f"decode-{index}": 4 for index in range(38)},
+        "prefill": 872,
+    }
+    output.total_num_scheduled_tokens = 1024
+    output.num_spec_tokens_to_schedule = 3
+    output.elastic_external_memory_bytes = 332
+    if expected_loan is None:
+        with pytest.raises(RuntimeError, match="residency exceeds its Graph loan"):
+            _settle_elastic_with_receipt(scheduler, output, resident, 0, peak)
+        assert controller.measured_bytes[key] == 174
+        assert controller.max_pending_grant() == 332
+        return
+    _settle_elastic_with_receipt(scheduler, output, resident, 0, peak)
+    assert controller.measured_bytes[key] == expected_loan
+    assert scheduler._elastic_graph_catalog[key]["hot_peak_bytes"] == expected_loan
+    assert controller.last_maintenance_step_key is None
+    assert controller.resident_bytes == 174
+
+
 def test_elastic_restore_hot_growth_expands_cold_recapture_envelope():
     scheduler = _new_elastic_scheduler(RuntimeGeneration("scheduler-unit"))
     scheduler.elastic_on_demand_graphs = True
@@ -13640,7 +13759,8 @@ def test_elastic_fully_hot_owner_set_uses_exact_hot_replay_envelope():
     )
 
 
-def test_elastic_x2_to_x1_tail_composes_live_transition_floor_upper_bound():
+@pytest.mark.parametrize("sealed", [False, True])
+def test_elastic_x2_to_x1_tail_composes_live_transition_floor_upper_bound(sealed):
     scheduler = _new_elastic_scheduler()
     source_key = (1, 3, 2, 8, 4)
     destination_key = (1, 3, 1, 4, 4)
@@ -13674,6 +13794,12 @@ def test_elastic_x2_to_x1_tail_composes_live_transition_floor_upper_bound():
     )
     scheduler.kv_cache_manager = Mock(coordinator=coordinator)
 
+    scheduler._elastic_graph_catalog_coverage = (
+        {"_catalog_source_sha256": "a" * 64} if sealed else {}
+    )
+    prices_before = copy.deepcopy(
+        scheduler._elastic_admission_controller.capture_envelopes
+    )
     grant = scheduler._plan_elastic_graph_loan(
         destination_key,
         minimum_free_primary_blocks=len(scheduler.running),
@@ -13681,6 +13807,10 @@ def test_elastic_x2_to_x1_tail_composes_live_transition_floor_upper_bound():
 
     assert grant == 301989888
     assert grant >= actual_failed_transition_peak
+    if sealed:
+        assert (
+            scheduler._elastic_admission_controller.capture_envelopes == prices_before
+        )
     assert (
         scheduler._elastic_admission_controller.recapture_pending_key == destination_key
     )
@@ -13739,7 +13869,8 @@ def test_elastic_step5_cold_same_logical_owner_requires_recapture():
     )
 
 
-def test_elastic_cold_growth_funds_immediate_same_key_hot_replay():
+@pytest.mark.parametrize("price_role", ["unsealed", "serving", "calibration"])
+def test_elastic_cold_growth_funds_immediate_same_key_hot_replay(price_role):
     scheduler = _new_elastic_scheduler(RuntimeGeneration("scheduler-unit"))
     key = (1, 3, 1, 4, 4)
     scheduler.elastic_on_demand_graphs = True
@@ -13769,6 +13900,7 @@ def test_elastic_cold_growth_funds_immediate_same_key_hot_replay():
     scheduler.scheduler_config = Mock(max_num_batched_tokens=4096, max_num_seqs=64)
     coordinator = Mock()
     coordinator.elastic_external_memory_bytes = 337641472
+    coordinator.max_elastic_external_memory.return_value = 1 << 30
     coordinator.normalize_elastic_external_memory.side_effect = lambda value: (
         ((value + (2 << 20) - 1) // (2 << 20)) * (2 << 20)
     )
@@ -13783,6 +13915,14 @@ def test_elastic_cold_growth_funds_immediate_same_key_hot_replay():
     output.num_spec_tokens_to_schedule = 3
     output.is_pure_decode_step = True
     output.elastic_external_memory_bytes = 337641472
+    scheduler._elastic_graph_catalog_coverage = (
+        {} if price_role == "unsealed" else {"_catalog_source_sha256": "a" * 64}
+    )
+    scheduler._elastic_restore_mode = price_role == "calibration"
+    catalog_before = copy.deepcopy(scheduler._elastic_graph_catalog)
+    prices_before = copy.deepcopy(
+        scheduler._elastic_admission_controller.capture_envelopes
+    )
     _settle_elastic_with_receipt(
         scheduler,
         output,
@@ -13792,8 +13932,18 @@ def test_elastic_cold_growth_funds_immediate_same_key_hot_replay():
         publish_step_key=key,
     )
 
-    assert scheduler._elastic_admission_controller.measured_bytes[key] == 268435456
+    assert scheduler._elastic_admission_controller.measured_bytes[key] == (
+        239075328 if price_role == "serving" else 268435456
+    )
+    if price_role == "serving":
+        assert scheduler._elastic_graph_catalog == catalog_before
+        assert (
+            scheduler._elastic_admission_controller.capture_envelopes == prices_before
+        )
     assert scheduler._elastic_admission_controller.recapture_pending_key is None
+    # The next assertion exercises serving replay, not calibration's explicit
+    # full-tail measurement loan.
+    scheduler._elastic_restore_mode = False
     assert (
         scheduler._plan_elastic_graph_loan(
             key, minimum_free_primary_blocks=len(scheduler.running)
@@ -13824,6 +13974,34 @@ def test_elastic_piecewise_cross_x_floor_rejects_insufficient_calibration_tail()
         minimum_free_primary_blocks=22,
         gdn_blocks=67,
     ) == (False, 600, 500)
+
+
+def test_restore_admission_failure_snapshot_is_read_only(monkeypatch):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    scheduler = create_scheduler(max_num_seqs=3)
+    manager = scheduler.kv_cache_manager
+    before = manager.block_pool.get_num_free_blocks()
+    rejection = ((0, 3, 3, 1024, 0), 201, 200)
+    scheduler._elastic_last_graph_admission_rejection = rejection
+    tokens = {"base": 4}
+    result = scheduler._elastic_restore_admission_diagnostic(
+        "graph_funding_rejected", 4092, tokens
+    )
+    assert result["graph_rejection"] == rejection
+    assert result["allocation_rejection"] is None
+    assert result["stop_reason"] == "graph_funding_rejected"
+    assert result["gdn"] is None
+    assert result["primary"]["free"] == before
+    assert result["scheduled_tokens"] == tokens
+    result["scheduled_tokens"].clear()
+    assert tokens == {"base": 4}
+    assert manager.block_pool.get_num_free_blocks() == before
+    scheduler._elastic_last_graph_admission_rejection = None
+    recovered = scheduler._elastic_restore_admission_diagnostic(None, 4096, {})
+    assert recovered["graph_rejection"] is None
+    assert result["graph_rejection"] == rejection
 
 
 def test_elastic_graph_maxx_defers_waiting_request_before_kv_allocation(
