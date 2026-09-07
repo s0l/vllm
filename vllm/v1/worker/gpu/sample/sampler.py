@@ -234,7 +234,12 @@ class Sampler:
 
         # Apply logit bias (e.g., allowed_token_ids, min_tokens) in place.
         self.logit_bias_state.apply_logit_bias(
-            logits, expanded_idx_mapping, idx_mapping_np, pos
+            logits,
+            expanded_idx_mapping,
+            idx_mapping_np,
+            pos,
+            vocab_start=vocab_start,
+            vocab_is_sharded=logits.shape[-1] != self.sampling_states.vocab_size,
         )
         capture("after_logit_bias", logits)
 

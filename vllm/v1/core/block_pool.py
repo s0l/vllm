@@ -179,6 +179,7 @@ class BlockPool:
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
         self.prefer_low_id_allocations = prefer_low_id_allocations
+        self.cache_preservation_num_blocks: int | None = None
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
@@ -669,7 +670,29 @@ class BlockPool:
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
         if self.prefer_low_id_allocations:
-            if self.active_num_gpu_blocks == self.num_gpu_blocks:
+            frontier = self.cache_preservation_num_blocks
+            if frontier is not None:
+                if not 1 <= frontier <= self.num_gpu_blocks:
+                    raise ValueError("invalid cache preservation frontier")
+                frontier = min(frontier, self.active_num_gpu_blocks)
+                uncached = []
+                cached = []
+                tail = []
+                for block in self.blocks[1 : self.active_num_gpu_blocks]:
+                    if block.ref_cnt != 0:
+                        continue
+                    if block.block_id >= frontier:
+                        tail.append(block)
+                    elif (
+                        block.block_hash is not None
+                        or block.block_id in self.cached_block_hashes_by_block
+                    ):
+                        cached.append(block)
+                    else:
+                        uncached.append(block)
+                # Fill every low hole before entering the shrinkable tail.
+                ret = (uncached + cached + tail)[:num_blocks]
+            elif self.active_num_gpu_blocks == self.num_gpu_blocks:
                 # At the fully expanded attention mapping, unused capacity can
                 # preserve prefix-cache entries without constraining an
                 # elastic shrink. Prefer lowest-ID uncached blocks first and

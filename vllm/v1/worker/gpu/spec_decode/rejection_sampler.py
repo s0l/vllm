@@ -172,7 +172,9 @@ class RejectionSampler:
             return False
         if self.sampler.logprob_token_ids_state.max_num_token_ids(idx) > 0:
             return False
-        if np.any(self.sampler.logit_bias_state.use_logit_bias[idx]):
+        if np.any(self.sampler.logit_bias_state.use_logit_bias[idx]) and not (
+            self.sampler.logit_bias_state.can_apply_sharded(idx)
+        ):
             return False
         return not np.any(self.sampler.bad_words_state.num_bad_words.np[idx] > 0)
 

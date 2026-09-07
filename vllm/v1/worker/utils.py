@@ -688,9 +688,24 @@ def copy_kv_cache_blocks_inplace(
         return
     first_tensor = copy_regions[0].tensor if copy_regions else storage_tensors[0]
     device = first_tensor.device
-    indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
-    indices = async_tensor_h2d(indices_np, device=device)
-    src_indices, dst_indices = indices.unbind(dim=1)
+    # CoW destinations are fresh blocks, disjoint from all retained sources.
+    # Advanced indexing gathers a full temporary of N * block_stride bytes
+    # (GiBs with elastic cross-layer blocks). Copy disjoint views directly.
+    # Preserve snapshot semantics for general overlapping/cyclic callers.
+    disjoint = {src for src, _ in kv_cache_block_copies}.isdisjoint(
+        dst for _, dst in kv_cache_block_copies
+    )
+    if not disjoint:
+        indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
+        indices = async_tensor_h2d(indices_np, device=device)
+        src_indices, dst_indices = indices.unbind(dim=1)
+
+    def copy_blocks(blocks: torch.Tensor) -> None:
+        if disjoint:
+            for src, dst in kv_cache_block_copies:
+                blocks[dst].copy_(blocks[src])
+        else:
+            blocks[dst_indices] = blocks[src_indices]
 
     # A complete backing is copied at most once. Exact views that cover only a
     # strided slice retain upstream's independent view semantics below.
@@ -726,7 +741,7 @@ def copy_kv_cache_blocks_inplace(
             size=(region.num_blocks, region.block_stride_bytes),
             stride=(region.block_stride_bytes, 1),
         )
-        blocks[dst_indices] = blocks[src_indices]
+        copy_blocks(blocks)
 
     seen_views: set[tuple[torch.device, int]] = set()
     for tensor in storage_tensors:
@@ -761,7 +776,7 @@ def copy_kv_cache_blocks_inplace(
             # Fold virtual block splitting into the shape so dim 0 counts
             # scheduler blocks; unflatten of dim 0 remains a view.
             blocks = tensor.unflatten(0, (num_blocks, kernel_blocks_per_block))
-        blocks[dst_indices] = blocks[src_indices]
+        copy_blocks(blocks)
 
 
 def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:

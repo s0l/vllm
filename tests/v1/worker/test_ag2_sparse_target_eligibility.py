@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from vllm.sampling_params import SamplingParams
+from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 from vllm.v1.worker.gpu.states import RequestState
@@ -65,6 +66,32 @@ def _make_input_batch() -> SimpleNamespace:
 def test_sparse_target_accepts_plain_active_mrv2_slots() -> None:
     rejection = _make_sampler()
     assert rejection.can_use_sparse_target_topk(_make_input_batch())
+
+
+@pytest.mark.parametrize("blocked", [None, "allowed", "bias", "restore"])
+def test_sparse_target_min_tokens_only_admission(blocked):
+    rejection = _make_sampler()
+    state = LogitBiasState.__new__(LogitBiasState)
+    state.use_logit_bias = np.ones(16, dtype=bool)
+    state.num_allowed_token_ids = _ArrayState([0] * 16)
+    state.num_logit_bias = _ArrayState([0] * 16)
+    state.restore_when_all_masked = _ArrayState([0] * 16)
+    if blocked is not None:
+        field = {
+            "allowed": state.num_allowed_token_ids,
+            "bias": state.num_logit_bias,
+            "restore": state.restore_when_all_masked,
+        }[blocked]
+        field.np[12] = 1
+    rejection.sampler.logit_bias_state = state
+    assert rejection.can_use_sparse_target_topk(_make_input_batch()) == (
+        blocked is None
+    )
+    # An inactive slot cannot poison the active batch's domain.
+    if blocked is not None:
+        field.np[12] = 0
+        field.np[2] = 1
+        assert rejection.can_use_sparse_target_topk(_make_input_batch())
 
 
 def test_sparse_target_accepts_active_thinking_budget_slot() -> None:

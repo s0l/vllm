@@ -31,7 +31,12 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
 
-def _parse_prefix_cache_hint_tokens(extra_args: dict[str, Any] | None) -> int:
+def _parse_prefix_cache_hint_tokens(
+    extra_args: dict[str, Any] | None,
+    *,
+    hash_block_size: int | None = None,
+    use_eagle: bool = False,
+) -> int:
     """Parse the bounded DCP fine-prefix research hint."""
     value = (extra_args or {}).get("ag2_prefix_cache_hint_tokens")
     if value is None:
@@ -55,7 +60,7 @@ def _parse_prefix_cache_hint_tokens(extra_args: dict[str, Any] | None) -> int:
         raise ValueError(
             "AG2_VLLM_DCP_FINE_PREFIX_HINT_TOKENS must be a positive integer"
         )
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
         raise ValueError("ag2_prefix_cache_hint_tokens must be an integer")
     try:
         value_tokens = int(value)
@@ -66,6 +71,11 @@ def _parse_prefix_cache_hint_tokens(extra_args: dict[str, Any] | None) -> int:
             "ag2_prefix_cache_hint_tokens must equal the server-configured "
             f"boundary ({configured_tokens})"
         )
+    if hash_block_size is not None:
+        if value_tokens % hash_block_size:
+            raise ValueError("prefix-cache hint must be hash aligned")
+        if use_eagle and value_tokens <= hash_block_size:
+            raise ValueError("prefix-cache hint must exceed the EAGLE/MTP overlap")
     return value_tokens
 
 

@@ -81,6 +81,45 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 
+@pytest.mark.parametrize("mm_bytes,expected", [(0, 3), (8, 3), (100, 1)])
+def test_prefix_cache_frontier_prices_rank_gdn_graph_and_vision(mm_bytes, expected):
+    """The weakest rank and the two phase peaks define a non-reserved frontier."""
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.worker.startup_plan import ElasticGraphCatalog
+
+    coordinator = object.__new__(HybridKVCacheCoordinator)
+    coordinator.kv_cache_config = SimpleNamespace(
+        elastic_mapping_quantum=2,
+        elastic_gdn_initial_blocks=4,
+        elastic_gdn_blocks_per_request=3,
+        elastic_rank_budget_bytes=(100, 90),
+        elastic_rank_primary_mapped_bytes=(tuple(range(0, 90, 10)),) * 2,
+        elastic_rank_gdn_mapped_bytes=(tuple(range(0, 30, 3)),) * 2,
+    )
+    coordinator.block_pool = BlockPool(8, True, 4, prefer_low_id_allocations=True)
+    coordinator.mamba_block_pool = BlockPool(10, False, 4)
+    scheduler = object.__new__(Scheduler)
+    scheduler.elastic_on_demand_graphs = True
+    scheduler.kv_cache_manager = SimpleNamespace(coordinator=coordinator)
+    scheduler.max_num_running_reqs = 2
+    scheduler._elastic_mm_activation_loan_bytes = mm_bytes
+    scheduler._elastic_graph_catalog = ElasticGraphCatalog(source_sha256="a" * 64)
+    scheduler._elastic_graph_catalog[(0, 3, 2, 8, 4)] = {
+        "cold_peak_bytes": 30,
+        "hot_peak_bytes": 20,
+    }
+    scheduler._elastic_graph_catalog_coverage = {"_catalog_source_sha256": "a" * 64}
+    scheduler._elastic_pressure_floor_external_bytes = lambda: 0
+    scheduler._refresh_elastic_cache_frontier()
+    assert coordinator.block_pool.cache_preservation_num_blocks == expected
+    assert coordinator.block_pool.active_num_gpu_blocks == 8
+    assert coordinator.block_pool.get_num_free_blocks() == 7
+    # Foreign/unsealed coverage cannot activate speculative cache placement.
+    scheduler._elastic_graph_catalog_coverage.clear()
+    scheduler._refresh_elastic_cache_frontier()
+    assert coordinator.block_pool.cache_preservation_num_blocks == 1
+
+
 def _elastic_controller(scheduler: Scheduler) -> ElasticAdmissionController:
     if not hasattr(scheduler, "scheduler_config"):
         scheduler.scheduler_config = SimpleNamespace(
@@ -9575,10 +9614,13 @@ def test_failed_prefix_joint_variants_retry_running_without_stale_identity():
         defer_prefills=False,
     ) == (running_key, False)
     assert attempted_keys == [
-        (0, 3, 9, 256, 0),
+        (0, 3, 9, 128, 0),
+        (0, 3, 9, 256, 0),  # One cold retry before deferring the arrival.
         running_key,
     ]
-    scheduler.kv_cache_manager.get_computed_blocks.assert_not_called()
+    scheduler.kv_cache_manager.get_computed_blocks.assert_called_once_with(waiting)
+    scheduler.kv_cache_manager.lease_computed_blocks.return_value.release.assert_called_once()
+    assert scheduler._elastic_prefix_hits == {}
     assert scheduler._elastic_preflight_joint_waiting_request_ids == ()
     assert scheduler._elastic_preflight_waiting_ignore_prefix_request_ids == ()
     assert _pending_elastic_maintenance(scheduler) is None
@@ -9613,6 +9655,7 @@ def test_running_waiting_joint_wave_excludes_full_isl_overcapacity():
     )
     scheduler.kv_cache_manager.coordinator.max_elastic_external_memory.return_value = 99
     scheduler._elastic_graph_catalog_coverage["pinned_full_bytes"] = 100
+    scheduler._elastic_pressure_floor_external_bytes = Mock(return_value=100)
     scheduler._can_fund_elastic_graph_step = Mock(return_value=(True, 64, 128))
 
     key, prepared_maintenance = scheduler._preflight_elastic_running_text_wave(
@@ -9627,7 +9670,10 @@ def test_running_waiting_joint_wave_excludes_full_isl_overcapacity():
     scheduler._can_fund_elastic_graph_step.assert_called_once()
 
 
-def test_running_waiting_joint_wave_reaches_graph_plan_after_idle_reclaim():
+@pytest.mark.parametrize("optional_pinned_bytes", [50, 150])
+def test_running_waiting_joint_wave_reaches_graph_plan_after_idle_reclaim(
+    optional_pinned_bytes,
+):
     scheduler = _make_elastic_running_text_wave_scheduler(num_reqs=1)
     scheduler.scheduler_reserve_full_isl = True
     waiting = Mock(
@@ -9652,7 +9698,9 @@ def test_running_waiting_joint_wave_reaches_graph_plan_after_idle_reclaim():
     scheduler.kv_cache_manager.coordinator.max_elastic_external_memory.return_value = (
         100
     )
-    scheduler._elastic_graph_catalog_coverage["pinned_full_bytes"] = 50
+    scheduler._elastic_graph_catalog_coverage["pinned_full_bytes"] = (
+        optional_pinned_bytes
+    )
     scheduler._can_fund_elastic_graph_step = Mock(return_value=(True, 64, 128))
 
     key, prepared_maintenance = scheduler._preflight_elastic_running_text_wave(
@@ -9717,6 +9765,83 @@ def test_running_x1_waiting_x38_preflight_requests_one_pressure_reclaim(running_
         (7,) * 38,
         physical_quiescent=True,
     )
+
+
+@pytest.mark.parametrize(
+    "blocker", [None, "inflight", "capacity", "unknown", "lease", "loan"]
+)
+def test_running_hot_waiting_cold_graph_reclaim_without_kv_deficit(blocker):
+    scheduler = _make_elastic_running_text_wave_scheduler(num_reqs=1)
+    scheduler._elastic_graph_execution_policy = _current_q4_piecewise_policy()
+    controller = scheduler._elastic_admission_controller
+    source = (0, 3, 1, 4, 4)
+    destination = (0, 3, 2, 8, 0)
+    scheduler._elastic_graph_carrier_step_key = source
+    terminal = scheduler._resolve_elastic_step_physical_keys((1, 3, 40, 40, 1))[-1]
+    scheduler._elastic_serving_carrier_keys = (terminal,)
+    controller.publish_hot(terminal, GraphPrice(20, 20, "terminal"), pinned=True)
+    for key in scheduler._resolve_elastic_step_physical_keys(source):
+        controller.publish_hot(key, GraphPrice(30, 30, key.identity), pinned=True)
+    controller.resident_bytes = 120
+    controller.floor_bytes = 10
+    controller.transition_floor_bytes = 10
+    controller.record_capture_envelope(
+        scheduler._elastic_graph_owner_key(destination), (100, 10, 0)
+    )
+    scheduler._elastic_graph_catalog = {}
+    coordinator = scheduler.kv_cache_manager.coordinator
+    coordinator.elastic_external_memory_bytes = 120
+    coordinator.max_elastic_external_memory.return_value = 150
+    coordinator.normalize_elastic_external_memory.side_effect = lambda n: n
+    request = Mock(
+        request_id="new-work",
+        status=RequestStatus.WAITING,
+        num_computed_tokens=0,
+        num_stale_output_tokens=0,
+        has_encoder_inputs=False,
+        force_non_speculative=False,
+        num_tokens=4,
+        num_prompt_tokens=4,
+        execution_prefill_len=4,
+    )
+    scheduler.waiting = [request]
+    scheduler.requests[request.request_id] = request
+    scheduler.kv_cache_manager.get_computed_blocks.return_value = (Mock(), 0, 0)
+    scheduler.kv_cache_manager.estimate_uncached_full_sequence_requirements.return_value = KVCacheBlockPoolRequirements(  # noqa: E501
+        primary=7
+    )
+    scheduler._prepare_elastic_waiting_deficit_reclaim = Mock(return_value=False)
+    # Preview must not depend on a previous wave's mutable diagnostic reason.
+    scheduler._elastic_last_defer_reason = None
+    if blocker == "capacity":
+        coordinator.max_elastic_external_memory.return_value = 129
+    elif blocker == "unknown":
+        controller.capture_envelopes.clear()
+    elif blocker == "lease":
+        user = controller.plan(
+            "inflight", tuple(controller.entries), request_bytes=0, available_bytes=1000
+        )
+        controller.commit_user(user)
+    elif blocker == "loan":
+        controller.reserve_loan(source, 120)
+    entries = dict(controller.entries)
+    key, maintenance = scheduler._preflight_elastic_running_text_wave(
+        token_budget=4096,
+        prefill_chunk_cap=0,
+        defer_prefills=False,
+        physical_quiescent=blocker != "inflight",
+    )
+    assert dict(controller.entries) == entries
+    coordinator.set_elastic_external_memory.assert_not_called()
+    if blocker is not None:
+        assert key == source and not maintenance
+        assert controller.pending_maintenance_plan is None
+        return
+    assert key is None and maintenance
+    plan = controller.pending_maintenance_plan
+    assert plan is not None and plan.kind == ElasticPlanKind.PRESSURE_RECLAIM
+    assert plan.protected_keys == (terminal,)
+    scheduler._reserve_elastic_admission.assert_not_called()
 
 
 def test_waiting_preflight_selects_budget_prefix_before_considering_reclaim():
@@ -9786,6 +9911,7 @@ def test_waiting_preflight_rejects_zero_aligned_candidate_before_x0_pricing():
     scheduler.need_mamba_block_aligned_split = True
     request = Mock(
         request_id="unaligned",
+        prefix_cache_hint_tokens=0,
         status=RequestStatus.WAITING,
         num_computed_tokens=0,
         num_stale_output_tokens=0,
@@ -10217,6 +10343,295 @@ def test_waiting_text_wave_preflights_only_final_assembled_shape():
     assert "preview_only" not in (
         scheduler._can_fund_elastic_graph_step.call_args_list[1].kwargs
     )
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("cold", [False, True])
+def test_elastic_prefix_lease_binds_hot_and_cold_wave(mixed, cold):
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks, PrefixCacheLease
+
+    scheduler = _make_elastic_waiting_text_wave_scheduler(num_reqs=2)
+    if mixed:
+        running = _make_elastic_running_text_wave_scheduler(num_reqs=1)
+        scheduler.running = running.running
+        scheduler.requests.update(running.requests)
+        scheduler.num_sampled_tokens_per_step = 1
+        scheduler.current_step = 7
+        scheduler.max_model_len = 262144
+        scheduler.canonical_prefill_admission = False
+    pool = BlockPool(5, True, 16)
+    blocks = pool.get_new_blocks(1)
+    pool.free_blocks(blocks)
+    hit = KVCacheBlocks((tuple(blocks),))
+    for request in scheduler.waiting:
+        request.num_tokens = request.num_prompt_tokens = 128
+        request.execution_prefill_len = 128
+    scheduler.kv_cache_manager.get_computed_blocks.return_value = (hit, 64, 0)
+    scheduler.kv_cache_manager.lease_computed_blocks.side_effect = lambda value: (
+        PrefixCacheLease([(pool, value.blocks[0])])
+    )
+
+    def fund(key, **kwargs):
+        if cold and not kwargs.get("preview_only"):
+            _arm_fixture_capture(scheduler, key)
+            return False, 96, 128
+        return True, 64, 128
+
+    scheduler._can_fund_elastic_graph_step = Mock(side_effect=fund)
+    preflight = (
+        scheduler._preflight_elastic_running_text_wave
+        if mixed
+        else scheduler._preflight_elastic_waiting_text_wave
+    )
+    result = preflight(token_budget=4096, prefill_chunk_cap=0, defer_prefills=False)
+    assert result[0][3] == (256 if mixed else 128)
+    assert result[1] is cold
+    assert scheduler._elastic_preflight_waiting_ignore_prefix_request_ids == ()
+    assert blocks[0].ref_cnt == 2
+    # Commit must consume exactly the held result even if the lookup source changes.
+    scheduler.kv_cache_manager.get_computed_blocks.return_value = (Mock(), 0, 0)
+    for request in scheduler.waiting:
+        assert scheduler._get_local_prefix_cache_hit(request) == (hit, 64, 0, False)
+    assert scheduler.kv_cache_manager.get_computed_blocks.call_count == 2
+    scheduler._release_elastic_prefix_hits()
+    assert blocks[0].ref_cnt == 0
+
+
+def test_elastic_prefix_schedule_exception_releases_all_leases():
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks, PrefixCacheLease
+
+    scheduler = _make_elastic_waiting_text_wave_scheduler(num_reqs=1)
+    pool = BlockPool(4, True, 16)
+    blocks = pool.get_new_blocks(1)
+    pool.free_blocks(blocks)
+    hit = KVCacheBlocks((tuple(blocks),))
+    scheduler.kv_cache_manager.get_computed_blocks.return_value = (hit, 1, 0)
+    scheduler.kv_cache_manager.lease_computed_blocks.side_effect = lambda value: (
+        PrefixCacheLease([(pool, value.blocks[0])])
+    )
+
+    def fail(*args, **kwargs):
+        scheduler._lease_local_prefix_cache_hit(scheduler.waiting[0])
+        assert blocks[0].ref_cnt == 1
+        raise RuntimeError("failed allocation")
+
+    scheduler._schedule_with_prefix_leases = fail
+    with pytest.raises(RuntimeError, match="failed allocation"):
+        scheduler.schedule()
+    assert blocks[0].ref_cnt == 0
+    assert scheduler._elastic_prefix_hits == {}
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize(
+    "num_cached,shared,hint", [(0, 384, 0), (192, 576, 0), (0, 0, 384), (0, 0, 0)]
+)
+def test_elastic_prefix_preflight_uses_commit_checkpoint_boundaries(
+    mixed, num_cached, shared, hint
+):
+    """A detected junction is relevant even when no KV prefix is reusable."""
+    from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
+
+    scheduler = _make_elastic_waiting_text_wave_scheduler(num_reqs=1)
+    if mixed:
+        running = _make_elastic_running_text_wave_scheduler(num_reqs=1)
+        scheduler.running = running.running
+        scheduler.requests.update(running.requests)
+        scheduler.num_sampled_tokens_per_step = 1
+        scheduler.current_step = 7
+        scheduler.max_model_len = 262144
+        scheduler.canonical_prefill_admission = False
+    scheduler.need_mamba_block_aligned_split = True
+    scheduler.block_size = 7488
+    scheduler.hash_block_size = 192
+    scheduler.use_eagle = True
+    scheduler.mamba_partial_cache_hit = True
+    scheduler.mamba_state_update_alignment = 64
+    scheduler.max_num_scheduled_tokens = 4096
+    coordinator = scheduler.kv_cache_manager.coordinator
+    coordinator.__class__ = HybridKVCacheCoordinator
+    coordinator.enable_dcp_fine_prefix = True
+    coordinator.gdn_checkpoint_keys = {}
+    request = scheduler.waiting[0]
+    request.num_tokens = request.num_prompt_tokens = request.execution_prefill_len = (
+        1200
+    )
+    request.shared_prefix_boundary = 960  # stale state must not decide this wave
+    request.prefix_cache_hint_tokens = hint
+    scheduler.kv_cache_manager.get_computed_blocks.return_value = (
+        Mock(),
+        num_cached,
+        shared,
+    )
+    scheduler._can_fund_elastic_graph_step = Mock(return_value=(True, 64, 128))
+    preflight = (
+        scheduler._preflight_elastic_running_text_wave
+        if mixed
+        else scheduler._preflight_elastic_waiting_text_wave
+    )
+    result = preflight(token_budget=4096, prefill_chunk_cap=1024, defer_prefills=False)
+    key, maintenance = result[:2]
+    assert not maintenance
+    assert request.shared_prefix_boundary == 960  # preview must not mutate request
+    request.shared_prefix_boundary = max(shared, hint)
+    committed = scheduler._mamba_block_aligned_split(request, 1024, num_cached, 0)
+    expected_rows = committed + (4 if mixed else 0)
+    assert key[3] == 1 << (expected_rows - 1).bit_length()
+    scheduler._release_elastic_prefix_hits()
+    assert scheduler._elastic_prefix_hits == {}
+
+    # A later cold retry must discard the former shared junction without
+    # mutating the still-stale request during preflight.
+    scheduler.kv_cache_manager.get_computed_blocks.return_value = (Mock(), 0, 0)
+    request.prefix_cache_hint_tokens = 0
+    stale_boundary = request.shared_prefix_boundary
+    cold = preflight(token_budget=4096, prefill_chunk_cap=1024, defer_prefills=False)
+    # MTP's prompt-tail checkpoint clips 1024 to 960; +4 decode rows
+    # still fit the same M1024 bucket.
+    assert cold[0][3] == 1024
+    assert request.shared_prefix_boundary == stale_boundary
+    scheduler._release_elastic_prefix_hits()
+
+
+def test_elastic_prefix_boundary_rejects_unaligned_hint_without_mutation():
+    scheduler = _make_elastic_waiting_text_wave_scheduler(num_reqs=1)
+    scheduler.hash_block_size = 192
+    request = scheduler.waiting[0]
+    request.prefix_cache_hint_tokens = 193
+    request.shared_prefix_boundary = 384
+    with pytest.raises(RuntimeError, match="hint is not hash aligned"):
+        scheduler._resolved_shared_prefix_boundary(request, 576)
+    assert request.shared_prefix_boundary == 384
+
+
+def test_elastic_prefix_smaller_wave_releases_excluded_waiting_before_pricing():
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks, PrefixCacheLease
+
+    scheduler = _make_elastic_waiting_text_wave_scheduler(num_reqs=2)
+    # Isolate suffix ownership; cold pressure replanning has its own control.
+    scheduler._drop_elastic_prefix_hits_for_pressure = Mock(return_value=False)
+    pool = BlockPool(5, True, 16)
+    blocks = pool.get_new_blocks(2)
+    pool.free_blocks(blocks)
+    hits = [KVCacheBlocks(((block,),)) for block in blocks]
+    for request in scheduler.waiting:
+        request.num_tokens = request.num_prompt_tokens = 128
+        request.execution_prefill_len = 128
+    scheduler.kv_cache_manager.get_computed_blocks.side_effect = [
+        (hit, 64, 0) for hit in hits
+    ]
+    scheduler.kv_cache_manager.lease_computed_blocks.side_effect = lambda value: (
+        PrefixCacheLease([(pool, value.blocks[0])])
+    )
+
+    def fund(key, **kwargs):
+        assert [block.ref_cnt for block in blocks] == (
+            [1, 1] if key[2] == 2 else [1, 0]
+        )
+        return key[2] == 1, 64, 128
+
+    scheduler._can_fund_elastic_graph_step = Mock(side_effect=fund)
+    key, maintenance, selected = scheduler._preflight_elastic_waiting_text_wave(
+        token_budget=4096,
+        prefill_chunk_cap=0,
+        defer_prefills=False,
+    )
+    assert key[2] == 1 and not maintenance
+    assert selected == (scheduler.waiting[0].request_id,)
+    assert len(scheduler.waiting) == 2
+    # Full-sequence demand counts pinned prefix storage once, not as new blocks.
+    scheduler.max_model_len = 262144
+    request = scheduler.waiting[0]
+    Scheduler._request_remaining_blocks(scheduler, request)
+    coordinator = scheduler.kv_cache_manager.coordinator
+    priced = coordinator.get_block_pool_requirements.call_args.kwargs
+    assert priced["new_computed_blocks"] == hits[0].blocks
+    assert priced["num_local_computed_tokens"] == 64
+    assert request.num_computed_tokens == 0
+    scheduler._release_elastic_prefix_hits()
+    assert pool.get_num_free_blocks() == 4
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_elastic_prefix_pressure_replans_once_without_reducing_wave(mixed):
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks, PrefixCacheLease
+
+    scheduler = _make_elastic_waiting_text_wave_scheduler(num_reqs=2)
+    if mixed:
+        running = _make_elastic_running_text_wave_scheduler(num_reqs=1)
+        scheduler.running = running.running
+        scheduler.requests.update(running.requests)
+        scheduler.num_sampled_tokens_per_step = 1
+        scheduler.current_step = 7
+        scheduler.max_model_len = 262144
+        scheduler.canonical_prefill_admission = False
+    pool = BlockPool(5, True, 16)
+    allocated = pool.get_new_blocks(4)
+    tail = allocated[-1:]
+    pool.free_blocks(allocated)
+    hit = KVCacheBlocks((tuple(tail),))
+    for request in scheduler.waiting:
+        request.num_tokens = request.num_prompt_tokens = 128
+        request.execution_prefill_len = 128
+    scheduler.kv_cache_manager.get_computed_blocks.return_value = (hit, 64, 0)
+    scheduler.kv_cache_manager.lease_computed_blocks.side_effect = lambda value: (
+        PrefixCacheLease([(pool, value.blocks[0])])
+    )
+    refs = []
+
+    def fund(key, **kwargs):
+        refs.append(tail[0].ref_cnt)
+        # A Graph loan needs the tail page; referenced cache cannot be evicted.
+        return tail[0].ref_cnt == 0, 64, 128
+
+    scheduler._can_fund_elastic_graph_step = Mock(side_effect=fund)
+    preflight = (
+        scheduler._preflight_elastic_running_text_wave
+        if mixed
+        else scheduler._preflight_elastic_waiting_text_wave
+    )
+    result = preflight(token_budget=4096, prefill_chunk_cap=0, defer_prefills=False)
+    assert result[0] is not None and not result[1]
+    assert result[0][2] == (3 if mixed else 2)
+    assert refs[0] == 2 and all(ref == 0 for ref in refs[1:])
+    assert scheduler.kv_cache_manager.get_computed_blocks.call_count == 2
+    assert not scheduler._drop_elastic_prefix_hits_for_pressure()
+    for request in scheduler.waiting:
+        assert scheduler._get_local_prefix_cache_hit(request)[1] == 0
+    scheduler._release_elastic_prefix_hits()
+    assert pool.deactivate_tail_blocks(4)
+
+
+@pytest.mark.parametrize("prompt_tokens,checkpoints", [(7265, []), (16065, [7488])])
+def test_coarse_dcp_prefix_requires_effective_block_checkpoint(
+    prompt_tokens, checkpoints
+):
+    scheduler = _make_elastic_waiting_text_wave_scheduler(num_reqs=1)
+    scheduler.block_size = 2496 * 3
+    scheduler.hash_block_size = 192
+    scheduler.use_eagle = True
+    scheduler.mamba_partial_cache_hit = False
+    scheduler.mamba_state_update_alignment = 64
+    scheduler.max_num_scheduled_tokens = 4096
+    request = scheduler.waiting[0]
+    request.execution_prefill_len = request.num_prompt_tokens = prompt_tokens
+    request.num_tokens = prompt_tokens
+    request.shared_prefix_boundary = 0
+    request.prefix_cache_hint_tokens = 0
+    boundaries = []
+    while request.num_computed_tokens < prompt_tokens:
+        chunk = Scheduler._mamba_block_aligned_split(
+            scheduler, request, min(4096, prompt_tokens - request.num_computed_tokens)
+        )
+        assert chunk > 0
+        request.num_computed_tokens += chunk
+        if request.num_computed_tokens % scheduler.block_size == 0:
+            boundaries.append(request.num_computed_tokens)
+    assert boundaries == checkpoints
 
 
 def test_waiting_text_wave_prepares_one_final_maintenance_not_prefixes():

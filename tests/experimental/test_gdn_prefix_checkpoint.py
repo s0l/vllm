@@ -34,6 +34,91 @@ class _TensorStore(GDNPrefixCheckpointStore):
 
 
 class TestGDNPrefixCheckpoint(unittest.TestCase):
+    def test_attention_cow_disjoint_and_overlapping_sources(self):
+        from tests.experimental.elastic_attention_cow_region_control import main
+
+        main()
+
+    def test_real_geometry_automatic_match_resume_and_bounded_splits(self):
+        coordinator = object.__new__(HybridKVCacheCoordinator)
+        coordinator.gdn_checkpoint_keys = OrderedDict()
+        coordinator.enable_dcp_fine_prefix = True
+        scheduler = object.__new__(Scheduler)
+        scheduler.kv_cache_manager = SimpleNamespace(coordinator=coordinator)
+        scheduler.hash_block_size = 192
+        scheduler.block_size = 7488
+        scheduler.mamba_state_update_alignment = 64
+        scheduler.use_eagle = True
+        scheduler.mamba_partial_cache_hit = True
+        scheduler.max_num_scheduled_tokens = 4096
+        scheduler._long_prefill_chunk_cap = lambda request: 0
+        for length in (192, 384, 3000, 3072, 7488, 16065):
+            request = SimpleNamespace(
+                num_computed_tokens=0,
+                num_prompt_tokens=length,
+                execution_prefill_len=length,
+                shared_prefix_boundary=0,
+                prefix_cache_hint_tokens=0,
+            )
+            tail = (length - 1) // 192 * 192
+            expected = tuple(b for b in (tail - 192, tail) if b > 0)
+            self.assertEqual(
+                scheduler._fine_prefix_checkpoint_boundaries(request), expected
+            )
+            visited = []
+            while request.num_computed_tokens < length:
+                count = scheduler._mamba_block_aligned_split(
+                    request, min(4096, length - request.num_computed_tokens)
+                )
+                self.assertGreater(count, 0)
+                request.num_computed_tokens += count
+                visited.append(request.num_computed_tokens)
+            self.assertTrue(set(expected).issubset(visited))
+            self.assertTrue(all(boundary % 64 == 0 for boundary in visited[:-1]))
+            self.assertLessEqual(len(visited), length // 4096 + 7)
+
+    def test_hint_geometry_rejected_before_scheduling(self):
+        env = {"AG2_VLLM_DCP_FINE_PREFIX": "1"}
+        for hint, error in ((336, "hash aligned"), (192, "overlap")):
+            with (
+                patch.dict(
+                    os.environ,
+                    {**env, "AG2_VLLM_DCP_FINE_PREFIX_HINT_TOKENS": str(hint)},
+                    clear=True,
+                ),
+                self.assertRaisesRegex(ValueError, error),
+            ):
+                _parse_prefix_cache_hint_tokens(
+                    {"ag2_prefix_cache_hint_tokens": hint},
+                    hash_block_size=192,
+                    use_eagle=True,
+                )
+        with patch.dict(
+            os.environ,
+            {**env, "AG2_VLLM_DCP_FINE_PREFIX_HINT_TOKENS": "384"},
+            clear=True,
+        ):
+            self.assertEqual(
+                _parse_prefix_cache_hint_tokens(
+                    {"ag2_prefix_cache_hint_tokens": 384},
+                    hash_block_size=192,
+                    use_eagle=True,
+                ),
+                384,
+            )
+            with self.assertRaisesRegex(ValueError, "integer"):
+                _parse_prefix_cache_hint_tokens({"ag2_prefix_cache_hint_tokens": 384.5})
+
+    def test_restore_metadata_failure_does_not_partially_mutate(self):
+        tensors = {"req": [torch.tensor([1.0]), torch.tensor([2.0])]}
+        store = _TensorStore(tensors)
+        store.save(b"key", "req", None, None, None)
+        tensors["req"] = [torch.tensor([10.0]), torch.tensor([20.0, 30.0])]
+        with self.assertRaisesRegex(RuntimeError, "metadata mismatch"):
+            store.restore(b"key", "req", None, None, None)
+        self.assertEqual(tensors["req"][0].item(), 10.0)
+        self.assertEqual(store.restores, 0)
+
     def test_exact_restore_and_wrong_key_miss(self):
         tensors = {
             "req": [

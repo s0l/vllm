@@ -9,6 +9,7 @@ from typing import Literal, overload
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     KVCacheBlockPoolRequirements,
@@ -29,6 +30,39 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
+
+
+class PrefixCacheLease:
+    """Temporary physical ownership between a cache lookup and admission."""
+
+    def __init__(self, groups: Sequence[tuple[BlockPool, Sequence[KVCacheBlock]]]):
+        self._groups = tuple((pool, tuple(blocks)) for pool, blocks in groups)
+        self._released = False
+        # Validate all pools before any ownership mutation.
+        for pool, blocks in self._groups:
+            for block in blocks:
+                if not (
+                    0 <= block.block_id < pool.active_num_gpu_blocks
+                    and pool.blocks[block.block_id] is block
+                ):
+                    raise ValueError(
+                        "prefix lease contains a foreign or unmapped block"
+                    )
+        for pool, blocks in self._groups:
+            pool.touch(blocks)
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        for pool, blocks in reversed(self._groups):
+            pool.free_blocks(reversed(blocks))
+
+    def __enter__(self) -> "PrefixCacheLease":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.release()
 
 
 @dataclass
@@ -249,6 +283,23 @@ class KVCacheManager:
     def prefix_cache_lookup_enabled(self, request: Request) -> bool:
         """Whether a local prefix cache lookup may be run for this request."""
         return self.enable_caching and not request.skip_reading_prefix_cache
+
+    def lease_computed_blocks(self, blocks: KVCacheBlocks) -> PrefixCacheLease:
+        """Protect hits in every physical pool without attaching a request."""
+        managers = self.coordinator.single_type_managers
+        if len(blocks.blocks) != len(managers):
+            raise ValueError("prefix lease group count differs from KV configuration")
+        return PrefixCacheLease(
+            tuple(
+                # Separate-pool Mamba hits are positional nulls from the
+                # primary pool; their state lives in exact host checkpoints.
+                (
+                    manager.block_pool,
+                    tuple(block for block in group if not block.is_null),
+                )
+                for manager, group in zip(managers, blocks.blocks, strict=True)
+            )
+        )
 
     def record_prefix_cache_stats(self, request: Request, num_hits: int) -> None:
         # Don't count a request that skipped the cache lookup.

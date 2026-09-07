@@ -816,10 +816,18 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         hash_block_size = self.block_pool.hash_block_size
         prompt_tail = request.num_prompt_tokens // hash_block_size * hash_block_size
         boundaries = {prompt_tail}
+        # get_computed_blocks retains a token for logits. When the prompt ends
+        # on a hash boundary, its full-tail alias is beyond the lookup limit.
+        replay_end = getattr(
+            request, "execution_prefill_len", request.num_prompt_tokens
+        )
+        boundaries.add(max(0, replay_end - 1) // hash_block_size * hash_block_size)
         if request.shared_prefix_boundary:
             boundaries.add(request.shared_prefix_boundary)
         blocks = self.req_to_blocks[request.request_id]
-        for boundary_tokens in sorted(boundaries):
+        # Publish the longest extent first: extending an existing primary
+        # alias invalidates older metadata, then shorter aliases can be added.
+        for boundary_tokens in sorted(boundaries, reverse=True):
             if boundary_tokens == 0 or boundary_tokens > num_tokens:
                 continue
             if boundary_tokens % self.block_size == 0:

@@ -5,6 +5,7 @@
 import copy
 from collections.abc import Callable
 from dataclasses import replace
+from itertools import product
 from math import lcm
 from types import SimpleNamespace
 
@@ -28,7 +29,12 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.v1.core.block_pool import BlockHashToBlockMap, BlockPool
-from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager, Request
+from vllm.v1.core.kv_cache_manager import (
+    KVCacheBlocks,
+    KVCacheManager,
+    PrefixCacheLease,
+    Request,
+)
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashWithGroupId,
@@ -50,6 +56,99 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowSpec,
 )
+
+
+@pytest.mark.parametrize("transfer", [False, True])
+def test_prefix_lease_protects_both_pools_and_balances_transfer(transfer):
+    pools = [BlockPool(5, True, 16), BlockPool(4, True, 16)]
+    groups = [(pool, pool.get_new_blocks(1)) for pool in pools]
+    for pool, blocks in groups:
+        pool.free_blocks(blocks)
+    before = [pool.get_num_free_blocks() for pool in pools]
+    lease = PrefixCacheLease(groups)
+    competitors = []
+    for pool, blocks in groups:
+        allocated = pool.get_new_blocks(pool.get_num_free_blocks())
+        assert blocks[0] not in allocated
+        competitors.append((pool, allocated))
+        if transfer:
+            pool.touch(blocks)  # Normal request ownership before temporary release.
+    lease.release()
+    lease.release()  # Idempotent failure/finally cleanup.
+    for pool, blocks in groups:
+        assert blocks[0].ref_cnt == int(transfer)
+        if transfer:
+            pool.free_blocks(blocks)
+    for pool, allocated in competitors:
+        pool.free_blocks(allocated)
+    assert [pool.get_num_free_blocks() for pool in pools] == before
+
+
+def test_prefix_lease_shared_requests_and_exception_recovery():
+    pool = BlockPool(4, True, 16)
+    blocks = pool.get_new_blocks(1)
+    pool.free_blocks(blocks)
+    with (
+        pytest.raises(RuntimeError, match="cancel"),
+        PrefixCacheLease([(pool, blocks)]),
+    ):
+        with PrefixCacheLease([(pool, blocks)]):
+            assert blocks[0].ref_cnt == 2
+        assert blocks[0].ref_cnt == 1
+        raise RuntimeError("cancel")
+    assert blocks[0].ref_cnt == 0
+    assert pool.get_num_free_blocks() == 3
+
+
+def test_prefix_lease_separate_mamba_nulls_do_not_own_gpu_state():
+    primary, mamba = BlockPool(5, True, 16), BlockPool(4, True, 16)
+    manager = object.__new__(KVCacheManager)
+    manager.coordinator = SimpleNamespace(
+        single_type_managers=[
+            SimpleNamespace(block_pool=primary),
+            SimpleNamespace(block_pool=mamba),
+        ]
+    )
+    blocks = primary.get_new_blocks(1)
+    primary.free_blocks(blocks)
+    # The coordinator returns primary-pool positional nulls for host GDN hits.
+    hit = KVCacheBlocks((tuple(blocks), (primary.null_block,) * 3))
+    before = (primary.null_block.ref_cnt, mamba.get_num_free_blocks())
+    with manager.lease_computed_blocks(hit):
+        assert blocks[0].ref_cnt == 1
+        assert (primary.null_block.ref_cnt, mamba.get_num_free_blocks()) == before
+    assert blocks[0].ref_cnt == 0
+    with pytest.raises(ValueError, match="group count"):
+        manager.lease_computed_blocks(KVCacheBlocks((tuple(blocks),)))
+
+
+def test_prefix_lease_blocks_tail_unmap_and_releases_for_maintenance():
+    pool = BlockPool(5, True, 16)
+    allocated = pool.get_new_blocks(4)
+    tail = allocated[-1:]
+    pool.free_blocks(allocated)
+    lease = PrefixCacheLease([(pool, tail)])
+    assert not pool.deactivate_tail_blocks(4)
+    assert pool.active_num_gpu_blocks == 5
+    lease.release()
+    assert pool.deactivate_tail_blocks(4)
+    with pytest.raises(ValueError, match="unmapped"):
+        PrefixCacheLease([(pool, tail)])
+    pool.activate_tail_blocks(5)
+    with PrefixCacheLease([(pool, tail)]):
+        assert tail[0].ref_cnt == 1
+    assert pool.get_num_free_blocks() == 4
+
+
+def test_prefix_lease_rejects_foreign_group_before_touch():
+    pools = [BlockPool(4, True, 16), BlockPool(4, True, 16)]
+    blocks = pools[0].get_new_blocks(1)
+    pools[0].free_blocks(blocks)
+    with pytest.raises(ValueError, match="foreign"):
+        PrefixCacheLease([(pools[0], blocks), (pools[1], blocks)])
+    assert blocks[0].ref_cnt == 0
+    assert all(pool.get_num_free_blocks() == 3 for pool in pools)
+
 
 pytestmark = pytest.mark.cpu_test
 
@@ -1155,7 +1254,8 @@ def test_prefill_hybrid_model_mamba_align_dcp_replay():
     computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
 
     assert num_computed_tokens == 3 * effective_block_size
-    assert all(len(group) == 3 for group in computed_blocks.blocks)
+    # Attention is sharded; replicated Mamba uses local block_size, not DCP.
+    assert [len(group) for group in computed_blocks.blocks] == [3, 9]
 
     per_group_blocks, per_group_hit_lengths = (
         manager.coordinator.find_longest_cache_hit_per_group(
@@ -1163,7 +1263,7 @@ def test_prefill_hybrid_model_mamba_align_dcp_replay():
         )
     )
     assert per_group_hit_lengths == (3 * effective_block_size,) * 2
-    assert all(len(group) == 3 for group in per_group_blocks)
+    assert [len(group) for group in per_group_blocks] == [3, 9]
 
     manager.free(req0)
     manager.free(req1)
@@ -1225,6 +1325,7 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
         hash_block_size=block_size,
         mamba_partial_cache_hit=False,
         mamba_has_prefill_checkpoint_blocks=False,
+        use_eagle=False,
     )
     req_2.shared_prefix_boundary = shared_prefix_boundary
     num_new_tokens_adjusted = Scheduler._mamba_block_aligned_split(
@@ -1828,6 +1929,92 @@ def test_low_id_allocation_compacts_when_elastic_attention_is_shrunk():
     assert [block.block_id for block in selected] == [1, 2]
     for block_hash in req.block_hashes:
         assert pool.get_cached_block(block_hash, [0]) is None
+
+
+@pytest.mark.parametrize("active", [6, 7])
+@pytest.mark.parametrize("frontier", [1, 3, 5, 7])
+@pytest.mark.parametrize("count", [1, 3, 5])
+def test_cache_frontier_preserves_only_non_tail_holes(active, frontier, count):
+    """Preservation must never skip a free low hole to pin a higher tail."""
+    pool = BlockPool(
+        num_gpu_blocks=7,
+        enable_caching=True,
+        hash_block_size=4,
+        prefer_low_id_allocations=True,
+    )
+    request = make_request("frontier", list(range(8)), 4, sha256)
+    cached = pool.get_new_blocks(2)
+    pool.cache_full_blocks(request, cached, 0, 2, 4, 0)
+    pool.free_blocks(cached)
+    assert pool.deactivate_tail_blocks(active)
+    pool.cache_preservation_num_blocks = frontier
+    selected = pool.get_new_blocks(count)
+    selected_ids = {block.block_id for block in selected}
+    if any(block_id >= frontier for block_id in selected_ids):
+        assert set(range(1, min(frontier, active))) <= selected_ids
+    for block, block_hash in zip(cached, request.block_hashes):
+        assert (pool.get_cached_block(block_hash, [0]) is None) == (
+            block.block_id in selected_ids
+        )
+    assert pool.get_num_free_blocks() == active - 1 - count
+    pool.free_blocks(selected)
+    assert pool.deactivate_tail_blocks(min(frontier, active))
+
+
+@pytest.mark.parametrize("frontier", [0, -1, 8])
+def test_cache_frontier_invalid_value_does_not_mutate_pool(frontier):
+    pool = BlockPool(7, True, 4, prefer_low_id_allocations=True)
+    pool.cache_preservation_num_blocks = frontier
+    with pytest.raises(ValueError, match="cache preservation frontier"):
+        pool.get_new_blocks(1)
+    assert pool.get_num_free_blocks() == 6
+    assert all(block.ref_cnt == 0 for block in pool.blocks)
+
+
+def test_cache_frontier_exhaustive_free_cached_owned_states():
+    """Exhaust five-block states; no cached hole may push work past F."""
+    request = make_request("frontier-state", list(range(20)), 4, sha256)
+    for states in product(("owned", "cached", "empty"), repeat=5):
+        free_ids = {i + 1 for i, state in enumerate(states) if state != "owned"}
+        for frontier in range(1, 7):
+            for count in range(len(free_ids) + 1):
+                pool = BlockPool(6, True, 4, prefer_low_id_allocations=True)
+                blocks = pool.get_new_blocks(5)
+                pool.cache_full_blocks(request, blocks, 0, 5, 4, 0)
+                for block, state in zip(blocks, states):
+                    if state == "empty":
+                        pool._maybe_evict_cached_block(block)
+                    if state != "owned":
+                        pool.free_blocks([block])
+                pool.cache_preservation_num_blocks = frontier
+                selected = pool.get_new_blocks(count)
+                selected_ids = {block.block_id for block in selected}
+                assert len(selected_ids) == count
+                assert selected_ids <= free_ids
+                if any(i >= frontier for i in selected_ids):
+                    assert {i for i in free_ids if i < frontier} <= selected_ids
+                assert pool.get_num_free_blocks() == len(free_ids) - count
+
+
+@pytest.mark.parametrize("cached_count,expected", [(2, [3, 4]), (21, [1, 2])])
+def test_cache_frontier_preserves_reuse_without_historical_gdn_tail_pin(
+    cached_count, expected
+):
+    """Replay the rejected 24->22 handoff without permitting IDs22/23."""
+    pool = BlockPool(68, True, 4, prefer_low_id_allocations=True)
+    request = make_request("growth", list(range(4 * cached_count)), 4, sha256)
+    cached = pool.get_new_blocks(cached_count)
+    pool.cache_full_blocks(request, cached, 0, cached_count, 4, 0)
+    pool.free_blocks(cached)
+    assert pool.deactivate_tail_blocks(24)
+    pool.cache_preservation_num_blocks = 22
+    live = pool.get_new_blocks(2)
+    assert [block.block_id for block in live] == expected
+    assert pool.deactivate_tail_blocks(22)
+    pool.free_blocks(live)
+    pool.activate_tail_blocks(24)
+    if cached_count == 2:
+        assert all(pool.get_cached_block(key, [0]) for key in request.block_hashes)
 
 
 def test_cache_blocks_multi_group():
@@ -4478,6 +4665,171 @@ def test_mamba_shared_prefix_reuse_under_zero_retention():
     assert last_req_hit(retention=0, pin=False) == 0
     # retention=0 with the pin keeps the junction -> reuse restored.
     assert last_req_hit(retention=0, pin=True) == 2 * block_size
+
+
+@pytest.mark.parametrize("leased", [False, True])
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("elastic_reduced", [False, True])
+def test_coarse_dcp_separate_gdn_completed_reuse_survives_unrelated_request(
+    monkeypatch, leased, chunked, elastic_reduced
+):
+    monkeypatch.setenv("AG2_VLLM_DCP_FINE_PREFIX", "0")
+    full = FullAttentionSpec(
+        block_size=2496, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    gdn = MambaSpec(
+        block_size=2496,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        separate_pool=True,
+        separate_pool_num_blocks=16,
+    )
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=69,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["target"], full),
+                KVCacheGroupSpec(["draft"], full),
+                KVCacheGroupSpec(["gdn"], gdn),
+            ],
+        ),
+        max_model_len=262144,
+        enable_caching=True,
+        use_eagle=True,
+        dcp_world_size=3,
+        scheduler_block_size=7488,
+        hash_block_size=192,
+        retention_interval=0,
+    )
+    if elastic_reduced:
+        # A retained Graph loan leaves a reduced arena even without allocation
+        # pressure. Preserve enough free capacity for both unrelated requests.
+        manager.coordinator.block_pool.prefer_low_id_allocations = True
+        assert manager.coordinator.block_pool.deactivate_tail_blocks(41)
+        # Allocator-only control: a separate scheduler test must prove the
+        # physical derivation, rather than treating this fixture as that proof.
+        manager.coordinator.block_pool.cache_preservation_num_blocks = 20
+    for index, (first, expected) in enumerate(
+        [(10, 0), (10, 7488), (11, 0), (10, 7488)]
+    ):
+        request = make_request(str(index), [first] + [10] * 16064, 192, sha256)
+        blocks, computed, _ = manager.get_computed_blocks(request)
+        assert computed == expected, (index, computed)
+        lease = manager.lease_computed_blocks(blocks) if leased and computed else None
+        checkpoint = kv_cache_utils.BlockHashListWithBlockSize(
+            request.block_hashes, 192, 7488
+        )[0]
+        ends = [4096, 7488, 11584, 15680, 16065] if chunked else [16065]
+        first_step = True
+        for end in ends:
+            if end <= computed:
+                continue
+            start = max(computed, request.num_computed_tokens)
+            assert (
+                manager.allocate_slots(
+                    request,
+                    end - start,
+                    computed if first_step else 0,
+                    blocks if first_step else None,
+                    num_lookahead_tokens=1,
+                )
+                is not None
+            )
+            if lease:
+                lease.release()
+                lease = None
+            request.num_computed_tokens = end
+            if end == 7488 or not chunked:
+                manager.coordinator.register_gdn_checkpoint(checkpoint)
+            first_step = False
+        manager.free(request)
+
+
+@pytest.mark.parametrize("prompt_len", [3000, 3072, 7488, 16065])
+@pytest.mark.parametrize("use_eagle", [False, True])
+def test_fine_dcp_real_geometry_automatic_tail_reuse(
+    monkeypatch, prompt_len, use_eagle
+):
+    """Real scheduler splits publish paired state/KV without a request hint."""
+    monkeypatch.setenv("AG2_VLLM_DCP_FINE_PREFIX", "1")
+    full = FullAttentionSpec(
+        block_size=2496, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    gdn = MambaSpec(
+        block_size=2496,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        separate_pool=True,
+        separate_pool_num_blocks=16,
+        state_update_chunk_alignment=64,
+    )
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["target"], full),
+                KVCacheGroupSpec(["draft"], full),
+                KVCacheGroupSpec(["gdn"], gdn),
+            ],
+        ),
+        max_model_len=262144,
+        enable_caching=True,
+        use_eagle=use_eagle,
+        dcp_world_size=3,
+        scheduler_block_size=7488,
+        hash_block_size=192,
+    )
+    scheduler = object.__new__(Scheduler)
+    scheduler.kv_cache_manager = manager
+    scheduler.block_size = 7488
+    scheduler.hash_block_size = 192
+    scheduler.mamba_state_update_alignment = 64
+    scheduler.use_eagle = use_eagle
+    scheduler.mamba_partial_cache_hit = True
+    scheduler.max_num_scheduled_tokens = 4096
+    scheduler._long_prefill_chunk_cap = lambda request: 0
+    prime = make_request("prime", list(range(prompt_len)), 192, sha256)
+    while prime.num_computed_tokens < prompt_len:
+        count = scheduler._mamba_block_aligned_split(
+            prime, min(4096, prompt_len - prime.num_computed_tokens)
+        )
+        assert count > 0
+        assert manager.allocate_slots(prime, count) is not None
+        prime.num_computed_tokens += count
+        if scheduler._should_save_gdn_checkpoint(prime, prime.num_computed_tokens):
+            key = scheduler._gdn_boundary_key(prime, prime.num_computed_tokens)
+            if key:
+                # Worker completion receipt is simulated; this is CPU state
+                # protocol proof, not proof of numerical GDN producer output.
+                manager.coordinator.register_gdn_checkpoint(key)
+        manager.new_step_starts()
+    manager.free(prime)
+    warm = make_request("warm", list(range(prompt_len)), 192, sha256)
+    blocks, hit, _ = manager.get_computed_blocks(warm)
+    expected = (prompt_len - 1) // 192 * 192 - (192 if use_eagle else 0)
+    assert hit == expected
+    source = blocks.blocks[0][-1]
+    lease = manager.lease_computed_blocks(blocks)
+    assert manager.allocate_slots(warm, prompt_len - hit, hit, blocks) is not None
+    lease.release()
+    # A partial match must never hand its cached tail to a writable consumer.
+    assert (
+        manager.coordinator.single_type_managers[0].req_to_blocks["warm"][-1]
+        is not source
+    )
+    changed = make_request("changed", [-1] + list(range(1, prompt_len)), 192, sha256)
+    assert manager.get_computed_blocks(changed)[1] == 0
+    manager.coordinator.sync_gdn_checkpoints(())
+    assert (
+        manager.get_computed_blocks(
+            make_request("evicted", list(range(prompt_len)), 192, sha256)
+        )[1]
+        == 0
+    )
 
 
 def test_dcp_separate_gdn_fine_prefix_positive_negative_recovery(monkeypatch):

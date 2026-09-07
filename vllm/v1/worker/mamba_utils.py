@@ -360,6 +360,8 @@ class GDNPrefixCheckpointStore:
         for device, host in zip(device_states, host_states):
             if device.shape != host.shape or device.dtype != host.dtype:
                 raise RuntimeError("GDN prefix checkpoint tensor metadata mismatch")
+        # Validate the entire restore before mutating any destination state.
+        for device, host in zip(device_states, host_states):
             device.copy_(host, non_blocking=host.is_pinned())
         self._checkpoints.move_to_end(key)
         self.restores += 1

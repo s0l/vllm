@@ -1440,11 +1440,12 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 raise ValueError(
                     "DCP fine-prefix only supports full-attention + Mamba groups"
                 )
-        # Partial hash hits are limited to full-attention + mamba ("align")
-        # without context parallelism. The research-only separate-GDN path
-        # pairs each partial attention boundary with an exact host checkpoint.
+        # Generic DCP partial hits use upstream per-group geometry. Only the
+        # separate host-state adapter needs its own activation gate.
         self.enable_partial_hash_hits = (
-            dcp_world_size == 1 or self.enable_dcp_fine_prefix
+            self.gdn_checkpoint_keys is None
+            or dcp_world_size == 1
+            or self.enable_dcp_fine_prefix
         ) and has_partial_mamba_group
         if self.enable_partial_hash_hits:
             unsupported_partial_hit_managers = {
@@ -1680,8 +1681,12 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         kv_cache_spec=spec,
                         drop_eagle_block=drop_eagle_block,
                         alignment_tokens=self._cache_hit_alignment_tokens,
-                        dcp_world_size=self.dcp_world_size,
-                        pcp_world_size=self.pcp_world_size,
+                        dcp_world_size=self.single_type_managers[
+                            first_group_id
+                        ].dcp_world_size,
+                        pcp_world_size=self.single_type_managers[
+                            first_group_id
+                        ].pcp_world_size,
                     )
                 if drop_eagle_block:
                     eagle_verified.add(idx)
@@ -1738,6 +1743,19 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         hit_lengths: list[int] = [0] * num_groups
 
         for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
+            if isinstance(spec, MambaSpec) and spec.separate_pool:
+                group_hit = self.find_gdn_checkpoint_boundary(
+                    block_hashes, max_cache_hit_length, spec
+                )
+                unit = (
+                    self.hash_block_size
+                    if self.enable_dcp_fine_prefix
+                    else spec.block_size * self.dcp_world_size * self.pcp_world_size
+                )
+                for gid in group_ids:
+                    hit_blocks[gid] = [self.block_pool.null_block] * (group_hit // unit)
+                    hit_lengths[gid] = group_hit
+                continue
             blocks, group_hit = manager_cls.find_longest_cache_hit(
                 block_hashes=block_hashes,
                 max_length=max_cache_hit_length,
@@ -1746,8 +1764,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 kv_cache_spec=spec,
                 drop_eagle_block=use_eagle,
                 alignment_tokens=self._cache_hit_alignment_tokens,
-                dcp_world_size=self.dcp_world_size,
-                pcp_world_size=self.pcp_world_size,
+                dcp_world_size=self.single_type_managers[group_ids[0]].dcp_world_size,
+                pcp_world_size=self.single_type_managers[group_ids[0]].pcp_world_size,
             )
             for gid, blks in zip(group_ids, blocks):
                 hit_blocks[gid] = blks

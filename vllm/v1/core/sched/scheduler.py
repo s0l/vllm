@@ -64,7 +64,11 @@ from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     KVCacheBlockPoolRequirements,
 )
-from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+from vllm.v1.core.kv_cache_manager import (
+    KVCacheBlocks,
+    KVCacheManager,
+    PrefixCacheLease,
+)
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHashListWithBlockSize,
@@ -614,6 +618,14 @@ class Scheduler(SchedulerInterface):
         if hash_block_size is None:
             hash_block_size = block_size
         self.hash_block_size = hash_block_size
+        self._elastic_prefix_hits: dict[
+            str,
+            tuple[
+                Request,
+                tuple[KVCacheBlocks, int, int, bool],
+                PrefixCacheLease | None,
+            ],
+        ] = {}
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -754,6 +766,17 @@ class Scheduler(SchedulerInterface):
             and self.hash_block_size < self.block_size
             and self.kv_cache_manager.coordinator.enable_partial_hash_hits
         )
+        if os.environ.get("AG2_VLLM_DCP_FINE_PREFIX", "0") == "1":
+            from vllm.v1.request import _parse_prefix_cache_hint_tokens
+
+            configured_hint = os.environ.get("AG2_VLLM_DCP_FINE_PREFIX_HINT_TOKENS")
+            _parse_prefix_cache_hint_tokens(
+                {"ag2_prefix_cache_hint_tokens": configured_hint}
+                if configured_hint
+                else None,
+                hash_block_size=self.hash_block_size,
+                use_eagle=self.use_eagle,
+            )
 
         # Counts of non-empty steps scheduled / processed. update_from_output
         # is called once per scheduled step in FIFO order, so these stay in sync.
@@ -947,6 +970,8 @@ class Scheduler(SchedulerInterface):
             return True
         if boundary == self._fine_prefix_resume_boundary(request):
             return True
+        if boundary in self._fine_prefix_checkpoint_boundaries(request):
+            return True
         prompt_tail = (
             request.execution_prefill_len
             // coordinator.hash_block_size
@@ -966,6 +991,36 @@ class Scheduler(SchedulerInterface):
             == 0
             for group in coordinator.kv_cache_config.kv_cache_groups
         )
+
+    def _fine_prefix_checkpoint_boundaries(
+        self, request: Request, *, shared_prefix_boundary: int | None = None
+    ) -> tuple[int, ...]:
+        """Materialize useful match/resume pairs, not every hash boundary."""
+        coordinator = getattr(self, "_gdn_checkpoint_coordinator", None)
+        if coordinator is None or not getattr(
+            coordinator, "enable_dcp_fine_prefix", False
+        ):
+            return ()
+        unit = self.hash_block_size
+        prefill_end = request.execution_prefill_len
+        tail = max(0, prefill_end - 1) // unit * unit
+        shared = (
+            (
+                request.shared_prefix_boundary
+                if shared_prefix_boundary is None
+                else shared_prefix_boundary
+            )
+            // unit
+            * unit
+        )
+        matches = {tail, shared, getattr(request, "prefix_cache_hint_tokens", 0)}
+        boundaries = set()
+        for match in matches:
+            if 0 < match < prefill_end:
+                boundaries.add(match)
+                if self.use_eagle and match > unit:
+                    boundaries.add(match - unit)
+        return tuple(sorted(boundaries))
 
     def _fine_prefix_resume_boundary(self, request: Request) -> int:
         """Return the recurrent-state boundary after the EAGLE overlap.
@@ -998,6 +1053,8 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
+        *,
+        shared_prefix_boundary: int | None = None,
     ) -> int:
         """Clip a prefill chunk so it ends where Mamba state must be cached.
 
@@ -1019,6 +1076,9 @@ class Scheduler(SchedulerInterface):
         prefill_end = request.execution_prefill_len
         if start >= prefill_end:
             return num_new_tokens
+
+        if shared_prefix_boundary is None:
+            shared_prefix_boundary = request.shared_prefix_boundary
 
         coordinator = getattr(self, "_gdn_checkpoint_coordinator", None)
         # Keep ordinary chunking on the proven global scheduler geometry.
@@ -1079,14 +1139,17 @@ class Scheduler(SchedulerInterface):
             # pairs this partial attention boundary with an exact host GDN
             # checkpoint; the default path remains block-floored.
             start
-            + (request.shared_prefix_boundary - start)
+            + (shared_prefix_boundary - start)
             // shared_boundary_alignment
             * shared_boundary_alignment
-            if start < request.shared_prefix_boundary < end
+            if start < shared_prefix_boundary < end
             else 0,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
-        end = min((s for s in stops if start < s < end), default=end)
+        fine_stops = Scheduler._fine_prefix_checkpoint_boundaries(
+            self, request, shared_prefix_boundary=shared_prefix_boundary
+        )
+        end = min((s for s in (*stops, *fine_stops) if start < s < end), default=end)
 
         # Preserve the backend's recurrence grouping across artificial prefill
         # splits. The natural prompt end is intentionally exempt: prompt to
@@ -1104,9 +1167,21 @@ class Scheduler(SchedulerInterface):
             end = end // state_alignment * state_alignment
         return max(end - start, 0)
 
+    def _resolved_shared_prefix_boundary(self, request: Request, cached: int) -> int:
+        """Use the same junction in leased preview and ordinary commit."""
+        hint = request.prefix_cache_hint_tokens
+        if hint and hint % self.hash_block_size != 0:
+            raise RuntimeError("Validated prefix-cache hint is not hash aligned")
+        return max(cached, hint)
+
     def _get_local_prefix_cache_hit(
         self, request: Request
     ) -> tuple[KVCacheBlocks, int, int, bool]:
+        bound = getattr(self, "_elastic_prefix_hits", {}).get(request.request_id)
+        if bound is not None:
+            if bound[0] is not request:
+                raise RuntimeError("prefix lease request identity changed")
+            return bound[1]
         connector = self.connector
         if connector is not None and connector.supports_divergent_local_hybrid_hits:
             return self.kv_cache_manager.get_computed_blocks_for_connector(request)
@@ -1115,6 +1190,50 @@ class Scheduler(SchedulerInterface):
             self.kv_cache_manager.get_computed_blocks(request)
         )
         return blocks, num_local, shared_prefix_boundary, False
+
+    def _lease_local_prefix_cache_hit(
+        self, request: Request
+    ) -> tuple[KVCacheBlocks, int, int, bool]:
+        if not hasattr(self, "_elastic_prefix_hits"):
+            self._elastic_prefix_hits = {}
+        bound = self._elastic_prefix_hits.get(request.request_id)
+        if bound is not None:
+            return self._get_local_prefix_cache_hit(request)
+        result = (
+            (self.kv_cache_manager.empty_kv_cache_blocks, 0, 0, False)
+            if getattr(self, "_elastic_prefix_pressure_fallback", False)
+            else self._get_local_prefix_cache_hit(request)
+        )
+        lease = (
+            self.kv_cache_manager.lease_computed_blocks(result[0])
+            if result[1] > 0
+            else None
+        )
+        self._elastic_prefix_hits[request.request_id] = (request, result, lease)
+        return result
+
+    def _release_elastic_prefix_hits(self, keep: Iterable[str] = ()) -> None:
+        retained = frozenset(keep)
+        hits = getattr(self, "_elastic_prefix_hits", {})
+        for request_id in tuple(hits):
+            if request_id not in retained:
+                _request, _result, lease = hits.pop(request_id)
+                if lease is not None:
+                    lease.release()
+
+    def _drop_elastic_prefix_hits_for_pressure(self) -> bool:
+        """Allow one cold replan when pinned cache prevents wave admission."""
+        hits = getattr(self, "_elastic_prefix_hits", {})
+        if not any(result[1] > 0 for _, result, _ in hits.values()):
+            return False
+        requests = [request for request, _result, _lease in hits.values()]
+        self._release_elastic_prefix_hits()
+        self._elastic_prefix_pressure_fallback = True
+        empty = self.kv_cache_manager.empty_kv_cache_blocks
+        for request in requests:
+            hits[request.request_id] = (request, (empty, 0, 0, False), None)
+        logger.info("Elastic prefix reuse deferred for physical admission pressure")
+        return True
 
     def _reserve_prefill_lookahead(
         self,
@@ -1404,8 +1523,8 @@ class Scheduler(SchedulerInterface):
         X1, X2, ... evict and recapture each other while assembling a larger
         steady cohort. This preflight covers the complete RUNNING wave,
         including partial-prefill, mixed, and encoder rows. It mirrors the
-        running loop's token and encoder budgets, but performs no request, KV,
-        encoder-cache, or draft mutation.
+        running loop's token and encoder budgets. Cache hits acquire temporary
+        references; request ownership, encoder state and drafts stay unchanged.
 
         Returns the final canonical key and whether request-free maintenance
         was prepared for the next scheduler output.
@@ -1588,12 +1707,10 @@ class Scheduler(SchedulerInterface):
                     or request.num_stale_output_tokens > 0
                 ):
                     break
-                # Prefix-cache lookup is an independent read, not a lease. A
-                # preceding RUNNING allocation or an earlier WAITING request
-                # can evict the observed blocks before this request commits.
-                # Until KV supplies a cohort preview/lease, bind the joint plan
-                # to the exact reproducible no-prefix view.
-                num_computed_tokens = 0
+                # Keep the same physical hits alive through the joint commit.
+                _, num_computed_tokens, shared_boundary, _ = (
+                    self._lease_local_prefix_cache_hit(request)
+                )
                 if defer_prefills and num_computed_tokens < request.num_tokens - 1:
                     break
                 num_new_tokens = request.num_tokens - num_computed_tokens
@@ -1630,6 +1747,9 @@ class Scheduler(SchedulerInterface):
                         num_new_tokens,
                         num_computed_tokens,
                         0,
+                        shared_prefix_boundary=self._resolved_shared_prefix_boundary(
+                            request, shared_boundary
+                        ),
                     )
                 encoder_inputs: Sequence[int] | None = None
                 candidate_encoder_budget = joint_remaining_encoder_budget
@@ -1691,6 +1811,9 @@ class Scheduler(SchedulerInterface):
                 joint_waiting_count += 1
                 if joint_remaining_budget <= 0:
                     break
+            # A candidate rejected by token/encoder/capacity limits must not
+            # pin cache capacity while pricing the selected wave.
+            self._release_elastic_prefix_hits(joint_computed_overrides)
             if joint_waiting_count:
                 prospective_tokens = joint_waiting_tokens
                 prospective_drafts = joint_waiting_drafts
@@ -1701,9 +1824,7 @@ class Scheduler(SchedulerInterface):
                 self._elastic_preflight_joint_waiting_request_ids = tuple(
                     joint_computed_overrides
                 )
-                self._elastic_preflight_waiting_ignore_prefix_request_ids = tuple(
-                    joint_computed_overrides
-                )
+                self._elastic_preflight_waiting_ignore_prefix_request_ids = ()
 
         def clear_joint_identity() -> None:
             self._elastic_preflight_joint_waiting_request_ids = ()
@@ -1712,6 +1833,7 @@ class Scheduler(SchedulerInterface):
         def retry_running_only() -> tuple[tuple[int, ...] | None, bool]:
             """Restore progress after an optional joint expansion fails."""
             clear_joint_identity()
+            self._release_elastic_prefix_hits()
             if not running_wave_tokens:
                 return None, False
             running_is_pure_decode = self._is_pure_decode_step(
@@ -1790,12 +1912,15 @@ class Scheduler(SchedulerInterface):
                 not running_wave_encoder_inputs
                 and self._prepare_elastic_cold_form_reclaim(
                     running_key,
+                    required_external=running_required,
                     available_external=running_available,
                     physical_quiescent=physical_quiescent,
                 )
             ):
                 return None, True
             return None, False
+
+        rejected_joint_graphs: list[tuple[tuple[int, ...], int, int]] = []
 
         def resolve_failed_joint() -> tuple[tuple[int, ...] | None, bool]:
             """Widen admission at a safe boundary, otherwise preserve RUNNING."""
@@ -1838,6 +1963,35 @@ class Scheduler(SchedulerInterface):
             ):
                 clear_joint_identity()
                 return None, True
+            # KV capacity alone does not price a new COLD joint Graph. A HOT
+            # RUNNING fallback must not strand otherwise fundable WAITING work.
+            # Only after all read-only previews failed may we arm an X0
+            # transaction, using that candidate's explicit byte evidence.
+            for key, required, available in rejected_joint_graphs:
+                if self._prepare_elastic_cold_form_reclaim(
+                    key,
+                    required_external=required,
+                    available_external=available,
+                    physical_quiescent=physical_quiescent,
+                ):
+                    clear_joint_identity()
+                    return None, True
+            if rejected_joint_graphs:
+                rejection = (
+                    tuple(rejected_joint_graphs),
+                    self._elastic_admission_controller.resident_bytes,
+                    self._elastic_pressure_floor_external_bytes(),
+                )
+                if rejection != getattr(
+                    self, "_elastic_last_joint_graph_rejection", None
+                ):
+                    self._elastic_last_joint_graph_rejection = rejection
+                    logger.info(
+                        "Elastic joint Graph admission blocked: "
+                        "candidates_key_required_available=%r resident=%d "
+                        "pressure_floor=%d",
+                        *rejection,
+                    )
             running_result = retry_running_only()
             if running_result[0] is not None or running_result[1]:
                 return running_result
@@ -1877,6 +2031,7 @@ class Scheduler(SchedulerInterface):
                 self.kv_cache_manager.coordinator.elastic_external_memory_bytes,
             )
             for prefix_size in range(joint_waiting_count, 0, -1):
+                self._release_elastic_prefix_hits(waiting_ids[:prefix_size])
                 prefix_ids = frozenset(waiting_ids[:prefix_size])
                 candidate_tokens = dict(running_wave_tokens)
                 candidate_tokens.update(
@@ -1924,7 +2079,11 @@ class Scheduler(SchedulerInterface):
                     for key in candidate_physical_keys
                 )
                 effective_prefix_size = prefix_size
-                if candidate_is_cold and any(candidate_overrides.values()):
+                if (
+                    candidate_is_cold
+                    and any(candidate_overrides.values())
+                    and not getattr(self, "_elastic_prefix_hits", {})
+                ):
                     # Independent prefix-cache peeks have no joint ownership
                     # lease. A COLD capture must therefore be selected against
                     # the exact conservative no-prefix wave that commit can
@@ -1953,7 +2112,11 @@ class Scheduler(SchedulerInterface):
                         num_new_tokens = min(num_new_tokens, candidate_budget)
                         if self.need_mamba_block_aligned_split:
                             num_new_tokens = self._mamba_block_aligned_split(
-                                request, num_new_tokens, 0, 0
+                                request,
+                                num_new_tokens,
+                                0,
+                                0,
+                                shared_prefix_boundary=0,
                             )
                         encoder_inputs: Sequence[int] | None = None
                         next_encoder_budget = candidate_encoder_budget
@@ -2048,6 +2211,16 @@ class Scheduler(SchedulerInterface):
                         candidate_overrides,
                     )
                     break
+                if not candidate_encoder_inputs:
+                    rejected_joint_graphs.append((candidate_key, _required, _available))
+                if self._drop_elastic_prefix_hits_for_pressure():
+                    clear_joint_identity()
+                    return self._preflight_elastic_running_text_wave(
+                        token_budget=token_budget,
+                        prefill_chunk_cap=prefill_chunk_cap,
+                        defer_prefills=defer_prefills,
+                        physical_quiescent=physical_quiescent,
+                    )
             if selected_state is None:
                 return resolve_failed_joint()
             if preview_state != (
@@ -2066,9 +2239,7 @@ class Scheduler(SchedulerInterface):
             self._elastic_preflight_joint_waiting_request_ids = waiting_ids[
                 :selected_prefix
             ]
-            self._elastic_preflight_waiting_ignore_prefix_request_ids = waiting_ids[
-                :selected_prefix
-            ]
+            self._elastic_preflight_waiting_ignore_prefix_request_ids = ()
             selected_joint_prefix = True
 
         if not prospective_tokens:
@@ -2148,7 +2319,11 @@ class Scheduler(SchedulerInterface):
                     scheduled_encoder_inputs=prospective_encoder_inputs,
                 )
                 return final_key, True
-            if joint_waiting_count and any(computed_overrides.values()):
+            if (
+                joint_waiting_count
+                and any(computed_overrides.values())
+                and not getattr(self, "_elastic_prefix_hits", {})
+            ):
                 # Prefix-cache peeks for new arrivals are not jointly leased
                 # with the running cohort. If the optimistic combined shape is
                 # COLD, bind the same full request cohort to a conservative
@@ -2187,7 +2362,11 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = min(num_new_tokens, remaining_budget)
                     if self.need_mamba_block_aligned_split:
                         num_new_tokens = self._mamba_block_aligned_split(
-                            request, num_new_tokens, 0, 0
+                            request,
+                            num_new_tokens,
+                            0,
+                            0,
+                            shared_prefix_boundary=0,
                         )
                     encoder_inputs: Sequence[int] | None = None
                     candidate_encoder_budget = remaining_encoder_budget
@@ -2332,6 +2511,7 @@ class Scheduler(SchedulerInterface):
             )
         if not prospective_encoder_inputs and self._prepare_elastic_cold_form_reclaim(
             final_key,
+            required_external=required_external,
             available_external=available_external,
             physical_quiescent=physical_quiescent,
         ):
@@ -2372,10 +2552,11 @@ class Scheduler(SchedulerInterface):
         self,
         step_key: tuple[int, ...],
         *,
+        required_external: int,
         available_external: int,
         physical_quiescent: bool,
     ) -> bool:
-        """Retire optional residency when it prevents a priced RUNNING wave.
+        """Retire optional residency when it prevents a priced text wave.
 
         This is a request-free transaction, not a shape fallback. The next
         tick reprices the same work against the worker's post-reclaim receipt.
@@ -2386,8 +2567,7 @@ class Scheduler(SchedulerInterface):
             or getattr(self, "_elastic_restore_mode", False)
             or controller.pending_loans
             or controller.pending_maintenance_plan is not None
-            or getattr(self, "_elastic_last_defer_reason", None)
-            != "insufficient_reclaimable_graph_and_kv_bytes"
+            or required_external <= available_external
         ):
             return False
         destination, cold = self._estimate_elastic_graph_step_bytes(step_key)
@@ -2437,9 +2617,10 @@ class Scheduler(SchedulerInterface):
         connector, LoRA conflict, stale output, blocked status, or KV-event
         side effect remains fail-closed. Encoder intent is planned read-only;
         a COLD graph is captured in a separate transaction before MM. The supported
-        product lane peeks the local prefix cache, derives every candidate's
+        product lane leases the local prefix cache, derives every candidate's
         exact token contribution, and prepares at most one final owner set.
-        No request status, block ownership, or candidate lease changes here.
+        No request status or request block-table changes occur here. Temporary
+        cache references survive through commit and release in schedule's finally.
         Ready structured grammars are viewed semantically as WAITING while
         remaining in ``skipped_waiting`` until the normal commit loop promotes
         them. The returned IDs bind the reservation to that exact readiness
@@ -2489,11 +2670,9 @@ class Scheduler(SchedulerInterface):
                 break
             if request.num_computed_tokens != 0 or request.num_stale_output_tokens > 0:
                 return None, False, ()
-            # This preflight spans multiple sequential allocations. Prefix
-            # cache peeks do not reserve ownership, so a later commit cannot
-            # reproduce them under LRU pressure. Price and bind the exact
-            # no-prefix wave until the KV layer exposes a cohort lease/clone.
-            num_computed_tokens = 0
+            _, num_computed_tokens, shared_boundary, _ = (
+                self._lease_local_prefix_cache_hit(request)
+            )
             num_new_tokens = request.num_tokens - num_computed_tokens
             num_new_tokens = self._cap_prefill_chunk(
                 request, num_new_tokens, prefill_chunk_cap
@@ -2513,6 +2692,9 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens,
                     num_computed_tokens,
                     0,
+                    shared_prefix_boundary=self._resolved_shared_prefix_boundary(
+                        request, shared_boundary
+                    ),
                 )
             encoder_inputs: Sequence[int] | None = None
             candidate_encoder_budget = remaining_encoder_budget
@@ -2549,6 +2731,7 @@ class Scheduler(SchedulerInterface):
             if remaining_budget <= 0:
                 break
 
+        self._release_elastic_prefix_hits(prospective_tokens)
         if not prospective_tokens:
             return None, False, ()
         selected_waiting_prefix = False
@@ -2572,6 +2755,7 @@ class Scheduler(SchedulerInterface):
             )
             for prefix_size in range(len(waiting_ids), 0, -1):
                 prefix_ids = waiting_ids[:prefix_size]
+                self._release_elastic_prefix_hits(prefix_ids)
                 candidate_tokens = {
                     request_id: prospective_tokens[request_id]
                     for request_id in prefix_ids
@@ -2637,6 +2821,13 @@ class Scheduler(SchedulerInterface):
                     )
                     waiting_candidates = waiting_candidates[:prefix_size]
                     break
+                if self._drop_elastic_prefix_hits_for_pressure():
+                    return self._preflight_elastic_waiting_text_wave(
+                        token_budget=token_budget,
+                        prefill_chunk_cap=prefill_chunk_cap,
+                        defer_prefills=defer_prefills,
+                        physical_quiescent=physical_quiescent,
+                    )
             if selected_state is None:
                 return None, False, ()
             if preview_state != (
@@ -2652,9 +2843,7 @@ class Scheduler(SchedulerInterface):
                 computed_overrides,
             ) = selected_state
             selected_waiting_prefix = True
-        self._elastic_preflight_waiting_ignore_prefix_request_ids = tuple(
-            prospective_tokens
-        )
+        self._elastic_preflight_waiting_ignore_prefix_request_ids = ()
         is_pure_decode = self._is_pure_decode_step(
             prospective_tokens,
             {},
@@ -2740,7 +2929,9 @@ class Scheduler(SchedulerInterface):
                     scheduled_encoder_inputs=prospective_encoder_inputs,
                 )
                 return final_key, True, tuple(prospective_tokens)
-            if any(computed_overrides.values()):
+            if any(computed_overrides.values()) and not getattr(
+                self, "_elastic_prefix_hits", {}
+            ):
                 # Independent prefix-cache peeks can overbook the same
                 # reclaimable blocks across a joint waiting wave. The normal
                 # allocator mutates ownership request by request and may then
@@ -2777,7 +2968,11 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = min(num_new_tokens, remaining_budget)
                     if self.need_mamba_block_aligned_split:
                         num_new_tokens = self._mamba_block_aligned_split(
-                            request, num_new_tokens, 0, 0
+                            request,
+                            num_new_tokens,
+                            0,
+                            0,
+                            shared_prefix_boundary=0,
                         )
                     encoder_inputs = None
                     candidate_encoder_budget = remaining_encoder_budget
@@ -2987,6 +3182,79 @@ class Scheduler(SchedulerInterface):
         return tuple(candidates)
 
     def schedule(
+        self,
+        throttle_prefills: bool = False,
+        *,
+        physical_quiescent: bool = False,
+    ) -> SchedulerOutput:
+        try:
+            self._refresh_elastic_cache_frontier()
+            return self._schedule_with_prefix_leases(
+                throttle_prefills, physical_quiescent=physical_quiescent
+            )
+        finally:
+            # Admitted requests acquired their own references in allocate_slots.
+            # Failure, cancellation and maintenance-only steps retain none.
+            self._release_elastic_prefix_hits()
+            self._elastic_prefix_pressure_fallback = False
+
+    def _refresh_elastic_cache_frontier(self) -> None:
+        """Price cache-preserving holes against future executable residency."""
+        if not getattr(self, "elastic_on_demand_graphs", False):
+            return
+        coordinator = self.kv_cache_manager.coordinator
+        if not isinstance(coordinator, HybridKVCacheCoordinator):
+            return
+        config = coordinator.kv_cache_config
+        if not config.elastic_mapping_quantum or coordinator.mamba_block_pool is None:
+            return
+        catalog = getattr(self, "_elastic_graph_catalog", {})
+        coverage = getattr(self, "_elastic_graph_catalog_coverage", {})
+        pool = coordinator.block_pool
+        source_digest = getattr(catalog, "source_sha256", None)
+        if (
+            getattr(self, "_elastic_restore_mode", False)
+            or not catalog
+            or not isinstance(source_digest, str)
+            or len(source_digest) != 64
+            or coverage.get("_catalog_source_sha256") != source_digest
+        ):
+            pool.cache_preservation_num_blocks = 1
+            return
+        max_gdn = max(
+            config.elastic_gdn_initial_blocks,
+            1 + self.max_num_running_reqs * config.elastic_gdn_blocks_per_request,
+        )
+        cold = max(
+            _elastic_catalog_cold_residency_envelope(row) for row in catalog.values()
+        )
+        hot = max(int(row["hot_peak_bytes"]) for row in catalog.values())
+        # Capture and vision execute in separate phases. Optional Graph owners
+        # may be reclaimed; the mandatory carrier and physical floor may not.
+        external = self._elastic_pressure_floor_external_bytes() + max(
+            cold, hot + self._elastic_mm_activation_loan_bytes
+        )
+        if not 1 <= max_gdn <= coordinator.mamba_block_pool.num_gpu_blocks:
+            raise RuntimeError("cache frontier GDN envelope exceeds virtual capacity")
+        external = coordinator.normalize_elastic_external_memory(external)
+        frontier = max(
+            1,
+            min(
+                pool.num_gpu_blocks,
+                coordinator._elastic_attention_capacity(max_gdn, external),
+            ),
+        )
+        identity = (frontier, max_gdn, external)
+        if identity != getattr(self, "_elastic_cache_frontier_identity", None):
+            logger.info(
+                "Elastic cache preservation frontier: blocks=%d max_gdn=%d "
+                "post_reclaim_external_bytes=%d; no memory reservation",
+                *identity,
+            )
+            self._elastic_cache_frontier_identity = identity
+        pool.cache_preservation_num_blocks = frontier
+
+    def _schedule_with_prefix_leases(
         self,
         throttle_prefills: bool = False,
         *,
@@ -3624,14 +3892,11 @@ class Scheduler(SchedulerInterface):
                             hit_diverged,
                         ) = self._get_local_prefix_cache_hit(request)
 
-                    if request.prefix_cache_hint_tokens and not ignore_prefix:
-                        if request.prefix_cache_hint_tokens % self.hash_block_size != 0:
-                            raise RuntimeError(
-                                "Validated prefix-cache hint is not hash aligned"
+                    if not ignore_prefix:
+                        request.shared_prefix_boundary = (
+                            self._resolved_shared_prefix_boundary(
+                                request, request.shared_prefix_boundary
                             )
-                        request.shared_prefix_boundary = max(
-                            request.shared_prefix_boundary,
-                            request.prefix_cache_hint_tokens,
                         )
 
                     # Get externally-cached tokens if using a KVConnector.
@@ -5272,12 +5537,15 @@ class Scheduler(SchedulerInterface):
         self,
         requirements: KVCacheBlockPoolRequirements,
     ) -> bool:
-        """Return whether KV can coexist with the irreducible Graph floor.
+        """Return whether KV can coexist after administrative Graph reclaim.
 
         ``can_allocate`` prices the currently mapped HOT set. A cold larger
         wave must still reach Graph planning when evicting idle PIECEWISE
-        entries would make it feasible; only pinned residency and the measured
-        allocator floor survive that reclaim boundary.
+        entries would make it feasible. Legacy pinned captures are also
+        reclaimable at quiescence; only the mandatory serving carrier and
+        measured allocator floor survive. This is a read-only feasibility
+        probe, not permission to mutate: the planner still proves quiescence,
+        leases, loans and the destination capture before admission.
         """
         coordinator = self.kv_cache_manager.coordinator
         gdn_blocks = coordinator.elastic_gdn_blocks_after_allocation(requirements.mamba)
@@ -5287,7 +5555,7 @@ class Scheduler(SchedulerInterface):
             ),
             gdn_blocks=gdn_blocks,
         )
-        return available_external >= self._elastic_irreducible_external_bytes()
+        return available_external >= self._elastic_pressure_floor_external_bytes()
 
     def _reserve_elastic_admission(
         self,
@@ -10243,13 +10511,18 @@ class Scheduler(SchedulerInterface):
     ) -> KVCacheBlockPoolRequirements:
         """Blocks `request` still needs to allocate to hold its full sequence."""
         full_num_tokens = min(request.num_tokens, self.max_model_len)
+        computed_tokens = request.num_computed_tokens
+        blocks = self.kv_cache_manager.empty_kv_cache_blocks
+        bound = getattr(self, "_elastic_prefix_hits", {}).get(request.request_id)
+        if bound is not None and computed_tokens == 0:
+            blocks, computed_tokens, _boundary, _diverged = bound[1]
         return self.kv_cache_manager.coordinator.get_block_pool_requirements(
             request_id=request.request_id,
             num_tokens=full_num_tokens,
-            new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
+            new_computed_blocks=blocks.blocks,
             num_encoder_tokens=0,
-            total_computed_tokens=request.num_computed_tokens,
-            num_local_computed_tokens=request.num_computed_tokens,
+            total_computed_tokens=computed_tokens,
+            num_local_computed_tokens=computed_tokens,
             num_tokens_main_model=full_num_tokens,
             apply_admission_cap=True,
         )
