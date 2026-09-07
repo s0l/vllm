@@ -193,5 +193,6 @@ def compute_elastic_runtime_generation(vllm_config: VllmConfig) -> str:
             "AG2_VLLM_ELASTIC_MM_ACTIVATION_LOAN_BYTES", ""
         ),
         "runtime_source_hashes": elastic_runtime_source_hashes(),
+        "row_profile_sha256": os.environ.get("AG2_VLLM_TP3_ROW_PROFILE_SHA256", ""),
     }
     return compute_elastic_runtime_generation_from_factors(factors)

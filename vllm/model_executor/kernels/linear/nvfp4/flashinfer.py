@@ -415,11 +415,26 @@ class FlashInferB12xNvFp4LinearKernel(NvFp4LinearKernel):
     def can_implement(cls, config: NvFp4LinearLayerConfig) -> tuple[bool, str | None]:
         return True, None
 
-    def input_quant_key(self) -> QuantKey | None:
-        """Advertise the owner POC's prequant ABI only when it is enabled."""
+    def input_quant_key(self, layer: torch.nn.Module | None = None) -> QuantKey | None:
+        """Admit explicit consumers without enabling the legacy owner runtime."""
+        if layer is not None and getattr(layer, "_ag2_row_prequant_input", False):
+            return kNvfp4Dynamic
         if os.environ.get("AG2_VLLM_TP3_OWNER_PREQUANT", "0") == "1":
             return kNvfp4Dynamic
         return None
+
+    def bind_row_prequant_input(self, layer: torch.nn.Module) -> None:
+        """Bind one loaded consumer during initialization, before compilation."""
+        if (
+            getattr(layer, "input_quant_key", None) not in (None, kNvfp4Dynamic)
+            or not hasattr(layer, "input_global_scale_inv")
+            or layer.input_global_scale_inv.dtype != torch.float32
+            or layer.input_global_scale_inv.numel() != 1
+            or not hasattr(layer, "weights_padding_cols")
+        ):
+            raise ValueError("row prequant requires a loaded compatible B12x consumer")
+        layer._ag2_row_prequant_input = True
+        layer.input_quant_key = kNvfp4Dynamic
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.weight_scale = torch.nn.Parameter(
@@ -438,7 +453,7 @@ class FlashInferB12xNvFp4LinearKernel(NvFp4LinearKernel):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         output_size = layer.output_size_per_partition
-        qa = as_quantized_activation(x, self.input_quant_key())
+        qa = as_quantized_activation(x, self.input_quant_key(layer))
         if qa is not None:
             x_fp4, x_blockscale = qa.data, qa.scale
             output_dtype = qa.orig_dtype

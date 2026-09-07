@@ -979,7 +979,15 @@ class Qwen3NextAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         return_ag2_mtp_trace: bool = False,
+        *,
+        return_tp_partial: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if return_tp_partial and (
+            not self._ag2_tp3_unified_exact_reduce
+            or self.o_proj.reduce_results
+            or return_ag2_mtp_trace
+        ):
+            raise RuntimeError("TP partial requires untraced TP3 exact attention")
         mtp_trace: dict[str, torch.Tensor] = {}
         qkv, _ = self.qkv_proj(hidden_states)
         if return_ag2_mtp_trace:
@@ -1090,7 +1098,7 @@ class Qwen3NextAttention(nn.Module):
             trace = attn_output[:3]
             self._ag2_trace_gated_output[: trace.shape[0]].copy_(trace)
         output, _ = self.o_proj(attn_output)
-        if self._ag2_tp3_unified_exact_reduce:
+        if self._ag2_tp3_unified_exact_reduce and not return_tp_partial:
             output = tensor_model_parallel_unified_exact_all_reduce(output)
         if return_ag2_mtp_trace:
             mtp_trace["output_parallel"] = self.o_proj._ag2_aux_output_parallel
@@ -2279,6 +2287,18 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        row_binding = getattr(self, "_ag2_row_continuation", None)
+        if row_binding is not None:
+            from vllm.model_executor.models.qwen3_next_row import row_model_forward
+
+            return row_model_forward(
+                self,
+                row_binding,
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+            )
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds

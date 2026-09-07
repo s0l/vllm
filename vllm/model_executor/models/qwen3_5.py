@@ -559,6 +559,9 @@ class Qwen3_5ForCausalLMBase(
     def process_weights_after_loading(self) -> None:
         if self.model._ag2_tp3_owner_prequant:
             self.model._ag2_validate_tp3_owner_prequant_weights()
+        from vllm.model_executor.models.qwen3_next_row import prepare_row_continuation
+
+        prepare_row_continuation(self.model, self.model_config.model)
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = layers

@@ -38,6 +38,16 @@ def test_unknown_downstream_flag_still_invalidates_compile(monkeypatch):
     assert _ag2_downstream_compile_factors() != original
 
 
+def test_row_profile_content_not_location_identifies_compile(monkeypatch):
+    monkeypatch.setenv("AG2_VLLM_TP3_ROW_PROFILE_SHA256", "a" * 64)
+    monkeypatch.setenv("AG2_VLLM_TP3_ROW_PROFILE", "/first/profile.json")
+    original = _ag2_downstream_compile_factors()
+    monkeypatch.setenv("AG2_VLLM_TP3_ROW_PROFILE", "/moved/profile.json")
+    assert _ag2_downstream_compile_factors() == original
+    monkeypatch.setenv("AG2_VLLM_TP3_ROW_PROFILE_SHA256", "b" * 64)
+    assert _ag2_downstream_compile_factors() != original
+
+
 def test_admission_policy_does_not_change_model_compile_identity(monkeypatch):
     monkeypatch.setenv("AG2_VLLM_TP3_OWNER_PREQUANT", "1")
     monkeypatch.setenv("AG2_VLLM_MAX_CONCURRENT_PARTIAL_PREFILLS", "1")

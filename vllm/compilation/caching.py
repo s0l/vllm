@@ -575,6 +575,9 @@ def _ag2_downstream_compile_factors() -> dict[str, str]:
     # Catalog selection and maintenance IO have no compiled-model consumer.
     # Keep the exclusion explicit: a future AG2 flag is not safe by prefix.
     catalog_control_only = {
+        # Data-only row profile is identified by the required SHA256 env.
+        # Moving the same profile does not change the consumed graph.
+        "AG2_VLLM_TP3_ROW_PROFILE",
         "AG2_VLLM_ELASTIC_REQUIRE_CATALOG",
         "AG2_VLLM_ELASTIC_AUTO_CALIBRATE",
         "AG2_VLLM_ELASTIC_CATALOG_PATH",

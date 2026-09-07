@@ -253,7 +253,13 @@ class Qwen2MoeMLP(nn.Module):
         torch.ops.vllm.ag2_bf16_mm_out(x, self.gate_up_proj.weight, output)
         return output
 
-    def forward(self, x):
+    def forward(self, x, *, return_tp_partial: bool = False):
+        if return_tp_partial and (
+            not self._ag2_tp3_unified_exact_reduce
+            or self.down_proj.reduce_results
+            or self.expert_gate is not None
+        ):
+            raise RuntimeError("TP partial requires ungated TP3 exact MLP projection")
         gate_up = self._gate_up(x)
         out = self.act_fn(gate_up)
         if getattr(self, "_ag2_aux_full_trace_enabled", False):
@@ -273,7 +279,7 @@ class Qwen2MoeMLP(nn.Module):
             self._ag2_aux_compact_gate_up = compact(gate_up)
             self._ag2_aux_compact_activation = compact(out)
         out, _ = self.down_proj(out)
-        if self._ag2_tp3_unified_exact_reduce:
+        if self._ag2_tp3_unified_exact_reduce and not return_tp_partial:
             out = tensor_model_parallel_unified_exact_all_reduce(out)
 
         if getattr(self, "_ag2_aux_full_trace_enabled", False):

@@ -22,9 +22,8 @@ def test_exact_full_attention_reduces_rank_local_projection() -> None:
     for node in ast.walk(forward):
         if not isinstance(node, ast.If):
             continue
-        if not (
-            isinstance(node.test, ast.Attribute)
-            and node.test.attr == "_ag2_tp3_unified_exact_reduce"
+        if ast.unparse(node.test) != (
+            "self._ag2_tp3_unified_exact_reduce and (not return_tp_partial)"
         ):
             continue
         guarded_calls.extend(

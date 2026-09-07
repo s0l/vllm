@@ -477,6 +477,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.padded_local_value_dim = self.gdn_partition.padded_value_dim
         self.local_conv_dim = self.gdn_partition.local_conv_dim
         self.padded_local_conv_dim = self.gdn_partition.padded_conv_dim
+        self._ag2_tp_partial_cuda_dispatch = False
         if current_platform.is_xpu():
             self._forward_method = self.forward_xpu
         elif current_platform.is_cpu():
@@ -490,6 +491,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self._forward_method = self.forward_hip
         else:
             self._forward_method = self.forward_cuda
+            self._ag2_tp_partial_cuda_dispatch = True
 
         # QKV
         self.conv_dim = self.key_dim * 2 + self.value_dim
@@ -1377,19 +1379,31 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def forward(
         self,
         hidden_states: torch.Tensor | GDNQuantizedActivations,
+        *,
+        return_tp_partial: bool = False,
     ) -> torch.Tensor:
+        if return_tp_partial:
+            if not self._ag2_tp_partial_cuda_dispatch:
+                raise RuntimeError("TP partial requires the CUDA GDN dispatch")
+            return self.forward_cuda(hidden_states, return_tp_partial=True)
         return self._forward_method(hidden_states)
 
     def _output_projection(
         self,
         core_attn_out: torch.Tensor,
         z: torch.Tensor,
+        *,
+        return_tp_partial: bool = False,
     ) -> torch.Tensor:
         """Part 3: RMSNormGated + output linear projection.
 
         The RMSNormGated + quant sequence is eligible for fusion
         by the compilation pass when fuse_norm_quant is enabled.
         """
+        if return_tp_partial and (
+            not self._ag2_tp3_unified_exact_reduce or self.out_proj.reduce_results
+        ):
+            raise RuntimeError("TP partial requires TP3 exact GDN projection")
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
@@ -1409,7 +1423,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self._ag2_trace_gated_norm[: trace.shape[0]].copy_(trace)
         output, _ = self.out_proj(core_attn_out)
         if self._ag2_tp3_unified_exact_reduce:
-            output = tensor_model_parallel_unified_exact_all_reduce(output)
+            if not return_tp_partial:
+                output = tensor_model_parallel_unified_exact_all_reduce(output)
         elif self._ag2_gdn_prefill_batch_invariant_reduce:
             output = tensor_model_parallel_gdn_all_reduce(output)
         if self._ag2_aux_boundaries_enabled:
@@ -1475,6 +1490,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def forward_cuda(
         self,
         hidden_states: torch.Tensor | GDNQuantizedActivations,
+        *,
+        return_tp_partial: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass with three parts:
@@ -1482,6 +1499,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         2. Core attention (custom op)
         3. Output projection
         """
+        if return_tp_partial and (
+            not self._ag2_tp3_unified_exact_reduce or self.out_proj.reduce_results
+        ):
+            raise RuntimeError("TP partial requires TP3 exact GDN projection")
         if isinstance(hidden_states, GDNQuantizedActivations):
             qkvz_input = hidden_states.qkvz
             ba_input = hidden_states.ba
@@ -1606,7 +1627,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        return self._output_projection(core_attn_out, z)
+        return self._output_projection(
+            core_attn_out, z, return_tp_partial=return_tp_partial
+        )
 
     def forward_xpu(
         self,

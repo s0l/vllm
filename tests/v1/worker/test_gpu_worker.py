@@ -200,6 +200,33 @@ def test_startup_plan_fingerprint_tracks_physical_dag_env(plan_env, monkeypatch,
     assert before != fp(_plan_worker().vllm_config, 0, 1)
 
 
+def test_row_profile_content_binds_price_startup_and_runtime(plan_env, monkeypatch):
+    from vllm.v1.core import elastic_runtime
+
+    config = _plan_worker().vllm_config
+    kv = SimpleNamespace(
+        elastic_attention_stride=128,
+        elastic_gdn_stride=64,
+        elastic_mapping_quantum=32,
+        elastic_gdn_blocks_per_request=3,
+    )
+
+    def identities():
+        return (
+            startup_plan.compute_plan_fingerprint(config, 0, 3),
+            startup_plan.compute_elastic_graph_catalog_fingerprint(config, kv),
+            elastic_runtime.compute_elastic_runtime_generation(config),
+        )
+
+    monkeypatch.setenv("AG2_VLLM_TP3_ROW_PROFILE_SHA256", "a" * 64)
+    monkeypatch.setenv("AG2_VLLM_TP3_ROW_PROFILE", "/first/profile")
+    original = identities()
+    monkeypatch.setenv("AG2_VLLM_TP3_ROW_PROFILE", "/moved/profile")
+    assert identities() == original
+    monkeypatch.setenv("AG2_VLLM_TP3_ROW_PROFILE_SHA256", "b" * 64)
+    assert all(a != b for a, b in zip(original, identities(), strict=True))
+
+
 def test_elastic_identities_include_profile_config(plan_env):
     from vllm.v1.core import elastic_runtime
 

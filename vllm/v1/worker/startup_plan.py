@@ -68,6 +68,7 @@ BOUNDED_PIECEWISE_REPLAY_CONTRACT = "cold_capture_bounds_same_key_hot-v1"
 # memory profiling.  They are therefore part of the cached KV-budget identity,
 # even when VllmConfig.compute_hash() is unchanged.
 STARTUP_PROFILE_ENV_NAMES = (
+    "AG2_VLLM_TP3_ROW_PROFILE_SHA256",
     "AG2_VLLM_DCP_ABSOLUTE_PREFILL_SEGMENT_SIZE",
     "AG2_VLLM_DCP_ABSOLUTE_SEGMENT_PREFILL",
     "AG2_VLLM_DCP_CANONICAL_PAGED_FIXED_SPLIT_SIZE",
