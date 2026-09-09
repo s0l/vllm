@@ -19,6 +19,7 @@ RUNTIME_SOURCES = (
     "distributed/device_communicators/tp3_row_norm_kernels.py",
     "distributed/device_communicators/tp3_row_plan.py",
     "distributed/device_communicators/tp3_row_transport.py",
+    "distributed/device_communicators/tp3_row_packet.py",
     "distributed/device_communicators/tp3_exact_reduce.py",
     "model_executor/models/qwen3_next.py",
     "model_executor/models/qwen3_5.py",

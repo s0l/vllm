@@ -13,6 +13,7 @@ from vllm.model_executor.kernels.linear.nvfp4.arc import ag2_nvfp4_arc_quantize
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .tp3_row_norm import RowNormSpec
+from .tp3_row_packet import publish_quantized
 from .tp3_row_plan import RowOwnerPlan, partition_rows
 from .tp3_row_transport import RowSeam
 
@@ -95,16 +96,25 @@ def _quantized(specs, inputs, gamma, divisor, selected, group, seam):
         normalized, carry = specs[rank].apply(inputs, gamma)
         q, sf = ag2_nvfp4_arc_quantize(normalized, divisor, selected[rank])
         return q, sf, carry, normalized
-    carry = None
+    operands = tuple(seam.owned(value) for value in inputs)
+    memo, carry = {}, None
 
     def normalized_for(destination):
         nonlocal carry
-        normalized, current = specs[destination].apply(inputs, gamma)
+        spec = specs[destination]
+        # The complete recipe and operands are identical only within this call.
+        if spec not in memo:
+            memo[spec] = spec.apply(operands, gamma)
+        normalized, current = memo[spec]
         if destination == rank:
             carry = current
         return normalized
 
-    q, sf = seam.quantized(normalized_for, divisor, selected, candidate=True)
+    q, sf = publish_quantized(seam, normalized_for, divisor, selected)
+    if carry is not None:
+        full = torch.zeros_like(inputs[0])
+        seam.owned(full).copy_(carry)
+        carry = full
     return q, sf, carry, None
 
 
