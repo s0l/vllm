@@ -965,12 +965,31 @@ class Qwen3NextAttention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             gate = None
 
-        q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
-            -1, self.num_heads * self.head_dim
-        )
-        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
-            -1, self.num_kv_heads * self.head_dim
-        )
+        if getattr(self, "_ag2_ready_exact_qk", False):
+            from vllm.model_executor.models.qwen3_next_exact_qk import (
+                normalize_from_sum,
+            )
+
+            qs, ks = torch.ops.vllm.ready_exact_qk_sums(qkv)
+            q = normalize_from_sum(
+                q.view(-1, self.num_heads, self.head_dim),
+                self.q_norm.weight,
+                qs,
+                self.q_norm.variance_epsilon,
+            ).view(-1, self.num_heads * self.head_dim)
+            k = normalize_from_sum(
+                k.view(-1, self.num_kv_heads, self.head_dim),
+                self.k_norm.weight,
+                ks,
+                self.k_norm.variance_epsilon,
+            ).view(-1, self.num_kv_heads * self.head_dim)
+        else:
+            q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
+                -1, self.num_heads * self.head_dim
+            )
+            k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
+                -1, self.num_kv_heads * self.head_dim
+            )
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v, gate
 
@@ -2298,6 +2317,7 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                 positions,
                 intermediate_tensors,
                 inputs_embeds,
+                ready_exact_norm=row_binding.ready_compaction,
             )
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:

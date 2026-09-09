@@ -1381,11 +1381,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         hidden_states: torch.Tensor | GDNQuantizedActivations,
         *,
         return_tp_partial: bool = False,
+        physical_rows: int | None = None,
+        ready_exact_norm: bool = False,
     ) -> torch.Tensor:
+        if (physical_rows is not None or ready_exact_norm) and not return_tp_partial:
+            raise ValueError("physical GDN envelope requires CUDA TP partial")
         if return_tp_partial:
             if not self._ag2_tp_partial_cuda_dispatch:
                 raise RuntimeError("TP partial requires the CUDA GDN dispatch")
-            return self.forward_cuda(hidden_states, return_tp_partial=True)
+            return self.forward_cuda(
+                hidden_states,
+                return_tp_partial=True,
+                physical_rows=physical_rows,
+                ready_exact_norm=ready_exact_norm,
+            )
         return self._forward_method(hidden_states)
 
     def _output_projection(
@@ -1394,6 +1403,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         z: torch.Tensor,
         *,
         return_tp_partial: bool = False,
+        physical_rows: int | None = None,
+        ready_projected: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Part 3: RMSNormGated + output linear projection.
 
@@ -1404,13 +1415,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             not self._ag2_tp3_unified_exact_reduce or self.out_proj.reduce_results
         ):
             raise RuntimeError("TP partial requires TP3 exact GDN projection")
-        z_shape_og = z.shape
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
-        core_attn_out = self._pad_local_value_flat(core_attn_out)
+        if ready_projected is not None:
+            if physical_rows is not None or not return_tp_partial:
+                raise ValueError("incompatible ready GDN norm envelopes")
+            core_attn_out = torch.ops.vllm.ready_exact_gdn_norm(
+                core_attn_out, ready_projected, self.norm.weight
+            )
+        else:
+            core_attn_out = self._original_output_norm(core_attn_out, z, physical_rows)
         if self._ag2_aux_boundaries_enabled:
             self._ag2_aux_gated_norm = core_attn_out
         if self._ag2_aux_compact_boundaries_enabled:
@@ -1450,6 +1462,28 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             trace = output[:3]
             self._ag2_trace_attention_output[: trace.shape[0]].copy_(trace)
         return output
+
+    def _original_output_norm(self, core_attn_out, z, physical_rows=None):
+        z_shape_og = z.shape
+        if physical_rows is not None:
+            # Keep the producer's P-row reduction geometry. Reconstructing the
+            # core from an M slice can change Inductor's reduction tree. Only
+            # the gate is padded; output projection still consumes M rows.
+            torch._check(core_attn_out.shape[0] == physical_rows)
+            torch._check(z.shape[0] >= 1)
+            torch._check(z.shape[0] <= physical_rows)
+            z = torch.cat((z, z.new_zeros((physical_rows - z.shape[0], *z.shape[1:]))))
+        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+        z = z.reshape(-1, z.shape[-1])
+        core_attn_out = self.norm(core_attn_out, z)
+        if physical_rows is None:
+            core_attn_out = core_attn_out.reshape(z_shape_og)
+        else:
+            core_attn_out = core_attn_out.reshape(physical_rows, *z_shape_og[1:])[
+                : z_shape_og[0]
+            ]
+        core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
+        return self._pad_local_value_flat(core_attn_out)
 
     def forward_hip(
         self,
@@ -1492,6 +1526,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         hidden_states: torch.Tensor | GDNQuantizedActivations,
         *,
         return_tp_partial: bool = False,
+        physical_rows: int | None = None,
+        ready_exact_norm: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass with three parts:
@@ -1519,6 +1555,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_tokens = hidden_states.size(0)
             input_dtype = hidden_states.dtype
             input_device = hidden_states.device
+        if physical_rows is not None:
+            if not return_tp_partial or self.enable_fused_gdn_decode:
+                raise ValueError("physical envelope requires unfused CUDA TP partial")
+            torch._check(num_tokens >= 1)
+            torch._check(physical_rows >= num_tokens)
+        if ready_exact_norm and (
+            not return_tp_partial
+            or physical_rows is not None
+            or self.enable_fused_gdn_decode
+            or self.gqa_interleaved_layout
+            or not self.gdn_explicit_partition
+        ):
+            raise ValueError("unproved ready GDN CUDA producer contract")
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
@@ -1582,7 +1631,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Note: we should not use torch.empty here like other attention backends,
         # see discussions in https://github.com/vllm-project/vllm/pull/28182
         core_attn_out = torch.zeros(
-            (num_tokens, self.local_num_v_heads, self.head_v_dim),
+            (
+                num_tokens if physical_rows is None else physical_rows,
+                self.local_num_v_heads,
+                self.head_v_dim,
+            ),
             dtype=input_dtype,
             device=input_device,
         )
@@ -1628,7 +1681,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Part 3: Output Projection
         # ============================================================
         return self._output_projection(
-            core_attn_out, z, return_tp_partial=return_tp_partial
+            core_attn_out,
+            z,
+            return_tp_partial=return_tp_partial,
+            physical_rows=physical_rows,
+            ready_projected=mixed_qkvz if ready_exact_norm else None,
         )
 
     def forward_xpu(

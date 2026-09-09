@@ -405,7 +405,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         "positions": -1,
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
-    }
+    },
 )
 class Qwen3_5Model(Qwen3NextModel):
     # Qwen3.5 ships the GDN in_proj checkpoints separately (qwen3-next
@@ -561,7 +561,9 @@ class Qwen3_5ForCausalLMBase(
             self.model._ag2_validate_tp3_owner_prequant_weights()
         from vllm.model_executor.models.qwen3_next_row import prepare_row_continuation
 
-        prepare_row_continuation(self.model, self.model_config.model)
+        prepare_row_continuation(
+            self.model, self.model_config.model, vllm_config=self.vllm_config
+        )
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = layers
@@ -576,15 +578,30 @@ class Qwen3_5ForCausalLMBase(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        ready_rows: torch.Tensor | None = None,
         **kwargs: object,
     ):
+        binding = getattr(self.model, "_ag2_row_continuation", None)
+        ready = binding is not None and binding.ready_compaction
+        if ready != (ready_rows is not None):
+            raise ValueError("ready target invocation must match its prepared recipe")
+        physical_rows = None
+        if ready_rows is not None:
+            from vllm.model_executor.models.qwen3_next_ready import compact_inputs
+
+            input_ids, positions, inputs_embeds, physical_rows = compact_inputs(
+                input_ids, positions, inputs_embeds, ready_rows
+            )
         hidden_states = self.model(
             input_ids,
             positions,
             intermediate_tensors,
             inputs_embeds,
         )
+        if physical_rows is not None:
+            from vllm.model_executor.models.qwen3_next_ready import physical_output
 
+            hidden_states = physical_output(hidden_states, physical_rows)
         return hidden_states
 
     @classmethod
@@ -1051,6 +1068,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        ready_rows: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
         """Run forward pass for Qwen3.5.
@@ -1080,11 +1098,14 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         if intermediate_tensors is not None:
             inputs_embeds = None
 
-        hidden_states = self.language_model.model(
+        # The language-model wrapper owns the exterior P/M invocation adapter.
+        # Calling its compiled backbone directly would bypass that contract.
+        hidden_states = self.language_model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
+            ready_rows=ready_rows,
         )
 
         return hidden_states

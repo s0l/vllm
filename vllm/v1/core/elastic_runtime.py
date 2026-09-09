@@ -55,6 +55,13 @@ _ELASTIC_RUNTIME_SOURCE_MODULES = (
     # topology, or draft/target numerics without changing VllmConfig.
     "vllm.model_executor.models.qwen3_5",
     "vllm.model_executor.models.qwen3_next",
+    "vllm.model_executor.models.qwen3_next_row",
+    "vllm.model_executor.models.qwen3_next_ready",
+    "vllm.model_executor.models.qwen3_next_exact_qk",
+    "vllm.model_executor.models.qwen3_next_exact_qk_kernels",
+    "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn",
+    "vllm.model_executor.layers.mamba.gdn.qwen_gdn_exact_norm",
+    "vllm.model_executor.layers.mamba.gdn.qwen_gdn_exact_norm_kernels",
     "vllm.model_executor.models.qwen3_5_mtp",
     "vllm.model_executor.layers.fused_qk_norm_rope",
     "vllm.model_executor.layers.rotary_embedding",

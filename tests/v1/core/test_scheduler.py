@@ -161,6 +161,7 @@ def _catalog_activation_scheduler(
         _elastic_admission_controller=SimpleNamespace(
             pending_maintenance_plan=None,
             record_measurement=Mock(),
+            record_capture_envelope=Mock(),
         ),
         _elastic_short_decode_inventory={47: ("raw",)},
         _rebuild_elastic_short_decode_inventory=Mock(),
@@ -201,6 +202,89 @@ def test_catalog_activation_accepts_drained_calibration_tombstones() -> None:
     assert scheduler.max_num_running_reqs == 39
     assert scheduler._elastic_graph_catalog
     scheduler._rebuild_elastic_short_decode_inventory.assert_called_once_with(39)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_catalog_activation_prices_physical_sets_before_order_free_m_class(reverse):
+    """A one-Graph mixed row cannot overwrite a three-Graph decode price."""
+    from vllm.v1.worker.startup_plan import ElasticGraphCatalog
+
+    scheduler = _new_elastic_scheduler()
+    scheduler._elastic_compiled_piecewise_sizes = frozenset((128,))
+    scheduler._elastic_graph_execution_policy = _current_q4_piecewise_policy((128,))
+    scheduler.max_num_running_reqs = 64
+    scheduler._elastic_graph_catalog = {}
+    scheduler._elastic_graph_catalog_coverage = {}
+    decode, mixed = (0, 3, 32, 128, 4), (0, 3, 39, 128, 0)
+    decode_keys = scheduler._resolve_elastic_step_physical_keys(decode)
+    mixed_keys = scheduler._resolve_elastic_step_physical_keys(mixed)
+    assert len(decode_keys) == 3 and len(mixed_keys) == 1
+    rows = (
+        (
+            decode,
+            dict(
+                cold_peak_bytes=168,
+                resident_bytes=200,
+                hot_peak_bytes=200,
+                floor_bytes=16,
+                resident_key_bytes=[(key.identity, 40) for key in decode_keys],
+            ),
+        ),
+        (
+            mixed,
+            dict(
+                cold_peak_bytes=202,
+                resident_bytes=202,
+                hot_peak_bytes=180,
+                floor_bytes=0,
+                resident_key_bytes=[(mixed_keys[0].identity, 44)],
+            ),
+        ),
+    )
+    catalog = ElasticGraphCatalog(source_sha256="a" * 64)
+    catalog.update(reversed(rows) if reverse else rows)
+    scheduler.activate_elastic_graph_catalog(
+        catalog,
+        dict(
+            representation="bounded_exact_hotset",
+            decode_max_x=39,
+            mixed_max_x=39,
+            full_context_max_x=39,
+            required_step_keys=[list(decode), list(mixed)],
+            restore_step_keys=[],
+            _catalog_source_sha256="a" * 64,
+        ),
+    )
+    controller = scheduler._elastic_admission_controller
+    for class_key in ((0, 3, 0, 128, 0), (0, 3, 0, 0, 0)):
+        assert controller.capture_envelopes[class_key] == (202, 16, 0)
+        assert controller.capture_envelope_resident_key_bytes(class_key) == ()
+    assert scheduler._elastic_capture_envelope_with_provenance(decode) == (
+        (200, 16, 0),
+        tuple(sorted((key.identity, 40) for key in decode_keys)),
+    )
+    assert scheduler._elastic_capture_envelope_with_provenance(mixed) == (
+        (202, 0, 0),
+        ((mixed_keys[0].identity, 44),),
+    )
+
+
+@pytest.mark.parametrize("source_floor", [0, 16, 31, 174])
+def test_elastic_cold_destination_does_not_reprice_the_source_floor(source_floor):
+    scheduler = _new_elastic_scheduler()
+    scheduler._elastic_graph_execution_policy = _current_q4_piecewise_policy()
+    controller = scheduler._elastic_admission_controller
+    key = (0, 3, 32, 128, 4)
+    controller.resident_bytes = 174
+    controller.transition_floor_bytes = source_floor
+    controller.record_capture_envelope(
+        scheduler._elastic_graph_owner_key(key),
+        (200, 16, 0),
+        resident_key_bytes=(),
+    )
+    assert scheduler._estimate_elastic_graph_step_bytes(key) == (200, True)
+    assert scheduler._elastic_capture_shared_evidence(key, 200) == ()
+    assert controller.transition_floor_bytes == source_floor
 
 
 def test_catalog_activation_rejects_stale_restore_carrier_without_mutation() -> None:
@@ -8756,6 +8840,201 @@ def test_running_cold_form_pressure_reclaim_makes_progress(
     )
     assert key == destination and not maintenance
     assert controller.pending_maintenance_plan is None
+
+
+def test_running_tail_reclaim_uses_independent_destination_and_new_receipt():
+    """Saved byte boundary: no shape fallback, then reprice real survivors."""
+    mib = 1 << 20
+    scheduler = _make_elastic_running_text_wave_scheduler(num_reqs=32)
+    scheduler._elastic_graph_execution_policy = _current_q4_piecewise_policy()
+    controller = scheduler._elastic_admission_controller
+    source, destination = (0, 3, 39, 156, 4), (0, 3, 32, 128, 4)
+    scheduler._elastic_graph_carrier_step_key = source
+    scheduler._elastic_terminal_decode_carrier_x = 39
+    source_keys = scheduler._resolve_elastic_step_physical_keys(source)
+    destination_keys = scheduler._resolve_elastic_step_physical_keys(destination)
+    terminal = next(key for key in source_keys if key.logical.owner == "mtp_decode")
+    scheduler._elastic_serving_carrier_keys = (terminal,)
+    prices = {"target": 26, "mtp_prefill": 46, "mtp_decode": 70}
+    entries = tuple(
+        sorted(
+            (
+                ElasticResidencyEntry(
+                    key=key,
+                    pinned=True,
+                    resident_bytes=prices[key.logical.owner] * mib,
+                    local_pool_bytes=0,
+                    reclaimable_bytes=0,
+                )
+                for key in source_keys
+            ),
+            key=lambda entry: entry.key.identity,
+        )
+    )
+    controller.accept_residency_receipt(
+        ElasticResidencyReceipt(
+            generation=controller.generation,
+            transaction_id=None,
+            resident_bytes=174 * mib,
+            floor_bytes=0,
+            transition_floor_bytes=31 * mib,
+            peak_bytes=174 * mib,
+            cublas_workspace_bytes=32 * mib,
+            entries=entries,
+        )
+    )
+    scheduler._elastic_graph_catalog = {
+        destination: dict(
+            cold_peak_bytes=168 * mib,
+            hot_peak_bytes=200 * mib,
+            resident_bytes=200 * mib,
+            floor_bytes=0,
+            resident_key_bytes=[(key.identity, 40 * mib) for key in destination_keys],
+        )
+    }
+    # Conflicting same-M fallback is deliberately present. Only identical
+    # physical DAG evidence may select the 200 MiB destination endpoint.
+    controller.record_capture_envelope(
+        scheduler._elastic_graph_owner_key(destination),
+        (202 * mib, 0, 0),
+        resident_key_bytes=((terminal.identity, 44 * mib),),
+    )
+    coordinator = scheduler.kv_cache_manager.coordinator
+    coordinator.elastic_external_memory_bytes = 174 * mib
+    coordinator.max_elastic_external_memory.return_value = 296 * mib
+    coordinator.normalize_elastic_external_memory.side_effect = lambda value: value
+    assert scheduler._can_fund_elastic_graph_step(
+        destination,
+        minimum_free_primary_blocks=0,
+        allow_maintenance=True,
+        preview_only=True,
+    ) == (False, 374 * mib, 296 * mib)
+    assert scheduler._preflight_elastic_running_text_wave(
+        token_budget=4096,
+        prefill_chunk_cap=0,
+        defer_prefills=False,
+        physical_quiescent=True,
+    ) == (None, True)
+    reclaim = controller.pending_maintenance_plan
+    assert reclaim is not None and reclaim.kind == ElasticPlanKind.PRESSURE_RECLAIM
+    assert reclaim.protected_keys == (terminal,)
+    assert set(reclaim.victim_keys) == set(source_keys) - {terminal}
+    coordinator.set_elastic_external_memory.assert_not_called()
+    scheduler._reserve_elastic_admission.assert_not_called()
+    controller.begin_reclaim(reclaim)
+    controller.accept_residency_receipt(
+        ElasticResidencyReceipt(
+            generation=controller.generation,
+            transaction_id=reclaim.transaction_id,
+            resident_bytes=70 * mib,
+            floor_bytes=0,
+            transition_floor_bytes=0,
+            peak_bytes=174 * mib,
+            cublas_workspace_bytes=0,
+            entries=tuple(entry for entry in entries if entry.key == terminal),
+        ),
+        expected_transaction_id=reclaim.transaction_id,
+    )
+    controller.clear_maintenance()
+    coordinator.elastic_external_memory_bytes = 70 * mib
+    assert scheduler._preflight_elastic_running_text_wave(
+        token_budget=4096,
+        prefill_chunk_cap=0,
+        defer_prefills=False,
+        physical_quiescent=True,
+    ) == (destination, True)
+    capture = controller.pending_maintenance_plan
+    assert capture is not None and capture.kind == ElasticPlanKind.MAINTENANCE
+    assert capture.capture_loan_bytes == 270 * mib
+    assert set(capture.cold_misses) == set(destination_keys)
+    # After physical reclaim, the same wave reserves its exact capture grant.
+    # The stub contains allocation; no real request/KV state is consumed here.
+    coordinator.set_elastic_external_memory.assert_not_called()
+    scheduler._reserve_elastic_admission.assert_called_once_with(
+        destination,
+        external_memory_bytes=270 * mib,
+        minimum_free_primary_blocks=0,
+        requirements=KVCacheBlockPoolRequirements(),
+    )
+
+
+@pytest.mark.parametrize("evidence_state", ["valid", "missing", "stale", "victim_only"])
+def test_cold_reclaim_sharing_is_receipt_backed_and_survives_teardown(evidence_state):
+    scheduler = _make_elastic_running_text_wave_scheduler(num_reqs=8)
+    scheduler._elastic_graph_execution_policy = _current_q4_piecewise_policy()
+    controller = scheduler._elastic_admission_controller
+    destination = (0, 3, 8, 32, 4)
+    keys = scheduler._resolve_elastic_step_physical_keys(destination)
+    terminal, optional = keys[-1], keys[0]
+    scheduler._elastic_serving_carrier_keys = (terminal,)
+    entries = tuple(
+        sorted(
+            (
+                ElasticResidencyEntry(
+                    key=key,
+                    pinned=True,
+                    resident_bytes=40,
+                    local_pool_bytes=0,
+                    reclaimable_bytes=0,
+                )
+                for key in (terminal, optional)
+            ),
+            key=lambda entry: entry.key.identity,
+        )
+    )
+    controller.accept_residency_receipt(
+        ElasticResidencyReceipt(
+            generation=controller.generation,
+            transaction_id=None,
+            resident_bytes=80,
+            floor_bytes=0,
+            transition_floor_bytes=0,
+            peak_bytes=80,
+            cublas_workspace_bytes=0,
+            entries=entries,
+        )
+    )
+    evidence = ((terminal.identity, 20),)
+    if evidence_state == "missing":
+        evidence = None
+    elif evidence_state == "stale":
+        evidence = ((terminal.identity + "-stale", 20),)
+    elif evidence_state == "victim_only":
+        evidence = ((optional.identity, 20),)
+    controller.record_capture_envelope(
+        scheduler._elastic_graph_owner_key(destination),
+        (100, 0, 0),
+        resident_key_bytes=evidence,
+    )
+    scheduler._elastic_graph_catalog = {}
+    assert scheduler._prepare_elastic_cold_form_reclaim(
+        destination,
+        required_external=180,
+        available_external=120,
+        physical_quiescent=True,
+    ) is (evidence_state == "valid")
+    if evidence_state != "valid":
+        assert controller.pending_maintenance_plan is None
+
+
+def test_hot_preflight_does_not_resolve_cold_catalog_evidence():
+    scheduler = _make_elastic_running_text_wave_scheduler(num_reqs=8)
+    scheduler._elastic_graph_execution_policy = _current_q4_piecewise_policy()
+    step = (0, 3, 8, 32, 4)
+    controller = scheduler._elastic_admission_controller
+    _publish_elastic_step_hot(scheduler, step)
+    controller.resident_bytes = 120
+    coordinator = scheduler.kv_cache_manager.coordinator
+    coordinator.elastic_external_memory_bytes = 120
+    coordinator.max_elastic_external_memory.return_value = 150
+    coordinator.normalize_elastic_external_memory.side_effect = lambda value: value
+    scheduler._elastic_capture_envelope_with_provenance = Mock(
+        side_effect=AssertionError("HOT replay consulted COLD evidence")
+    )
+    assert scheduler._can_fund_elastic_graph_step(
+        step,
+        minimum_free_primary_blocks=0,
+    ) == (True, 120, 150)
 
 
 def test_running_wave_defer_observer_deduplicates_but_reports_new_budget():

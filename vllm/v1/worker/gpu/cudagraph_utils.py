@@ -4308,6 +4308,18 @@ class ModelCudaGraphManager(CudaGraphManager):
                 "positions": input_buffers.positions[:num_tokens],
                 **model_state.prepare_dummy_inputs(num_reqs, num_tokens),
             }
+            from vllm.model_executor.models.qwen3_next_ready import (
+                bind_ready_rows,
+                ready_compaction_enabled,
+            )
+
+            model_inputs = bind_ready_rows(
+                model_inputs,
+                enabled=ready_compaction_enabled(self.vllm_config),
+                actual_rows=num_tokens,
+                physical_rows=num_tokens,
+                full_graph=True,
+            )
             if not self.is_first_pp_rank:
                 # Update for non-first PP ranks.
                 model_inputs["input_ids"] = None

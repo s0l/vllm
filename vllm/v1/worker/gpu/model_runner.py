@@ -3831,6 +3831,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # values above.
             **prepared_model_inputs,
         }
+        from vllm.model_executor.models.qwen3_next_ready import (
+            bind_ready_rows,
+            ready_compaction_enabled,
+        )
+
+        model_inputs = bind_ready_rows(
+            model_inputs,
+            enabled=ready_compaction_enabled(self.vllm_config),
+            actual_rows=input_batch.num_tokens,
+            physical_rows=input_batch.num_tokens_after_padding,
+            full_graph=batch_desc.cg_mode == CUDAGraphMode.FULL,
+        )
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
             model_inputs["input_ids"] = None

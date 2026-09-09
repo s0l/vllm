@@ -72,15 +72,20 @@ class RowContinuation(nn.Module):
                 )
 
 
-def prepare_row_continuation(model, model_root):
+def prepare_row_continuation(model, model_root, *, vllm_config=None):
+    from vllm.model_executor.models.qwen3_next_ready import ready_compaction_enabled
+
+    ready = ready_compaction_enabled(vllm_config) if vllm_config is not None else False
     expected_sha = os.environ.get("AG2_VLLM_TP3_ROW_PROFILE_SHA256", "")
     path = os.environ.get("AG2_VLLM_TP3_ROW_PROFILE", "")
     if not expected_sha and not path:
+        if ready:
+            raise ValueError("ready target requires an admitted row profile")
         return
     profile = read_profile(path, expected_sha, model_root)
     old = getattr(model, "_ag2_row_continuation", None)
     if old is not None:
-        if old.profile_sha != expected_sha:
+        if old.profile_sha != expected_sha or old.ready_compaction != ready:
             raise ValueError("cannot rebind a compiled row model to another profile")
         return
     group = get_tp_group()
@@ -187,21 +192,63 @@ def prepare_row_continuation(model, model_root):
         or not model.norm.weight.is_contiguous()
     ):
         raise ValueError("row terminal norm ABI mismatch")
+    if ready:
+        from vllm.model_executor.layers.layernorm import RMSNormGated
+        from vllm.model_executor.layers.mamba.gdn import qwen_gdn_exact_norm  # noqa: F401
+        from vllm.model_executor.models.qwen3_next_exact_qk import validate_owner
+
+        for layer in model.layers:
+            if layer.layer_type != "linear_attention":
+                validate_owner(layer.self_attn, model.norm.weight.device)
+                continue
+            owner = layer.linear_attn
+            norm = owner.norm
+            if (
+                type(norm) is not RMSNormGated
+                or norm.weight.shape != (128,)
+                or norm.weight.dtype != torch.bfloat16
+                or not norm.weight.is_contiguous()
+                or norm.weight.device != model.norm.weight.device
+                or norm.eps != 1e-6
+                or not norm.norm_before_gate
+                or norm.activation not in ("silu", "swish")
+                or norm.group_size is not None
+                or owner.local_num_v_heads not in (15, 18)
+                or owner.enable_fused_gdn_decode
+                or owner.gqa_interleaved_layout
+                or not owner.gdn_explicit_partition
+            ):
+                raise ValueError("unproved ready GDN norm/producer recipe")
     binding = RowContinuation(
         profile, peers, model.layers, model.norm.weight.device, expected_sha
     )
-    # Startup failure aborts the model instance. No live route is enabled until
-    # all allocations and consumers have been admitted.
+    binding.ready_compaction = ready
+    # All admission checks precede allocations/binding. An allocation failure
+    # aborts startup; never expose a partially prepared model to inference.
     for consumer in consumers:
         consumer.scheme.kernel.bind_row_prequant_input(consumer)
+    if ready:
+        for layer in model.layers:
+            if layer.layer_type == "full_attention":
+                layer.self_attn._ag2_ready_exact_qk = True
     model._ag2_row_continuation = binding
 
 
 def row_model_forward(
-    model, binding, input_ids, positions, intermediate_tensors, inputs_embeds
+    model,
+    binding,
+    input_ids,
+    positions,
+    intermediate_tensors,
+    inputs_embeds,
+    *,
+    ready_exact_norm=False,
 ):
     if intermediate_tensors is not None or model.aux_hidden_state_layers:
         raise ValueError("row target does not admit PP or auxiliary hidden consumers")
+    if ready_exact_norm:
+        if not binding.ready_compaction:
+            raise ValueError("ready rows require an immutable admitted recipe")
     residual = (
         inputs_embeds if inputs_embeds is not None else model.embed_input_ids(input_ids)
     )
@@ -239,7 +286,14 @@ def row_model_forward(
                     hidden, quantized(bq, bsf, residual.shape[0])
                 )
         if layer.layer_type == "linear_attention":
-            partial = layer.linear_attn(hidden_states=hidden, return_tp_partial=True)
+            if not ready_exact_norm:
+                partial = layer.linear_attn(
+                    hidden_states=hidden, return_tp_partial=True
+                )
+            else:
+                partial = layer.linear_attn(
+                    hidden_states=hidden, return_tp_partial=True, ready_exact_norm=True
+                )
         else:
             partial = layer.self_attn(
                 positions=positions, hidden_states=hidden, return_tp_partial=True
@@ -258,7 +312,7 @@ def row_model_forward(
             quantized(q, sf, residual.shape[0]), return_tp_partial=True
         )
     assert contribution is not None and attention is not None
-    return torch.ops.vllm.tp3_row_terminal(
+    output = torch.ops.vllm.tp3_row_terminal(
         contribution,
         attention,
         residual,
@@ -266,3 +320,4 @@ def row_model_forward(
         binding.terminal_config,
         binding.group_name,
     )
+    return output

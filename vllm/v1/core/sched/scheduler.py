@@ -896,16 +896,14 @@ class Scheduler(SchedulerInterface):
                 coverage["full_context_max_x"],
                 self.max_num_running_reqs,
             )
+            capture_groups = defaultdict(list)
             for catalog_key, row in catalog.items():
-                self._record_elastic_capture_envelope(
-                    catalog_key,
-                    (
-                        _elastic_catalog_cold_residency_envelope(row),
-                        row["floor_bytes"],
-                        0,
-                    ),
-                    resident_key_bytes=row.get("resident_key_bytes"),
-                )
+                for owner_key in (
+                    Scheduler._elastic_graph_owner_key(catalog_key),
+                    Scheduler._elastic_graph_global_owner_key(catalog_key),
+                ):
+                    if owner_key is not None:
+                        capture_groups[owner_key].append(row)
                 # A bounded short PIECEWISE request has one prefill step and
                 # must reclaim before a fresh cohort crosses admission. Its
                 # repeated cold envelope is the conservative same-key price.
@@ -919,6 +917,14 @@ class Scheduler(SchedulerInterface):
                         )
                         else row["hot_peak_bytes"]
                     ),
+                )
+            for owner_key, rows in capture_groups.items():
+                envelope, provenance = (
+                    Scheduler._combine_elastic_catalog_envelope_evidence(tuple(rows))
+                )
+                assert envelope is not None
+                self._elastic_admission_controller.record_capture_envelope(
+                    owner_key, envelope, resident_key_bytes=provenance
                 )
         except Exception:
             self._elastic_graph_catalog = previous_catalog
@@ -2575,11 +2581,17 @@ class Scheduler(SchedulerInterface):
             return False
         # Do not assume allocator slack or future KV compaction. The same
         # pinned-KV capacity must fund the destination and mandatory carrier.
-        # Omitting sharing here is conservative and avoids treating optional
-        # source entries as if they survived the administrative teardown.
+        # Only the protected destination intersection survives this teardown;
+        # optional victims cannot contribute shared bytes to the next capture.
+        protected = getattr(self, "_elastic_serving_carrier_keys", ())
+        shared = self._elastic_capture_shared_resident_bytes(
+            protected,
+            self._elastic_capture_shared_evidence(step_key, destination),
+        )
         post_reclaim_bound = controller.compose_destination_capture_loan(
             current_residency_bytes=self._elastic_pressure_floor_external_bytes(),
             destination_capture_endpoint_bytes=destination,
+            shared_resident_bytes=shared,
         )
         if post_reclaim_bound > available_external:
             return False
@@ -2587,7 +2599,7 @@ class Scheduler(SchedulerInterface):
             self._next_elastic_transaction_id(),
             request_bytes=controller.resident_bytes,
             available_bytes=available_external,
-            protected_keys=getattr(self, "_elastic_serving_carrier_keys", ()),
+            protected_keys=protected,
         )
         if reclaim.kind != ElasticPlanKind.PRESSURE_RECLAIM:
             return False
@@ -5821,16 +5833,16 @@ class Scheduler(SchedulerInterface):
         physical_keys: tuple[PhysicalReplayKey, ...] = ()
         if step_key is not None and hasattr(self, "_elastic_admission_controller"):
             physical_keys = self._resolve_elastic_step_physical_keys(step_key)
-            # A semantic PIECEWISE carrier is not necessarily a PIECEWISE
-            # CUDA Graph. Generic B4096 target/MTP-prefill work is compiled
-            # only, while the same step can still consume a small FULL
-            # mtp_decode owner. Price that exact physical subset from sealed
-            # aggregate observations of the same physical DAG before
-            # consulting PIECEWISE rows. Per-owner GraphPrice entries are not
-            # a complete cold envelope: they exclude shared capture/floor
-            # workspace and underfunded the first live X1/B128 replay.
-            if physical_keys and not any(
-                key.logical.mode == "PIECEWISE" for key in physical_keys
+            # One semantic M class may contain a compiled-only target plus
+            # one FULL MTP Graph, or a three-Graph batched-decode DAG. Resolve
+            # the complete physical set before the class fallback. Individual
+            # GraphPrice entries omit capture/floor workspace and cannot price
+            # the independent aggregate endpoint.
+            # PIECEWISE calibration replaces provisional class envelopes while
+            # mutating rows. Those partial rows are not sealed observations.
+            if physical_keys and (
+                not getattr(self, "_elastic_restore_mode", False)
+                or not any(key.logical.mode == "PIECEWISE" for key in physical_keys)
             ):
                 requested = frozenset(physical_keys)
                 exact_rows = tuple(
@@ -5934,7 +5946,7 @@ class Scheduler(SchedulerInterface):
         if not rows:
             return None, None
         envelope = (
-            max(int(row.get("cold_peak_bytes", 0)) for row in rows),
+            max(_elastic_catalog_cold_residency_envelope(row) for row in rows),
             max(int(row.get("floor_bytes", 0)) for row in rows),
             0,
         )
@@ -6072,7 +6084,7 @@ class Scheduler(SchedulerInterface):
         if prior is not None:
             prior_value = self._adjust_elastic_capture_envelope(
                 prior,
-                self._elastic_admission_controller.transition_floor_bytes,
+                0,
                 0,
             )[0]
         floor_value, floor_keys = self._elastic_piecewise_physical_floor_evidence(
@@ -6105,6 +6117,26 @@ class Scheduler(SchedulerInterface):
         if floor_selected:
             return floor_keys
         return None
+
+    def _elastic_capture_shared_resident_bytes(
+        self,
+        destination_keys: Iterable[PhysicalReplayKey],
+        evidence: tuple[tuple[str, int], ...] | None,
+    ) -> int:
+        """Intersect a priced destination with completed, still-HOT residency."""
+        controller = self._elastic_admission_controller
+        receipt = controller.last_receipt
+        observed = (
+            {}
+            if receipt is None
+            else {entry.key.identity: entry.resident_bytes for entry in receipt.entries}
+        )
+        proven = dict(evidence or ())
+        return sum(
+            min(observed.get(key.identity, 0), proven.get(key.identity, 0))
+            for key in set(destination_keys)
+            if (entry := controller.entries.get(key)) is not None and entry.hot
+        )
 
     def _estimate_elastic_graph_step_bytes(
         self,
@@ -6260,13 +6292,14 @@ class Scheduler(SchedulerInterface):
             desired_external, _floor_delta, _sampling_delta = (
                 self._adjust_elastic_capture_envelope(
                     prior_capture,
-                    self._elastic_admission_controller.transition_floor_bytes,
+                    0,
                     0,
                 )
             )
-            # Keep this as the independently measured destination set. Current
-            # residency, one retained source-workspace unit and their measured
-            # intersection are composed exactly once by the controller.
+            # This is the independent destination endpoint, including its own
+            # historical floor. C + D - S already carries current residency and
+            # source teardown leftovers; adding the source transition floor to
+            # D would charge it twice. Reclaim reduces C only by physical proof.
         elif measured_external is not None:
             desired_external = max(
                 measured_external, self._elastic_admission_controller.floor_bytes
@@ -6373,13 +6406,18 @@ class Scheduler(SchedulerInterface):
         desired_external, capture_envelope_planned = (
             self._estimate_elastic_graph_step_bytes(residency_step_key)
         )
-        prior_capture, _prior_envelope_keys = (
-            self._elastic_capture_envelope_with_provenance(residency_step_key)
-        )
-        destination_envelope_key_bytes = self._elastic_capture_shared_evidence(
-            residency_step_key,
-            desired_external,
-        )
+        # HOT replay has no destination capture endpoint or sharing deduction.
+        # Keep exact-set catalog resolution off the steady decode path.
+        prior_capture = None
+        destination_envelope_key_bytes = None
+        if capture_envelope_planned:
+            prior_capture, _prior_envelope_keys = (
+                self._elastic_capture_envelope_with_provenance(residency_step_key)
+            )
+            destination_envelope_key_bytes = self._elastic_capture_shared_evidence(
+                residency_step_key,
+                desired_external,
+            )
         cold_unknown = (
             capture_envelope_planned
             and prior_capture is None
@@ -6408,32 +6446,11 @@ class Scheduler(SchedulerInterface):
         # The worker measures a destination set independently, but exact HOT
         # destination owners may already be present in the current set. Their
         # receipt-backed resident bytes are a proved intersection and must be
-        # deducted once. Successor-only protected keys are deliberately not
-        # included: the destination endpoint does not prove they are shared.
-        last_receipt = self._elastic_admission_controller.last_receipt
-        receipt_resident_bytes = (
-            {}
-            if last_receipt is None
-            else {
-                entry.key.identity: entry.resident_bytes
-                for entry in last_receipt.entries
-            }
+        # deducted once. Retained successors qualify only when the selected
+        # endpoint's receipt explicitly proves the same allocation identity.
+        shared_resident_bytes = self._elastic_capture_shared_resident_bytes(
+            physical_keys, destination_envelope_key_bytes
         )
-        destination_proven_bytes = dict(destination_envelope_key_bytes or ())
-        shared_hot_destination_bytes = sum(
-            min(
-                receipt_resident_bytes.get(key.identity, 0),
-                destination_proven_bytes.get(key.identity, 0),
-            )
-            for key in physical_keys
-            if key.identity in destination_proven_bytes
-            and (
-                (entry := self._elastic_admission_controller.entries.get(key))
-                is not None
-                and entry.hot
-            )
-        )
-        shared_resident_bytes = shared_hot_destination_bytes
         compiled_only_step = bool(
             step_key is not None
             and not physical_keys
