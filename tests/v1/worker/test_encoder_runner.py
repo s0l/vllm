@@ -249,6 +249,33 @@ def test_execute_mm_encoder_is_a_noop_without_scheduled_items():
     state.encoder_runner.execute_mm_encoder.assert_not_called()
 
 
+def test_elastic_encoder_defers_multi_group_validation_until_all_calls(monkeypatch):
+    runner = object.__new__(EncoderRunner)
+    runner.device = torch.device("cpu")
+    runner.model = MagicMock()
+    runner.prepare_mm_inputs = MagicMock(
+        return_value=(["hash-a", "hash-b"], [("image", object())])
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.mm.encoder_runner.group_and_batch_mm_kwargs",
+        lambda *_args, **_kwargs: iter(
+            [
+                ("image", 1, {"pixels": torch.zeros(1)}),
+                ("audio", 1, {"audio": torch.zeros(1)}),
+            ]
+        ),
+    )
+
+    _hashes, batches = runner.stage_mm_encoder_batches({"req0": [0, 1]})
+    runner.model.embed_multimodal.side_effect = [[], [torch.zeros(1, HIDDEN)]]
+
+    grouped = runner.execute_staged_mm_encoder_batches(batches)
+
+    assert runner.model.embed_multimodal.call_count == 2
+    with pytest.raises(AssertionError):
+        runner.finalize_staged_mm_encoder_outputs(grouped)
+
+
 def _pe_feature(identifier: str, embeds: torch.Tensor, offset: int = 0):
     return MultiModalFeatureSpec(
         data=_embeds_item(embeds),
@@ -311,9 +338,10 @@ def test_execute_mm_encoder_skips_encoder_for_prompt_embeds_only():
     assert torch.equal(runner.encoder_cache.encoder_outputs["hash_pe"], prompt_embeds)
 
 
-def test_encoder_timing_stats_registry():
+def test_encoder_timing_stats_registry(monkeypatch):
     runner = _make_runner([], [])
     runner.enable_timing = True
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
 
     with runner.timed_encoder_operation({"r1"}):
         pass

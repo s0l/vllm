@@ -10,6 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -32,6 +33,12 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor, xxhash, xxhash_cbor
 from vllm.utils.mem_constants import GiB_bytes
+from vllm.v1.core.kv_cache_capacity import PhysicalPoolCapacityPlanner
+from vllm.v1.core.kv_cache_coordinator import (
+    ElasticAdmissionPlan,
+    HybridKVCacheCoordinator,
+    KVCacheBlockPoolRequirements,
+)
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -51,6 +58,7 @@ from vllm.v1.core.kv_cache_utils import (
     is_kv_cache_spec_uniform,
     make_block_hash_with_group_id,
     tensor_data,
+    update_kv_cache_capacity,
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
@@ -126,6 +134,18 @@ def make_request(
         block_hasher=get_request_block_hasher(block_size, hash_fn),
         prompt_embeds=prompt_embeds,
     )
+
+
+def test_elastic_runtime_reserve_config_is_rejected() -> None:
+    config = SimpleNamespace(
+        additional_config={
+            "elastic_gdn_backing": True,
+            "elastic_runtime_reserve_mb": 0,
+        }
+    )
+
+    with pytest.raises(ValueError, match="is retired"):
+        kv_cache_utils._use_elastic_gdn_backing(config)
 
 
 def new_kv_cache_spec(
@@ -555,6 +575,17 @@ def test_free_kv_cache_block_queue_popleft_n():
     for block in result_blocks:
         assert block.prev_free_block is None
         assert block.next_free_block is None
+
+
+def test_free_kv_cache_block_queue_peek_left_n_does_not_mutate():
+    blocks = [KVCacheBlock(block_id=i) for i in range(4)]
+    queue = FreeKVCacheBlockQueue(blocks)
+
+    assert [block.block_id for block in queue.peek_left_n(3)] == [0, 1, 2]
+    assert queue.num_free_blocks == 4
+    assert [block.block_id for block in queue.popleft_n(4)] == [0, 1, 2, 3]
+    with pytest.raises(ValueError, match="peek length"):
+        queue.peek_left_n(1)
 
 
 def test_free_kv_cache_block_queue_get_all_free_blocks():
@@ -1743,6 +1774,551 @@ def test_allocate_with_lookahead():
         num_lookahead_tokens=4,
     )
     assert len(blocks.get_block_ids()[0]) == 2
+
+
+@pytest.mark.parametrize(("pool_blocks", "admitted"), [(3, False), (4, True)])
+def test_separate_gdn_pool_admission_is_pool_aware(pool_blocks, admitted):
+    """Admission checks the GDN pool instead of charging it to attention."""
+    block_size = 4
+    mamba_spec = MambaSpec(
+        block_size=block_size,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        separate_pool=True,
+        separate_pool_num_blocks=pool_blocks,
+    )
+    config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            *(KVCacheGroupSpec([f"gdn-{i}"], mamba_spec) for i in range(3)),
+        ],
+    )
+    manager = KVCacheManager(
+        kv_cache_config=config,
+        max_model_len=32,
+        scheduler_block_size=block_size,
+        hash_block_size=block_size,
+    )
+    request = make_request("gdn-exhaustion", [1], block_size)
+
+    requirements = manager.coordinator.get_block_pool_requirements(
+        request_id=request.request_id,
+        num_tokens=1,
+        new_computed_blocks=manager.empty_kv_cache_blocks.blocks,
+        num_encoder_tokens=0,
+        total_computed_tokens=0,
+        num_local_computed_tokens=0,
+        num_tokens_main_model=1,
+    )
+
+    assert requirements.primary == 1
+    assert requirements.mamba == 3
+    assert manager.block_pool.get_num_free_blocks() == 9
+    assert manager.coordinator.mamba_block_pool is not None
+    assert manager.coordinator.mamba_block_pool.get_num_free_blocks() == pool_blocks - 1
+    assert manager.coordinator.can_allocate(requirements) is admitted
+    assert not manager.coordinator.can_allocate(
+        requirements,
+        reserved=KVCacheBlockPoolRequirements(mamba=1),
+    )
+    blocks = manager.allocate_slots(request, num_new_tokens=1)
+    assert (blocks is not None) is admitted
+
+
+@pytest.mark.parametrize("width", [7, 38])
+def test_elastic_mixed_repeated_admission_reuses_freed_cohort_blocks(width):
+    """Replay the allocation boundary, independent of Graph/sampling code."""
+    from .utils import create_requests
+
+    block_size = 2496
+    mamba_spec = MambaSpec(
+        block_size=block_size,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        separate_pool=True,
+        separate_pool_num_blocks=193,
+    )
+    config = KVCacheConfig(
+        num_blocks=69,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            *(KVCacheGroupSpec([f"gdn-{i}"], mamba_spec) for i in range(3)),
+        ],
+        elastic_attention_stride=86900736,
+        elastic_gdn_stride=19611648,
+        elastic_mapping_quantum=2 << 20,
+        elastic_gdn_initial_blocks=4,
+        elastic_gdn_blocks_per_request=3,
+        elastic_budget_bytes=6139685684,
+    )
+    manager = KVCacheManager(
+        kv_cache_config=config,
+        max_model_len=262144,
+        scheduler_block_size=block_size,
+        hash_block_size=block_size,
+        enable_caching=True,
+    )
+    coordinator = manager.coordinator
+    assert coordinator.set_elastic_external_memory(182452224)
+    assert coordinator.apply_elastic_admission_wave((1,) * width) == width
+    base = create_requests(width, num_tokens=2, block_size=block_size)
+    for request in base:
+        assert manager.allocate_slots(request, 2) is not None
+    pool = coordinator.mamba_block_pool
+    assert pool is not None
+    for repeat in range(3):
+        request = create_requests(
+            1,
+            num_tokens=872,
+            block_size=block_size,
+            req_ids=[f"mixed-{repeat}"],
+        )[0]
+        requirements = manager.estimate_uncached_full_sequence_requirements(request)
+        assert coordinator.apply_elastic_admission_wave((requirements.primary,)) == 1
+        available = coordinator.max_elastic_external_memory(
+            minimum_free_primary_blocks=requirements.primary,
+            gdn_blocks=coordinator.elastic_gdn_blocks_after_allocation(
+                requirements.mamba
+            ),
+        )
+        assert available >= 182452224
+        assert manager.allocate_slots(request, 872) is not None
+        manager.free(request)
+        assert pool.active_num_gpu_blocks - pool.get_num_free_blocks() == 1 + 3 * width
+    for request in base:
+        manager.free(request)
+    coordinator.rebalance_elastic_capacity()
+    assert pool.active_num_gpu_blocks == 4
+
+
+def test_elastic_gdn_capacity_transaction_and_rebalance():
+    block_size = 4
+    mamba_spec = MambaSpec(
+        block_size=block_size,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        separate_pool=True,
+        separate_pool_num_blocks=10,
+    )
+    config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            *(KVCacheGroupSpec([f"gdn-{i}"], mamba_spec) for i in range(3)),
+        ],
+        elastic_attention_stride=100,
+        elastic_gdn_stride=20,
+        elastic_mapping_quantum=100,
+        elastic_gdn_initial_blocks=4,
+        elastic_gdn_blocks_per_request=3,
+        elastic_budget_bytes=1100,
+    )
+    manager = KVCacheManager(
+        kv_cache_config=config,
+        max_model_len=32,
+        scheduler_block_size=block_size,
+        hash_block_size=block_size,
+    )
+    coordinator = manager.coordinator
+    assert coordinator.mamba_block_pool is not None
+    gdn_pool = coordinator.mamba_block_pool
+    assert gdn_pool.active_num_gpu_blocks == 4
+    leases = gdn_pool.get_new_blocks(3)
+
+    assert coordinator.ensure_elastic_capacity(KVCacheBlockPoolRequirements(mamba=3))
+    assert gdn_pool.active_num_gpu_blocks == 7
+    assert coordinator.block_pool.active_num_gpu_blocks == 9
+    assert coordinator.take_elastic_transition() == (9, 7)
+    coordinator._record_elastic_transition()
+    assert coordinator.take_elastic_transition() is None
+
+    gdn_pool.free_blocks(reversed(leases))
+    coordinator.rebalance_elastic_capacity()
+    assert gdn_pool.active_num_gpu_blocks == 4
+    assert coordinator.block_pool.active_num_gpu_blocks == 10
+    assert coordinator.take_elastic_transition() == (10, 4)
+    coordinator._record_elastic_transition()
+    assert coordinator.take_elastic_transition() is None
+    assert coordinator.last_elastic_rejection is None
+
+    # Map the immediate candidate pair before allocating primary blocks so the
+    # first request cannot occupy the logical tail needed by the second.
+    assert coordinator.apply_elastic_admission_wave((1, 1)) == 2
+    assert coordinator.block_pool.active_num_gpu_blocks == 9
+    assert gdn_pool.active_num_gpu_blocks == 7
+    wave_attention = coordinator.block_pool.get_new_blocks(2)
+    wave_gdn = gdn_pool.get_new_blocks(6)
+    assert [block.block_id for block in wave_attention] == [1, 2]
+    coordinator.block_pool.free_blocks(reversed(wave_attention))
+    gdn_pool.free_blocks(reversed(wave_gdn))
+    coordinator.rebalance_elastic_capacity()
+    assert coordinator.block_pool.active_num_gpu_blocks == 10
+    assert gdn_pool.active_num_gpu_blocks == 4
+
+    # An unused candidate lease must collapse to the last emitted initial layout.
+    assert coordinator.apply_elastic_admission_wave((1, 1)) == 2
+    coordinator.rebalance_elastic_capacity()
+    assert coordinator.take_elastic_transition() is None
+
+    # A referenced logical tail must fail closed and expose the exact reason.
+    attention_leases = coordinator.block_pool.get_new_blocks(9)
+    assert attention_leases[-1].block_id == 9
+    assert not coordinator.ensure_elastic_capacity(
+        KVCacheBlockPoolRequirements(mamba=8)
+    )
+    assert coordinator.last_elastic_rejection == {
+        "reason": "attention_tail_pinned",
+        "requirements": KVCacheBlockPoolRequirements(mamba=8),
+        "attention_active": 10,
+        "attention_free": 0,
+        "gdn_active": 4,
+        "gdn_free": 3,
+        "desired_gdn": 9,
+        "desired_attention": 9,
+        "pinned_attention_tail": ((9, 1),),
+    }
+
+
+def test_elastic_external_memory_borrows_and_returns_attention_tail():
+    block_size = 4
+    mamba_spec = MambaSpec(
+        block_size=block_size,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        separate_pool=True,
+        separate_pool_num_blocks=10,
+    )
+    config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            *(KVCacheGroupSpec([f"gdn-{i}"], mamba_spec) for i in range(3)),
+        ],
+        elastic_attention_stride=100,
+        elastic_gdn_stride=20,
+        elastic_mapping_quantum=100,
+        elastic_gdn_initial_blocks=4,
+        elastic_gdn_blocks_per_request=3,
+        elastic_budget_bytes=1100,
+    )
+    manager = KVCacheManager(
+        kv_cache_config=config,
+        max_model_len=32,
+        scheduler_block_size=block_size,
+        hash_block_size=block_size,
+    )
+    coordinator = manager.coordinator
+
+    # The null block is always resident, so three free primary blocks require
+    # four mapped attention blocks in total.
+    assert coordinator.max_elastic_external_memory(3) == 600
+    # A prospective X uses its post-allocation GDN residency, not a larger
+    # waiting-wave mapping that will be released before the graph loan.
+    assert coordinator.max_elastic_external_memory(3, gdn_blocks=10) == 500
+    assert coordinator.elastic_gdn_blocks_after_allocation(3) == 4
+    # Growth beyond the currently mapped free queue is exact. Mapping one
+    # missing block must not price the entire virtual GDN arena.
+    assert coordinator.elastic_gdn_blocks_after_allocation(4) == 5
+    assert coordinator.elastic_gdn_blocks_after_allocation(9) == 10
+    pinned_tail = coordinator.block_pool.blocks[9]
+    coordinator.block_pool.touch((pinned_tail,))
+    assert coordinator.max_elastic_external_memory(3) == 0
+    assert not coordinator.set_elastic_external_memory(200)
+    assert coordinator.elastic_external_memory_bytes == 0
+    assert coordinator.block_pool.active_num_gpu_blocks == 10
+    assert coordinator.last_elastic_rejection is not None
+    assert (
+        coordinator.last_elastic_rejection["reason"] == "external_attention_tail_pinned"
+    )
+
+    coordinator.block_pool.free_blocks((pinned_tail,))
+    assert coordinator.set_elastic_external_memory(200)
+    assert coordinator.elastic_external_memory_bytes == 200
+    assert coordinator.block_pool.active_num_gpu_blocks == 8
+    assert coordinator.take_elastic_transition() == (8, 4)
+
+    # A prospective request can need a larger attention prefix than the one
+    # currently mapped under the old loan. Price that future prefix rather than
+    # clamping it to the current active tail. Revalidate the headroom even when
+    # the requested loan itself did not change.
+    assert coordinator.max_elastic_external_memory(8) == 100
+    assert not coordinator.set_elastic_external_memory(
+        200, minimum_free_primary_blocks=8
+    )
+    assert coordinator.elastic_external_memory_bytes == 200
+    assert coordinator.block_pool.active_num_gpu_blocks == 8
+    assert coordinator.last_elastic_rejection is not None
+    assert coordinator.last_elastic_rejection["reason"] == (
+        "external_attention_headroom"
+    )
+    assert coordinator.set_elastic_external_memory(100, minimum_free_primary_blocks=8)
+    assert coordinator.elastic_external_memory_bytes == 100
+    assert coordinator.block_pool.active_num_gpu_blocks == 9
+
+    assert coordinator.set_elastic_external_memory(0)
+    assert coordinator.elastic_external_memory_bytes == 0
+    assert coordinator.block_pool.active_num_gpu_blocks == 10
+    assert coordinator.take_elastic_transition() == (10, 4)
+
+    assert not coordinator.set_elastic_external_memory(
+        600, minimum_free_primary_blocks=4
+    )
+    assert coordinator.elastic_external_memory_bytes == 0
+    assert coordinator.last_elastic_rejection is not None
+    assert coordinator.last_elastic_rejection["reason"] == (
+        "external_attention_headroom"
+    )
+    assert coordinator.set_elastic_external_memory(600, minimum_free_primary_blocks=3)
+    plan = coordinator.plan_elastic_admission_wave((1, 1, 1))
+    assert plan is not None
+    assert plan.max_requests == 2
+    assert coordinator.apply_elastic_admission_wave((1, 1, 1)) == 2
+
+    assert coordinator.set_elastic_external_memory(0)
+    reserved_plan = coordinator.plan_elastic_admission_wave(
+        (1, 1, 1), external_memory_bytes=600
+    )
+    assert reserved_plan is not None
+    assert reserved_plan.max_requests == 2
+    assert (
+        coordinator.apply_elastic_admission_wave((1, 1, 1), external_memory_bytes=600)
+        == 2
+    )
+    assert coordinator.elastic_external_memory_bytes == 600
+
+    # Returning the Graph loan can admit a wider attention requirement without
+    # growing GDN. Preview must price that destination, without applying it.
+    mapped_before = coordinator.block_pool.active_num_gpu_blocks
+    return_plan = coordinator.plan_elastic_admission_wave((6,), external_memory_bytes=0)
+    assert return_plan is not None
+    assert return_plan.max_requests == 1
+    assert coordinator.block_pool.active_num_gpu_blocks == mapped_before
+    assert coordinator.elastic_external_memory_bytes == 600
+    assert coordinator.apply_elastic_admission_wave((6,), external_memory_bytes=0) == 1
+    assert coordinator.block_pool.get_num_free_blocks() >= 6
+    assert coordinator.elastic_external_memory_bytes == 0
+
+
+def test_elastic_wave_restores_external_loan_when_gdn_commit_fails():
+    coordinator = object.__new__(HybridKVCacheCoordinator)
+    coordinator.elastic_external_memory_bytes = 100
+    coordinator.plan_elastic_admission_wave = Mock(
+        return_value=ElasticAdmissionPlan(
+            max_requests=2,
+            requirements=KVCacheBlockPoolRequirements(primary=4, mamba=6),
+        )
+    )
+    coordinator.set_elastic_external_memory = Mock(side_effect=[True, True])
+    coordinator.ensure_elastic_capacity = Mock(return_value=False)
+    coordinator.rebalance_elastic_capacity = Mock()
+
+    assert (
+        coordinator.apply_elastic_admission_wave((2, 2), external_memory_bytes=300) == 0
+    )
+    assert coordinator.set_elastic_external_memory.call_args_list == [
+        ((300,), {"minimum_free_primary_blocks": 4}),
+        ((100,), {}),
+    ]
+    coordinator.rebalance_elastic_capacity.assert_called_once_with()
+
+
+def test_elastic_startup_capacity_is_unknown_not_raw_x0_promise(caplog):
+    caplog.set_level("INFO")
+    spec = FullAttentionSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    config = KVCacheConfig(
+        num_blocks=20,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["full"], spec)],
+        elastic_mapping_quantum=100,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=32),
+        cache_config=SimpleNamespace(
+            kv_cache_size_tokens=-1,
+            kv_cache_max_concurrency=-1.0,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        additional_config={"elastic_gdn_backing": True},
+    )
+
+    update_kv_cache_capacity(vllm_config, config)
+
+    assert vllm_config.cache_config.kv_cache_size_tokens is None
+    assert vllm_config.cache_config.kv_cache_max_concurrency is None
+    assert "Elastic KV raw X0 geometry" in caplog.text
+    assert "executable capacity: UNKNOWN" in caplog.text
+    assert "Maximum concurrency" not in caplog.text
+
+
+def test_elastic_full_context_capacity_exact_fit_and_one_quantum_short():
+    block_size = 4
+    mamba_spec = MambaSpec(
+        block_size=block_size,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        separate_pool=True,
+        separate_pool_num_blocks=10,
+    )
+    primary_surface = tuple(blocks * 100 for blocks in range(11))
+    gdn_surface = tuple(blocks * 20 for blocks in range(11))
+    config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            *(KVCacheGroupSpec([f"gdn-{i}"], mamba_spec) for i in range(3)),
+        ],
+        elastic_attention_stride=100,
+        elastic_gdn_stride=20,
+        elastic_mapping_quantum=100,
+        elastic_gdn_initial_blocks=4,
+        elastic_gdn_blocks_per_request=3,
+        elastic_budget_bytes=1000,
+        elastic_rank_primary_mapped_bytes=(primary_surface,),
+        elastic_rank_gdn_mapped_bytes=(gdn_surface,),
+        elastic_rank_budget_bytes=(1000,),
+    )
+    coordinator = KVCacheManager(
+        kv_cache_config=config,
+        max_model_len=32,
+        scheduler_block_size=block_size,
+        hash_block_size=block_size,
+    ).coordinator
+
+    # X2 needs 1+2*2=5 attention blocks and 1+2*3=7 GDN blocks.
+    # With a 300-byte executable loan this fits; one more byte rounds the loan
+    # to 400 and leaves capacity for only four attention blocks.
+    assert coordinator.max_elastic_full_context_requests(2, 300, 4) == 2
+    assert coordinator.max_elastic_full_context_requests(2, 301, 4) == 1
+    assert coordinator._elastic_attention_capacity(7, 300) == 5
+    assert coordinator._elastic_attention_capacity(7, 301) == 4
+    assert coordinator.elastic_full_context_capacity_receipt(2, 300, 2) == {
+        "num_reqs": 2,
+        "external_memory_bytes": 300,
+        "gdn_blocks": 7,
+        "attention_blocks": 5,
+        "required_attention_blocks": 5,
+        "residual_attention_blocks": 0,
+    }
+    assert coordinator.elastic_kv_authority_receipt(2, 300) == {
+        "max_model_len": 32,
+        "scheduler_block_size": 4,
+        "primary_blocks_per_max_request": 2,
+        "raw_attention_blocks_per_rank": (9,),
+        "raw_attention_bytes_per_rank": (900,),
+        "raw_attention_token_equivalent_per_rank": (128,),
+        "effective_attention_blocks_per_rank": (6,),
+        "effective_attention_bytes_per_rank": (600,),
+        "effective_attention_token_equivalent_per_rank": (80,),
+        "active_gdn_blocks": 4,
+        "graph_external_bytes": 300,
+        "rank_budget_bytes": (1000,),
+    }
+
+
+def test_physical_pool_capacity_planner_matches_legacy_formula():
+    primary_block_sizes = (17, 31, 64)
+    secondary_stride = 29
+    quantum = 100
+    budget = 5000
+    planner = PhysicalPoolCapacityPlanner(
+        primary_block_sizes=primary_block_sizes,
+        secondary_block_stride=secondary_stride,
+        mapping_quantum=quantum,
+        budget_bytes=budget,
+    )
+
+    def mapped(logical_bytes: int) -> int:
+        return ((logical_bytes + quantum - 1) // quantum) * quantum
+
+    for secondary_blocks in range(0, 41):
+        legacy = 0
+        secondary_mapped = mapped(secondary_blocks * secondary_stride)
+        for primary_blocks in range(60, -1, -1):
+            primary_mapped = sum(
+                mapped(primary_blocks * block_size)
+                for block_size in primary_block_sizes
+            )
+            if primary_mapped + secondary_mapped <= budget:
+                legacy = primary_blocks
+                break
+        assert planner.max_primary_blocks(secondary_blocks, upper_bound=60) == legacy
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"primary_block_sizes": ()}, "primary block sizes"),
+        ({"secondary_block_stride": 0}, "secondary block stride"),
+        ({"mapping_quantum": 0}, "mapping quantum"),
+        ({"budget_bytes": 0}, "physical pool budget"),
+    ],
+)
+def test_physical_pool_capacity_planner_rejects_invalid_geometry(kwargs, message):
+    geometry = {
+        "primary_block_sizes": (1,),
+        "secondary_block_stride": 1,
+        "mapping_quantum": 1,
+        "budget_bytes": 1,
+    }
+    geometry.update(kwargs)
+    with pytest.raises(ValueError, match=message):
+        PhysicalPoolCapacityPlanner(**geometry)
 
 
 def test_get_kv_cache_config_one_worker():
@@ -3992,3 +4568,89 @@ def test_deepseek_v4_annotation_requires_model_type():
     )
 
     assert not any(g.is_eagle_group for g in groups)
+
+
+def test_generate_scheduler_elastic_capacity_uses_worst_rank_geometry():
+    def make_config(attention_block_size: int, budget: int) -> KVCacheConfig:
+        return KVCacheConfig(
+            num_blocks=10,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=80,
+                    shared_by=["attention"],
+                    backing_id="elastic-attention-0",
+                    mapping_quantum=4,
+                    num_blocks=10,
+                    logical_block_size=attention_block_size,
+                ),
+                KVCacheTensor(
+                    size=40,
+                    shared_by=["gdn"],
+                    backing_id="elastic-gdn",
+                    mapping_quantum=4,
+                    num_blocks=8,
+                    logical_block_size=5,
+                ),
+            ],
+            kv_cache_groups=[],
+            elastic_attention_stride=attention_block_size,
+            elastic_gdn_stride=5,
+            elastic_mapping_quantum=4,
+            elastic_gdn_initial_blocks=2,
+            elastic_gdn_blocks_per_request=3,
+            elastic_budget_bytes=budget,
+        )
+
+    scheduler_config = generate_scheduler_kv_cache_config(
+        [
+            make_config(attention_block_size=5, budget=64),
+            make_config(attention_block_size=7, budget=60),
+        ]
+    )
+
+    # At three GDN blocks the first rank can map nine attention blocks, but
+    # the second can map only six. A common scheduler transition must use six.
+    assert scheduler_config.elastic_attention_capacity_by_gdn_blocks[3] == 6
+    assert scheduler_config.elastic_gdn_blocks_per_request == 3
+    assert scheduler_config.elastic_rank_budget_bytes == (64, 60)
+    assert scheduler_config.elastic_rank_primary_mapped_bytes[1][6] == 44
+    assert scheduler_config.elastic_rank_gdn_mapped_bytes[1][3] == 16
+
+    mismatched = make_config(attention_block_size=7, budget=60)
+    mismatched.elastic_gdn_blocks_per_request = 4
+    with pytest.raises(
+        ValueError, match="elastic GDN blocks per request differs across workers"
+    ):
+        generate_scheduler_kv_cache_config(
+            [
+                make_config(attention_block_size=5, budget=64),
+                mismatched,
+            ]
+        )
+
+
+def test_mixed_precision_kv_cache_with_uniform_type_specs():
+    fp8_spec = new_kv_cache_spec(dtype=torch.float8_e4m3fn)
+    bf16_spec = new_kv_cache_spec(dtype=torch.bfloat16)
+    worker_config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["fp8_layer"],
+                UniformTypeKVCacheSpecs(
+                    block_size=16, kv_cache_specs={"fp8_layer": fp8_spec}
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["bf16_layer"],
+                UniformTypeKVCacheSpecs(
+                    block_size=16, kv_cache_specs={"bf16_layer": bf16_spec}
+                ),
+            ),
+        ],
+    )
+    scheduler_config = generate_scheduler_kv_cache_config([worker_config])
+
+    assert worker_config.needs_kv_cache_zeroing
+    assert scheduler_config.needs_kv_cache_zeroing

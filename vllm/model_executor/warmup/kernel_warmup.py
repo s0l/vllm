@@ -22,7 +22,7 @@ from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
 )
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     resolve_flashinfer_autotune_file,
-    write_flashinfer_autotune_cache,
+    synchronize_flashinfer_autotune_cache,
 )
 from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     deepseek_v4_sparse_mla_attention_warmup,
@@ -337,9 +337,9 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     Without autotuning, FlashInfer will rely on heuristics, which may
     be significantly slower.
 
-    Every rank profiles the same tactics. When distributed, per-tactic
-    timings are averaged over the world CPU group so all ranks select the
-    same tactic.
+    A fingerprinted rank-0 cache is loaded and broadcast before any benchmark.
+    On cache miss, distributed workers run tuning so collective kernels stay
+    synchronized, then rank 0's choices are broadcast and persisted.
     """
     from flashinfer.autotuner import AutoTuner, set_autotune_process_group
 
@@ -363,22 +363,25 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     if is_leader:
         logger.info_once("Using FlashInfer autotune cache file: %s", cache_path)
 
+    if synchronize_flashinfer_autotune_cache(
+        cache_path=cache_path,
+        world=world,
+        tuner=tuner,
+        save_leader=False,
+    ):
+        logger.info_once(
+            "Loaded existing FlashInfer autotune cache on rank %d from %s; "
+            "startup tuning is skipped.",
+            world.rank_in_group,
+            cache_path,
+        )
+        return
+
     # We skip EPLB here since we don't want to record dummy metrics.
     # Randomize inputs to avoid every token pick the same experts,
     # which lead to some EP ranks receiving no tokens and skipping their
     # MoE kernel entirely, and cause hang due to all-reduce collective
     # during synchronized autotuning.
-    # Read cached autotune results and broadcast to all ranks.
-    cached_results: bytes | None = None
-    if is_leader and cache_path.exists():
-        with open(cache_path, "rb") as f:
-            cached_results = f.read()
-    cached_results = world.broadcast_object(cached_results, src=0)
-    if cached_results is not None:
-        write_flashinfer_autotune_cache(cache_path, cached_results)
-        world.barrier()
-        tuner.load_configs(str(cache_path))
-
     group = world.cpu_group if world.world_size > 1 else None
     set_autotune_process_group(group)
     try:
@@ -392,7 +395,20 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     finally:
         set_autotune_process_group(None)
 
-    if world.world_size > 1:
-        world.barrier()
-    if is_leader:
-        tuner.save_configs(str(cache_path))
+    synchronized = synchronize_flashinfer_autotune_cache(
+        cache_path=cache_path,
+        world=world,
+        tuner=tuner,
+        save_leader=True,
+    )
+    if not synchronized:
+        logger.warning(
+            "No FlashInfer autotune cache entries found."
+            "Falling back to default tactics."
+        )
+    else:
+        logger.info_once(
+            "FlashInfer autotune cache loaded on rank %d from %s.",
+            world.rank_in_group,
+            cache_path,
+        )

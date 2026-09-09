@@ -78,6 +78,7 @@ from vllm.utils.mem_utils import (
 )
 from vllm.utils.torch_utils import set_random_seed, set_torch_threads_for_runtime
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
+from vllm.v1.core.elastic_graph import ElasticResidencyReceipt
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
@@ -111,14 +112,51 @@ def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> 
     )
 
 
-def maybe_rocm_profiling_fallback(profile_result: MemoryProfilingResult) -> int | None:
-    """Memory in bytes to size the KV cache from when profiling measured a
-    release on ROCm, or None to keep what profiling measured.
+def _reconcile_pre_kv_physical_budget(
+    profiled_kv_bytes: int,
+    profile_free_bytes: int,
+    prepared_free_bytes: int,
+) -> int:
+    """Reconcile two physical endpoints without charging allocator bytes twice.
 
-    The measurement is the drop in free device memory across startup, so it comes
-    out negative when anything else on the device released memory meanwhile. Torch
-    reserved is process local, so it stands in as a lower bound instead of refusing
-    to start. Kept to ROCm, where the AMD CI groups hit this, following #45490.
+    The profiled budget already deducts driver-visible consumption and measured
+    transient headroom. Charge only additional physical consumption after graph
+    profiling teardown and production owner preparation. Cached allocations may
+    reuse already charged pages; allocated/reserved counters are not additive
+    with this physical ledger (especially with custom VMM pools).
+
+    A free-memory increase does not authorize exceeding the profiled budget:
+    its ownership is unknown and could belong to another process.
+    """
+    if min(profile_free_bytes, prepared_free_bytes) < 0:
+        raise ValueError("physical free-memory endpoints must be nonnegative")
+    additional_consumption = max(profile_free_bytes - prepared_free_bytes, 0)
+    return max(profiled_kv_bytes - additional_consumption, 0)
+
+
+def _startup_plan_kv_budget(
+    *,
+    elastic_dynamic_kv: bool,
+    final_available_bytes: int,
+    requested_limit_bytes: int,
+) -> int:
+    """Persist a KV value at the same contract layer as plan replay.
+
+    Elastic sizing has already charged production static owners and capacity
+    stranded in the default allocator domain. Recomputing the generic
+    requested-memory limit would discard those charges and make a cached boot
+    allocate more KV than the fresh boot that produced the plan.
+    """
+    return int(final_available_bytes if elastic_dynamic_kv else requested_limit_bytes)
+
+
+def maybe_rocm_profiling_fallback(
+    profile_result: MemoryProfilingResult,
+) -> int | None:
+    """Return a conservative ROCm memory estimate for an invalid profile.
+
+    Free-memory growth makes ``total_consumed`` negative. Process-local torch
+    reservations are the usable lower bound in that ROCm-only case.
     """
     if profile_result.total_consumed >= 0 or not current_platform.is_rocm():
         return None
@@ -128,14 +166,35 @@ def maybe_rocm_profiling_fallback(profile_result: MemoryProfilingResult) -> int 
     torch_reserved = max(after_profile.torch_memory - baseline.torch_memory, 0)
     logger.warning(
         "Free memory grew by %s GiB during profiling (initial %s GiB, current "
-        "%s GiB). Sizing the KV cache from the %s GiB torch reserved instead of "
-        "the profiling difference.",
+        "%s GiB). Sizing the KV cache from the %s GiB torch reserved instead "
+        "of the profiling difference.",
         format_gib(-profile_result.total_consumed),
         format_gib(baseline.free_memory),
         format_gib(after_profile.free_memory),
         format_gib(torch_reserved),
     )
     return torch_reserved
+
+
+_KV_REDUNDANCY_BUFFER_BYTES = 150 * (1 << 20)
+
+
+def _startup_kv_memory_deductions(
+    *,
+    elastic_dynamic_kv: bool,
+    cudagraph_memory_estimate: int,
+    estimate_cudagraphs: bool,
+) -> tuple[int, int]:
+    """Return startup-only graph and generic-buffer deductions.
+
+    Elastic on-demand owners are charged later from the exact step loan, so
+    neither a hypothetical graph estimate nor a generic buffer may reduce the
+    physical KV arena here.
+    """
+    if elastic_dynamic_kv:
+        return 0, 0
+    graph_bytes = cudagraph_memory_estimate if estimate_cudagraphs else 0
+    return graph_bytes, _KV_REDUNDANCY_BUFFER_BYTES
 
 
 if TYPE_CHECKING:
@@ -536,10 +595,41 @@ class Worker(WorkerBase):
         """
         maybe_apply_startup_plan(self)
 
+        additional_config = self.vllm_config.additional_config or {}
+        if additional_config.get("tp3_ce_reduce", False):
+            from vllm.distributed.device_communicators.tp3_ce_all_reduce import (
+                initialize_tp3_ce_workspace,
+            )
+
+            initialize_tp3_ce_workspace(
+                get_tp_group().device_group,
+                self.device,
+                cols=self.model_config.get_hidden_size(),
+                max_rows=self.model_runner.max_num_tokens,
+            )
+
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
             self.model_runner.profile_run()
+
+            elastic_dynamic_kv = bool(
+                additional_config.get("elastic_gdn_backing", False)
+            )
+            if elastic_dynamic_kv:
+                # A persisted elastic plan stores the final post-owner KV
+                # budget. Materialize the same production owners as the fresh
+                # profiling path before allocating KV so both paths share the
+                # same ownership and allocator-domain boundary.
+                static_attn_owner_bytes = (
+                    self.model_runner.prepare_static_attn_owners_for_kv_sizing()
+                )
+                torch.accelerator.synchronize()
+                logger.info(
+                    "Applied persisted elastic KV budget after materializing "
+                    "%.2f MiB of production static attention owners",
+                    static_attn_owner_bytes / (1 << 20),
+                )
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -568,6 +658,12 @@ class Worker(WorkerBase):
         ) as profile_result:
             self.model_runner.profile_run()
 
+        additional_config = self.vllm_config.additional_config
+        elastic_dynamic_kv = bool(
+            isinstance(additional_config, dict)
+            and additional_config.get("elastic_gdn_backing", False)
+        )
+
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
         # torch.accelerator.get_memory_info (reliable on ROCm, as used by
@@ -581,12 +677,64 @@ class Worker(WorkerBase):
         ):
             cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
+        static_attn_owner_bytes = 0
+        free_before_static_owners = 0
+        free_after_static_owners: int | None = None
+        if elastic_dynamic_kv:
+            # Graph profiling uses disposable builders. Recreate and retain
+            # production owners before publishing the reserve-free elastic KV
+            # capacity so no static allocation can appear after sizing.
+            torch.accelerator.synchronize()
+            free_before_static_owners = torch.accelerator.get_memory_info()[0]
+            static_attn_owner_bytes = (
+                self.model_runner.prepare_static_attn_owners_for_kv_sizing()
+            )
+            torch.accelerator.synchronize()
+            free_after_static_owners = torch.accelerator.get_memory_info()[0]
+            reserved_unallocated_after_static = max(
+                torch.accelerator.memory_reserved()
+                - torch.accelerator.memory_allocated(),
+                0,
+            )
+        else:
+            reserved_unallocated_after_static = 0
+
         # Respect the opt-in flag as originally designed.
-        cudagraph_memory_estimate_applied = (
-            cudagraph_memory_estimate
-            if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+        # On-demand graphs are paid from the elastic KV tail at the exact
+        # next step. Applying the startup profiler's hypothetical graph size
+        # here would recreate a permanent reserve before any graph exists.
+        (
+            cudagraph_memory_estimate_applied,
+            redundancy_buffer_memory,
+        ) = _startup_kv_memory_deductions(
+            elastic_dynamic_kv=elastic_dynamic_kv,
+            cudagraph_memory_estimate=cudagraph_memory_estimate,
+            estimate_cudagraphs=envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS,
+        )
+        dynamic_graph_budget_mb = (
+            additional_config.get("dynamic_cudagraph_budget_mb", 0)
+            if isinstance(additional_config, dict)
             else 0
         )
+        if (
+            isinstance(dynamic_graph_budget_mb, bool)
+            or not isinstance(dynamic_graph_budget_mb, int)
+            or dynamic_graph_budget_mb < 0
+        ):
+            raise ValueError("dynamic_cudagraph_budget_mb must be an integer >= 0")
+        if dynamic_graph_budget_mb and not bool(
+            additional_config.get("elastic_gdn_backing", False)
+        ):
+            raise ValueError(
+                "dynamic CUDA Graph residency requires elastic_gdn_backing so "
+                "its physical memory can be borrowed from KV at step time"
+            )
+        if dynamic_graph_budget_mb:
+            logger.info_once(
+                "Dynamic CUDA Graph ceiling is %.2f GiB; no startup memory is "
+                "withheld from KV",
+                dynamic_graph_budget_mb / 1024,
+            )
 
         init_free_memory = self.init_snapshot.free_memory
         free_gpu_memory = profile_result.after_profile.free_memory
@@ -619,9 +767,48 @@ class Worker(WorkerBase):
             self.requested_memory
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
+            - redundancy_buffer_memory
         )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
+        if free_after_static_owners is not None:
+            profiled_kv_cache_memory_bytes = self.available_kv_cache_memory_bytes
+            self.available_kv_cache_memory_bytes = _reconcile_pre_kv_physical_budget(
+                profiled_kv_cache_memory_bytes,
+                profile_result.after_profile.free_memory,
+                free_after_static_owners,
+            )
+            logger.info(
+                "KV physical-endpoint ledger: profiled=%s GiB, "
+                "static_attention_new=%.2f MiB, free_after_static=%s GiB, "
+                "allocator_reserved_unused_diagnostic=%s GiB, "
+                "transient_headroom=%s GiB, unrequested=%s GiB, final=%s GiB; "
+                "profile_free_bytes=%d before_owners_free_bytes=%d "
+                "prepared_free_bytes=%d static_owner_allocated_bytes=%d "
+                "profiled_kv_bytes=%d final_kv_bytes=%d "
+                "transient_headroom_bytes=%d unrequested_bytes=%d "
+                "profile_allocated_bytes=%d profile_reserved_bytes=%d "
+                "prepared_allocated_bytes=%d prepared_reserved_bytes=%d",
+                format_gib(profiled_kv_cache_memory_bytes),
+                static_attn_owner_bytes / (1 << 20),
+                format_gib(free_after_static_owners),
+                format_gib(reserved_unallocated_after_static),
+                format_gib(profile_result.transient_peak_headroom),
+                format_gib(unrequested_memory),
+                format_gib(self.available_kv_cache_memory_bytes),
+                profile_result.after_profile.free_memory,
+                free_before_static_owners,
+                free_after_static_owners,
+                static_attn_owner_bytes,
+                profiled_kv_cache_memory_bytes,
+                self.available_kv_cache_memory_bytes,
+                profile_result.transient_peak_headroom,
+                unrequested_memory,
+                profile_result.after_profile.torch_allocated,
+                profile_result.after_profile.torch_memory,
+                torch.accelerator.memory_allocated(),
+                torch.accelerator.memory_reserved(),
+            )
         logger.debug(
             "Initial free memory: %s GiB; Requested memory: %f (util), %s GiB",
             format_gib(self.init_snapshot.free_memory),
@@ -833,8 +1020,19 @@ class Worker(WorkerBase):
             # empirically observed that the memory profiling may
             # slightly underestimate the memory consumption.
             # So leave a small buffer (=150MiB) to avoid OOM.
-            redundancy_buffer_memory = 150 * (1 << 20)
-
+            additional_config = self.vllm_config.additional_config
+            elastic_dynamic_kv = bool(
+                isinstance(additional_config, dict)
+                and additional_config.get("elastic_gdn_backing", False)
+            )
+            _, redundancy_buffer_memory = _startup_kv_memory_deductions(
+                elastic_dynamic_kv=elastic_dynamic_kv,
+                cudagraph_memory_estimate=0,
+                estimate_cudagraphs=False,
+            )
+            # Elastic startup calibration measures every post-profile owner
+            # against the real KV tail. A generic 150 MiB subtraction is an
+            # unowned reserve and would make the published KV capacity false.
             non_kv_cache_memory = (
                 self.total_consumed
                 + self.peak_activation_memory
@@ -875,7 +1073,14 @@ class Worker(WorkerBase):
 
             logger.info(msg)
 
-            maybe_save_startup_plan(self, kv_cache_memory_bytes_to_requested_limit)
+            maybe_save_startup_plan(
+                self,
+                _startup_plan_kv_budget(
+                    elastic_dynamic_kv=elastic_dynamic_kv,
+                    final_available_bytes=int(self.available_kv_cache_memory_bytes),
+                    requested_limit_bytes=kv_cache_memory_bytes_to_requested_limit,
+                ),
+            )
 
         if not self.use_v2_model_runner and get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other
@@ -934,6 +1139,15 @@ class Worker(WorkerBase):
         # Startup is done; steady-state serving gets no benefit from torch
         # intra-op parallelism.
         set_torch_threads_for_runtime()
+
+        from vllm.distributed.parallel_state import set_tp3_ce_runtime_enabled
+
+        set_tp3_ce_runtime_enabled(
+            bool(
+                self.vllm_config.additional_config
+                and self.vllm_config.additional_config.get("tp3_ce_reduce", False)
+            )
+        )
 
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
@@ -1275,10 +1489,9 @@ class Worker(WorkerBase):
             try:
                 self.profiler.stop()
             finally:
-                if self.profiler_config.profiler == "proton":
-                    # Proton output names are fixed when the wrapper is constructed.
-                    # Recreate it so the next profile_prefix is honored.
-                    self.profiler = None
+                # Profiler wrappers are one-shot: Proton fixes output names at
+                # construction and torch.profiler cannot restart after stop().
+                self.profiler = None
 
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
@@ -1476,6 +1689,60 @@ class Worker(WorkerBase):
 
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
+
+    def get_elastic_graph_residency_receipt(self) -> ElasticResidencyReceipt:
+        """Return complete physical Graph residency after startup/restore."""
+        manager = getattr(self.model_runner, "cudagraph_manager", None)
+        if manager is None:
+            raise RuntimeError("elastic residency receipt requires Graph manager")
+        resident, floor, transition_floor = (
+            self.model_runner._current_dynamic_graph_receipt()
+        )
+        return self.model_runner._dynamic_graph_working_set().residency_receipt(
+            transaction_id=None,
+            resident_bytes=resident,
+            floor_bytes=floor,
+            transition_floor_bytes=transition_floor,
+            peak_bytes=max(
+                resident,
+                getattr(self.model_runner, "_elastic_last_step_peak_external_bytes", 0),
+            ),
+            cublas_workspace_bytes=int(torch._C._cuda_getCublasWorkspaceSize()),
+        )
+
+    def prune_elastic_pinned_full_above(
+        self, max_x: int, transaction_id: str
+    ) -> tuple[int, int, int]:
+        """Remove only calibration probes outside the accepted FULL prefix."""
+        return self.model_runner._dynamic_graph_working_set().prune_pinned_full_above(
+            max_x, transaction_id
+        )
+
+    def set_elastic_runtime_generation(self, generation: str) -> str:
+        """Bind deferred worker recipes to the scheduler's post-KV epoch."""
+        manager = getattr(self.model_runner, "cudagraph_manager", None)
+        if manager is None:
+            return "static"
+        from vllm.v1.core.elastic_graph import RuntimeGeneration
+
+        self.model_runner._dynamic_graph_working_set().rebind_runtime_generation(
+            RuntimeGeneration(generation)
+        )
+        return generation
+
+    def get_elastic_graph_execution_policy(self) -> dict[str, Any] | None:
+        """Return the effective post-backend Graph representation policy."""
+        manager = getattr(self.model_runner, "cudagraph_manager", None)
+        if manager is None or not manager.defer_startup_graphs:
+            return None
+        from vllm.v1.worker.gpu.cudagraph_utils import (
+            graph_execution_policy_from_managers,
+        )
+
+        policy = graph_execution_policy_from_managers(
+            self.model_runner._dynamic_graph_working_set().managers
+        )
+        return policy.to_payload()
 
 
 def init_worker_distributed_environment(

@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -7,16 +10,29 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.worker.gpu.spec_decode.autoregressive.ag2_draft_capture import (
+    Ag2DraftCapture,
+)
+from vllm.v1.worker.gpu.spec_decode.autoregressive.ag2_flight_recorder import (
+    Ag2FlightRecorder,
+)
+from vllm.v1.worker.gpu.spec_decode.autoregressive.ag2_mtp_layer_capture import (
+    MTP_LAYER_TRACE_FIELDS,
+    Ag2MtpLayerCapture,
+)
 from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
     SpeculatorCudaGraphManager,
 )
@@ -26,9 +42,47 @@ from vllm.v1.worker.utils import AttentionGroup, get_uniform_decode_token_count
 logger = init_logger(__name__)
 
 
+def _ag2_mtp_layer_trace_shape_from_env() -> tuple[int, int]:
+    rows = int(os.environ.get("AG2_VLLM_MTP_LAYER_CAPTURE_ROWS", "8"))
+    history_tokens = int(
+        os.environ.get("AG2_VLLM_MTP_LAYER_CAPTURE_HISTORY_TOKENS", "640")
+    )
+    if rows < 1 or history_tokens < 1:
+        raise ValueError("AG2 MTP layer capture shape must be positive")
+    return rows, history_tokens
+
+
+def _resolve_prefill_cudagraph_mode(
+    configured_mode: CUDAGraphMode,
+    attention_support: AttentionCGSupport,
+    query_len: int,
+) -> CUDAGraphMode:
+    """Select a safe graph mode for the first autoregressive draft pass."""
+    if (
+        query_len > 1
+        and attention_support == AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    ):
+        if configured_mode.has_piecewise_cudagraphs():
+            return CUDAGraphMode.PIECEWISE
+        return CUDAGraphMode.NONE
+    return configured_mode
+
+
 class AutoRegressiveSpeculator(DraftModelSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
+        self._ag2_mtp_boundary_saved = False
+        self._ag2_mtp_boundary_path: Path | None = None
+        self._ag2_draft_capture = Ag2DraftCapture.from_env()
+        self._ag2_mtp_layer_capture = Ag2MtpLayerCapture.from_env(
+            get_tensor_model_parallel_rank()
+        )
+        self._ag2_current_mtp_trace: dict[str, torch.Tensor] | None = None
+        self._ag2_flight_recorder = (
+            Ag2FlightRecorder.from_env(num_drafts=self.num_speculative_steps)
+            if get_tensor_model_parallel_rank() == 0
+            else None
+        )
 
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
@@ -43,21 +97,79 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         self.inputs_embeds: torch.Tensor | None = None
 
+        if self._ag2_mtp_layer_capture is not None:
+            self._ag2_current_positions = torch.full(
+                (self.max_num_reqs,), -1, dtype=torch.int64, device=device
+            )
+
+        if self._ag2_draft_capture is not None:
+            steps = self.num_speculative_steps
+            shape = (steps, self.max_num_reqs)
+            hidden_shape = (*shape, self.hidden_size)
+            self._ag2_current_input_hidden = torch.zeros(
+                self.max_num_reqs,
+                self.hidden_size,
+                dtype=self.dtype,
+                device=device,
+            )
+            self._ag2_current_sample_hidden = torch.zeros_like(
+                self._ag2_current_input_hidden
+            )
+            self._ag2_current_input_ids = torch.full(
+                (self.max_num_reqs,), -1, dtype=torch.int64, device=device
+            )
+            if self._ag2_mtp_layer_capture is None:
+                self._ag2_current_positions = torch.full(
+                    (self.max_num_reqs,), -1, dtype=torch.int64, device=device
+                )
+            self._ag2_step_input_hidden = torch.zeros(
+                hidden_shape, dtype=self.dtype, device=device
+            )
+            self._ag2_step_sample_hidden = torch.zeros_like(self._ag2_step_input_hidden)
+            self._ag2_step_input_ids = torch.full(
+                shape, -1, dtype=torch.int64, device=device
+            )
+            self._ag2_step_positions = torch.full(
+                shape, -1, dtype=torch.int64, device=device
+            )
+            self._ag2_step_top_pairs = torch.zeros(
+                *shape,
+                self.vllm_config.parallel_config.tensor_parallel_size,
+                2,
+                dtype=torch.float32,
+                device=device,
+            )
+            self._ag2_step_top_tokens = torch.full(
+                shape, -1, dtype=torch.int64, device=device
+            )
+
         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.use_fused_multi_step_decode = False
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
-        if not self.supports_mm_inputs:
-            return
+        if self.supports_mm_inputs:
+            self.inputs_embeds = torch.zeros(
+                self.max_num_tokens,
+                self.hidden_size,
+                dtype=self.dtype,
+                device=self.device,
+            )
 
-        self.inputs_embeds = torch.zeros(
-            self.max_num_tokens,
-            self.hidden_size,
-            dtype=self.dtype,
-            device=self.device,
-        )
+        if self._ag2_draft_capture is not None:
+            if not hasattr(self.model, "ag2_enable_top_token_trace"):
+                raise RuntimeError(
+                    "AG2 draft capture requires local-argmax provenance support"
+                )
+            self.model.ag2_enable_top_token_trace(self.max_num_reqs)
+        if self._ag2_mtp_layer_capture is not None:
+            if not hasattr(self.model, "ag2_enable_mtp_layer_trace"):
+                raise RuntimeError("AG2 MTP layer capture requires Qwen trace support")
+            rows, history_tokens = _ag2_mtp_layer_trace_shape_from_env()
+            self.model.ag2_enable_mtp_layer_trace(
+                rows=rows, history_tokens=history_tokens
+            )
 
     # Lifecycle hooks for model-specific optimizations. Subclasses override
     # the ones they need. These fire in both `capture` and `propose` so that
@@ -125,12 +237,36 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        prefill_query_len = self.num_speculative_steps + 1
+        prefill_cudagraph_mode = _resolve_prefill_cudagraph_mode(
+            cudagraph_mode,
+            self.attn_cg_support.min_cg_support,
+            prefill_query_len,
+        )
+        if prefill_cudagraph_mode != cudagraph_mode:
+            logger.info(
+                "Draft prefill query_len=%d will use %s instead of %s "
+                "because %s only supports full CUDA graphs for single-token "
+                "decode.",
+                prefill_query_len,
+                prefill_cudagraph_mode,
+                cudagraph_mode,
+                self.attn_cg_support.min_cg_attn_backend,
+            )
+
         # Initialize cudagraph manager for draft prefill (draft position 0).
         self.prefill_cudagraph_manager = SpeculatorCudaGraphManager(
             self.vllm_config,
             self.device,
-            cudagraph_mode,
-            self.num_speculative_steps + 1,
+            prefill_cudagraph_mode,
+            prefill_query_len,
+            expand_dynamic_decode_query_lens=False,
+            max_uniform_decode_reqs=(
+                self.kv_cache_config.effective_max_resident_seqs or self.max_num_reqs
+            ),
+            owner="mtp_prefill",
+            elastic_graph_activation="speculative",
+            elastic_graph_token_source="step",
         )
 
         # PIECEWISE cudagraphs are not supported for draft decodes.
@@ -145,6 +281,89 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             decode_query_len=1,
+            expand_dynamic_decode_query_lens=False,
+            max_uniform_decode_reqs=(
+                self.kv_cache_config.effective_max_resident_seqs or self.max_num_reqs
+            ),
+            owner="mtp_decode",
+            elastic_graph_activation="speculative",
+            elastic_graph_token_source="requests",
+        )
+        if self._ag2_mtp_layer_capture is not None:
+            self.decode_cudagraph_manager.require_capture_output(MTP_LAYER_TRACE_FIELDS)
+
+    def dynamic_cudagraph_managers(self) -> tuple[SpeculatorCudaGraphManager, ...]:
+        return tuple(
+            manager
+            for manager in (
+                self.prefill_cudagraph_manager,
+                self.decode_cudagraph_manager,
+            )
+            if manager is not None
+        )
+
+    def capture_next_dynamic(self, manager: SpeculatorCudaGraphManager) -> bool:
+        if manager is self.prefill_cudagraph_manager:
+            forward_fn = self._prefill
+            progress_bar_desc = "Promoting dynamic prefill CUDA graph"
+            # Draft prefill consumes the target model's attention metadata and
+            # slot mappings at runtime. Match the accepted startup-capture
+            # contract instead of constructing incompatible metadata from the
+            # drafter's post-prefill decode buffers.
+            capture_input_buffers = self.target_input_buffers
+            capture_attn_groups = self.target_attn_groups
+            capture_begin = self.on_prefill_begin
+            capture_end = self.on_prefill_end
+        elif manager is self.decode_cudagraph_manager:
+            forward_fn = self._decode_capture_fn()
+            progress_bar_desc = "Promoting dynamic decode CUDA graph"
+            capture_input_buffers = self.input_buffers
+            capture_attn_groups = self.attn_groups
+            capture_begin = self.on_multi_step_decode_begin
+            capture_end = self.on_multi_step_decode_end
+        else:
+            raise ValueError("unknown speculator CUDA Graph manager")
+
+        # Dynamic promotion happens before live request state is copied into
+        # the drafter for this step. Clear indices left by earlier warmups so
+        # the dummy capture cannot gather beyond its exact runtime descriptor.
+        self.last_token_indices.zero_()
+        self.idx_mapping.zero_()
+
+        def capture_override(capture_descs, capture_complete_hook) -> None:
+            capture_begin(self.max_num_reqs)
+            try:
+                manager.capture(
+                    forward_fn,
+                    self.model_state,
+                    capture_input_buffers,
+                    self.block_tables,
+                    capture_attn_groups,
+                    self.kv_cache_config,
+                    progress_bar_desc=progress_bar_desc,
+                    capture_descs=capture_descs,
+                    capture_complete_hook=capture_complete_hook,
+                )
+            finally:
+                capture_end(self.max_num_reqs)
+
+        return manager.capture_next_dynamic(
+            self.model,
+            self.model_state,
+            self.input_buffers,
+            None,
+            self.block_tables,
+            self.attn_groups,
+            self.kv_cache_config,
+            capture_override=capture_override,
+        )
+
+    def _decode_capture_fn(self) -> Callable[..., Any]:
+        """Return the same decode body that one runtime replay consumes."""
+        return (
+            self._generate_fused_drafts
+            if self.use_fused_multi_step_decode
+            else self._generate_draft
         )
 
     def capture(self) -> None:
@@ -184,13 +403,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.on_multi_step_decode_begin(self.max_num_reqs)
         # Capture either the fused decode loop or one decode step per graph.
         assert self.decode_cudagraph_manager is not None
-        decode_fn = (
-            self._generate_fused_drafts
-            if self.use_fused_multi_step_decode
-            else self._generate_draft
-        )
         self.decode_cudagraph_manager.capture(
-            decode_fn,
+            self._decode_capture_fn(),
             self.model_state,
             self.input_buffers,
             self.block_tables,
@@ -199,6 +413,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             progress_bar_desc="Capturing decode CUDA graphs",
         )
         self.on_multi_step_decode_end(self.max_num_reqs)
+
+    @torch.inference_mode()
+    def capture_target_lm_head_inputs(
+        self,
+        target_lm_head_hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+    ) -> None:
+        if self._ag2_draft_capture is not None:
+            self._ag2_draft_capture.stage_target_lm_head_inputs(
+                rank=get_tensor_model_parallel_rank(),
+                hidden_states=target_lm_head_hidden_states,
+                input_batch=input_batch,
+            )
 
     @torch.inference_mode()
     def propose(
@@ -258,6 +485,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             temperature,
             seeds,
         )
+        if self._ag2_mtp_layer_capture is not None and not dummy_run:
+            self._ag2_mtp_layer_capture.begin(
+                req_ids=input_batch.req_ids,
+                idx_mapping=input_batch.idx_mapping,
+                num_reqs=num_reqs,
+            )
 
         # Get the input ids and last token indices for the speculator.
         prepare_prefill_inputs(
@@ -270,6 +503,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             last_sampled,
             next_prefill_tokens,
             self.max_num_reqs,
+        )
+        self._maybe_save_ag2_mtp_boundary(
+            input_batch=input_batch,
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+            dummy_run=dummy_run,
         )
 
         # When all requests are decoding (no true prefills), each has
@@ -285,11 +526,18 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         prefill_batch_desc, prefill_batch_sync = dispatch_cg_and_sync_dp(
             self.prefill_cudagraph_manager,
             num_reqs,
-            num_tokens_padded,
+            # The target carrier is padded for stable buffers, but the
+            # prefill CUDA Graph safety decision must use live rows. Passing
+            # num_tokens_after_padding here hid underfilled B64 replay from
+            # the manager even after the target correctly selected NONE.
+            input_batch.num_tokens,
             uniform_token_count,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
-            need_eager=is_profile,
+            # Target compile/profile dummy runs propagate into both drafter
+            # phases without scheduler admission. Compile the direct path;
+            # only live admitted work may enter elastic Graph dispatch.
+            need_eager=dummy_run or is_profile,
             dp_sync=dp_sync,
         )
         num_tokens_across_dp = (
@@ -300,41 +548,94 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         self._prepare_eplb_forward(num_tokens)
 
-        self.on_prefill_begin(num_reqs)
-        if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
-            # Replay the full graph for draft prefill.
-            assert self.prefill_cudagraph_manager is not None
-            self.prefill_cudagraph_manager.run_fullgraph(prefill_batch_desc)
-        else:
-            # The target model's attention metadata and slot mappings
-            # can directly be used for draft prefill, because of the
-            # identical batch shape and KV cache layout.
-            self._prefill(
-                num_reqs,
-                prefill_batch_desc.num_tokens,
-                attn_metadata,
-                slot_mappings,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
-                mm_inputs=mm_inputs,
+        # Target and MTP owners can select different physical modes for the
+        # same live input (for example target FULL M3 and MTP PIECEWISE M4).
+        # The target InputBatch mask is consequently only target-sized. Build
+        # the MTP mask in its own stable buffer and mark its physical tail;
+        # slicing the shorter target mask silently returned three elements for
+        # a four-token MTP replay.
+        self.input_buffers.is_padding[: input_batch.num_tokens].copy_(
+            input_batch.is_padding[: input_batch.num_tokens]
+        )
+        if prefill_batch_desc.num_tokens > input_batch.num_tokens:
+            self.input_buffers.is_padding[
+                input_batch.num_tokens : prefill_batch_desc.num_tokens
+            ].fill_(True)
+        prefill_is_padding = self.input_buffers.is_padding[
+            : prefill_batch_desc.num_tokens
+        ]
+
+        prefill_receipt_name = (
+            "ag2.mtp_prefill_graph_receipt"
+            f"|mode={prefill_batch_desc.cg_mode.name}"
+            f"|tokens_unpadded={input_batch.num_tokens}"
+            f"|tokens_padded={prefill_batch_desc.num_tokens}"
+            f"|requests={num_reqs}"
+            f"|uniform_token_count={uniform_token_count}"
+            f"|descriptor={prefill_batch_desc}"
+        )
+        prefill_default_scope = (
+            "ag2.mtp_prefill.full"
+            if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL
+            else (
+                "ag2.mtp_prefill.piecewise"
+                if prefill_batch_desc.cg_mode == CUDAGraphMode.PIECEWISE
+                else "ag2.mtp_prefill.eager"
             )
+        )
+        prefill_scope = (
+            torch.profiler.record_function(prefill_receipt_name)
+            if os.getenv("AG2_VLLM_GRAPH_MODE_RECEIPT") == "1" and not dummy_run
+            else record_function_or_nullcontext(prefill_default_scope)
+        )
+
+        with prefill_scope:
+            if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
+                # Replay the full graph for draft prefill.
+                assert self.prefill_cudagraph_manager is not None
+                self.prefill_cudagraph_manager.run_fullgraph(prefill_batch_desc)
+            else:
+                # The target model's attention metadata and slot mappings
+                # can directly be used for draft prefill, because of the
+                # identical batch shape and KV cache layout.
+                self._prefill(
+                    num_reqs,
+                    prefill_batch_desc.num_tokens,
+                    attn_metadata,
+                    slot_mappings,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
+                    mm_inputs=mm_inputs,
+                    physical_num_reqs=prefill_batch_desc.physical_num_reqs,
+                    runtime_generation=prefill_batch_desc.runtime_generation,
+                    num_tokens_unpadded=input_batch.num_tokens,
+                    is_padding=prefill_is_padding,
+                )
+
         self.on_prefill_end(num_reqs)
+        self._ag2_snapshot_proposal_step(
+            0,
+            num_reqs,
+            trace_row_indices=self.last_token_indices[:num_reqs],
+        )
 
         if self.num_speculative_steps == 1:
             # Early exit.
+            self._maybe_append_ag2_mtp_drafts(num_reqs)
             return self.draft_tokens[:num_reqs, :1]
 
         # Prepare the inputs for the decode steps.
-        prepare_decode_inputs(
-            self.draft_tokens[:num_reqs, 0],
-            input_batch.seq_lens,
-            num_rejected,
-            self.input_buffers,
-            self.sample_src_positions,
-            self.max_model_len,
-            self.max_num_reqs,
-            advance_draft_positions=self.advance_draft_positions,
-        )
+        with record_function_or_nullcontext("ag2.mtp_prepare_decode"):
+            prepare_decode_inputs(
+                self.draft_tokens[:num_reqs, 0],
+                input_batch.seq_lens,
+                num_rejected,
+                self.input_buffers,
+                self.sample_src_positions,
+                self.max_model_len,
+                self.max_num_reqs,
+                advance_draft_positions=self.advance_draft_positions,
+            )
 
         decode_batch_sync, num_batch_tokens = (
             self._build_uniform_batch_dp_sync(dp_sync, num_reqs, num_query_per_req=1)
@@ -350,7 +651,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             uniform_token_count=1,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
-            need_eager=is_profile,
+            need_eager=dummy_run or is_profile,
             dp_sync=decode_batch_sync,
         )
         num_tokens_across_dp = (
@@ -358,24 +659,151 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             if decode_batch_sync is not None
             else None
         )
+        self.input_buffers.is_padding[:num_reqs].fill_(False)
+        if decode_batch_desc.num_tokens > num_reqs:
+            self.input_buffers.is_padding[
+                num_reqs : decode_batch_desc.num_tokens
+            ].fill_(True)
 
         self.on_multi_step_decode_begin(num_reqs)
         # Generate the remaining num_speculative_steps - 1 draft tokens.
-        decode_fn = (
-            self._fused_multi_step_decode
-            if self.use_fused_multi_step_decode
-            else self._multi_step_decode
+        decode_receipt_name = (
+            "ag2.mtp_decode_graph_receipt"
+            f"|mode={decode_batch_desc.cg_mode.name}"
+            f"|tokens_unpadded={num_reqs}"
+            f"|tokens_padded={decode_batch_desc.num_tokens}"
+            f"|requests={num_reqs}"
+            "|uniform_token_count=1"
+            f"|descriptor={decode_batch_desc}"
         )
-        decode_fn(
-            num_reqs,
-            dummy_run and skip_attn_for_dummy_run,
-            decode_batch_desc,
-            num_tokens_across_dp,
-            input_batch.seq_lens_cpu_upper_bound,
+        decode_default_scope = (
+            "ag2.mtp_decode.full"
+            if decode_batch_desc.cg_mode == CUDAGraphMode.FULL
+            else "ag2.mtp_decode.eager"
         )
-        self.on_multi_step_decode_end(num_reqs)
+        decode_scope = (
+            torch.profiler.record_function(decode_receipt_name)
+            if os.getenv("AG2_VLLM_GRAPH_MODE_RECEIPT") == "1" and not dummy_run
+            else record_function_or_nullcontext(decode_default_scope)
+        )
+        with decode_scope:
+            decode_fn = (
+                self._fused_multi_step_decode
+                if self.use_fused_multi_step_decode
+                else self._multi_step_decode
+            )
+            decode_fn(
+                num_reqs,
+                dummy_run and skip_attn_for_dummy_run,
+                decode_batch_desc,
+                num_tokens_across_dp,
+                input_batch.seq_lens_cpu_upper_bound,
+            )
 
+        self._maybe_append_ag2_mtp_drafts(num_reqs)
+        if self._ag2_flight_recorder is not None and not dummy_run:
+            self._ag2_flight_recorder.record(
+                num_reqs=num_reqs,
+                req_ids=input_batch.req_ids,
+                draft_tokens=self.draft_tokens,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+                last_sampled=last_sampled,
+                idx_mapping=self.idx_mapping,
+            )
+        if self._ag2_draft_capture is not None and not dummy_run:
+            self._ag2_draft_capture.collect(
+                rank=get_tensor_model_parallel_rank(),
+                num_reqs=num_reqs,
+                draft_logits=self.draft_logits,
+                draft_tokens=self.draft_tokens,
+                hidden_states=self.hidden_states,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+                last_sampled=last_sampled,
+                next_prefill_tokens=next_prefill_tokens,
+                idx_mapping=self.idx_mapping,
+                temperature=self.temperature,
+                seeds=self.seeds,
+                step_input_hidden=self._ag2_step_input_hidden,
+                step_sample_hidden=self._ag2_step_sample_hidden,
+                step_input_ids=self._ag2_step_input_ids,
+                step_positions=self._ag2_step_positions,
+                step_top_pairs=self._ag2_step_top_pairs,
+                step_top_tokens=self._ag2_step_top_tokens,
+            )
+        if self._ag2_mtp_layer_capture is not None and not dummy_run:
+            self._ag2_mtp_layer_capture.finalize(
+                draft_tokens=self.draft_tokens,
+                num_reqs=num_reqs,
+            )
+        self.on_multi_step_decode_end(num_reqs)
         return self.draft_tokens[:num_reqs]
+
+    def _maybe_save_ag2_mtp_boundary(
+        self,
+        *,
+        input_batch: InputBatch,
+        num_tokens: int,
+        num_reqs: int,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        dummy_run: bool,
+    ) -> None:
+        """Save the exact first MTP inputs once for offline reference replay."""
+        output = os.environ.get("AG2_VLLM_MTP_BOUNDARY_OUTPUT")
+        if not output or dummy_run or self._ag2_mtp_boundary_saved:
+            return
+
+        rank = get_tensor_model_parallel_rank()
+        path = Path(f"{output}.rank{rank}.pt")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema": 1,
+            "rank": rank,
+            "num_speculative_steps": self.num_speculative_steps,
+            "num_tokens": num_tokens,
+            "num_reqs": num_reqs,
+            "target_input_ids": input_batch.input_ids[:num_tokens].detach().cpu(),
+            "target_positions": input_batch.positions[:num_tokens].detach().cpu(),
+            "target_query_start_loc": input_batch.query_start_loc[: num_reqs + 1]
+            .detach()
+            .cpu(),
+            "target_seq_lens": input_batch.seq_lens[:num_reqs].detach().cpu(),
+            "target_hidden_states": self.hidden_states[:num_tokens].detach().cpu(),
+            "mtp_input_ids": self.input_buffers.input_ids[:num_tokens].detach().cpu(),
+            "mtp_positions": self.input_buffers.positions[:num_tokens].detach().cpu(),
+            "mtp_query_start_loc": self.input_buffers.query_start_loc[: num_reqs + 1]
+            .detach()
+            .cpu(),
+            "mtp_seq_lens": self.input_buffers.seq_lens[:num_reqs].detach().cpu(),
+            "last_token_indices": self.last_token_indices[:num_reqs].detach().cpu(),
+            "num_sampled": num_sampled[:num_reqs].detach().cpu(),
+            "num_rejected": num_rejected[:num_reqs].detach().cpu(),
+        }
+        torch.save(payload, path)
+        self._ag2_mtp_boundary_saved = True
+        self._ag2_mtp_boundary_path = path
+        logger.warning(
+            "Saved one-shot MTP consumed-input boundary rank=%d path=%s "
+            "tokens=%d requests=%d K=%d",
+            rank,
+            path,
+            num_tokens,
+            num_reqs,
+            self.num_speculative_steps,
+        )
+
+    def _maybe_append_ag2_mtp_drafts(self, num_reqs: int) -> None:
+        path = self._ag2_mtp_boundary_path
+        if path is None:
+            return
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        payload["runtime_draft_tokens"] = (
+            self.draft_tokens[:num_reqs, : self.num_speculative_steps].detach().cpu()
+        )
+        torch.save(payload, path)
+        self._ag2_mtp_boundary_path = None
 
     @torch.inference_mode()
     def _run_model(
@@ -386,8 +814,27 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
+        return_ag2_mtp_trace: bool = False,
+        cudagraph_owner: str = "mtp_prefill",
+        physical_num_reqs: int | None = None,
+        runtime_generation: str = "static",
+        num_tokens_unpadded: int | None = None,
+        is_padding: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor] | None]:
+        if num_tokens_unpadded is None:
+            num_tokens_unpadded = num_tokens
+        if not 0 < num_tokens_unpadded <= num_tokens:
+            raise RuntimeError("invalid MTP padded/live token contract")
+        if is_padding is None:
+            is_padding = self.input_buffers.is_padding[:num_tokens]
+        if is_padding.numel() != num_tokens:
+            raise RuntimeError("MTP padding mask does not match physical tokens")
+        batch_descriptor = BatchDescriptor(
+            num_tokens=num_tokens,
+            cudagraph_owner=cudagraph_owner,
+            physical_num_reqs=physical_num_reqs,
+            runtime_generation=runtime_generation,
+        )
         with set_forward_context(
             attn_metadata,
             self.vllm_config,
@@ -396,6 +843,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             num_tokens_across_dp=num_tokens_across_dp,
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
+            is_padding=is_padding,
+            num_tokens_unpadded=num_tokens_unpadded,
+            # Every call in this model is owned by the MTP drafter. Keep the
+            # identity explicit and graph-static so FULL capture cannot alias
+            # it with an equal-shaped target decode or short prefill.
+            tp3_mtp_device_ce=(os.environ.get("AG2_VLLM_MTP_DEVICE_CE", "0") == "1"),
         ):
             inputs_embeds = None
             if self.supports_mm_inputs:
@@ -418,6 +871,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 hidden_states=self.hidden_states[:num_tokens],
                 inputs_embeds=inputs_embeds,
             )
+            if self._ag2_mtp_layer_capture is not None:
+                # This model is compiled with TorchCompileWithNoGuards. A
+                # Python flag observed as False by the first profile call
+                # cannot be switched to True later for decode graph capture.
+                # Keep the diagnostic return contract invariant from the
+                # first compiled invocation; persistence remains position-
+                # gated outside the graph.
+                model_inputs["return_ag2_mtp_trace"] = True
             if cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
                 # Draft prefill with PIECEWISE cudagraph (compiled PW or breakable),
                 # chosen inside run_pw_graph.
@@ -430,12 +891,15 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 ret_hidden_states = self.model(**model_inputs)
         # Some MTP models declare a single-tensor contract but return
         # (logits_hidden, feedback_hidden) for final-norm correctness.
-        if isinstance(ret_hidden_states, tuple):
+        mtp_trace = None
+        if isinstance(ret_hidden_states, tuple) and len(ret_hidden_states) == 3:
+            last_hidden_states, hidden_states, mtp_trace = ret_hidden_states
+        elif isinstance(ret_hidden_states, tuple):
             last_hidden_states, hidden_states = ret_hidden_states
         else:
             last_hidden_states = ret_hidden_states
             hidden_states = ret_hidden_states
-        return last_hidden_states, hidden_states
+        return last_hidden_states, hidden_states, mtp_trace
 
     def _prefill(
         self,
@@ -446,6 +910,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        physical_num_reqs: int | None = None,
+        runtime_generation: str = "static",
+        num_tokens_unpadded: int | None = None,
+        is_padding: torch.Tensor | None = None,
     ) -> None:
         last_token_indices = self.last_token_indices[:num_reqs]
         positions = self.input_buffers.positions[last_token_indices]
@@ -455,14 +923,36 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         sample_src_positions = positions + 1
         idx_mapping = self.idx_mapping[:num_reqs]
 
-        last_hidden_states, hidden_states = self._run_model(
+        if (
+            self._ag2_draft_capture is not None
+            or self._ag2_mtp_layer_capture is not None
+        ):
+            self._ag2_current_positions[:num_reqs].copy_(positions)
+        if self._ag2_draft_capture is not None:
+            self._ag2_current_input_hidden[:num_reqs].copy_(
+                self.hidden_states[last_token_indices]
+            )
+            self._ag2_current_input_ids[:num_reqs].copy_(
+                self.input_buffers.input_ids[last_token_indices]
+            )
+
+        last_hidden_states, hidden_states, mtp_trace = self._run_model(
             num_tokens,
             attn_metadata,
             slot_mappings,
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             mm_inputs=mm_inputs,
+            cudagraph_owner="mtp_prefill",
+            physical_num_reqs=physical_num_reqs,
+            runtime_generation=runtime_generation,
+            num_tokens_unpadded=num_tokens_unpadded,
+            is_padding=is_padding,
         )
+        self._ag2_current_mtp_trace = mtp_trace
+        sample_hidden_states = last_hidden_states[last_token_indices]
+        if self._ag2_draft_capture is not None:
+            self._ag2_current_sample_hidden[:num_reqs].copy_(sample_hidden_states)
 
         sample_hidden_states = last_hidden_states[last_token_indices]
         self.draft_tokens[:num_reqs, 0] = self.sample_draft(
@@ -521,7 +1011,13 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
             if batch_desc.cg_mode == CUDAGraphMode.FULL:
                 assert self.decode_cudagraph_manager is not None
-                self.decode_cudagraph_manager.run_fullgraph(batch_desc)
+                graph_output = self.decode_cudagraph_manager.run_fullgraph(batch_desc)
+                if self._ag2_mtp_layer_capture is not None:
+                    if not isinstance(graph_output, dict):
+                        raise RuntimeError(
+                            "AG2 MTP FULL graph did not publish its trace outputs"
+                        )
+                    self._ag2_current_mtp_trace = graph_output
             else:
                 self._generate_draft(
                     num_reqs,
@@ -530,7 +1026,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                     slot_mappings_by_layer,
                     num_tokens_across_dp=num_tokens_across_dp,
                     cudagraph_runtime_mode=batch_desc.cg_mode,
+                    physical_num_reqs=batch_desc.physical_num_reqs,
+                    runtime_generation=batch_desc.runtime_generation,
                 )
+            self._ag2_snapshot_proposal_step(step, num_reqs)
 
     def _fused_multi_step_decode(
         self,
@@ -588,6 +1087,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         slot_mappings: dict[str, torch.Tensor] | None,
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        physical_num_reqs: int | None = None,
+        runtime_generation: str = "static",
     ) -> None:
         idx_mapping = self.idx_mapping[:num_reqs]
         positions = self.input_buffers.positions[:num_reqs]
@@ -607,6 +1108,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 slot_mappings,
                 num_tokens_across_dp,
                 cudagraph_runtime_mode,
+                physical_num_reqs=physical_num_reqs,
+                runtime_generation=runtime_generation,
             )
             if (
                 step < self.num_speculative_steps - 1
@@ -630,18 +1133,43 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         slot_mappings: dict[str, torch.Tensor] | None,
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-    ) -> None:
+        physical_num_reqs: int | None = None,
+        runtime_generation: str = "static",
+    ) -> dict[str, torch.Tensor] | None:
         self._prepare_eplb_forward(num_reqs)
 
         idx_mapping = self.idx_mapping[:num_reqs]
+        positions = self.input_buffers.positions[:num_reqs]
+        if (
+            self._ag2_draft_capture is not None
+            or self._ag2_mtp_layer_capture is not None
+        ):
+            self._ag2_current_positions[:num_reqs].copy_(positions)
+        if self._ag2_draft_capture is not None:
+            self._ag2_current_input_hidden[:num_reqs].copy_(
+                self.hidden_states[:num_reqs]
+            )
+            self._ag2_current_input_ids[:num_reqs].copy_(
+                self.input_buffers.input_ids[:num_reqs]
+            )
         # Run the draft model forward pass.
-        last_hidden_states, hidden_states = self._run_model(
+        last_hidden_states, hidden_states, mtp_trace = self._run_model(
             num_tokens_padded,
             attn_metadata,
             slot_mappings,
             num_tokens_across_dp,
-            cudagraph_runtime_mode,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            return_ag2_mtp_trace=self._ag2_mtp_layer_capture is not None,
+            cudagraph_owner="mtp_decode",
+            physical_num_reqs=physical_num_reqs,
+            runtime_generation=runtime_generation,
+            num_tokens_unpadded=num_reqs,
+            is_padding=self.input_buffers.is_padding[:num_tokens_padded],
         )
+        self._ag2_current_mtp_trace = mtp_trace
+        last_hidden_states = last_hidden_states[:num_reqs]
+        if self._ag2_draft_capture is not None:
+            self._ag2_current_sample_hidden[:num_reqs].copy_(last_hidden_states)
 
         # Sample the draft tokens.
         sample_hidden_states = last_hidden_states[:num_reqs]
@@ -670,6 +1198,44 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.num_speculative_steps,
             advance_draft_positions=self.advance_draft_positions,
         )
+        return mtp_trace
+
+    def _ag2_snapshot_proposal_step(
+        self,
+        step: int,
+        num_reqs: int,
+        *,
+        trace_row_indices: torch.Tensor | None = None,
+    ) -> None:
+        """Snapshot one completed proposal step outside graph dispatch."""
+        if self._ag2_draft_capture is None and self._ag2_mtp_layer_capture is None:
+            return
+        if not 0 <= step < self.num_speculative_steps:
+            raise RuntimeError(f"AG2 proposal step is out of bounds: {step}")
+        if self._ag2_draft_capture is not None:
+            self._ag2_step_input_hidden[step, :num_reqs].copy_(
+                self._ag2_current_input_hidden[:num_reqs]
+            )
+            self._ag2_step_sample_hidden[step, :num_reqs].copy_(
+                self._ag2_current_sample_hidden[:num_reqs]
+            )
+            self._ag2_step_input_ids[step, :num_reqs].copy_(
+                self._ag2_current_input_ids[:num_reqs]
+            )
+            self._ag2_step_positions[step, :num_reqs].copy_(
+                self._ag2_current_positions[:num_reqs]
+            )
+            top_pairs, top_tokens = self.model.ag2_get_top_token_trace()
+            self._ag2_step_top_pairs[step, :num_reqs].copy_(top_pairs[:num_reqs])
+            self._ag2_step_top_tokens[step, :num_reqs].copy_(top_tokens[:num_reqs])
+        if self._ag2_mtp_layer_capture is not None:
+            self._ag2_mtp_layer_capture.stage(
+                proposal_step=step,
+                num_reqs=num_reqs,
+                trace=self._ag2_current_mtp_trace,
+                dispatch_positions=self._ag2_current_positions,
+                trace_row_indices=trace_row_indices,
+            )
 
 
 @triton.jit

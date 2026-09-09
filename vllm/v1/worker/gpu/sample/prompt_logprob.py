@@ -12,6 +12,12 @@ from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 
+# Keep the transient TP all-gather bounded for large vocabularies.  At the
+# previous 1024 rows, a 248K-vocabulary BF16 model needs about 486 MiB per
+# rank just for the gathered logits.  Prompt logprobs are an observer path, so
+# trading four smaller lm-head calls for bounded peak memory is preferable.
+PROMPT_LOGPROBS_CHUNK_SIZE = 256
+
 
 class PromptLogprobsWorker:
     def __init__(self, max_num_reqs: int, logprobs_mode: LogprobsMode = "raw_logprobs"):
@@ -205,14 +211,13 @@ def compute_prompt_logprobs_with_chunking(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Since materializing the full prompt logits can take too much memory,
     # we compute it in chunks.
-    CHUNK_SIZE = 1024
     token_ids = []
     scores = []
     ranks = []
     logits_mode = logprobs_mode in ("raw_logits", "processed_logits")
     prompt_token_ids = prompt_token_ids.to(torch.int64)
-    for start_idx in range(0, prompt_token_ids.shape[0], CHUNK_SIZE):
-        end_idx = start_idx + CHUNK_SIZE
+    for start_idx in range(0, prompt_token_ids.shape[0], PROMPT_LOGPROBS_CHUNK_SIZE):
+        end_idx = start_idx + PROMPT_LOGPROBS_CHUNK_SIZE
         # NOTE(woosuk): logits_fn can be slow because it involves all-gather.
         prompt_logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
         requested_num = (

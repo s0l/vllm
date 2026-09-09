@@ -74,6 +74,8 @@ def create_scheduler(
     use_v2_model_runner: bool | None = None,
     kv_cache_spec: KVCacheSpec | None = None,
     per_request_spec_decode_metrics: str = "none",
+    additional_config: dict | None = None,
+    elastic_graph_execution_policy: dict | None = None,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -97,6 +99,10 @@ def create_scheduler(
         # The scheduler reads model_config.max_model_len, not the
         # SchedulerConfig one, so both must agree.
         max_model_len=max_model_len,
+        # Synthetic scheduler geometry; no weights or inference use this config.
+        hf_overrides={"max_position_embeddings": max_model_len}
+        if max_model_len is not None
+        else {},
     )
     if use_ec_connector and ec_role == "ec_producer":
         model_config.multimodal_config = MultiModalConfig()
@@ -172,6 +178,9 @@ def create_scheduler(
         else None
     )
 
+    vllm_config_kwargs = {}
+    if additional_config is not None:
+        vllm_config_kwargs["additional_config"] = additional_config
     vllm_config = VllmConfig(
         scheduler_config=scheduler_config,
         model_config=model_config,
@@ -186,6 +195,7 @@ def create_scheduler(
         observability_config=ObservabilityConfig(
             per_request_spec_decode_metrics=per_request_spec_decode_metrics,
         ),
+        **vllm_config_kwargs,
     )
     if kv_cache_spec is None:
         kv_cache_spec = FullAttentionSpec(
@@ -198,6 +208,7 @@ def create_scheduler(
         num_blocks=num_blocks,  # A large number of blocks to hold all requests
         kv_cache_tensors=[],
         kv_cache_groups=[KVCacheGroupSpec(["layer"], kv_cache_spec)],
+        elastic_graph_execution_policy=elastic_graph_execution_policy,
     )
     cache_config.num_gpu_blocks = num_blocks
     register_all_kvcache_specs(vllm_config)

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.multimodal.utils import strip_covered_mm_data
+from vllm.v1.core.elastic_graph import ElasticStepPlan
 
 if TYPE_CHECKING:
     import numpy as np
@@ -49,6 +50,11 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
+    # Scheduler-owned boundary of the token stream that must execute as
+    # prefill.  For a resumed request this can extend past the user prompt over
+    # output tokens whose KV/state is being reconstructed.
+    execution_prefill_len: int | None = None
+
     @classmethod
     def from_request(
         cls,
@@ -75,6 +81,7 @@ class NewRequestData:
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
+            execution_prefill_len=request.execution_prefill_len,
         )
 
     @property
@@ -94,6 +101,7 @@ class NewRequestData:
             f"req_id={self.req_id},"
             f"prompt_token_ids={self.prompt_token_ids},"
             f"prefill_token_ids={self.prefill_token_ids},"
+            f"execution_prefill_len={self.execution_prefill_len},"
             f"mm_features={self.mm_features},"
             f"sampling_params={self.sampling_params},"
             f"block_ids={self.block_ids},"
@@ -119,6 +127,7 @@ class NewRequestData:
             f"req_id={self.req_id},"
             f"prompt_token_ids_len={prompt_token_ids_len},"
             f"prefill_token_ids_len={prefill_token_ids_len},"
+            f"execution_prefill_len={self.execution_prefill_len},"
             f"mm_features={self.mm_features},"
             f"sampling_params={self.sampling_params},"
             f"block_ids={self.block_ids},"
@@ -302,6 +311,64 @@ class SchedulerOutput:
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
+
+    # Explicit phase contract for target-model collectives. True only when all
+    # scheduled rows are ordinary autoregressive decode rows (including prior
+    # draft positions), never for prefill, replay or mixed batches.
+    is_pure_decode_step: bool = False
+
+    # Experimental separate-pool GDN prefix checkpoint commands. Keys are the
+    # exact chained content hashes of scheduler-block boundaries. Workers save
+    # after a successful forward and restore before preprocess_mamba.
+    gdn_checkpoint_save: dict[str, bytes] | None = None
+    gdn_checkpoint_restore: dict[str, bytes] | None = None
+
+    # Physical mapped-prefix sizes for (attention, GDN) stable-VA arenas.
+    elastic_kv_transition: tuple[int, int] | None = None
+
+    # Step-scoped physical bytes loaned from the elastic KV arena to dynamic
+    # CUDA Graph pools and transient consumers. Zero restores the X1 KV baseline.
+    elastic_external_memory_bytes: int = 0
+
+    # Immutable breakdown of the aggregate external loan. The Graph endpoint
+    # is absolute; the MM activation loan is incremental and step-scoped.
+    elastic_graph_external_memory_bytes: int = 0
+    elastic_mm_activation_loan_bytes: int = 0
+
+    # Exact KV primary-block delta reserved for the sampled successor of this
+    # step. It is computed once during scheduling and carried through
+    # settlement so mutable request state cannot create a second authority.
+    elastic_successor_primary_headroom: int = 0
+
+    # Immutable transaction identity shared by scheduler and every worker rank.
+    elastic_transaction_id: str | None = None
+
+    # Canonical physical Graph shape committed when this output was scheduled.
+    # Request cancellation may change the scheduler's live carrier before the
+    # worker result settles, so settlement must not reconstruct this identity
+    # from mutable scheduler state.
+    elastic_graph_step_key: tuple[int, ...] | None = None
+
+    # Complete physical plan selected before worker-side CUDA/KV mutation.
+    # Workers validate its runtime generation and rank fingerprint and never
+    # reconstruct owner identity or eviction policy from request metadata.
+    elastic_step_plan: ElasticStepPlan | None = None
+    elastic_plan_fingerprint: str | None = None
+
+    # Request-free barrier emitted immediately after a staged hotset
+    # publication. Workers retire only the hidden victim fences, keep the new
+    # candidate resident, and publish a synchronized physical receipt before
+    # the scheduler may observe a changed request/cache shape.
+
+    # A zero-token service tick has no next execution shape and therefore must
+    # not evict the last HOT graph merely because the engine is idle. Explicit
+    # teardown/recovery leaves this false and requests X0 instead.
+    elastic_preserve_graph_residency: bool = False
+
+    # True only for scheduler-bypassing startup kernel warmup. These batches
+    # exercise compiled kernels and KV mappings, but are not live admissions
+    # and therefore cannot authorize an on-demand CUDA Graph/KV loan.
+    is_synthetic_warmup: bool = False
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

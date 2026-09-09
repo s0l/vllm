@@ -115,6 +115,7 @@ class ThinkingBudgetState:
         idx_mapping_np: np.ndarray,
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
+        vocab_start: int = 0,
     ) -> None:
         if not self.enabled or not np.any(self.use_thinking_budget[idx_mapping_np]):
             return
@@ -134,6 +135,7 @@ class ThinkingBudgetState:
             self.reasoning_start_token_ids,
             self.natural_reasoning_end_token_ids,
             self.reasoning_end_token_ids,
+            vocab_start,
         )
 
 
@@ -270,6 +272,8 @@ def _thinking_budget_kernel(
     reasoning_start_token_ids_ptr,
     natural_reasoning_end_token_ids_ptr,
     reasoning_end_token_ids_ptr,
+    vocab_start,
+    local_vocab_size,
     START_LEN: tl.constexpr,
     NATURAL_END_LEN: tl.constexpr,
     END_LEN: tl.constexpr,
@@ -366,7 +370,12 @@ def _thinking_budget_kernel(
                 end_prefix_len = prefix_len
 
     force_token_id = tl.load(reasoning_end_token_ids_ptr + end_prefix_len)
-    tl.store(logits_ptr + token_idx * logits_stride + force_token_id, 1.0e9)
+    local_force_token_id = force_token_id - vocab_start
+    if local_force_token_id >= 0 and local_force_token_id < local_vocab_size:
+        tl.store(
+            logits_ptr + token_idx * logits_stride + local_force_token_id,
+            1.0e9,
+        )
 
 
 def apply_thinking_budget(
@@ -384,6 +393,7 @@ def apply_thinking_budget(
     reasoning_start_token_ids: torch.Tensor,
     natural_reasoning_end_token_ids: torch.Tensor,
     reasoning_end_token_ids: torch.Tensor,
+    vocab_start: int = 0,
 ) -> None:
     num_tokens = logits.shape[0]
     start_len = reasoning_start_token_ids.shape[0]
@@ -422,6 +432,8 @@ def apply_thinking_budget(
         reasoning_start_token_ids,
         natural_reasoning_end_token_ids,
         reasoning_end_token_ids,
+        vocab_start,
+        logits.shape[1],
         START_LEN=start_len,
         NATURAL_END_LEN=natural_end_len,
         END_LEN=end_len,

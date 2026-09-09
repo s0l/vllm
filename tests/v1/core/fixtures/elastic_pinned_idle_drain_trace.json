@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "generation": "kv6-step11-pinned-growth",
+  "provenance": {
+    "artifact": "evals/results/exp22-kv6-full-acceptance-v1-20260829/step11-02-hot-main-wave.json",
+    "artifact_sha256": "c70cfff9e326f11df1b5f6af5a2536c9b7c3e460309ba1d665343496bfc418ec",
+    "population": "X1 -> X32 -> X16 -> X17 -> X39",
+    "observer_interval_ms": 20
+  },
+  "resident": {
+    "total_bytes": 660602880,
+    "pinned_bytes": 255852544,
+    "evictable_bytes": 371195904,
+    "floor_bytes": 0,
+    "shared_bytes": 33554432
+  },
+  "capacity": {
+    "target_x": 39,
+    "current_max_x": 32,
+    "ordinary_reclaim_max_x": 32,
+    "administrative_idle_max_x": 39,
+    "mutation_administrative_idle_max_x": 38
+  },
+  "outcome": {
+    "physical_peak_x": 32,
+    "attempts": 39,
+    "preemptions": 0,
+    "deferrals": 841
+  }
+}

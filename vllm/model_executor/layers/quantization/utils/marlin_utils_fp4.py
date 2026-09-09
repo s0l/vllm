@@ -165,6 +165,7 @@ def apply_fp4_marlin_linear(
     bias: torch.Tensor | None = None,
     input_dtype: torch.dtype | None = None,
     use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # For GPUs that lack FP4 hardware support, we can leverage the
     # Marlin kernel for fast weight-only FP4 quantization
@@ -174,6 +175,19 @@ def apply_fp4_marlin_linear(
 
     padded_n, padded_k = marlin_repacked_nk(weight, num_bits=4)
     reshaped_x = marlin_pad_dim(reshaped_x, size_k, padded_k)
+
+    if output is not None:
+        if output.shape != (reshaped_x.size(0), padded_n):
+            raise ValueError(
+                "Marlin caller-provided output must use the physical padded "
+                f"shape {(reshaped_x.size(0), padded_n)}, got {output.shape}"
+            )
+        if output.dtype != input.dtype or output.device != input.device:
+            raise ValueError(
+                "Marlin caller-provided output must match input dtype/device"
+            )
+        if not output.is_contiguous():
+            raise ValueError("Marlin caller-provided output must be contiguous")
 
     use_atomic_add = should_use_atomic_add_reduce(
         m=reshaped_x.size(0),
@@ -196,7 +210,7 @@ def apply_fp4_marlin_linear(
 
     output = ops.marlin_gemm(
         a=inputs,
-        c=None,
+        c=output,
         b_q_weight=weight,
         b_bias=bias,
         b_scales=weight_scale,
@@ -346,10 +360,11 @@ def prepare_nvfp4_moe_layer_for_marlin(
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
     logger.warning_once(
-        "Your GPU does not have native support for FP4 computation but "
-        "FP4 quantization is being used. Weight-only FP4 compression will "
-        "be used leveraging the Marlin kernel. This may degrade "
-        "performance for compute-heavy workloads."
+        "Selected the Marlin NVFP4 MoE kernel for this deployment "
+        "configuration. This does not imply that the GPU lacks native FP4 "
+        "support; the available native MoE kernels rejected this layer's "
+        "quantization or shape configuration. Marlin may be slower for "
+        "compute-heavy workloads."
     )
 
     input_dtype = get_marlin_input_dtype(prefix="")

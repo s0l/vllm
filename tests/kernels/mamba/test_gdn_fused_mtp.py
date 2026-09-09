@@ -91,6 +91,17 @@ def _make_vllm_config():
     return config
 
 
+def test_fused_decode_rejects_nonuniform_gdn_partition() -> None:
+    """The fused packed path derives every local width by exact TP division."""
+    layer = QwenGatedDeltaNetAttention.__new__(QwenGatedDeltaNetAttention)
+    layer.gdn_explicit_partition = True
+
+    reason = layer._fused_gdn_decode_unsupported_reason(_make_vllm_config())
+
+    assert reason is not None
+    assert "uniform GDN head shards" in reason
+
+
 def _build_layer(
     vllm_config,
     conv_state: torch.Tensor,

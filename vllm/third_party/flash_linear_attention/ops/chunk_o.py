@@ -15,8 +15,13 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
-from .op import exp
-from .utils import FLA_CHUNK_SIZE, check_shared_mem, is_nvidia_hopper
+from .op import exp, safe_dot
+from .utils import (
+    FLA_CHUNK_SIZE,
+    check_shared_mem,
+    is_nvidia_hopper,
+    use_blackwell_safe_gdn,
+)
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
@@ -36,7 +41,7 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
         for num_warps in NUM_WARPS
         for num_stages in [2, 3, 4]
     ],
-    key=["H", "K", "V", "BT"],
+    key=["H", "K", "V", "BT", "USE_BLACKWELL_SAFE_O"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_fwd_kernel_o(
@@ -58,6 +63,7 @@ def chunk_fwd_kernel_o(
     BK: tl.constexpr,
     BV: tl.constexpr,
     USE_G: tl.constexpr,
+    USE_BLACKWELL_SAFE_O: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -134,7 +140,18 @@ def chunk_fwd_kernel_o(
 
     # to fix mma -> mma layout conversion
     # already solved by triton v3.2 or higher
-    b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
+    if USE_BLACKWELL_SAFE_O:
+        b_o = (
+            b_o * scale
+            + safe_dot(
+                b_A,
+                b_v.to(tl.float32),
+                input_precision="ieee",
+            )
+            * scale
+        )
+    else:
+        b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -186,5 +203,6 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
+        USE_BLACKWELL_SAFE_O=use_blackwell_safe_gdn and v.dtype == torch.bfloat16,
     )
     return o

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import itertools
 import weakref
 from collections import Counter
 from collections.abc import Callable
@@ -129,10 +130,16 @@ class CUDAGraphEntry:
     batch_descriptor: BatchDescriptor
     cudagraph: torch.cuda.CUDAGraph | None = None
     output: Any | None = None
+    graph_pool: Any | None = None
+    # PIECEWISE captures many graphs into one shared private pool.  Preserve
+    # their physical capture order so descriptor eviction can detach the
+    # complete artifact first and reset its graphs in reverse order.
+    capture_order: int = -1
 
     # for cudagraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
     input_addresses: list[int] | None = None
+    first_replay_addresses_validated: bool = False
 
 
 @dataclasses.dataclass
@@ -168,12 +175,59 @@ class CUDAGraphWrapper:
     """
 
     _all_instances: ClassVar[weakref.WeakSet["CUDAGraphWrapper"]] = weakref.WeakSet()
+    _capture_sequence: ClassVar = itertools.count()
 
     @classmethod
     def clear_all_graphs(cls) -> None:
         """Clear captured graphs from all CUDAGraphWrapper instances."""
         for instance in list(cls._all_instances):
             instance.clear_graphs()
+
+    @classmethod
+    def count_batch_descriptor(
+        cls, batch_descriptor: BatchDescriptor, graph_pool: Any | None = None
+    ) -> int:
+        """Count compiled graph segments resident for one descriptor."""
+        return sum(
+            (entry := instance.concrete_cudagraph_entries.get(batch_descriptor))
+            is not None
+            and (graph_pool is None or entry.graph_pool == graph_pool)
+            for instance in list(cls._all_instances)
+        )
+
+    @classmethod
+    def evict_batch_descriptor(
+        cls, batch_descriptor: BatchDescriptor, graph_pool: Any | None = None
+    ) -> int:
+        """Atomically destroy one ordered PIECEWISE descriptor artifact.
+
+        Multiple compiled segments share one descriptor-private CUDA graph
+        pool.  Detach every dictionary/output reference before resetting any
+        graph, then unwind the graphs in reverse capture order.  Iterating the
+        wrapper WeakSet directly made teardown order nondeterministic and let
+        a later shape reuse a pool while earlier segment objects still held
+        references into it.
+        """
+        detached: list[tuple[int, torch.cuda.CUDAGraph]] = []
+        evicted = 0
+        for instance in list(cls._all_instances):
+            entry = instance.concrete_cudagraph_entries.get(batch_descriptor)
+            if entry is None or (
+                graph_pool is not None and entry.graph_pool != graph_pool
+            ):
+                continue
+            del instance.concrete_cudagraph_entries[batch_descriptor]
+            if entry.cudagraph is not None:
+                detached.append((entry.capture_order, entry.cudagraph))
+            entry.cudagraph = None
+            entry.output = None
+            entry.input_addresses = None
+            entry.first_replay_addresses_validated = False
+            entry.graph_pool = None
+            evicted += 1
+        for _capture_order, graph in sorted(detached, reverse=True):
+            graph.reset()
+        return evicted
 
     def __init__(
         self,
@@ -335,6 +389,8 @@ class CUDAGraphWrapper:
             # to save memory
             entry.output = weak_ref_tensors(output)
             entry.cudagraph = cudagraph
+            entry.graph_pool = self.graph_pool
+            entry.capture_order = next(self._capture_sequence)
 
             compilation_counter.num_cudagraph_captured += 1
 
@@ -343,16 +399,19 @@ class CUDAGraphWrapper:
             # manage the memory during cuda graph capture
             return output
 
-        if self.is_debugging_mode:
+        if self.is_debugging_mode or not entry.first_replay_addresses_validated:
             # check if the input addresses are the same
             new_input_addresses = [
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
-            assert new_input_addresses == entry.input_addresses, (
-                f"Input addresses for cudagraphs are different "
-                f"during replay. Expected {entry.input_addresses}, "
-                f"got {new_input_addresses}"
-            )
+            if new_input_addresses != entry.input_addresses:
+                raise RuntimeError(
+                    "CUDA Graph input addresses changed between capture and "
+                    "replay for "
+                    f"{entry.batch_descriptor}. Expected "
+                    f"{entry.input_addresses}, got {new_input_addresses}."
+                )
+            entry.first_replay_addresses_validated = True
 
         # Sync offloader before replay - ensures any external dependencies
         # from pre-capture prefetches are satisfied.

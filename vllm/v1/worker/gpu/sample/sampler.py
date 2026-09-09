@@ -216,8 +216,19 @@ class Sampler:
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
         skip_top_k_top_p: bool = False,
+        capture_stages: dict[str, torch.Tensor] | None = None,
+        vocab_start: int = 0,
     ) -> torch.Tensor:
+        def capture(name: str, value: torch.Tensor) -> None:
+            if capture_stages is not None:
+                # Sampling runs outside model CUDA graphs.  The full-trace mode
+                # intentionally pays synchronous D2H here so successive
+                # in-place transformations cannot alias the same evidence.
+                capture_stages[name] = value.detach().cpu().clone()
+
+        capture("input", logits)
         if not np.any(self.needs_logits_processing[idx_mapping_np]):
+            capture("no_processing", logits)
             return logits
 
         # Copy logits to a new FP32 tensor.
@@ -225,8 +236,14 @@ class Sampler:
 
         # Apply logit bias (e.g., allowed_token_ids, min_tokens) in place.
         self.logit_bias_state.apply_logit_bias(
-            logits, expanded_idx_mapping, idx_mapping_np, pos
+            logits,
+            expanded_idx_mapping,
+            idx_mapping_np,
+            pos,
+            vocab_start=vocab_start,
+            vocab_is_sharded=logits.shape[-1] != self.sampling_states.vocab_size,
         )
+        capture("after_logit_bias", logits)
 
         # Apply penalties in place.
         self.penalties_state.apply_penalties(
@@ -235,7 +252,9 @@ class Sampler:
             idx_mapping_np,
             input_ids,
             expanded_local_pos,
+            vocab_start=vocab_start,
         )
+        capture("after_penalties", logits)
 
         # Apply bad words masking in place.
         self.bad_words_state.apply_bad_words(
@@ -245,6 +264,7 @@ class Sampler:
             input_ids,
             expanded_local_pos,
         )
+        capture("after_bad_words", logits)
 
         # Force the reasoning end marker once a request's thinking budget is
         # reached; applied before temperature so the forced token is always kept.
@@ -255,23 +275,28 @@ class Sampler:
             idx_mapping_np,
             input_ids,
             expanded_local_pos,
+            vocab_start=vocab_start,
         )
 
         # Apply temperature in place.
         self.sampling_states.apply_temperature(
             logits, expanded_idx_mapping, idx_mapping_np
         )
+        capture("after_temperature", logits)
 
         # Apply min_p in place.
         self.sampling_states.apply_min_p(logits, expanded_idx_mapping, idx_mapping_np)
+        capture("after_min_p", logits)
 
         if skip_top_k_top_p:
             return logits
 
         # Apply top_k and/or top_p. This might or might not return a new tensor.
-        return self.sampling_states.apply_top_k_top_p(
+        logits = self.sampling_states.apply_top_k_top_p(
             logits, expanded_idx_mapping, idx_mapping_np
         )
+        capture("after_top_k_top_p", logits)
+        return logits
 
     def sample(
         self,

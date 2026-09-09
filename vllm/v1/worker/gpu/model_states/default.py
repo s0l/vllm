@@ -100,33 +100,87 @@ class DefaultModelState(ModelState):
         input_batch: InputBatch,
         req_states: RequestState,
     ) -> torch.Tensor:
-        # Use unpadded input_ids to match is_mm_embed size (num_tokens).
-        # input_batch.input_ids may be padded for CUDA graphs.
-        input_ids_unpadded = input_batch.input_ids[: input_batch.num_tokens]
+        self.execute_mm_encoder(scheduled_encoder_inputs)
+        staged = self.stage_mm_embeddings(input_batch, req_states)
+        embeddings = self.execute_staged_mm_embeddings(staged, input_batch)
+        inputs_embeds = self.commit_staged_mm_embeddings(embeddings, input_batch)
+        return self.apply_prompt_embeddings(input_batch, req_states, inputs_embeds)
 
-        if self.supports_mm_inputs:
-            self.execute_mm_encoder(scheduled_encoder_inputs)
-
-            mm_embeds, is_mm_embed = super().gather_mm_embeddings(input_batch)
-            if self.mm_pruner is not None and mm_embeds:
-                # EVS: recompute mrope positions for pruned media.
-                mm_embeds = self.mm_pruner.recompute(mm_embeds, input_batch, req_states)
-                # We must flush the staged rope updates for prepare_inputs() to pick up.
-                self.apply_staged_writes()
-
-            inputs_embeds = self.encoder_runner.get_inputs_embeds(
-                input_ids_unpadded, mm_embeds, is_mm_embed
-            )
-        else:
-            input_embeddings = self.model.embed_input_ids(input_ids_unpadded)
-            self.inputs_embeds[: input_embeddings.shape[0]] = input_embeddings
-            inputs_embeds = self.inputs_embeds
-
+    def apply_prompt_embeddings(
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+        inputs_embeds: torch.Tensor,
+    ) -> torch.Tensor:
         if self.prompt_embeds_state is not None:
             self.prompt_embeds_state.apply(
                 input_batch, req_states.num_computed_tokens.gpu, inputs_embeds
             )
+        return inputs_embeds
 
+    def stage_mm_embeddings(
+        self, input_batch: InputBatch, req_states: RequestState
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        if self.supports_mm_inputs:
+            mm_embeds, is_mm_embed = super().gather_mm_embeddings(input_batch)
+        else:
+            mm_embeds = []
+            is_mm_embed = torch.zeros(input_batch.num_tokens, dtype=torch.bool)
+        if self.mm_pruner is not None and mm_embeds:
+            # EVS: recompute mrope positions for pruned media.
+            mm_embeds = self.mm_pruner.recompute(mm_embeds, input_batch, req_states)
+            # We must flush the staged rope updates for prepare_inputs() to pick up.
+            self.apply_staged_writes()
+
+        return mm_embeds, is_mm_embed
+
+    def execute_staged_mm_embeddings(
+        self,
+        staged: tuple[list[torch.Tensor], torch.Tensor],
+        input_batch: InputBatch,
+    ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor, bool]:
+        mm_embeds, is_mm_embed = staged
+        # Use unpadded input_ids to match is_mm_embed size (num_tokens).
+        # input_batch.input_ids may be padded for CUDA graphs.
+        input_ids_unpadded = input_batch.input_ids[: input_batch.num_tokens]
+        if not self.supports_mm_inputs:
+            text_embeddings = self.model.embed_input_ids(input_ids_unpadded)
+            return text_embeddings, [], is_mm_embed, True
+        embed_text = getattr(self.model, "embed_text_input_ids_for_elastic", None)
+        if callable(embed_text):
+            text_embeddings = embed_text(input_ids_unpadded, is_multimodal=is_mm_embed)
+            return text_embeddings, mm_embeds, is_mm_embed, False
+        merged_embeddings = self.model.embed_input_ids(
+            input_ids_unpadded,
+            multimodal_embeddings=mm_embeds,
+            is_multimodal=is_mm_embed,
+        )
+        return merged_embeddings, [], is_mm_embed, True
+
+    def commit_staged_mm_embeddings(
+        self,
+        embeddings: tuple[torch.Tensor, list[torch.Tensor], torch.Tensor, bool],
+        input_batch: InputBatch,
+    ) -> torch.Tensor:
+        text_embeddings, mm_embeds, is_mm_embed, already_merged = embeddings
+        if not already_merged:
+            merge_mm = getattr(
+                self.model, "merge_multimodal_embeddings_for_elastic", None
+            )
+            if not callable(merge_mm):
+                raise RuntimeError("missing elastic multimodal merge hook")
+            if mm_embeds:
+                text_embeddings = merge_mm(
+                    text_embeddings,
+                    mm_embeds,
+                    is_multimodal=is_mm_embed,
+                )
+        inputs_embeds = (
+            self.encoder_runner.inputs_embeds
+            if self.supports_mm_inputs
+            else self.inputs_embeds
+        )
+        inputs_embeds[: text_embeddings.shape[0]] = text_embeddings
         return inputs_embeds[: input_batch.num_tokens_after_padding]
 
     def gather_mm_embeddings(
@@ -174,7 +228,10 @@ class DefaultModelState(ModelState):
         for_capture: bool = False,
         ubatch_idx: int = 0,
     ) -> dict[str, Any]:
-        if cudagraph_mode == CUDAGraphMode.FULL:
+        if (
+            cudagraph_mode == CUDAGraphMode.FULL
+            or input_batch.num_reqs_after_padding > input_batch.num_reqs
+        ):
             # Use padded sizes - padding is handled by model_runner.prepare_attn.
             num_reqs = input_batch.num_reqs_after_padding
             num_tokens = input_batch.num_tokens_after_padding
@@ -206,6 +263,21 @@ class DefaultModelState(ModelState):
                 mm_features=self.encoder_cache.mm_features,
                 sliding_window=self.model_config.get_sliding_window(),
             )
+        request_ids: tuple[str | None, ...] = tuple(input_batch.req_ids)
+        if num_reqs > input_batch.num_reqs:
+            request_ids += (None,) * (num_reqs - input_batch.num_reqs)
+        num_scheduled_tokens_cpu = torch.zeros(num_reqs, dtype=torch.int32)
+        num_scheduled_tokens_cpu[: input_batch.num_reqs] = torch.from_numpy(
+            input_batch.num_scheduled_tokens
+        )
+        num_computed_tokens_provenance_cpu = torch.zeros(num_reqs, dtype=torch.int32)
+        num_computed_tokens_provenance_cpu[: input_batch.num_reqs] = torch.from_numpy(
+            input_batch.num_computed_tokens_np
+        )
+        num_prompt_tokens_cpu = torch.zeros(num_reqs, dtype=torch.int32)
+        num_prompt_tokens_cpu[: input_batch.num_reqs] = torch.from_numpy(
+            input_batch.prefill_len_np
+        )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
@@ -222,8 +294,13 @@ class DefaultModelState(ModelState):
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             positions=input_batch.positions,
             is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
+            request_ids=request_ids,
+            num_scheduled_tokens_cpu=num_scheduled_tokens_cpu,
+            num_computed_tokens_provenance_cpu=(num_computed_tokens_provenance_cpu),
+            num_prompt_tokens_cpu=num_prompt_tokens_cpu,
             mm_req_doc_ranges=req_doc_ranges,
             for_cudagraph_capture=for_capture,
+            full_cudagraph=cudagraph_mode == CUDAGraphMode.FULL,
             rswa_prefix_lens=input_batch.prompt_lens,
             ubatch_idx=ubatch_idx,
         )

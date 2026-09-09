@@ -27,6 +27,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     triton_scalar_specialization_rep,
 )
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import next_power_of_2
 from vllm.v1.attention.ops.cp_common import (
     DirectCPWorkspace,
     direct_cp_enabled,
@@ -50,10 +51,15 @@ def mask_dcp_empty_shards_(
     seq_lens: torch.Tensor | None,
     query_start_loc: torch.Tensor | None,
 ) -> None:
-    if seq_lens is None and query_start_loc is None:
+    if seq_lens is None:
+        if query_start_loc is not None:
+            raise ValueError("query_start_loc requires seq_lens")
         return
-    if seq_lens is None or query_start_loc is None:
-        raise ValueError("seq_lens and query_start_loc must be provided together")
+    if query_start_loc is None:
+        if seq_lens.ndim != 1 or seq_lens.shape[0] != lse.shape[0]:
+            raise ValueError("row-aligned seq_lens must match LSE rows")
+        lse.masked_fill_((seq_lens == 0)[:, None], float("-inf"))
+        return
     if (
         seq_lens.ndim != 1
         or query_start_loc.ndim != 1
@@ -89,6 +95,7 @@ class CorrectAttnCPOutKernel(VllmTritonJitKernel["CorrectAttnCPOutKernel.Compile
         lses_stride_h: int
         lse_idx: int
         head_dim: int
+        n: int
         n_rounded: int
         is_base_e: bool
 
@@ -107,6 +114,7 @@ class CorrectAttnCPOutKernel(VllmTritonJitKernel["CorrectAttnCPOutKernel.Compile
         lses_stride_H,
         lse_idx,
         HEAD_DIM: tl.constexpr,
+        N: tl.constexpr,
         N_ROUNDED: tl.constexpr,
         IS_BASE_E: tl.constexpr,
     ):
@@ -138,7 +146,9 @@ class CorrectAttnCPOutKernel(VllmTritonJitKernel["CorrectAttnCPOutKernel.Compile
         )
 
         # calc final lse
-        lse = tl.load(lses_ptr + lse_offsets).to(tl.float32)
+        lse = tl.load(
+            lses_ptr + lse_offsets, mask=num_n_offsets < N, other=-float("inf")
+        ).to(tl.float32)
         lse = tl.where((lse != lse) | (lse == float("inf")), -float("inf"), lse)
         lse_max = tl.max(lse, axis=0)
         lse_max = tl.where(lse_max == -float("inf"), 0, lse_max)
@@ -216,7 +226,8 @@ class CorrectAttnCPOutKernel(VllmTritonJitKernel["CorrectAttnCPOutKernel.Compile
             lses_stride_h=triton_scalar_specialization_rep(lses_stride_h),
             lse_idx=triton_scalar_specialization_rep(lse_idx),
             head_dim=head_dim,
-            n_rounded=n_rounded,
+            n=n_rounded,
+            n_rounded=next_power_of_2(n_rounded),
             is_base_e=is_base_e,
         )
 
@@ -273,7 +284,7 @@ class CorrectAttnCPOutKernel(VllmTritonJitKernel["CorrectAttnCPOutKernel.Compile
         )
         lse_ptr = TritonWarmupTensor(
             compile_key.lse_dtype,
-            shape=(compile_key.n_rounded, 1, 1),
+            shape=(compile_key.n, 1, 1),
             strides=(
                 compile_key.lses_stride_n,
                 compile_key.lses_stride_b,
@@ -315,7 +326,8 @@ class CorrectAttnCPOutKernel(VllmTritonJitKernel["CorrectAttnCPOutKernel.Compile
             lses_stride_B=lses_stride_b,
             lses_stride_H=lses_stride_h,
             HEAD_DIM=head_dim,
-            N_ROUNDED=n_rounded,
+            N=n_rounded,
+            N_ROUNDED=next_power_of_2(n_rounded),
             IS_BASE_E=is_base_e,
             _runtime_launcher=None if self._warming else ctx.call_kernel,
             # CPTritonContext caches the non-constexpr positional prefix; derive
@@ -456,7 +468,19 @@ def cp_lse_ag_out_rs(
         seq_lens=seq_lens,
         query_start_loc=query_start_loc,
     )
-    out = cp_group.reduce_scatter(out, dim=1)
+    max_native_rows = envs.VLLM_DCP_NATIVE_RS_MAX_ROWS
+    if max_native_rows < 0:
+        raise ValueError("VLLM_DCP_NATIVE_RS_MAX_ROWS must be non-negative")
+    use_native_reduce_scatter = (
+        max_native_rows > 0
+        and out.dim() == 3
+        and out.shape[0] <= max_native_rows
+        and out.shape[1] % cp_group.world_size == 0
+    )
+    if use_native_reduce_scatter:
+        out = cp_group.reduce_scatter(out, dim=1)
+    else:
+        out = cp_group.reduce_scatter_chunked(out, dim=1)
 
     if return_lse:
         cp_num_heads = lse.shape[1] // cp_group.world_size

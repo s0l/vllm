@@ -126,13 +126,26 @@ class LogitBiasState:
         self.restore_when_all_masked.copy_to_uva()
         self.stop_token_ids.apply_write()
 
+    def can_apply_sharded(self, idx_mapping_np: np.ndarray) -> bool:
+        """Only plain min_tokens has an independent vocabulary-shard contract."""
+        return not (
+            np.any(self.num_allowed_token_ids.np[idx_mapping_np])
+            or np.any(self.num_logit_bias.np[idx_mapping_np])
+            or np.any(self.restore_when_all_masked.np[idx_mapping_np])
+        )
+
     def apply_logit_bias(
         self,
         logits: torch.Tensor,
         expanded_idx_mapping: torch.Tensor,
         idx_mapping_np: np.ndarray,
         pos: torch.Tensor,
+        *,
+        vocab_start: int = 0,
+        vocab_is_sharded: bool = False,
     ) -> None:
+        if vocab_is_sharded and not self.can_apply_sharded(idx_mapping_np):
+            raise ValueError("sharded logit bias supports only plain min_tokens")
         if not np.any(self.use_logit_bias[idx_mapping_np]):
             # No request uses logit bias. Skip the kernel launch.
             return
@@ -155,6 +168,7 @@ class LogitBiasState:
             self.restore_when_all_masked.gpu,
             self.stop_token_ids.gpu,
             enable_stop_token_restore,
+            vocab_start=vocab_start,
         )
 
 
@@ -184,6 +198,7 @@ def _bias_kernel(
     BLOCK_SIZE: tl.constexpr,
     LOGITS_BLOCK_SIZE: tl.constexpr,
     CHECK_ALL_MASKED_ROWS: tl.constexpr,
+    VOCAB_START: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
@@ -248,6 +263,8 @@ def _bias_kernel(
             stop_token_ids_ptr + req_state_idx * stop_token_ids_stride + block,
             mask=mask,
         )
+        stop_token_ids -= VOCAB_START
+        mask = mask & (stop_token_ids >= 0) & (stop_token_ids < vocab_size)
         if CHECK_ALL_MASKED_ROWS:
             should_restore_stop_logits = tl.load(
                 restore_when_all_masked_ptr + req_state_idx
@@ -317,6 +334,7 @@ def apply_logit_bias(
     restore_when_all_masked: torch.Tensor,
     stop_token_ids: torch.Tensor,
     check_all_masked_rows: bool = False,
+    vocab_start: int = 0,
 ) -> None:
     num_tokens, vocab_size = logits.shape
     BLOCK_SIZE = triton.next_power_of_2(
@@ -349,4 +367,5 @@ def apply_logit_bias(
         BLOCK_SIZE=BLOCK_SIZE,
         LOGITS_BLOCK_SIZE=LOGITS_BLOCK_SIZE,
         CHECK_ALL_MASKED_ROWS=check_all_masked_rows,
+        VOCAB_START=vocab_start,
     )

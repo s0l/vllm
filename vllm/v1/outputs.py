@@ -12,6 +12,7 @@ import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.utils.torch_utils import PIN_MEMORY
+from vllm.v1.core.elastic_graph import ElasticResidencyReceipt
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
@@ -355,6 +356,43 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
+    # Authoritative worker-side membership/order for exact GDN prefix
+    # checkpoints. The scheduler must not infer this from a parallel LRU:
+    # candidate lookups and admission can differ from actual worker restores.
+    gdn_checkpoint_keys: tuple[bytes, ...] | None = None
+
+    # Actual aggregate graph residency after this step. Missing-graph capture
+    # headroom is planned by the scheduler before the same step executes.
+    elastic_external_memory_bytes: int = 0
+
+    # Worker echo of the scheduler-requested transient MM loan. The scheduler
+    # rejects a silent drop before settling Graph/KV state.
+    elastic_mm_activation_loan_bytes: int = 0
+
+    # Portion of aggregate external memory that is physically unavailable to a
+    # fresh graph capture after active graph executables are excluded. This is
+    # measured after each step and may return to zero; it is not a reserve.
+    elastic_external_memory_floor_bytes: int = 0
+
+    # Proven upper bound for the physical floor after evicting the currently
+    # HOT graph entries. This prices only a following changed-key capture and
+    # is never committed as resident memory by itself.
+    elastic_external_memory_transition_floor_bytes: int = 0
+
+    # Rank-safe allocator/driver high-water observed from the post-KV-shrink
+    # boundary through capture, replay and sampling completion.
+    elastic_external_memory_peak_bytes: int = 0
+
+    # Per-handle classic cuBLAS workspace size reported by the exact CUDA
+    # runtime. A request-free capture may be followed by one first replay that
+    # creates this workspace; scheduler uses the value only for that immediate
+    # maintenance -> consumer transition.
+    elastic_cublas_workspace_unit_bytes: int = 0
+
+    # Complete CPU-only physical residency publication. A missing receipt is
+    # valid only for paths that did not enter the elastic lifecycle.
+    elastic_residency_receipt: ElasticResidencyReceipt | None = None
+
     # Per-step routed experts data captured by the worker.
     # ``routing_data`` shape: (num_scheduled_tokens, num_layers,
     #                         num_experts_per_tok); expert IDs as uint8/uint16.
@@ -372,14 +410,30 @@ class ModelRunnerOutput:
     @staticmethod
     def with_kv_conn_output_only(
         kv_connector_output: KVConnectorOutput | None,
+        elastic_external_memory_bytes: int = 0,
+        elastic_external_memory_floor_bytes: int = 0,
+        elastic_external_memory_transition_floor_bytes: int = 0,
+        elastic_external_memory_peak_bytes: int = 0,
     ) -> "ModelRunnerOutput":
         """Return ModelRunnerOutput containing the provided KVConnectorOutput,
         otherwise empty. Returns None if kv_connector_output is passed as None.
         """
-        if kv_connector_output is None or kv_connector_output.is_empty():
+        if (
+            (kv_connector_output is None or kv_connector_output.is_empty())
+            and elastic_external_memory_bytes == 0
+            and (elastic_external_memory_floor_bytes == 0)
+            and elastic_external_memory_transition_floor_bytes == 0
+            and (elastic_external_memory_peak_bytes == 0)
+        ):
             return EMPTY_MODEL_RUNNER_OUTPUT
         output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
         output.kv_connector_output = kv_connector_output
+        output.elastic_external_memory_bytes = elastic_external_memory_bytes
+        output.elastic_external_memory_floor_bytes = elastic_external_memory_floor_bytes
+        output.elastic_external_memory_transition_floor_bytes = (
+            elastic_external_memory_transition_floor_bytes
+        )
+        output.elastic_external_memory_peak_bytes = elastic_external_memory_peak_bytes
         return output
 
     @staticmethod

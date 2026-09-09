@@ -1041,9 +1041,11 @@ class VllmBackend:
         )
         hash_content = []
         for filepath in forward_code_files:
-            if filepath == "<string>":
-                # This means the function was dynamically generated, with
-                # e.g. exec(). We can't actually check these.
+            if filepath.startswith("<") and filepath.endswith(">"):
+                # Dynamically generated and frozen stdlib modules do not have
+                # readable source paths.  They cannot contribute file content
+                # to this hash; their code is covered by the compiler/runtime
+                # factors instead.
                 continue
             hash_content.append(filepath)
             try:

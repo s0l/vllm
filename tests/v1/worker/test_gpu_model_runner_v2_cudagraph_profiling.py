@@ -28,6 +28,68 @@ GLOBAL_POOL = "global-pool"
 THROWAWAY_POOL = "throwaway-pool"
 
 
+def test_full_capture_consumes_declared_stream_across_descriptors(monkeypatch):
+    stream = object()
+    captured_streams = []
+    contexts = []
+    context = SimpleNamespace(stream=stream)
+
+    @contextlib.contextmanager
+    def outer_capture(*, device, graph_capture_context):
+        assert graph_capture_context is context
+        contexts.append(graph_capture_context)
+        yield context
+
+    @contextlib.contextmanager
+    def capture(graph, pool, *, stream=None):
+        captured_streams.append(stream)
+        yield
+
+    monkeypatch.setattr(cgu, "graph_capture", outer_capture)
+    monkeypatch.setattr(cgu, "is_global_first_rank", lambda: False)
+    monkeypatch.setattr(cgu, "set_graph_pool_id", lambda _: None)
+    monkeypatch.setattr(
+        cgu,
+        "get_offloader",
+        lambda: SimpleNamespace(
+            sync_prev_onload=lambda: None, join_after_forward=lambda: None
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda **_: object())
+    monkeypatch.setattr(torch.cuda, "graph", capture)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _: None)
+    manager = cgu.CudaGraphManager.__new__(cgu.CudaGraphManager)
+    manager.defer_startup_graphs = True
+    manager.device = torch.device("cuda:0")
+    manager._get_dynamic_graph_capture_context = lambda: context
+    manager._capture_num_reqs = lambda desc: desc.num_reqs
+    manager.dynamic_graph_owner = "target"
+    manager.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(rank=0))
+    manager._p3_node_cutoff = None
+    manager._p3_node_prefix_counts = ()
+    manager._p3_graph_debug = False
+    manager.pool = THROWAWAY_POOL
+    manager.graphs = {}
+    calls = []
+    for size in (4, 8):
+        desc = cgu.BatchExecutionDescriptor(
+            cg_mode=CUDAGraphMode.FULL,
+            num_tokens=size,
+            num_reqs=size,
+            uniform_token_count=1,
+            num_active_loras=0,
+        )
+        manager.capture(
+            lambda desc, warmup: lambda mode: calls.append((desc, warmup, mode)),
+            capture_descs={CUDAGraphMode.FULL: [desc]},
+        )
+    assert captured_streams == [stream, stream]
+    assert contexts == [context, context]
+    assert len(calls) == 4
+    assert len(manager.graphs) == 2
+
+
 class _FakeCudaGraphManager:
     def __init__(
         self, needs_capture: bool, num_full_descs: int, piecewise_only: bool = False
@@ -59,6 +121,7 @@ def _make_profiling_runner(
 ) -> Any:
     runner: Any = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
     runner.compilation_config = SimpleNamespace(cudagraph_mode=cudagraph_mode)
+    runner.device = torch.device("cuda:0")
     runner.cudagraph_manager = _FakeCudaGraphManager(
         needs_capture, num_full_descs, piecewise_only
     )
@@ -108,6 +171,7 @@ def _patch_module(monkeypatch) -> None:
     monkeypatch.setattr(
         cgu, "_teardown_profiling_state", lambda r: r.events.append("teardown")
     )
+    monkeypatch.setattr(cgu, "_trim_device_graph_memory", lambda _device: None)
     # The profiler reads free GPU memory before/after to compute what it
     # retained; default to a constant (nothing retained).
     monkeypatch.setattr(cgu.torch.accelerator, "empty_cache", lambda: None)
@@ -199,6 +263,18 @@ def test_profile_cudagraph_memory_tears_down_on_capture_error(monkeypatch):
 
     # Teardown still runs even if capture raises.
     assert runner.events == ["init", "capture", "teardown"]
+
+
+def test_profile_cudagraph_memory_trims_after_throwaway_teardown(monkeypatch):
+    _patch_module(monkeypatch)
+    runner = _make_profiling_runner(CUDAGraphMode.FULL)
+    trimmed: list[torch.device] = []
+    monkeypatch.setattr(cgu, "_trim_device_graph_memory", trimmed.append)
+
+    cgu.profile_cudagraph_memory(runner)
+
+    assert trimmed == [runner.device]
+    assert _FakePlatform._global_graph_pool == GLOBAL_POOL
 
 
 def test_profile_cudagraph_memory_restores_compilation_counters(monkeypatch):
@@ -425,7 +501,11 @@ def test_teardown_profiling_state_clears_mamba_align_metadata(monkeypatch):
     )
     runner.cache_config = SimpleNamespace(num_gpu_blocks=1)
     runner.kv_caches = []
+    block_copy_owner = [object()]
+    runner.kv_caches_for_block_copy = block_copy_owner
     runner.attn_groups = []
+    draft_owners = [object()]
+    runner.speculator = SimpleNamespace(attn_groups=draft_owners)
     runner.kv_cache_config = SimpleNamespace()
     runner.cudagraph_manager = object()
     runner.lora_config = None
@@ -439,3 +519,6 @@ def test_teardown_profiling_state_clears_mamba_align_metadata(monkeypatch):
     assert runner.model_state._mamba_ctx is None
     assert runner.model_state._mamba_group_ids == []
     assert runner.model_state._mamba_spec is None
+    assert block_copy_owner == []
+    assert draft_owners == []
+    assert not hasattr(runner, "kv_caches_for_block_copy")

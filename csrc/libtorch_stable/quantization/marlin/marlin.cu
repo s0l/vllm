@@ -25,6 +25,8 @@
 
 #include "kernel.h"
 
+#include <cstdlib>
+
 #include <torch/csrc/stable/accelerator.h>
 #include <torch/csrc/stable/library.h>
 #include <torch/csrc/stable/ops.h>
@@ -245,8 +247,9 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                vllm::ScalarType const& c_type, vllm::ScalarType const& s_type,
                bool has_bias, bool has_zp, int num_groups, int group_size,
                int dev, cudaStream_t stream, int thread_k_init,
-               int thread_n_init, int sms, bool use_atomic_add,
-               bool use_fp32_reduce, bool is_zp_float) {
+               int thread_n_init, int num_threads_init, int sms,
+               bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float,
+               bool whole_slice_schedule) {
   bool is_a_8bit = a_type.size_bits() == 8;
   STD_TORCH_CHECK(prob_m > 0 && prob_n > 0 && prob_k > 0, "Invalid MNK = [",
                   prob_m, ", ", prob_n, ", ", prob_k, "]");
@@ -316,14 +319,18 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     int thread_k = thread_k_init;
     int thread_n = thread_n_init;
 
+    // A complete-K slice fixes the reduction order independently of physical
+    // M. Select the smallest existing M tile that contains this host chunk;
+    // K/N reduction geometry remains fixed independently by projection family.
+    bool whole_slice_part = whole_slice_schedule;
     int thread_m_blocks = min(div_ceil(prob_m_split, 16), max_thread_m_blocks);
     int m_block_size_8 = prob_m_split <= 8 && a_type.size_bits() == 16;
 
     // Set thread config
     exec_config_t exec_cfg;
     thread_config_t thread_tfg;
-    if (thread_k != -1 && thread_n != -1) {
-      thread_tfg = thread_config_t{thread_k, thread_n, default_threads};
+    if (thread_k != -1 && thread_n != -1 && num_threads_init != -1) {
+      thread_tfg = thread_config_t{thread_k, thread_n, num_threads_init};
       exec_cfg = exec_config_t{1, thread_tfg};
       STD_TORCH_CHECK(prob_n % thread_n == 0, "prob_n = ", prob_n,
                       " is not divisible by thread_n = ", thread_n);
@@ -406,7 +413,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     kernel<<<blocks, num_threads, max_shared_mem_new, stream>>>(
         A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr,
         prob_m_split, prob_n, prob_k, lda, locks, has_bias, part_use_atomic_add,
-        use_fp32_reduce, max_shared_mem_new);
+        use_fp32_reduce, whole_slice_part, max_shared_mem_new);
     // clang-format on
 
     bool is_a_8bit = a_type.size_bits() == 8;
@@ -558,10 +565,59 @@ torch::stable::Tensor marlin_gemm(
   // thread_n: `n` size of a thread_tile in `weights` (can usually be left as
   // auto -1)
   int thread_n = -1;
+  // num_threads: thread count paired with the forced thread tile.  Auto mode
+  // leaves all three values at -1.
+  int num_threads = -1;
   // sms: number of SMs to use for the kernel
   int sms = -1;
   const int32_t device_index = a.get_device_index();
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device_index);
+
+  // Batch-invariant schedule for NVFP4 W4A16. Marlin's
+  // automatic small/large-batch selection can choose a different K reduction
+  // tree for the same output row as M changes.  Pin the highest-priority valid
+  // small-batch tile from K/N alone so packing unrelated rows cannot change the
+  // result.  Select only tiles present in both Marlin's small- and large-batch
+  // tables, so the same launch contract remains valid across M.  Keep this
+  // default-off unless the caller explicitly requests the proven policy.
+  const char* fixed_schedule =
+      std::getenv("AG2_VLLM_NVFP4_MARLIN_FIXED_SCHEDULE");
+  const char* whole_slice_prefill =
+      std::getenv("AG2_VLLM_NVFP4_MARLIN_WHOLE_SLICE_PREFILL");
+  bool fixed_schedule_enabled = fixed_schedule != nullptr &&
+                                fixed_schedule[0] == '1' &&
+                                fixed_schedule[1] == '\0';
+  bool whole_slice_schedule =
+      whole_slice_prefill != nullptr && whole_slice_prefill[0] == '1' &&
+      whole_slice_prefill[1] == '\0' && b_type == vllm::kFE2M1f &&
+      a_type.size_bits() == 16;
+  STD_TORCH_CHECK(!whole_slice_schedule || fixed_schedule_enabled,
+                  "Whole-slice NVFP4 Marlin requires the fixed K/N schedule");
+  bool selected_n64_projection =
+      whole_slice_schedule &&
+      ((size_k == 5120 && size_n == 6144) ||
+       (size_n == 5120 && (size_k == 2304 || size_k == 2048)));
+  if (fixed_schedule_enabled && b_type == vllm::kFE2M1f &&
+      a_type.size_bits() == 16) {
+    if (selected_n64_projection) {
+      thread_k = 128;
+      thread_n = 64;
+      num_threads = 128;
+    } else if (size_k % 64 == 0 && size_n % 128 == 0) {
+      thread_k = 64;
+      thread_n = 128;
+      num_threads = 128;
+    } else if (size_k % 128 == 0 && size_n % 64 == 0) {
+      thread_k = 128;
+      thread_n = 64;
+      num_threads = 128;
+    } else {
+      STD_TORCH_CHECK(false,
+                      "No fixed Marlin thread schedule for NVFP4 W4A16 "
+                      "shape K/N = [",
+                      size_k, ", ", size_n, "]");
+    }
+  }
 
   // Alloc buffers
   torch::stable::accelerator::DeviceGuard device_guard(device_index);
@@ -722,8 +778,8 @@ torch::stable::Tensor marlin_gemm(
       global_scale.mutable_data_ptr(), b_zeros.mutable_data_ptr(), size_m,
       size_n, size_k, a.stride(0), workspace.mutable_data_ptr(), a_type, b_type,
       c_type, s_type, has_bias, has_zp, num_groups, group_size, device_index,
-      get_current_cuda_stream(device_index), thread_k, thread_n, sms,
-      use_atomic_add, use_fp32_reduce, is_zp_float);
+      get_current_cuda_stream(device_index), thread_k, thread_n, num_threads,
+      sms, use_atomic_add, use_fp32_reduce, is_zp_float, whole_slice_schedule);
 
   return c;
 }

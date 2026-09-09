@@ -570,12 +570,66 @@ def reconstruct_serializable_fn_from_mega_artifact(
     return fn
 
 
+def _ag2_downstream_compile_factors() -> dict[str, str]:
+    """Return downstream env values that can alter the compiled graph."""
+    # Catalog selection and maintenance IO have no compiled-model consumer.
+    # Keep the exclusion explicit: a future AG2 flag is not safe by prefix.
+    catalog_control_only = {
+        # Data-only row profile is identified by the required SHA256 env.
+        # Moving the same profile does not change the consumed graph.
+        "AG2_VLLM_TP3_ROW_PROFILE",
+        "AG2_VLLM_ELASTIC_REQUIRE_CATALOG",
+        "AG2_VLLM_ELASTIC_AUTO_CALIBRATE",
+        "AG2_VLLM_ELASTIC_CATALOG_PATH",
+        "AG2_VLLM_ELASTIC_CALIBRATION_ROLE",
+        "AG2_VLLM_ELASTIC_CALIBRATION_SURFACE",
+        "AG2_VLLM_ELASTIC_CALIBRATION_RECEIPT",
+        "AG2_VLLM_ELASTIC_CALIBRATION_REQUEST",
+        "AG2_VLLM_ELASTIC_CALIBRATION_SEED_CATALOG",
+        "AG2_VLLM_ELASTIC_CALIBRATION_MAX_NEW_ROWS_PER_PROCESS",
+        "AG2_VLLM_ELASTIC_CALIBRATION_MAX_PRODUCER_EPOCHS_PER_PROCESS",
+    }
+    # These values affect only scheduler arrival/admission state. Keeping them
+    # in the model AOT identity recompiles numerically identical target/MTP
+    # graphs whenever a burst window changes, and can turn a scheduler-only
+    # experiment into a different numerical/performance stimulus. Canonicalize
+    # them to the pre-burst defaults while preserving their real runtime env.
+    scheduler_only_defaults = {
+        "AG2_VLLM_MAX_CONCURRENT_PARTIAL_PREFILLS": "1",
+        "AG2_VLLM_PREFILL_ADMISSION_DELAY_MS": "0",
+        "AG2_VLLM_PREFILL_ADMISSION_MAX_DELAY_MS": "",
+        # This flag adds bounded log/profiler scopes around already-selected
+        # execution. It cannot alter model math or tensor ownership and must
+        # not force a numerically different AOT/autotune epoch when production
+        # diagnostics are disabled after acceptance.
+        "AG2_VLLM_GRAPH_MODE_RECEIPT": "1",
+    }
+    factors: dict[str, str] = {}
+    for name, value in sorted(os.environ.items()):
+        if name in catalog_control_only or not name.startswith(
+            ("AG2_VLLM_", "VLLM_TP3_")
+        ):
+            continue
+        factors[name] = scheduler_only_defaults.get(name, value)
+    return factors
+
+
 def aot_compile_hash_factors(vllm_config: VllmConfig) -> list[str]:
     factors = []
     # 0. factors come from the env, for example, The values of
     # VLLM_PP_LAYER_PARTITION will affect the computation graph.
     env_hash = hash_factors(envs.compile_factors())
     factors.append(env_hash)
+
+    # Downstream AG2 runtime switches are intentionally not registered as
+    # upstream VLLM_* envs, but several of them change module structure or the
+    # compiled forward graph (diagnostic buffers, owner-prequant paths, exact
+    # reducers, and MTP attention dispatch). Reusing an AOT artifact across
+    # those values can load a graph that references buffers the new module
+    # does not own. Hash the complete downstream namespaces fail-closed; a
+    # harmless observability-only change may recompile, but a structural change
+    # can never silently consume a stale graph.
+    factors.append(hash_factors(_ag2_downstream_compile_factors()))
 
     # 1. factors come from the vllm_config (it mainly summarizes how the
     #    model is created)

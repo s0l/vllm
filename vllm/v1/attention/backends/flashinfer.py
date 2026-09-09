@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+import json
+import os
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import partial
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -74,7 +76,6 @@ from vllm.v1.attention.backends.utils import (
     get_num_attention_heads_from_layers,
     get_per_layer_parameters,
     infer_global_hyperparameters,
-    log2_lse_to_ln,
     split_decodes_and_prefills,
 )
 from vllm.v1.attention.ops.dcp import (
@@ -97,9 +98,658 @@ FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM = 16
 FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 
+_ag2_canonical_paged_logged_shapes: set[tuple[int, int, int, int]] = set()
+_ag2_canonical_route_provenance_keys: set[tuple[object, ...]] = set()
+
 logger = init_logger(__name__)
 
 trtllm_workspace_buffer = None
+_ag2_dcp_prefill_query_scratch: torch.Tensor | None = None
+
+
+def get_query_scale_for_flashinfer(
+    q_scale: float,
+    query_dtype: torch.dtype,
+) -> float | None:
+    """Pass q_scale only when FlashInfer receives an FP8 query.
+
+    FlashInfer folds a supplied q_scale into the attention softmax scale.
+    Model-dtype queries were not divided by q_scale, so applying a calibrated
+    non-unit scale to BF16/FP16 queries changes the attention logits.
+    """
+    if query_dtype in (FP8_DTYPE, torch.float8_e5m2):
+        return q_scale
+    return None
+
+
+def set_ag2_dcp_prefill_query_scratch(scratch: torch.Tensor | None) -> None:
+    global _ag2_dcp_prefill_query_scratch
+    if scratch is not None and (scratch.dtype != torch.bfloat16 or not scratch.is_cuda):
+        raise ValueError("DCP prefill query scratch must be a CUDA BF16 tensor")
+    _ag2_dcp_prefill_query_scratch = scratch
+
+
+def _resolve_decode_split_plan(
+    *,
+    num_decode_tokens: int,
+    num_decodes: int,
+    fixed_split_size: int,
+    disable_split_kv: bool,
+    spec_target_only: bool,
+    qlen1_fixed_split_size: int = -1,
+    qlen1_disable_split_kv: bool = False,
+) -> tuple[int, bool, bool]:
+    """Resolve native-decode split policy and graph-wrapper eligibility.
+
+    A speculative target verifies more than one query token per request.  Its
+    vLLM lane is already PIECEWISE, so a fixed split can use FlashInfer's
+    ordinary replannable wrapper.  MTP draft decode has one query token and
+    retains the existing FULL CUDA-graph wrapper.
+
+    Returns ``(fixed_split_size, disable_split_kv, force_non_graph_wrapper)``.
+    """
+    if num_decodes <= 0 or num_decode_tokens % num_decodes:
+        raise ValueError(
+            "FlashInfer native decode requires a positive request count and "
+            "uniform query length: "
+            f"{num_decode_tokens=} {num_decodes=}"
+        )
+    query_len = num_decode_tokens // num_decodes
+    if query_len == 1 and qlen1_fixed_split_size > 0:
+        return qlen1_fixed_split_size, qlen1_disable_split_kv, False
+    if spec_target_only and query_len == 1:
+        return -1, False, False
+    force_non_graph_wrapper = spec_target_only and fixed_split_size > 0
+    return fixed_split_size, disable_split_kv, force_non_graph_wrapper
+
+
+def _use_decode_cudagraph_wrapper(
+    *,
+    backend_enabled: bool,
+    full_cudagraph: bool,
+    pure_decode: bool,
+    num_decode_tokens: int,
+    max_cudagraph_tokens: int,
+    force_non_graph_wrapper: bool,
+) -> bool:
+    """Route only outer-FULL attention through FlashInfer graph storage.
+
+    Standard attention is an eager breakpoint in vLLM PIECEWISE mode.  Giving
+    that path a FlashInfer ``use_cuda_graph`` wrapper creates shape-owned plan
+    storage whose lifetime outlives the evictable PIECEWISE subgraphs.
+    """
+    return (
+        backend_enabled
+        and full_cudagraph
+        and pure_decode
+        and num_decode_tokens <= max_cudagraph_tokens
+        and not force_non_graph_wrapper
+    )
+
+
+def _flashinfer_seq_lens_and_blocks_for_paged_kv(
+    seq_lens_cpu: torch.Tensor,
+    qo_indptr_cpu: torch.Tensor,
+    num_decodes: int,
+    num_prefills: int,
+    page_size: int,
+    *,
+    use_dcp: bool,
+    dcp_world_size: int,
+    dcp_rank: int,
+    dcp_kv_cache_interleave_size: int,
+    include_prefill_query: bool = False,
+    include_prefill_query_from: int | None = None,
+) -> tuple[torch.Tensor, np.ndarray, np.ndarray]:
+    """Return FlashInfer paged-KV lengths after context/DCP localization.
+
+    ``CommonAttentionMetadata.seq_lens`` includes the scheduled query tokens.
+    Native FlashInfer DCP prefill has two phases: attend over the previously
+    cached context with paged KV, then attend over the new ragged KV tokens.
+    Therefore the paged-KV metadata must be computed from context lengths, and
+    when DCP is enabled those context lengths must be localized before deriving
+    page counts and last-page lengths.
+    """
+    localized_seq_lens_cpu = seq_lens_cpu.clone()
+    if use_dcp:
+        if include_prefill_query and include_prefill_query_from is not None:
+            raise ValueError(
+                "Specify either include_prefill_query or "
+                "include_prefill_query_from, not both"
+            )
+        if include_prefill_query:
+            include_prefill_query_from = num_decodes
+        if include_prefill_query_from is None:
+            include_prefill_query_from = num_decodes + num_prefills
+        if not num_decodes <= include_prefill_query_from <= num_decodes + num_prefills:
+            raise ValueError(
+                "Prefill-query inclusion boundary is outside the prefill cohort: "
+                f"{include_prefill_query_from=} {num_decodes=} {num_prefills=}"
+            )
+        if num_prefills > 0 and include_prefill_query_from > num_decodes:
+            qo_indptr_prefill_cpu = (
+                qo_indptr_cpu[num_decodes:] - qo_indptr_cpu[num_decodes]
+            )
+            query_lens_prefill_cpu = (
+                qo_indptr_prefill_cpu[1:] - qo_indptr_prefill_cpu[:-1]
+            )
+            standard_prefill_count = include_prefill_query_from - num_decodes
+            localized_seq_lens_cpu[num_decodes:include_prefill_query_from] -= (
+                query_lens_prefill_cpu[:standard_prefill_count]
+            )
+
+        localized_seq_lens_cpu = get_dcp_local_seq_lens(
+            localized_seq_lens_cpu,
+            dcp_world_size,
+            dcp_rank,
+            dcp_kv_cache_interleave_size,
+        )
+
+    seq_lens_np = localized_seq_lens_cpu.numpy()
+    num_blocks_np = (seq_lens_np + (page_size - 1)) // page_size
+    return localized_seq_lens_cpu, seq_lens_np, num_blocks_np
+
+
+def _physicalize_empty_dcp_decode_rows(
+    seq_lens_np: np.ndarray,
+    num_blocks_np: np.ndarray,
+    num_decodes: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Give native FlashInfer a safe dummy page for logical empty DCP rows.
+
+    Native paged decode cannot consume a row with zero KV pages. DCP can
+    legitimately produce such a row when a short sequence has no token on the
+    current rank. The caller must mask these rows' LSE to ``-inf`` before the
+    cross-rank combine, so the dummy page cannot contribute to consumed math.
+    """
+    if seq_lens_np.ndim != 1 or num_blocks_np.shape != seq_lens_np.shape:
+        raise ValueError("DCP sequence lengths and block counts must be vectors")
+    if not 0 <= num_decodes <= seq_lens_np.size:
+        raise ValueError("DCP decode boundary exceeds the request vector")
+    empty_decode_rows = seq_lens_np[:num_decodes] == 0
+    if not np.any(empty_decode_rows):
+        return seq_lens_np, num_blocks_np, empty_decode_rows
+
+    physical_seq_lens = seq_lens_np.copy()
+    physical_num_blocks = num_blocks_np.copy()
+    physical_seq_lens[:num_decodes][empty_decode_rows] = 1
+    physical_num_blocks[:num_decodes][empty_decode_rows] = 1
+    return physical_seq_lens, physical_num_blocks, empty_decode_rows
+
+
+def _dcp_pseudo_decode_rows(
+    seq_lens_cpu: torch.Tensor,
+    qo_indptr_cpu: torch.Tensor,
+    dcp_world_size: int,
+    dcp_rank: int,
+    dcp_kv_cache_interleave_size: int,
+    padded_num_rows: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand qlen>1 requests into causal qlen=1 DCP decode rows.
+
+    The source KV for every row is the original request's block table. The
+    inclusive global length advances once per query token, then is localized
+    independently for the current DCP rank. This prevents earlier verification
+    rows from seeing later speculative K/V that has already been written to the
+    paged cache.
+    """
+    query_lens = qo_indptr_cpu[1:] - qo_indptr_cpu[:-1]
+    if query_lens.numel() != seq_lens_cpu.numel():
+        raise ValueError(
+            "Pseudo-decode requires one query length per sequence length: "
+            f"{query_lens.numel()=} versus {seq_lens_cpu.numel()=}."
+        )
+    if bool(torch.any(query_lens < 0)):
+        raise ValueError("Pseudo-decode query indptr must be monotonic.")
+    active_requests = query_lens > 0
+    if not bool(torch.any(active_requests)):
+        raise ValueError("Pseudo-decode requires at least one active query row.")
+    active_request_ids = torch.arange(query_lens.numel(), dtype=torch.int64)[
+        active_requests
+    ]
+    active_query_lens = query_lens[active_requests]
+
+    row_to_req = torch.repeat_interleave(
+        active_request_ids,
+        active_query_lens.to(torch.int64),
+    )
+    row_offsets = torch.cat(
+        [
+            torch.arange(1, int(query_len) + 1, dtype=seq_lens_cpu.dtype)
+            for query_len in active_query_lens
+        ]
+    )
+    query_lens_per_row = torch.repeat_interleave(active_query_lens, active_query_lens)
+    final_seq_lens_per_row = seq_lens_cpu[row_to_req]
+    global_row_lens = final_seq_lens_per_row - query_lens_per_row + row_offsets
+    local_row_lens = get_dcp_local_seq_lens(
+        global_row_lens,
+        dcp_world_size,
+        dcp_rank,
+        dcp_kv_cache_interleave_size,
+    )
+    if padded_num_rows is not None:
+        semantic_rows = row_to_req.numel()
+        if padded_num_rows < semantic_rows:
+            raise ValueError(
+                "Pseudo-decode physical row carrier is smaller than its "
+                f"semantic rows: {padded_num_rows=} {semantic_rows=}"
+            )
+        padding = padded_num_rows - semantic_rows
+        if padding:
+            # FULL CUDA graphs retain their physical carrier after a request
+            # finishes.  Route ignored padding queries through one valid KV
+            # row so capture/replay keeps the same pseudo-decode wrapper.
+            # Their outputs stay beyond qo_indptr's semantic tail.
+            row_to_req = torch.cat([row_to_req, row_to_req[:1].expand(padding)])
+            local_row_lens = torch.cat(
+                [local_row_lens, local_row_lens[:1].expand(padding)]
+            )
+    return row_to_req, local_row_lens
+
+
+def _dcp_causal_paged_custom_mask(
+    seq_lens_cpu: torch.Tensor,
+    qo_indptr_cpu: torch.Tensor,
+    dcp_world_size: int,
+    dcp_rank: int,
+    dcp_kv_cache_interleave_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build a causal mask over full DCP-local paged KV for each prefill.
+
+    ``seq_lens_cpu`` includes the newly scheduled query tokens, which have
+    already been written to paged KV before the attention backend runs.  A
+    query at global position ``p`` may consume the first DCP-local
+    ``get_dcp_local_seq_lens(p + 1)`` keys.  FlashInfer expects custom masks
+    flattened request by request with ``q_len * local_kv_len`` elements.
+
+    This helper only defines and validates the metadata contract.  It is not
+    selected by the runtime until a separate default-off canonical-paged POC
+    passes saved-boundary and cost gates.
+    """
+    if seq_lens_cpu.device.type != "cpu" or qo_indptr_cpu.device.type != "cpu":
+        raise ValueError("DCP causal paged mask metadata must be built on CPU")
+    if seq_lens_cpu.ndim != 1 or qo_indptr_cpu.ndim != 1:
+        raise ValueError("DCP causal paged mask expects one-dimensional metadata")
+    if qo_indptr_cpu.numel() != seq_lens_cpu.numel() + 1:
+        raise ValueError(
+            "DCP causal paged mask requires one query span per sequence: "
+            f"{qo_indptr_cpu.numel()=} {seq_lens_cpu.numel()=}"
+        )
+    if dcp_world_size < 1 or not 0 <= dcp_rank < dcp_world_size:
+        raise ValueError(f"Invalid DCP geometry: {dcp_world_size=} {dcp_rank=}")
+    if dcp_kv_cache_interleave_size < 1:
+        raise ValueError("DCP KV cache interleave size must be positive")
+
+    query_lens = qo_indptr_cpu[1:] - qo_indptr_cpu[:-1]
+    if bool(torch.any(query_lens <= 0)):
+        raise ValueError("DCP causal paged mask does not support empty query spans")
+    if bool(torch.any(seq_lens_cpu < query_lens)):
+        raise ValueError("DCP sequence length cannot be shorter than its query span")
+
+    local_seq_lens = get_dcp_local_seq_lens(
+        seq_lens_cpu,
+        dcp_world_size,
+        dcp_rank,
+        dcp_kv_cache_interleave_size,
+    )
+    request_masks: list[torch.Tensor] = []
+    for seq_len_t, query_len_t, local_seq_len_t in zip(
+        seq_lens_cpu, query_lens, local_seq_lens, strict=True
+    ):
+        seq_len = int(seq_len_t)
+        query_len = int(query_len_t)
+        local_seq_len = int(local_seq_len_t)
+        first_query_position = seq_len - query_len
+        inclusive_global_bounds = torch.arange(
+            first_query_position + 1,
+            seq_len + 1,
+            dtype=torch.int32,
+        )
+        visible_local_lens = get_dcp_local_seq_lens(
+            inclusive_global_bounds,
+            dcp_world_size,
+            dcp_rank,
+            dcp_kv_cache_interleave_size,
+        )
+        local_positions = torch.arange(local_seq_len, dtype=torch.int32)
+        request_masks.append(
+            (local_positions.unsqueeze(0) < visible_local_lens.unsqueeze(1)).reshape(-1)
+        )
+    return torch.cat(request_masks), local_seq_lens
+
+
+def _dcp_pseudo_block_table_capacity(
+    max_model_len: int,
+    max_num_batched_tokens: int,
+    page_size: int,
+    dcp_world_size: int,
+) -> int:
+    """Bound the worker's hybrid block-table width before graph capture."""
+    if min(max_model_len, max_num_batched_tokens, page_size, dcp_world_size) <= 0:
+        raise ValueError("pseudo-decode capacity inputs must be positive")
+    # History pages are DCP-local, but the scheduler tail is already expressed
+    # in kernel pages and must not be divided by DCP.  Keep one world-sized
+    # boundary/speculation guard, then mirror the worker's page alignment.
+    base_pages = cdiv(max_model_len, page_size * dcp_world_size)
+    scheduler_tail_pages = cdiv(max_num_batched_tokens, page_size)
+    capacity = base_pages + scheduler_tail_pages + dcp_world_size
+    if page_size <= 128:
+        alignment = 128 // page_size
+        capacity = cdiv(capacity, alignment) * alignment
+    return capacity
+
+
+@dataclass(frozen=True)
+class _AbsolutePrefillSegments:
+    """CPU metadata for a scheduler-history-independent prompt segmentation."""
+
+    qo_indptr_cpu: torch.Tensor
+    request_indices_cpu: torch.Tensor
+    global_starts_cpu: torch.Tensor
+    global_ends_cpu: torch.Tensor
+    context_query_indices_cpu: torch.Tensor
+    context_segment_indices_cpu: torch.Tensor
+
+
+def _ag2_absolute_prefill_segments(
+    *,
+    global_seq_lens_cpu: torch.Tensor,
+    qo_indptr_cpu: torch.Tensor,
+    num_prompt_tokens_cpu: torch.Tensor,
+    segment_size: int,
+) -> _AbsolutePrefillSegments:
+    """Split actual prompt rows at stable absolute token boundaries.
+
+    The caller supplies only a contiguous actual-prefill cohort. Artificial
+    scheduler boundaries must already satisfy the model's recurrent-state
+    alignment. A non-aligned final endpoint is valid only when it is the
+    semantic end of the prompt. The flattened query-token order is preserved;
+    this function changes only the attention batch-item boundaries.
+    """
+    tensors = (global_seq_lens_cpu, qo_indptr_cpu, num_prompt_tokens_cpu)
+    if any(tensor.device.type != "cpu" for tensor in tensors):
+        raise ValueError("Absolute prefill segment metadata must be built on CPU")
+    if any(tensor.ndim != 1 for tensor in tensors):
+        raise ValueError("Absolute prefill segment metadata must be one-dimensional")
+    num_requests = int(global_seq_lens_cpu.numel())
+    if qo_indptr_cpu.numel() != num_requests + 1:
+        raise ValueError("Absolute prefill requires one query span per request")
+    if num_prompt_tokens_cpu.numel() != num_requests:
+        raise ValueError("Absolute prefill requires one prompt length per request")
+    if segment_size < 1:
+        raise ValueError("Absolute prefill segment size must be positive")
+    if int(qo_indptr_cpu[0]) != 0 or bool(
+        torch.any(qo_indptr_cpu[1:] <= qo_indptr_cpu[:-1])
+    ):
+        raise ValueError("Absolute prefill query spans must be positive and monotonic")
+
+    segment_lengths: list[int] = []
+    request_indices: list[int] = []
+    global_starts: list[int] = []
+    global_ends: list[int] = []
+    context_query_indices: list[int] = []
+    context_segment_indices: list[int] = []
+    for request_index in range(num_requests):
+        query_begin = int(qo_indptr_cpu[request_index])
+        query_end = int(qo_indptr_cpu[request_index + 1])
+        query_len = query_end - query_begin
+        global_end = int(global_seq_lens_cpu[request_index])
+        prompt_len = int(num_prompt_tokens_cpu[request_index])
+        global_start = global_end - query_len
+        if global_start < 0 or global_end > prompt_len:
+            raise ValueError(
+                "Absolute prefill span is outside the semantic prompt: "
+                f"request={request_index} start={global_start} end={global_end} "
+                f"prompt={prompt_len}"
+            )
+        if global_start % segment_size:
+            raise ValueError(
+                "Absolute prefill cannot resume from an unaligned boundary: "
+                f"request={request_index} start={global_start} "
+                f"segment_size={segment_size}"
+            )
+        if global_end < prompt_len and global_end % segment_size:
+            raise ValueError(
+                "Absolute prefill cannot commit an unaligned non-final boundary: "
+                f"request={request_index} end={global_end} prompt={prompt_len} "
+                f"segment_size={segment_size}"
+            )
+
+        segment_start = global_start
+        while segment_start < global_end:
+            segment_end = min(segment_start + segment_size, global_end)
+            segment_index = len(segment_lengths)
+            segment_length = segment_end - segment_start
+            flat_query_start = query_begin + segment_start - global_start
+            segment_lengths.append(segment_length)
+            request_indices.append(request_index)
+            global_starts.append(segment_start)
+            global_ends.append(segment_end)
+            if segment_start > 0:
+                context_segment_indices.append(segment_index)
+                context_query_indices.extend(
+                    range(flat_query_start, flat_query_start + segment_length)
+                )
+            segment_start = segment_end
+
+    cumulative = [0]
+    for length in segment_lengths:
+        cumulative.append(cumulative[-1] + length)
+    if cumulative[-1] != int(qo_indptr_cpu[-1]):
+        raise AssertionError("Absolute segments did not preserve flattened query size")
+    return _AbsolutePrefillSegments(
+        qo_indptr_cpu=torch.tensor(cumulative, dtype=torch.int32),
+        request_indices_cpu=torch.tensor(request_indices, dtype=torch.int32),
+        global_starts_cpu=torch.tensor(global_starts, dtype=torch.int32),
+        global_ends_cpu=torch.tensor(global_ends, dtype=torch.int32),
+        context_query_indices_cpu=torch.tensor(
+            context_query_indices, dtype=torch.int64
+        ),
+        context_segment_indices_cpu=torch.tensor(
+            context_segment_indices, dtype=torch.int32
+        ),
+    )
+
+
+def _ag2_is_actual_prefill_cohort(
+    is_prefilling: torch.Tensor | np.ndarray | list[bool],
+    num_decodes: int,
+    num_prefills: int,
+) -> bool:
+    """Distinguish real prompt prefill from qlen>1 target verification."""
+    if num_decodes < 0 or num_prefills < 1:
+        raise ValueError("Actual-prefill selector requires non-negative decode count")
+    prefill_start = num_decodes
+    prefill_end = prefill_start + num_prefills
+    if len(is_prefilling) < prefill_end:
+        raise ValueError(
+            "Actual-prefill selector metadata is shorter than the selected cohort"
+        )
+    if isinstance(is_prefilling, torch.Tensor):
+        return bool(torch.all(is_prefilling[prefill_start:prefill_end]).item())
+    return bool(np.all(np.asarray(is_prefilling)[prefill_start:prefill_end]))
+
+
+def _ag2_semantic_prefill_split(
+    common_attn_metadata: CommonAttentionMetadata,
+    generic_split: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """Split real prompt-prefill rows by lifecycle, including short extends."""
+    is_prefilling = common_attn_metadata.is_prefilling
+    if is_prefilling is None:
+        raise RuntimeError(
+            "Canonical paged DCP prefill requires request lifecycle metadata"
+        )
+    lifecycle = (
+        is_prefilling[: common_attn_metadata.num_reqs].cpu().numpy()
+        if isinstance(is_prefilling, torch.Tensor)
+        else np.asarray(is_prefilling[: common_attn_metadata.num_reqs])
+    ).astype(np.bool_, copy=False)
+    if not bool(np.any(lifecycle)):
+        # Preserve the existing target/decode routing exactly. In particular,
+        # qlen4 speculative verification is not a prompt-prefill merely because
+        # its physical query length exceeds one.
+        return generic_split
+    first_actual_prefill = int(np.argmax(lifecycle))
+    if bool(np.any(~lifecycle[first_actual_prefill:])):
+        raise RuntimeError(
+            "Canonical paged DCP prefill requires decode rows before prompt-prefill "
+            "rows; lifecycle metadata is not a contiguous suffix"
+        )
+    # ``generic_split`` is a computational dispatch contract, not a request
+    # lifecycle classification. In particular, qlen>1 target verification is
+    # intentionally routed through FlashInfer's prefill kernel. Never turn an
+    # existing computational-prefill row back into native decode merely
+    # because its request is no longer in prompt-prefill lifecycle. Expand the
+    # prefill suffix only when a short actual prompt was classified as decode.
+    num_decodes = min(generic_split[0], first_actual_prefill)
+    num_prefills = common_attn_metadata.num_reqs - num_decodes
+    num_decode_tokens = int(
+        common_attn_metadata.query_start_loc_cpu[num_decodes].item()
+    )
+    num_prefill_tokens = common_attn_metadata.num_actual_tokens - num_decode_tokens
+    return num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens
+
+
+def _ag2_resolve_canonical_prefill_route(
+    *,
+    common_attn_metadata: CommonAttentionMetadata,
+    generic_split: tuple[int, int, int, int],
+    common_prefix_len: int,
+    enabled: bool,
+    causal: bool,
+    use_dcp: bool,
+    use_dcp_pseudo_decode: bool,
+) -> tuple[tuple[int, int, int, int], int | None, bool]:
+    """Resolve semantic split, canonical arm and cascade as one contract."""
+    semantic_split = generic_split
+    canonical_paged_start_req: int | None = None
+    if enabled and causal and use_dcp and not use_dcp_pseudo_decode:
+        is_prefilling = common_attn_metadata.is_prefilling
+        # Draft/speculator metadata is a separate non-prompt producer and does
+        # not carry main-runner prompt lifecycle. It is explicitly outside this
+        # candidate: preserve its existing generic route and never select the
+        # canonical prompt arm. Main prompt metadata supplies lifecycle and is
+        # proven separately by the bounded route artifact.
+        if is_prefilling is not None:
+            semantic_split = _ag2_semantic_prefill_split(
+                common_attn_metadata,
+                generic_split,
+            )
+            num_decodes, num_prefills, _, _ = semantic_split
+            lifecycle = (
+                is_prefilling[: common_attn_metadata.num_reqs].cpu().numpy()
+                if isinstance(is_prefilling, torch.Tensor)
+                else np.asarray(is_prefilling[: common_attn_metadata.num_reqs])
+            ).astype(np.bool_, copy=False)
+            if bool(np.any(lifecycle)):
+                canonical_paged_start_req = int(np.argmax(lifecycle))
+                if (
+                    not num_decodes
+                    <= canonical_paged_start_req
+                    < (num_decodes + num_prefills)
+                ):
+                    raise RuntimeError(
+                        "Actual prompt-prefill boundary is outside the resolved "
+                        "computational-prefill cohort"
+                    )
+        else:
+            num_decodes, num_prefills = generic_split[:2]
+    # Candidate A consumes the complete block table through one full-paged
+    # custom-mask call. Keeping cascade enabled for that cohort would silently
+    # route a common prefix through a second execution tree.
+    use_cascade = common_prefix_len > 0 and canonical_paged_start_req is None
+    return semantic_split, canonical_paged_start_req, use_cascade
+
+
+def _ag2_record_canonical_route_provenance(
+    *,
+    common_attn_metadata: CommonAttentionMetadata,
+    common_prefix_len: int,
+    generic_split: tuple[int, int, int, int],
+    semantic_split: tuple[int, int, int, int],
+    canonical_paged_prefill: bool,
+    canonical_mode: str | None,
+    canonical_paged_start_req: int | None,
+    use_cascade: bool,
+    dcp_rank: int,
+    for_cudagraph_capture: bool,
+) -> None:
+    """Persist one bounded record per distinct runtime route signature."""
+    output = os.environ.get("AG2_VLLM_DCP_CANONICAL_ROUTE_OUTPUT", "")
+    if not output or dcp_rank != 0:
+        return
+    num_reqs = common_attn_metadata.num_reqs
+    request_ids = common_attn_metadata.request_ids
+    scheduled = common_attn_metadata.num_scheduled_tokens_cpu
+    computed = common_attn_metadata.num_computed_tokens_provenance_cpu
+    lifecycle = common_attn_metadata.is_prefilling
+    prompt_tokens = common_attn_metadata.num_prompt_tokens_cpu
+    if (
+        request_ids is None
+        or scheduled is None
+        or computed is None
+        or lifecycle is None
+    ):
+        raise RuntimeError(
+            "Canonical route provenance requires request ids, computed/scheduled "
+            "counts and lifecycle metadata"
+        )
+    query_lens = (
+        common_attn_metadata.query_start_loc_cpu[1 : num_reqs + 1]
+        - common_attn_metadata.query_start_loc_cpu[:num_reqs]
+    ).tolist()
+    record = {
+        "schema": 1,
+        "request_ids": list(request_ids[:num_reqs]),
+        "num_computed_tokens": computed[:num_reqs].tolist(),
+        "num_scheduled_tokens": scheduled[:num_reqs].tolist(),
+        "is_prefilling": lifecycle[:num_reqs].tolist(),
+        "query_lens": query_lens,
+        "common_prefix_len": int(common_prefix_len),
+        "generic_split": list(generic_split),
+        "semantic_split": list(semantic_split),
+        "canonical_paged_prefill": bool(canonical_paged_prefill),
+        "canonical_mode": (
+            canonical_mode
+            if canonical_mode is not None
+            else ("dense_paged" if canonical_paged_prefill else "off")
+        ),
+        "canonical_paged_start_req": canonical_paged_start_req,
+        "use_cascade": bool(use_cascade),
+        "for_cudagraph_capture": bool(for_cudagraph_capture),
+    }
+    key = (
+        tuple(record["request_ids"]),
+        tuple(record["num_computed_tokens"]),
+        tuple(record["num_scheduled_tokens"]),
+        tuple(record["is_prefilling"]),
+        int(common_prefix_len),
+        tuple(generic_split),
+        tuple(semantic_split),
+        bool(canonical_paged_prefill),
+        record["canonical_mode"],
+        canonical_paged_start_req,
+        bool(use_cascade),
+        bool(for_cudagraph_capture),
+    )
+    if prompt_tokens is not None:
+        record["num_prompt_tokens"] = prompt_tokens[:num_reqs].tolist()
+    if key in _ag2_canonical_route_provenance_keys:
+        return
+    max_records = int(
+        os.environ.get("AG2_VLLM_DCP_CANONICAL_ROUTE_MAX_RECORDS", "4096")
+    )
+    if max_records < 1 or len(_ag2_canonical_route_provenance_keys) >= max_records:
+        raise RuntimeError(
+            "Canonical route provenance capacity exhausted before recording a new "
+            f"signature: capacity={max_records}"
+        )
+    _ag2_canonical_route_provenance_keys.add(key)
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    with open(output, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 def _get_trtllm_workspace_buffer():
@@ -281,19 +931,813 @@ def trtllm_prefill_attn_kvfp8_dequant(
     return mock_kv_cache, mock_block_table
 
 
+def _copy_ag2_dcp_trace(
+    layer: torch.nn.Module,
+    name: str,
+    value: torch.Tensor,
+) -> None:
+    """Copy an attention intermediate into an optional graph-safe trace buffer."""
+    if not getattr(layer, "_ag2_dcp_trace_enabled", False):
+        return
+    buffer = getattr(layer, f"_ag2_dcp_trace_{name}")
+    trace = value[: buffer.shape[0]]
+    buffer[: trace.shape[0]].copy_(trace)
+
+
+AG2_DCP_OBSERVER_SCHEMA_VERSION = 1
+AG2_DCP_OBSERVER_PLAN_BIT = 1 << 0
+AG2_DCP_OBSERVER_HISTORY_BIT = 1 << 1
+AG2_DCP_OBSERVER_CURRENT_KV_BIT = 1 << 2
+AG2_DCP_OBSERVER_SCALES_BIT = 1 << 3
+AG2_DCP_OBSERVER_STAGE_BITS = {
+    "local_output": 1 << 4,
+    "local_lse": 1 << 5,
+    "combined_output": 1 << 6,
+    "combined_lse": 1 << 7,
+    "query_output": 1 << 8,
+    "query_lse": 1 << 9,
+    "merged_output": 1 << 10,
+}
+AG2_DCP_OBSERVER_COMPLETE_MASK = (
+    AG2_DCP_OBSERVER_PLAN_BIT
+    | AG2_DCP_OBSERVER_HISTORY_BIT
+    | AG2_DCP_OBSERVER_CURRENT_KV_BIT
+    | AG2_DCP_OBSERVER_SCALES_BIT
+    | sum(AG2_DCP_OBSERVER_STAGE_BITS.values())
+)
+
+
+def _write_ag2_dcp_aux_pack(
+    layer: torch.nn.Module,
+    stage: str,
+    value: torch.Tensor,
+    dcp_output_pack: torch.Tensor | None,
+    dcp_lse_pack: torch.Tensor | None,
+    request_tail_indices: torch.Tensor | None = None,
+    request_tail_count: int = 0,
+    request_row_stride: int = 0,
+    dcp_observer_meta: torch.Tensor | None = None,
+) -> None:
+    """Write per-request-tail DCP state into explicit custom-op outputs.
+
+    These packs differ from the historical registered trace buffers: they are
+    explicit mutated arguments of the attention custom op and are returned as
+    model auxiliary outputs. This makes their CUDA Graph dataflow
+    authoritative.
+    """
+    if dcp_output_pack is None and dcp_lse_pack is None:
+        return
+    if dcp_output_pack is None or dcp_lse_pack is None:
+        raise RuntimeError("DCP auxiliary output and LSE packs must be paired")
+    if request_tail_indices is not None and request_row_stride:
+        raise RuntimeError(
+            "DCP auxiliary pack cannot combine explicit indices and row stride"
+        )
+    if request_row_stride < 0:
+        raise RuntimeError("DCP auxiliary pack row stride must be nonnegative")
+    strided_request_rows = request_row_stride > 0
+    legacy_row_zero = request_tail_indices is None and not strided_request_rows
+    if legacy_row_zero:
+        request_tail_count = 1
+    if request_tail_count > dcp_output_pack.shape[0]:
+        # Non-target CUDA Graph capture shapes can be wider than the bounded
+        # observer. Preserve an explicit incomplete sentinel; the analyzer
+        # must reject it if such a shape reaches the target packet.
+        dcp_output_pack.fill_(torch.nan)
+        dcp_lse_pack.fill_(torch.nan)
+        if dcp_observer_meta is not None:
+            dcp_observer_meta.fill_(-1)
+        return
+    local_heads = layer.num_heads
+    total_heads = local_heads * get_dcp_group().world_size
+    head_dim = value.shape[-1] if value.ndim == 3 else layer.head_size
+    output_layout = {
+        "local_output": (0, total_heads * head_dim),
+        "combined_output": (
+            total_heads * head_dim,
+            local_heads * head_dim,
+        ),
+        "query_output": (
+            (total_heads + local_heads) * head_dim,
+            local_heads * head_dim,
+        ),
+        "merged_output": (
+            (total_heads + 2 * local_heads) * head_dim,
+            local_heads * head_dim,
+        ),
+    }
+    lse_layout = {
+        "local_lse": (0, total_heads),
+        "combined_lse": (total_heads, local_heads),
+        "query_lse": (total_heads + local_heads, local_heads),
+    }
+    if stage in output_layout:
+        offset, expected = output_layout[stage]
+        if legacy_row_zero:
+            selected = value[:1]
+        elif strided_request_rows:
+            selected = value[
+                : request_tail_count * request_row_stride : request_row_stride
+            ]
+        else:
+            selected = torch.index_select(
+                value,
+                0,
+                request_tail_indices[:request_tail_count],
+            )
+        selected = selected.reshape(request_tail_count, -1)
+        if selected.shape[1] != expected:
+            raise RuntimeError(
+                f"DCP auxiliary {stage} output has {selected.shape[1]} values, "
+                f"expected {expected}"
+            )
+        dcp_output_pack[:request_tail_count, offset : offset + expected].copy_(selected)
+        if (
+            dcp_observer_meta is not None
+            and request_tail_count <= dcp_observer_meta.shape[0]
+        ):
+            dcp_observer_meta[:request_tail_count, 1].bitwise_or_(
+                AG2_DCP_OBSERVER_STAGE_BITS[stage]
+            )
+        return
+    if stage in lse_layout:
+        offset, expected = lse_layout[stage]
+        if legacy_row_zero:
+            selected = value[:1]
+        elif strided_request_rows:
+            selected = value[
+                : request_tail_count * request_row_stride : request_row_stride
+            ]
+        else:
+            selected = torch.index_select(
+                value,
+                0,
+                request_tail_indices[:request_tail_count],
+            )
+        selected = selected.reshape(request_tail_count, -1)
+        if selected.shape[1] != expected:
+            raise RuntimeError(
+                f"DCP auxiliary {stage} LSE has {selected.shape[1]} values, "
+                f"expected {expected}"
+            )
+        dcp_lse_pack[:request_tail_count, offset : offset + expected].copy_(selected)
+        if (
+            dcp_observer_meta is not None
+            and request_tail_count <= dcp_observer_meta.shape[0]
+        ):
+            dcp_observer_meta[:request_tail_count, 1].bitwise_or_(
+                AG2_DCP_OBSERVER_STAGE_BITS[stage]
+            )
+        return
+    raise ValueError(f"Unknown DCP auxiliary pack stage: {stage}")
+
+
+def _write_ag2_dcp_kv_history_pack(
+    layer: torch.nn.Module,
+    kv_cache_tuple: tuple[torch.Tensor, torch.Tensor],
+    decode: "FIDecode",
+    kv_layout: str,
+    history_pack: torch.Tensor | None,
+    history_meta: torch.Tensor | None,
+    page_indices_pack: torch.Tensor | None,
+    observer_meta: torch.Tensor | None,
+    *,
+    request_count: int,
+    request_row_stride: int,
+) -> None:
+    """Copy each request's first decode row's logical paged KV into a trace.
+
+    The trace contains only consumed tokens, in logical sequence order. Physical
+    page ids and unused last-page tails are excluded, so equal histories compare
+    byte-for-byte even when requests occupy different cache blocks.
+    """
+    del layer
+    outputs = (history_pack, history_meta, page_indices_pack, observer_meta)
+    if all(output is None for output in outputs):
+        return
+    if any(output is None for output in outputs):
+        raise RuntimeError(
+            "DCP KV history data, pages and observer metadata must be paired"
+        )
+    assert history_pack is not None
+    assert history_meta is not None
+    assert page_indices_pack is not None
+    assert observer_meta is not None
+    if request_row_stride < 1:
+        raise RuntimeError("DCP KV history requires a positive request row stride")
+    if request_count > history_pack.shape[0]:
+        history_pack.zero_()
+        history_meta.fill_(-1)
+        page_indices_pack.fill_(-1)
+        observer_meta.fill_(-1)
+        return
+    wrapper = decode.wrapper
+    indptr = wrapper._paged_kv_indptr_buf
+    indices = wrapper._paged_kv_indices_buf
+    last_page_len = wrapper._paged_kv_last_page_len_buf
+    if indptr is None or indices is None or last_page_len is None:
+        raise RuntimeError("FlashInfer decode wrapper did not retain paged KV metadata")
+    if indices.numel() == 0:
+        # Dummy CUDA Graph inputs can have valid zero-page indptr metadata and
+        # an empty page table. There is no consumed history to observe.
+        history_pack.zero_()
+        history_meta.fill_(-1)
+        page_indices_pack.fill_(-1)
+        observer_meta.fill_(-1)
+        return
+
+    layout = kv_layout
+    if layout == "HND":
+        page_size = kv_cache_tuple[0].shape[2]
+    elif layout == "NHD":
+        page_size = kv_cache_tuple[0].shape[1]
+    else:
+        raise RuntimeError(f"Unsupported KV cache layout for history trace: {layout}")
+    capacity = history_pack.shape[2]
+    if any(cache.element_size() != 1 for cache in kv_cache_tuple):
+        raise RuntimeError("DCP KV history byte trace currently requires FP8 KV")
+
+    if request_row_stride == 1:
+        # Draft qlen=1 runs inside FULL CUDA Graphs. Capture a bounded logical
+        # tail using only device tensor operations: scalar CPU reads would
+        # either break capture or turn the record into a stale side effect.
+        # The wrapper buffers are the exact metadata consumed by FlashInfer.
+        request_rows = torch.arange(
+            request_count,
+            dtype=torch.long,
+            device=indptr.device,
+        )
+        page_starts = indptr[:request_count].to(torch.long)
+        page_ends = indptr[1 : request_count + 1].to(torch.long)
+        total_pages = page_ends - page_starts
+        max_trace_pages = (history_pack.shape[2] + page_size - 1) // page_size
+        if max_trace_pages > page_indices_pack.shape[1]:
+            raise RuntimeError("DCP page provenance pack is narrower than KV history")
+        trace_starts = torch.maximum(page_starts, page_ends - max_trace_pages)
+        trace_pages = page_ends - trace_starts
+        page_offsets = torch.arange(
+            max_trace_pages,
+            dtype=torch.long,
+            device=indptr.device,
+        )
+        flat_offsets = trace_starts[:, None] + page_offsets[None, :]
+        valid_pages = page_offsets[None, :] < trace_pages[:, None]
+        safe_offsets = flat_offsets.clamp(0, max(indices.numel() - 1, 0))
+        selected_page_ids = indices.to(torch.long)[safe_offsets]
+        selected_page_ids = torch.where(
+            valid_pages,
+            selected_page_ids,
+            torch.zeros_like(selected_page_ids),
+        )
+
+        final_page_lens = last_page_len[:request_count].to(torch.long)
+        logical_tokens = torch.where(
+            total_pages > 0,
+            (total_pages - 1) * page_size + final_page_lens,
+            torch.zeros_like(total_pages),
+        )
+        retained_tokens = torch.where(
+            trace_pages > 0,
+            (trace_pages - 1) * page_size + final_page_lens,
+            torch.zeros_like(trace_pages),
+        ).clamp_max(history_pack.shape[2])
+
+        history_pack.zero_()
+        history_meta.fill_(-1)
+        page_indices_pack.fill_(-1)
+        page_indices_pack[:request_count, :max_trace_pages].copy_(
+            torch.where(
+                valid_pages,
+                selected_page_ids.to(page_indices_pack.dtype),
+                torch.full_like(selected_page_ids, -1).to(page_indices_pack.dtype),
+            )
+        )
+        for kv_index, cache in enumerate(kv_cache_tuple):
+            pages = torch.index_select(cache, 0, selected_page_ids.reshape(-1))
+            pages = pages.reshape(request_count, max_trace_pages, *cache.shape[1:])
+            if layout == "HND":
+                pages = pages.permute(0, 1, 3, 2, 4)
+            logical = pages.reshape(
+                request_count,
+                max_trace_pages * page_size,
+                pages.shape[-2],
+                pages.shape[-1],
+            )[:, : history_pack.shape[2]]
+            token_offsets = torch.arange(
+                history_pack.shape[2],
+                dtype=torch.long,
+                device=logical.device,
+            )
+            valid_tokens = token_offsets[None, :] < retained_tokens[:, None]
+            logical = torch.where(
+                valid_tokens[:, :, None, None],
+                logical,
+                torch.zeros_like(logical),
+            )
+            history_pack[:request_count, kv_index].copy_(logical.view(torch.uint8))
+
+        history_meta[:request_count].copy_(
+            torch.stack(
+                [request_rows, retained_tokens, trace_pages, final_page_lens], dim=1
+            ).to(history_meta.dtype)
+        )
+        if observer_meta is not None:
+            if observer_meta.shape[1] < 24:
+                raise RuntimeError("DCP causal observer metadata requires 24 columns")
+            observer_meta.fill_(-1)
+            observer_meta[:request_count, 0] = AG2_DCP_OBSERVER_SCHEMA_VERSION
+            observer_meta[:request_count, 1] = (
+                AG2_DCP_OBSERVER_PLAN_BIT | AG2_DCP_OBSERVER_HISTORY_BIT
+            )
+            observer_meta[:request_count, 2] = 1
+            observer_meta[:request_count, 3] = request_rows.to(observer_meta.dtype)
+            observer_meta[:request_count, 4] = request_rows.to(observer_meta.dtype)
+            observer_meta[:request_count, 5] = request_row_stride
+            observer_meta[:request_count, 6] = logical_tokens.to(observer_meta.dtype)
+            observer_meta[:request_count, 7] = total_pages.to(observer_meta.dtype)
+            observer_meta[:request_count, 8] = final_page_lens.to(observer_meta.dtype)
+            observer_meta[:request_count, 9] = page_starts.to(observer_meta.dtype)
+            observer_meta[:request_count, 10] = page_ends.to(observer_meta.dtype)
+            observer_meta[:request_count, 11] = request_count
+            observer_meta[:request_count, 12] = int(
+                getattr(wrapper, "_use_cuda_graph", True)
+            )
+            observer_meta[:request_count, 13] = 3  # decode request row
+            observer_meta[:request_count, 14] = page_size
+            observer_meta[:request_count, 15] = 1 if layout == "NHD" else 2
+        return
+    history_pack.zero_()
+    history_meta.fill_(-1)
+    for request_index in range(request_count):
+        source_row = request_index * request_row_stride
+        page_start = int(indptr[source_row].item())
+        page_end = int(indptr[source_row + 1].item())
+        num_pages = page_end - page_start
+        final_page_len = int(last_page_len[source_row].item())
+        logical_tokens = (
+            (num_pages - 1) * page_size + final_page_len if num_pages else 0
+        )
+        if logical_tokens > capacity:
+            raise RuntimeError(
+                "DCP KV history exceeds trace capacity: "
+                f"{logical_tokens=} > {capacity=}"
+            )
+        page_ids = indices[page_start:page_end].to(torch.long)
+        for kv_index, cache in enumerate(kv_cache_tuple):
+            pages = torch.index_select(cache, 0, page_ids)
+            if layout == "HND":
+                pages = pages.permute(0, 2, 1, 3)
+            logical = pages.reshape(-1, pages.shape[-2], pages.shape[-1])[
+                :logical_tokens
+            ]
+            history_pack[request_index, kv_index, :logical_tokens].copy_(
+                logical.view(torch.uint8)
+            )
+        history_meta[request_index, 0] = source_row
+        history_meta[request_index, 1] = logical_tokens
+        history_meta[request_index, 2] = num_pages
+        history_meta[request_index, 3] = final_page_len
+
+
+def _ag2_dcp_request_trace_indices(
+    qo_indptr_cpu: torch.Tensor,
+    row: str,
+) -> torch.Tensor:
+    """Return one flattened query-row index for each DCP prefill request."""
+    if row == "first":
+        return qo_indptr_cpu[:-1]
+    if row == "tail":
+        return qo_indptr_cpu[1:] - 1
+    raise ValueError(
+        f"AG2 DCP request-row trace must select 'first' or 'tail', got {row!r}"
+    )
+
+
+def _write_ag2_dcp_prefill_kv_history_pack(
+    kv_cache_tuple: tuple[torch.Tensor, torch.Tensor],
+    *,
+    kv_layout: str,
+    qo_indptr_cpu: torch.Tensor | None,
+    paged_kv_indptr_cpu: torch.Tensor | None,
+    paged_kv_indices: torch.Tensor | None,
+    paged_kv_last_page_len_cpu: torch.Tensor | None,
+    history_pack: torch.Tensor | None,
+    history_meta: torch.Tensor | None,
+    page_indices_pack: torch.Tensor | None,
+    observer_meta: torch.Tensor | None,
+    use_cuda_graph: bool,
+    request_row: str,
+    selected_query_len: int = 4,
+) -> None:
+    """Capture logical historical KV for selected DCP-prefill requests.
+
+    Pack row ``i`` always describes request ``i``. Only requests whose query
+    length equals ``selected_query_len`` are populated; other rows retain the
+    fail-closed ``zero/-1`` sentinel. This excludes unrelated long prefills in
+    a mixed batch while preserving request-index alignment with auxiliary QKV
+    and attention-output packs.
+    """
+    observer_outputs = (
+        history_pack,
+        history_meta,
+        page_indices_pack,
+        observer_meta,
+    )
+    if all(value is None for value in observer_outputs):
+        return
+    if any(value is None for value in observer_outputs):
+        raise RuntimeError(
+            "DCP causal observer history, pages and metadata must be provided together"
+        )
+    assert history_pack is not None
+    assert history_meta is not None
+    assert page_indices_pack is not None
+    assert observer_meta is not None
+    if any(
+        value is None
+        for value in (
+            qo_indptr_cpu,
+            paged_kv_indptr_cpu,
+            paged_kv_indices,
+            paged_kv_last_page_len_cpu,
+        )
+    ):
+        # Compile/profile and graph warmup can execute the compile-time trace
+        # contract before a real paged plan has populated wrapper metadata.
+        # Publish an explicit invalid sentinel; a real persisted qlen1 packet
+        # must later satisfy the complete observer bitmap in the analyzer.
+        history_pack.zero_()
+        history_meta.fill_(-1)
+        page_indices_pack.fill_(-1)
+        observer_meta.fill_(-1)
+        return
+    assert qo_indptr_cpu is not None
+    assert paged_kv_indptr_cpu is not None
+    assert paged_kv_indices is not None
+    assert paged_kv_last_page_len_cpu is not None
+
+    request_count = int(qo_indptr_cpu.numel()) - 1
+    if request_count > history_pack.shape[0]:
+        # The five-row observer is intentionally narrower than the 44-request
+        # compile envelope. Leave a fail-closed sentinel for unrelated warmup
+        # or larger batches; the target x5 must fit and become complete.
+        history_pack.zero_()
+        history_meta.fill_(-1)
+        page_indices_pack.fill_(-1)
+        observer_meta.fill_(-1)
+        return
+    if any(
+        value.shape[0] < request_count
+        for value in (history_meta, page_indices_pack, observer_meta)
+    ):
+        raise RuntimeError("DCP causal observer outputs have inconsistent row capacity")
+    if observer_meta.shape[1] < 24:
+        raise RuntimeError("DCP causal observer metadata requires 24 columns")
+    if int(paged_kv_indptr_cpu.numel()) != request_count + 1:
+        raise RuntimeError("DCP prefill KV indptr does not match request count")
+    if int(paged_kv_last_page_len_cpu.numel()) < request_count:
+        raise RuntimeError("DCP prefill last-page lengths do not match requests")
+
+    layout = kv_layout
+    if layout == "HND":
+        page_size = kv_cache_tuple[0].shape[2]
+    elif layout == "NHD":
+        page_size = kv_cache_tuple[0].shape[1]
+    else:
+        raise RuntimeError(f"Unsupported KV cache layout for history trace: {layout}")
+    if any(cache.element_size() != 1 for cache in kv_cache_tuple):
+        raise RuntimeError("DCP KV history byte trace currently requires FP8 KV")
+
+    capacity = history_pack.shape[2]
+    history_pack.zero_()
+    history_meta.fill_(-1)
+    page_indices_pack.fill_(-1)
+    observer_meta.fill_(-1)
+    query_lens = qo_indptr_cpu[1:] - qo_indptr_cpu[:-1]
+    for request_index in range(request_count):
+        request_query_len = int(query_lens[request_index].item())
+        trace_row = int(
+            _ag2_dcp_request_trace_indices(qo_indptr_cpu, request_row)[
+                request_index
+            ].item()
+        )
+        selected = request_query_len == selected_query_len
+        # Scalar device fills are CUDA-Graph-capturable. Constructing a CUDA
+        # tensor from this CPU metadata performs a host-to-device copy during
+        # capture and is rejected by PyTorch (or can freeze capture-time
+        # values into later replays).
+        observer_meta[request_index, 0] = AG2_DCP_OBSERVER_SCHEMA_VERSION
+        observer_meta[request_index, 1] = AG2_DCP_OBSERVER_PLAN_BIT
+        observer_meta[request_index, 2] = int(selected)
+        observer_meta[request_index, 3] = trace_row
+        observer_meta[request_index, 4] = request_index
+        observer_meta[request_index, 5] = request_query_len
+        observer_meta[request_index, 11] = int(qo_indptr_cpu[-1].item())
+        observer_meta[request_index, 12] = int(use_cuda_graph)
+        observer_meta[request_index, 13] = 1 if request_row == "first" else 2
+        observer_meta[request_index, 14] = page_size
+        observer_meta[request_index, 15] = 1 if layout == "NHD" else 2
+        if not selected:
+            continue
+        page_start = int(paged_kv_indptr_cpu[request_index].item())
+        page_end = int(paged_kv_indptr_cpu[request_index + 1].item())
+        num_pages = page_end - page_start
+        final_page_len = int(paged_kv_last_page_len_cpu[request_index].item())
+        logical_tokens = (
+            (num_pages - 1) * page_size + final_page_len if num_pages else 0
+        )
+        if logical_tokens > capacity:
+            raise RuntimeError(
+                "DCP KV history exceeds trace capacity: "
+                f"{logical_tokens=} > {capacity=}"
+            )
+        if num_pages > page_indices_pack.shape[1]:
+            raise RuntimeError(
+                "DCP KV page provenance exceeds trace capacity: "
+                f"{num_pages=} > {page_indices_pack.shape[1]}"
+            )
+        page_ids = paged_kv_indices[page_start:page_end].to(torch.long)
+        page_indices_pack[request_index, :num_pages].copy_(
+            page_ids.to(page_indices_pack.dtype)
+        )
+        for kv_index, cache in enumerate(kv_cache_tuple):
+            pages = torch.index_select(cache, 0, page_ids)
+            if layout == "HND":
+                pages = pages.permute(0, 2, 1, 3)
+            logical = pages.reshape(-1, pages.shape[-2], pages.shape[-1])[
+                :logical_tokens
+            ]
+            history_pack[request_index, kv_index, :logical_tokens].copy_(
+                logical.view(torch.uint8)
+            )
+        history_meta[request_index, 0] = trace_row
+        history_meta[request_index, 1] = logical_tokens
+        history_meta[request_index, 2] = num_pages
+        history_meta[request_index, 3] = final_page_len
+        observer_meta[request_index, 1].bitwise_or_(AG2_DCP_OBSERVER_HISTORY_BIT)
+        observer_meta[request_index, 6] = logical_tokens
+        observer_meta[request_index, 7] = num_pages
+        observer_meta[request_index, 8] = final_page_len
+        observer_meta[request_index, 9] = page_start
+        observer_meta[request_index, 10] = page_end
+
+
+def _write_ag2_dcp_current_kv_and_scales(
+    layer: torch.nn.Module,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    request_indices: torch.Tensor | None,
+    request_count: int,
+    current_kv_pack: torch.Tensor | None,
+    scale_pack: torch.Tensor | None,
+    observer_meta: torch.Tensor | None,
+    match_fp8_new_tokens: bool,
+    sm_scale: float,
+) -> None:
+    outputs = (current_kv_pack, scale_pack, observer_meta)
+    if all(output is None for output in outputs):
+        return
+    if any(output is None for output in outputs):
+        raise RuntimeError("DCP current-KV, scale and observer packs must be paired")
+    assert current_kv_pack is not None
+    assert scale_pack is not None
+    assert observer_meta is not None
+    if request_indices is None:
+        if request_count == 0:
+            # Profile/compile can execute before semantic request rows are
+            # attached. Keep the complete pack invalid until a real plan
+            # supplies row ownership.
+            current_kv_pack.zero_()
+            scale_pack.fill_(torch.nan)
+            observer_meta.fill_(-1)
+            return
+        raise RuntimeError("DCP current-KV observer requires request row indices")
+    if request_count > current_kv_pack.shape[0]:
+        current_kv_pack.zero_()
+        scale_pack.fill_(torch.nan)
+        observer_meta.fill_(-1)
+        return
+    selected_key = torch.index_select(key, 0, request_indices[:request_count])
+    selected_value = torch.index_select(value, 0, request_indices[:request_count])
+    if current_kv_pack.shape[2:] != selected_key.shape[1:]:
+        raise RuntimeError(
+            "DCP current-KV observer geometry differs from consumed K/V: "
+            f"{current_kv_pack.shape[2:]} != {selected_key.shape[1:]}"
+        )
+    current_kv_pack.zero_()
+    current_kv_pack[:request_count, 0].copy_(selected_key)
+    current_kv_pack[:request_count, 1].copy_(selected_value)
+    scale_pack.fill_(torch.nan)
+    # Avoid torch.tensor([...], device="cuda") here. This function executes
+    # inside the qlen=1 FULL CUDA Graph and such construction is a CPU->CUDA
+    # copy during capture. Device scalar fills are recorded by the graph and
+    # these scales are immutable for the lifetime of the loaded layer.
+    scale_pack[:request_count, 0].fill_(sm_scale)
+    scale_pack[:request_count, 1].fill_(float(layer._q_scale_float))
+    scale_pack[:request_count, 2].fill_(float(layer._k_scale_float))
+    scale_pack[:request_count, 3].fill_(float(layer._v_scale_float))
+    observer_meta[:request_count, 1].bitwise_or_(
+        AG2_DCP_OBSERVER_CURRENT_KV_BIT | AG2_DCP_OBSERVER_SCALES_BIT
+    )
+    observer_meta[:request_count, 18] = int(match_fp8_new_tokens)
+    observer_meta[:request_count, 20] = selected_key.shape[1]
+
+
+def _match_fp8_cache_representation(
+    value: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """Round-trip live K/V through the exact static FP8 cache representation."""
+    quantized = (value / scale).to(FP8_DTYPE)
+    return quantized.to(value.dtype) * scale
+
+
 class BatchDCPPrefillWrapper:
     def __init__(
         self,
         kv_layout: str,
         workspace_buffer: torch.Tensor | None = None,
         dcp_a2a: bool = False,
+        *,
+        use_cuda_graph: bool = False,
+        qo_indptr_buffer: torch.Tensor | None = None,
+        paged_kv_indptr_buffer: torch.Tensor | None = None,
+        paged_kv_indices_buffer: torch.Tensor | None = None,
+        paged_kv_last_page_len_buffer: torch.Tensor | None = None,
+        context_int_workspace_buffer: torch.Tensor | None = None,
+        new_tokens_int_workspace_buffer: torch.Tensor | None = None,
     ):
         if dcp_a2a:
             self._dcp_combine = partial(dcp_a2a_lse_reduce, is_lse_base_on_e=False)
         else:
             self._dcp_combine = partial(cp_lse_ag_out_rs, is_lse_base_on_e=False)
-        self._context = BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, kv_layout)
-        self._new_tokens = BatchPrefillWithRaggedKVCacheWrapper(workspace_buffer)
+        self._kv_layout = kv_layout
+        self._convert_log2_lse_for_merge = (
+            os.environ.get("AG2_VLLM_FLASHINFER_LOG2_LSE_MERGE", "0") == "1"
+        )
+        self._use_cuda_graph = use_cuda_graph
+        self._disable_split_kv_for_cuda_graph = (
+            use_cuda_graph
+            and os.environ.get("AG2_VLLM_FLASHINFER_DCP_PREFILL_NO_SPLIT", "0") == "1"
+        )
+        self._ragged_fixed_split_size = int(
+            os.environ.get(
+                "AG2_VLLM_FLASHINFER_DCP_RAGGED_FIXED_SPLIT_SIZE",
+                "-1",
+            )
+        )
+        self._context_fixed_split_size = int(
+            os.environ.get(
+                "AG2_VLLM_FLASHINFER_DCP_CONTEXT_FIXED_SPLIT_SIZE",
+                "-1",
+            )
+        )
+        if self._context_fixed_split_size == 0 or self._context_fixed_split_size < -1:
+            raise ValueError("DCP context fixed split size must be -1 or positive")
+        self._context = BatchPrefillWithPagedKVCacheWrapper(
+            workspace_buffer,
+            kv_layout,
+            use_cuda_graph=use_cuda_graph,
+            qo_indptr_buf=qo_indptr_buffer,
+            paged_kv_indptr_buf=paged_kv_indptr_buffer,
+            paged_kv_indices_buf=paged_kv_indices_buffer,
+            paged_kv_last_page_len_buf=paged_kv_last_page_len_buffer,
+        )
+        # Candidate A may coexist with ordinary qlen>1 target verification in
+        # one computational-prefill cohort. Its full-paged plan must not
+        # overwrite the ordinary context plan used by the prefix of that
+        # cohort, so keep a second PIECEWISE wrapper. It intentionally has no
+        # CUDA-graph buffers: canonical-paged execution is rejected in graph
+        # mode below.
+        self._canonical_context = (
+            None
+            if use_cuda_graph
+            else BatchPrefillWithPagedKVCacheWrapper(
+                workspace_buffer,
+                kv_layout,
+            )
+        )
+        self._absolute_segment_context = (
+            None
+            if use_cuda_graph
+            else BatchPrefillWithPagedKVCacheWrapper(
+                workspace_buffer,
+                kv_layout,
+            )
+        )
+        self._absolute_segment_current = (
+            None
+            if use_cuda_graph
+            else BatchPrefillWithRaggedKVCacheWrapper(workspace_buffer)
+        )
+        self._new_tokens = BatchPrefillWithRaggedKVCacheWrapper(
+            workspace_buffer,
+            use_cuda_graph=use_cuda_graph,
+            qo_indptr_buf=qo_indptr_buffer,
+            kv_indptr_buf=qo_indptr_buffer,
+        )
+        if use_cuda_graph:
+            if (
+                context_int_workspace_buffer is None
+                or new_tokens_int_workspace_buffer is None
+            ):
+                raise ValueError(
+                    "DCP prefill CUDA graph mode requires persistent context "
+                    "and new-token integer workspaces."
+                )
+            self._context.reset_workspace_buffer(
+                workspace_buffer, context_int_workspace_buffer
+            )
+            self._new_tokens.reset_workspace_buffer(
+                workspace_buffer, new_tokens_int_workspace_buffer
+            )
+        self._local_kv_head_index_tensors: dict[
+            tuple[tuple[int, ...], torch.device], torch.Tensor
+        ] = {}
+        self._ag2_request_tail_indices: torch.Tensor | None = None
+        self._ag2_request_tail_count = 0
+        self._ag2_history_qo_indptr_cpu: torch.Tensor | None = None
+        self._ag2_history_paged_kv_indptr_cpu: torch.Tensor | None = None
+        self._ag2_history_paged_kv_indices: torch.Tensor | None = None
+        self._ag2_history_last_page_len_cpu: torch.Tensor | None = None
+        self._ag2_request_trace_row = "tail"
+        self._ag2_prefill_fixed_split_size = -1
+        self._ag2_prefill_disable_split_kv = False
+        self._ag2_window_left = -1
+        self._ag2_dcp_world_size = 1
+        self._ag2_sm_scale = 1.0
+        self._ag2_logits_soft_cap = 0.0
+        self._ag2_plan_ready = False
+        self._canonical_paged = False
+        self._canonical_paged_start_req = 0
+        self._canonical_paged_start_token = 0
+        self._canonical_paged_mask_bits = 0
+        self._absolute_segmented = False
+        self._absolute_segment_start_token = 0
+        self._absolute_segment_context_query_indices: torch.Tensor | None = None
+
+    def _get_local_kv_head_index_tensor(
+        self,
+        local_kv_head_indices: list[int] | tuple[int, ...],
+        device: torch.device,
+    ) -> torch.Tensor:
+        key = (tuple(local_kv_head_indices), device)
+        tensor = self._local_kv_head_index_tensors.get(key)
+        if tensor is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "DCP KV-head index tensor was not initialized before "
+                    "CUDA graph capture"
+                )
+            tensor = torch.tensor(
+                local_kv_head_indices,
+                device=device,
+                dtype=torch.long,
+            )
+            self._local_kv_head_index_tensors[key] = tensor
+        return tensor
+
+    def _select_local_kv_heads(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        local_kv_head_indices: list[int] | tuple[int, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Select the rank-local overlapping-GQA slots without poisoning CUDA.
+
+        ``torch.index_select`` reports an invalid device index with a
+        device-side assert. In a TP process that escalates through the NCCL
+        watchdog and can leave every GPU in the communicator unusable until a
+        reset. The head map is immutable host metadata and the source head
+        count is static tensor geometry, so validate their complete contract
+        synchronously before launching the CUDA kernel.
+        """
+        if key.ndim < 2 or value.ndim < 2:
+            raise RuntimeError(
+                "DCP full-KV attention requires key/value tensors with a head axis: "
+                f"key_shape={tuple(key.shape)} value_shape={tuple(value.shape)}"
+            )
+        if key.shape[1] != value.shape[1]:
+            raise RuntimeError(
+                "DCP full-KV attention key/value head counts differ: "
+                f"key_heads={key.shape[1]} value_heads={value.shape[1]}"
+            )
+        if not local_kv_head_indices:
+            raise RuntimeError("DCP full-KV attention local KV-head map is empty")
+        first = min(local_kv_head_indices)
+        last = max(local_kv_head_indices)
+        if first < 0 or last >= key.shape[1]:
+            raise RuntimeError(
+                "DCP full-KV attention head map exceeds the produced K/V geometry: "
+                f"indices={tuple(local_kv_head_indices)} key_heads={key.shape[1]} "
+                f"value_heads={value.shape[1]}"
+            )
+        index = self._get_local_kv_head_index_tensor(local_kv_head_indices, key.device)
+        return (
+            torch.index_select(key, dim=1, index=index),
+            torch.index_select(value, dim=1, index=index),
+        )
 
     def plan(
         self,
@@ -301,7 +1745,6 @@ class BatchDCPPrefillWrapper:
         paged_kv_indptr_cpu: torch.Tensor,
         paged_kv_indices: torch.Tensor,
         paged_kv_last_page_len_cpu: torch.Tensor,
-        kv_lens_cpu: torch.Tensor,
         page_size: int,
         num_qo_heads: int,
         dcp_world_size: int,
@@ -314,8 +1757,457 @@ class BatchDCPPrefillWrapper:
         kv_cache_dtype: torch.dtype,
         prefill_fixed_split_size: int,
         disable_split_kv: bool,
+        canonical_paged: bool = False,
+        absolute_segmented: bool = False,
+        canonical_paged_start_req: int = 0,
+        global_seq_lens_cpu: torch.Tensor | None = None,
+        num_prompt_tokens_cpu: torch.Tensor | None = None,
+        dcp_rank: int | None = None,
+        dcp_kv_cache_interleave_size: int | None = None,
+        kv_lens_cpu: torch.Tensor | None = None,
     ):
         """Plan the prefill operation with given parameters."""
+        self._ag2_plan_ready = False
+        if (
+            kv_lens_cpu is not None
+            and kv_lens_cpu.shape != paged_kv_last_page_len_cpu.shape
+        ):
+            raise ValueError("DCP KV lengths must match the planned request cohort")
+        self._canonical_paged = canonical_paged
+        self._absolute_segmented = absolute_segmented
+        self._canonical_paged_start_req = 0
+        self._canonical_paged_start_token = 0
+        self._absolute_segment_start_token = 0
+        self._absolute_segment_context_query_indices = None
+        if canonical_paged and absolute_segmented:
+            raise ValueError(
+                "Dense canonical paged and absolute-segment prefill are "
+                "mutually exclusive"
+            )
+        context_fixed_split_size = (
+            self._context_fixed_split_size
+            if self._context_fixed_split_size > 0
+            else prefill_fixed_split_size
+        )
+        self._ag2_prefill_fixed_split_size = context_fixed_split_size
+        self._ag2_prefill_disable_split_kv = disable_split_kv
+        self._ag2_window_left = window_left
+        self._ag2_dcp_world_size = dcp_world_size
+        self._ag2_sm_scale = sm_scale
+        self._ag2_logits_soft_cap = logits_soft_cap or 0.0
+        trace_tail_rows = int(
+            os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_DCP_REQUEST_TAIL_ROWS",
+                "0",
+            )
+        )
+        if trace_tail_rows:
+            request_tail_count = int(qo_indptr_cpu.numel()) - 1
+            if request_tail_count > trace_tail_rows:
+                raise RuntimeError(
+                    "DCP request-tail trace capacity is smaller than the "
+                    f"planned request count: {trace_tail_rows} < "
+                    f"{request_tail_count}"
+                )
+            if (
+                self._ag2_request_tail_indices is None
+                or self._ag2_request_tail_indices.shape[0] != trace_tail_rows
+                or self._ag2_request_tail_indices.device != paged_kv_indices.device
+            ):
+                self._ag2_request_tail_indices = torch.zeros(
+                    trace_tail_rows,
+                    dtype=qo_indptr_cpu.dtype,
+                    device=paged_kv_indices.device,
+                )
+            trace_row = os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_DCP_REQUEST_ROW",
+                "tail",
+            )
+            self._ag2_request_trace_row = trace_row
+            tail_indices = _ag2_dcp_request_trace_indices(
+                qo_indptr_cpu,
+                trace_row,
+            ).to(
+                device=paged_kv_indices.device,
+                non_blocking=True,
+            )
+            self._ag2_request_tail_indices[:request_tail_count].copy_(tail_indices)
+            self._ag2_request_tail_count = request_tail_count
+        if int(
+            os.environ.get(
+                "AG2_VLLM_AUX_HIDDEN_TRACE_DCP_KV_HISTORY_TOKENS",
+                "0",
+            )
+        ):
+            # The ordinary qlen4 DCP-prefill lane is PIECEWISE, so planning is
+            # outside graph replay. Clone the small CPU metadata because the
+            # builder reuses its staging tensors for later batches.
+            if self._use_cuda_graph:
+                raise RuntimeError(
+                    "DCP prefill KV history observer is not CUDA-graph compatible"
+                )
+            self._ag2_history_qo_indptr_cpu = qo_indptr_cpu.clone()
+            self._ag2_history_paged_kv_indptr_cpu = paged_kv_indptr_cpu.clone()
+            self._ag2_history_paged_kv_indices = paged_kv_indices
+            self._ag2_history_last_page_len_cpu = paged_kv_last_page_len_cpu.clone()
+        if absolute_segmented:
+            if self._use_cuda_graph:
+                raise RuntimeError("Absolute-segment DCP prefill POC is PIECEWISE-only")
+            if window_left != -1:
+                raise ValueError(
+                    "Absolute-segment DCP prefill is not proven for sliding-window "
+                    f"attention: {window_left=}"
+                )
+            if global_seq_lens_cpu is None or num_prompt_tokens_cpu is None:
+                raise ValueError(
+                    "Absolute-segment DCP prefill requires sequence and prompt lengths"
+                )
+            if dcp_rank is None or dcp_kv_cache_interleave_size is None:
+                raise ValueError(
+                    "Absolute-segment DCP prefill requires explicit DCP geometry"
+                )
+            if (
+                self._absolute_segment_context is None
+                or self._absolute_segment_current is None
+            ):
+                raise RuntimeError(
+                    "Absolute-segment DCP prefill has no PIECEWISE wrappers"
+                )
+            num_requests = int(qo_indptr_cpu.numel()) - 1
+            if not 0 <= canonical_paged_start_req < num_requests:
+                raise ValueError(
+                    "Absolute-segment start request is outside the planned "
+                    f"prefill cohort: {canonical_paged_start_req=} {num_requests=}"
+                )
+            self._canonical_paged_start_req = canonical_paged_start_req
+            self._absolute_segment_start_token = int(
+                qo_indptr_cpu[canonical_paged_start_req]
+            )
+            segment_size = int(
+                os.environ.get(
+                    "AG2_VLLM_DCP_ABSOLUTE_PREFILL_SEGMENT_SIZE",
+                    "64",
+                )
+            )
+            canonical_qo_indptr_cpu = (
+                qo_indptr_cpu[canonical_paged_start_req:]
+                - qo_indptr_cpu[canonical_paged_start_req]
+            )
+            canonical_global_seq_lens_cpu = global_seq_lens_cpu[
+                canonical_paged_start_req:
+            ]
+            canonical_prompt_lens_cpu = num_prompt_tokens_cpu[
+                canonical_paged_start_req:
+            ]
+            segments = _ag2_absolute_prefill_segments(
+                global_seq_lens_cpu=canonical_global_seq_lens_cpu,
+                qo_indptr_cpu=canonical_qo_indptr_cpu,
+                num_prompt_tokens_cpu=canonical_prompt_lens_cpu,
+                segment_size=segment_size,
+            )
+
+            canonical_page_offset = int(paged_kv_indptr_cpu[canonical_paged_start_req])
+            canonical_request_page_indptr = (
+                paged_kv_indptr_cpu[canonical_paged_start_req:] - canonical_page_offset
+            )
+            canonical_page_indices = paged_kv_indices[canonical_page_offset:]
+            context_page_parts: list[torch.Tensor] = []
+            context_page_counts: list[int] = []
+            context_last_page_lens: list[int] = []
+            for segment_index_t in segments.context_segment_indices_cpu:
+                segment_index = int(segment_index_t)
+                request_index = int(segments.request_indices_cpu[segment_index])
+                global_start = int(segments.global_starts_cpu[segment_index])
+                local_len = int(
+                    get_dcp_local_seq_lens(
+                        torch.tensor([global_start], dtype=torch.int32),
+                        dcp_world_size,
+                        dcp_rank,
+                        dcp_kv_cache_interleave_size,
+                    )[0]
+                )
+                page_count = cdiv(local_len, page_size)
+                request_page_start = int(canonical_request_page_indptr[request_index])
+                request_page_end = int(canonical_request_page_indptr[request_index + 1])
+                if page_count < 1 or request_page_start + page_count > request_page_end:
+                    raise RuntimeError(
+                        "Absolute-segment context exceeds the request page table: "
+                        f"request={request_index} start={global_start} "
+                        f"pages={page_count} available="
+                        f"{request_page_end - request_page_start}"
+                    )
+                context_page_parts.append(
+                    canonical_page_indices[
+                        request_page_start : request_page_start + page_count
+                    ]
+                )
+                context_page_counts.append(page_count)
+                context_last_page_lens.append(local_len % page_size or page_size)
+
+            metadata_device = paged_kv_indices.device
+            context_lengths = [
+                int(segments.qo_indptr_cpu[index + 1])
+                - int(segments.qo_indptr_cpu[index])
+                for index in segments.context_segment_indices_cpu.tolist()
+            ]
+            context_qo_indptr = [0]
+            context_page_indptr = [0]
+            for length in context_lengths:
+                context_qo_indptr.append(context_qo_indptr[-1] + length)
+            for count in context_page_counts:
+                context_page_indptr.append(context_page_indptr[-1] + count)
+            if context_lengths:
+                self._absolute_segment_context.plan(
+                    qo_indptr=torch.tensor(
+                        context_qo_indptr,
+                        dtype=torch.int32,
+                        device=metadata_device,
+                    ),
+                    paged_kv_indptr=torch.tensor(
+                        context_page_indptr,
+                        dtype=torch.int32,
+                        device=metadata_device,
+                    ),
+                    paged_kv_indices=torch.cat(context_page_parts),
+                    paged_kv_last_page_len=torch.tensor(
+                        context_last_page_lens,
+                        dtype=torch.int32,
+                        device=metadata_device,
+                    ),
+                    num_qo_heads=num_qo_heads * dcp_world_size,
+                    num_kv_heads=num_kv_heads,
+                    head_dim_qk=head_dim,
+                    page_size=page_size,
+                    causal=False,
+                    sm_scale=sm_scale,
+                    window_left=window_left,
+                    logits_soft_cap=logits_soft_cap,
+                    q_data_type=q_data_type,
+                    kv_data_type=kv_cache_dtype,
+                    fixed_split_size=context_fixed_split_size,
+                    disable_split_kv=disable_split_kv,
+                )
+            self._absolute_segment_current.plan(
+                qo_indptr=segments.qo_indptr_cpu.to(metadata_device),
+                kv_indptr=segments.qo_indptr_cpu.to(metadata_device),
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim,
+                head_dim_vo=head_dim,
+                causal=True,
+                sm_scale=sm_scale,
+                window_left=window_left,
+                logits_soft_cap=logits_soft_cap,
+                q_data_type=q_data_type,
+                fixed_split_size=(
+                    self._ragged_fixed_split_size
+                    if self._ragged_fixed_split_size > 0
+                    else prefill_fixed_split_size
+                ),
+                disable_split_kv=disable_split_kv,
+            )
+            self._absolute_segment_context_query_indices = (
+                segments.context_query_indices_cpu.to(metadata_device)
+            )
+            if dcp_rank == 0:
+                logger.info_once(
+                    "Absolute-segment DCP prefill route: requests=%d "
+                    "segments=%d context_segments=%d query_tokens=%d "
+                    "page_references=%d segment_size=%d",
+                    int(canonical_global_seq_lens_cpu.numel()),
+                    int(segments.request_indices_cpu.numel()),
+                    len(context_lengths),
+                    int(segments.qo_indptr_cpu[-1]),
+                    sum(context_page_counts),
+                    segment_size,
+                )
+
+            if canonical_paged_start_req == 0:
+                self._ag2_request_tail_count = 0
+                self._ag2_history_qo_indptr_cpu = None
+                self._ag2_history_paged_kv_indptr_cpu = None
+                self._ag2_history_paged_kv_indices = None
+                self._ag2_history_last_page_len_cpu = None
+                self._ag2_plan_ready = True
+                return
+
+            qo_indptr_cpu = qo_indptr_cpu[: canonical_paged_start_req + 1]
+            paged_kv_indptr_cpu = paged_kv_indptr_cpu[: canonical_paged_start_req + 1]
+            paged_kv_last_page_len_cpu = paged_kv_last_page_len_cpu[
+                :canonical_paged_start_req
+            ]
+            if kv_lens_cpu is not None:
+                kv_lens_cpu = kv_lens_cpu[:canonical_paged_start_req]
+            if self._ag2_request_tail_indices is not None:
+                tail_indices = _ag2_dcp_request_trace_indices(
+                    qo_indptr_cpu,
+                    self._ag2_request_trace_row,
+                ).to(device=paged_kv_indices.device, non_blocking=True)
+                self._ag2_request_tail_indices[:canonical_paged_start_req].copy_(
+                    tail_indices
+                )
+            self._ag2_request_tail_count = canonical_paged_start_req
+            if self._ag2_history_qo_indptr_cpu is not None:
+                self._ag2_history_qo_indptr_cpu = qo_indptr_cpu.clone()
+                self._ag2_history_paged_kv_indptr_cpu = paged_kv_indptr_cpu.clone()
+                self._ag2_history_last_page_len_cpu = paged_kv_last_page_len_cpu.clone()
+
+        if canonical_paged:
+            if self._use_cuda_graph:
+                raise RuntimeError("Canonical paged DCP prefill POC is PIECEWISE-only")
+            if global_seq_lens_cpu is None:
+                raise ValueError(
+                    "Canonical paged DCP prefill requires global sequence lengths"
+                )
+            if dcp_rank is None or dcp_kv_cache_interleave_size is None:
+                raise ValueError(
+                    "Canonical paged DCP prefill requires explicit DCP rank "
+                    "and KV-cache interleave metadata"
+                )
+            num_requests = int(qo_indptr_cpu.numel()) - 1
+            if not 0 <= canonical_paged_start_req < num_requests:
+                raise ValueError(
+                    "Canonical paged DCP start request is outside the planned "
+                    f"prefill cohort: {canonical_paged_start_req=} "
+                    f"{num_requests=}"
+                )
+            self._canonical_paged_start_req = canonical_paged_start_req
+            self._canonical_paged_start_token = int(
+                qo_indptr_cpu[canonical_paged_start_req].item()
+            )
+            canonical_qo_indptr_cpu = (
+                qo_indptr_cpu[canonical_paged_start_req:]
+                - qo_indptr_cpu[canonical_paged_start_req]
+            )
+            canonical_page_offset = int(
+                paged_kv_indptr_cpu[canonical_paged_start_req].item()
+            )
+            canonical_paged_kv_indptr_cpu = (
+                paged_kv_indptr_cpu[canonical_paged_start_req:] - canonical_page_offset
+            )
+            canonical_paged_kv_indices = paged_kv_indices[canonical_page_offset:]
+            canonical_last_page_len_cpu = paged_kv_last_page_len_cpu[
+                canonical_paged_start_req:
+            ]
+            canonical_global_seq_lens_cpu = global_seq_lens_cpu[
+                canonical_paged_start_req:
+            ]
+            custom_mask, local_seq_lens = _dcp_causal_paged_custom_mask(
+                canonical_global_seq_lens_cpu,
+                canonical_qo_indptr_cpu,
+                dcp_world_size,
+                dcp_rank,
+                dcp_kv_cache_interleave_size,
+            )
+            expected_local_seq_lens = (
+                canonical_paged_kv_indptr_cpu[1:]
+                - canonical_paged_kv_indptr_cpu[:-1]
+                - 1
+            ) * page_size + canonical_last_page_len_cpu
+            if not torch.equal(
+                local_seq_lens.to(expected_local_seq_lens.dtype),
+                expected_local_seq_lens,
+            ):
+                raise RuntimeError(
+                    "Canonical paged DCP mask and paged metadata disagree: "
+                    f"mask={local_seq_lens.tolist()} "
+                    f"paged={expected_local_seq_lens.tolist()}"
+                )
+            self._canonical_paged_mask_bits = custom_mask.numel()
+            route_shape = (
+                int(custom_mask.numel()),
+                int(canonical_qo_indptr_cpu.numel() - 1),
+                int(canonical_qo_indptr_cpu[-1]),
+                int(local_seq_lens.max()),
+            )
+            if dcp_rank == 0 and route_shape not in _ag2_canonical_paged_logged_shapes:
+                _ag2_canonical_paged_logged_shapes.add(route_shape)
+                logger.info(
+                    "Canonical paged DCP prefill runtime route: "
+                    "mask_bits=%d requests=%d query_tokens=%d "
+                    "max_local_kv_tokens=%d",
+                    *route_shape,
+                )
+            max_mask_bits = int(
+                os.environ.get(
+                    "AG2_VLLM_DCP_CANONICAL_PAGED_MASK_MAX_BITS",
+                    str(32 * 1024 * 1024),
+                )
+            )
+            if max_mask_bits < 1 or custom_mask.numel() > max_mask_bits:
+                raise RuntimeError(
+                    "Canonical paged DCP bool-mask budget exceeded: "
+                    f"required_bits={custom_mask.numel()} "
+                    f"max_bits={max_mask_bits}. This bounded POC must not "
+                    "silently allocate a production-scale dense mask."
+                )
+            canonical_fixed_split_size = int(
+                os.environ.get(
+                    "AG2_VLLM_DCP_CANONICAL_PAGED_FIXED_SPLIT_SIZE",
+                    "4096",
+                )
+            )
+            if canonical_fixed_split_size < 1:
+                raise ValueError(
+                    "Canonical paged DCP fixed split size must be positive"
+                )
+            metadata_device = paged_kv_indices.device
+            if self._canonical_context is None:
+                raise RuntimeError(
+                    "Canonical paged DCP prefill has no PIECEWISE wrapper"
+                )
+            self._canonical_context.plan(
+                qo_indptr=canonical_qo_indptr_cpu.to(metadata_device),
+                paged_kv_indptr=canonical_paged_kv_indptr_cpu.to(metadata_device),
+                paged_kv_indices=canonical_paged_kv_indices,
+                paged_kv_last_page_len=canonical_last_page_len_cpu.to(metadata_device),
+                num_qo_heads=num_qo_heads * dcp_world_size,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim,
+                page_size=page_size,
+                custom_mask=custom_mask.to(metadata_device),
+                causal=False,
+                sm_scale=sm_scale,
+                window_left=window_left,
+                logits_soft_cap=logits_soft_cap,
+                q_data_type=q_data_type,
+                kv_data_type=kv_cache_dtype,
+                fixed_split_size=canonical_fixed_split_size,
+                disable_split_kv=False,
+            )
+            if canonical_paged_start_req == 0:
+                self._ag2_request_tail_count = 0
+                self._ag2_history_qo_indptr_cpu = None
+                self._ag2_history_paged_kv_indptr_cpu = None
+                self._ag2_history_paged_kv_indices = None
+                self._ag2_history_last_page_len_cpu = None
+                self._ag2_plan_ready = True
+                return
+
+            # The prefix remains on the established paged-context + ragged-
+            # query path. Rebind the local planning views so its metadata is
+            # independent of the canonical suffix plan above.
+            qo_indptr_cpu = qo_indptr_cpu[: canonical_paged_start_req + 1]
+            paged_kv_indptr_cpu = paged_kv_indptr_cpu[: canonical_paged_start_req + 1]
+            paged_kv_last_page_len_cpu = paged_kv_last_page_len_cpu[
+                :canonical_paged_start_req
+            ]
+            if kv_lens_cpu is not None:
+                kv_lens_cpu = kv_lens_cpu[:canonical_paged_start_req]
+            if self._ag2_request_tail_indices is not None:
+                tail_indices = _ag2_dcp_request_trace_indices(
+                    qo_indptr_cpu,
+                    self._ag2_request_trace_row,
+                ).to(device=paged_kv_indices.device, non_blocking=True)
+                self._ag2_request_tail_indices[:canonical_paged_start_req].copy_(
+                    tail_indices
+                )
+            self._ag2_request_tail_count = canonical_paged_start_req
+            if self._ag2_history_qo_indptr_cpu is not None:
+                self._ag2_history_qo_indptr_cpu = qo_indptr_cpu.clone()
+                self._ag2_history_paged_kv_indptr_cpu = paged_kv_indptr_cpu.clone()
+                self._ag2_history_last_page_len_cpu = paged_kv_last_page_len_cpu.clone()
+
         self._context.plan(
             qo_indptr=qo_indptr_cpu,
             paged_kv_indptr=paged_kv_indptr_cpu,
@@ -332,8 +2224,13 @@ class BatchDCPPrefillWrapper:
             logits_soft_cap=logits_soft_cap,
             q_data_type=q_data_type,
             kv_data_type=kv_cache_dtype,
-            fixed_split_size=prefill_fixed_split_size,
-            disable_split_kv=disable_split_kv,
+            fixed_split_size=context_fixed_split_size,
+            # Research draft: forcing launch-static split-K did not make M6
+            # replay correct. Keep it available only for explicit reproduction,
+            # not as part of the native DCP prefill CUDA Graph POC.
+            disable_split_kv=(
+                disable_split_kv or self._disable_split_kv_for_cuda_graph
+            ),
         )
         self._new_tokens.plan(
             qo_indptr=qo_indptr_cpu,
@@ -347,7 +2244,29 @@ class BatchDCPPrefillWrapper:
             window_left=window_left,
             logits_soft_cap=logits_soft_cap,
             q_data_type=q_data_type,
+            fixed_split_size=(
+                self._ragged_fixed_split_size
+                if self._ragged_fixed_split_size > 0
+                else prefill_fixed_split_size
+            ),
+            disable_split_kv=(
+                disable_split_kv or self._disable_split_kv_for_cuda_graph
+            ),
         )
+        self._ag2_plan_ready = True
+
+    def assert_plan_contract(
+        self,
+        *,
+        window_left: int,
+        logits_soft_cap: float,
+        sm_scale: float,
+    ) -> None:
+        """Validate caller-owned plan state without FlashInfer private fields."""
+        assert self._ag2_plan_ready
+        assert self._ag2_window_left == window_left
+        assert self._ag2_logits_soft_cap == logits_soft_cap
+        assert self._ag2_sm_scale == sm_scale
 
     def run(
         self,
@@ -357,32 +2276,356 @@ class BatchDCPPrefillWrapper:
         key: torch.Tensor,
         value: torch.Tensor,
         out: torch.Tensor,
+        dcp_output_pack: torch.Tensor | None = None,
+        dcp_lse_pack: torch.Tensor | None = None,
+        dcp_kv_history_pack: torch.Tensor | None = None,
+        dcp_kv_history_meta: torch.Tensor | None = None,
+        dcp_kv_page_indices_pack: torch.Tensor | None = None,
+        dcp_observer_meta: torch.Tensor | None = None,
+        dcp_current_kv_pack: torch.Tensor | None = None,
+        dcp_scale_pack: torch.Tensor | None = None,
+        match_fp8_new_tokens: bool = False,
     ):
-        prefill_query_across_dcp = get_dcp_group().all_gather(
-            prefill_query.contiguous(), dim=1
+        _write_ag2_dcp_prefill_kv_history_pack(
+            kv_cache_tuple,
+            kv_layout=self._kv_layout,
+            qo_indptr_cpu=self._ag2_history_qo_indptr_cpu,
+            paged_kv_indptr_cpu=self._ag2_history_paged_kv_indptr_cpu,
+            paged_kv_indices=self._ag2_history_paged_kv_indices,
+            paged_kv_last_page_len_cpu=self._ag2_history_last_page_len_cpu,
+            history_pack=dcp_kv_history_pack,
+            history_meta=dcp_kv_history_meta,
+            page_indices_pack=dcp_kv_page_indices_pack,
+            observer_meta=dcp_observer_meta,
+            use_cuda_graph=self._use_cuda_graph,
+            request_row=self._ag2_request_trace_row,
         )
+        if dcp_observer_meta is not None:
+            request_count = self._ag2_request_tail_count
+            dcp_observer_meta[:request_count, 16] = self._ag2_prefill_fixed_split_size
+            dcp_observer_meta[:request_count, 17] = int(
+                self._ag2_prefill_disable_split_kv
+            )
+            dcp_observer_meta[:request_count, 19] = self._ag2_dcp_world_size
+            dcp_observer_meta[:request_count, 21] = self._ag2_window_left
+        if envs.AG2_VLLM_DCP_PREFILL_QUERY_SCRATCH:
+            query = prefill_query.contiguous()
+            dcp_group = get_dcp_group()
+            if dcp_group.world_size != 3 or query.ndim != 3:
+                raise RuntimeError(
+                    "AG2 DCP query scratch requires DCP3 and a rank-3 query, got "
+                    f"world_size={dcp_group.world_size} shape={tuple(query.shape)}"
+                )
+            scratch = _ag2_dcp_prefill_query_scratch
+            output_elements = dcp_group.world_size * query.numel()
+            if scratch is None or scratch.numel() < 2 * output_elements:
+                raise RuntimeError(
+                    "AG2 DCP query scratch is absent or too small: "
+                    f"need={2 * output_elements} available="
+                    f"{0 if scratch is None else scratch.numel()}"
+                )
+            flat_scratch = scratch.view(-1)
+            raw_output = flat_scratch[:output_elements].view(
+                dcp_group.world_size * query.shape[0],
+                query.shape[1],
+                query.shape[2],
+            )
+            prefill_query_across_dcp = flat_scratch[
+                output_elements : 2 * output_elements
+            ].view(
+                query.shape[0],
+                dcp_group.world_size * query.shape[1],
+                query.shape[2],
+            )
+            dcp_group.all_gather_into(
+                query, raw_output, prefill_query_across_dcp, dim=1
+            )
+        else:
+            prefill_query_across_dcp = get_dcp_group().all_gather(
+                prefill_query.contiguous(), dim=1
+            )
+        if self._absolute_segmented:
+            if getattr(layer, "_ag2_dcp_trace_enabled", False):
+                raise RuntimeError(
+                    "Absolute-segment DCP prefill requires its dedicated "
+                    "phase-tree artifact; the legacy request-tail trace is "
+                    "not a compatible schema"
+                )
+            if self._absolute_segment_current is None:
+                raise RuntimeError(
+                    "Absolute-segment DCP prefill has no current-segment wrapper"
+                )
+            canonical_start = self._absolute_segment_start_token
+            current_query = prefill_query[canonical_start:]
+            current_key = key[canonical_start:]
+            current_value = value[canonical_start:]
+            if getattr(layer, "dcp_full_kv_attention_heads", False):
+                local_kv_head_indices = getattr(
+                    layer, "dcp_local_kv_head_indices", None
+                )
+                if local_kv_head_indices is None:
+                    raise ValueError(
+                        "DCP full-KV attention requires local KV head indices."
+                    )
+                current_key, current_value = self._select_local_kv_heads(
+                    current_key,
+                    current_value,
+                    local_kv_head_indices,
+                )
+            current_output, current_lse = self._absolute_segment_current.run(
+                current_query,
+                current_key,
+                current_value,
+                q_scale=get_query_scale_for_flashinfer(
+                    layer._q_scale_float,
+                    current_query.dtype,
+                ),
+                return_lse=True,
+            )
+            segment_out = out[canonical_start:]
+            segment_out.copy_(current_output)
+            context_indices = self._absolute_segment_context_query_indices
+            if context_indices is None:
+                raise RuntimeError("Absolute-segment context row metadata is absent")
+            if context_indices.numel():
+                if self._absolute_segment_context is None:
+                    raise RuntimeError(
+                        "Absolute-segment DCP prefill has no context wrapper"
+                    )
+                context_query = torch.index_select(
+                    prefill_query_across_dcp[canonical_start:],
+                    0,
+                    context_indices,
+                )
+                context_output_tmp, context_lse_tmp = (
+                    self._absolute_segment_context.run(
+                        context_query,
+                        kv_cache_tuple,
+                        q_scale=get_query_scale_for_flashinfer(
+                            layer._q_scale_float,
+                            context_query.dtype,
+                        ),
+                        k_scale=layer._k_scale_float,
+                        v_scale=layer._v_scale_float,
+                        return_lse=True,
+                    )
+                )
+                context_output, context_lse = self._dcp_combine(
+                    context_output_tmp,
+                    context_lse_tmp,
+                    get_dcp_group(),
+                    return_lse=True,
+                )
+                selected_current_output = torch.index_select(
+                    current_output,
+                    0,
+                    context_indices,
+                )
+                selected_current_lse = torch.index_select(
+                    current_lse,
+                    0,
+                    context_indices,
+                )
+                merged_output = torch.empty_like(context_output)
+                context_lse = context_lse.transpose(0, 1).contiguous()
+                selected_current_lse = selected_current_lse.transpose(0, 1).contiguous()
+                if self._convert_log2_lse_for_merge:
+                    context_lse = context_lse * 0.6931471805599453
+                    selected_current_lse = selected_current_lse * 0.6931471805599453
+                merge_attn_states(
+                    merged_output,
+                    context_output,
+                    context_lse,
+                    selected_current_output,
+                    selected_current_lse,
+                )
+                segment_out.index_copy_(0, context_indices, merged_output)
+            if canonical_start == 0:
+                return out
+            # A mixed computational-prefill wave may have qlen4 target
+            # verification before the actual prompt suffix. Keep that prefix
+            # on the established wrappers and route only the prompt segments.
+            prefill_query = prefill_query[:canonical_start]
+            prefill_query_across_dcp = prefill_query_across_dcp[:canonical_start]
+            key = key[:canonical_start]
+            value = value[:canonical_start]
+            out = out[:canonical_start]
+
+        if self._canonical_paged:
+            if getattr(layer, "_ag2_dcp_trace_enabled", False):
+                raise RuntimeError(
+                    "Canonical paged DCP prefill cannot use the legacy "
+                    "paged+ragged+merge trace schema. Reuse the validated "
+                    "canonical saved-stage artifact or add a dedicated "
+                    "single-paged-call trace schema before enabling it."
+                )
+            if self._canonical_context is None:
+                raise RuntimeError(
+                    "Canonical paged DCP prefill has no PIECEWISE wrapper"
+                )
+            canonical_start = self._canonical_paged_start_token
+            canonical_output_tmp, canonical_lse_tmp = self._canonical_context.run(
+                prefill_query_across_dcp[canonical_start:],
+                kv_cache_tuple,
+                q_scale=get_query_scale_for_flashinfer(
+                    layer._q_scale_float,
+                    prefill_query_across_dcp.dtype,
+                ),
+                k_scale=layer._k_scale_float,
+                v_scale=layer._v_scale_float,
+                return_lse=True,
+            )
+            out[canonical_start:].copy_(
+                self._dcp_combine(
+                    canonical_output_tmp,
+                    canonical_lse_tmp,
+                    get_dcp_group(),
+                )
+            )
+            if canonical_start == 0:
+                return out
+            # Preserve the established target-verification computation for the
+            # prefix of a mixed wave. Only the actual prompt suffix uses the
+            # canonical full-paged call.
+            prefill_query = prefill_query[:canonical_start]
+            prefill_query_across_dcp = prefill_query_across_dcp[:canonical_start]
+            key = key[:canonical_start]
+            value = value[:canonical_start]
+            out = out[:canonical_start]
+
         output_context_tmp, lse_context_tmp = self._context.run(
             prefill_query_across_dcp,
             kv_cache_tuple,
+            q_scale=get_query_scale_for_flashinfer(
+                layer._q_scale_float,
+                prefill_query_across_dcp.dtype,
+            ),
             k_scale=layer._k_scale_float,
             v_scale=layer._v_scale_float,
             return_lse=True,
         )
+        _copy_ag2_dcp_trace(layer, "prefill_context_local_output", output_context_tmp)
+        _copy_ag2_dcp_trace(layer, "prefill_context_local_lse", lse_context_tmp)
+        _write_ag2_dcp_aux_pack(
+            layer,
+            "local_output",
+            output_context_tmp,
+            dcp_output_pack,
+            dcp_lse_pack,
+            request_tail_indices=self._ag2_request_tail_indices,
+            request_tail_count=self._ag2_request_tail_count,
+            dcp_observer_meta=dcp_observer_meta,
+        )
+        _write_ag2_dcp_aux_pack(
+            layer,
+            "local_lse",
+            lse_context_tmp,
+            dcp_output_pack,
+            dcp_lse_pack,
+            request_tail_indices=self._ag2_request_tail_indices,
+            request_tail_count=self._ag2_request_tail_count,
+            dcp_observer_meta=dcp_observer_meta,
+        )
+        del prefill_query_across_dcp
         output_context, lse_context = self._dcp_combine(
             output_context_tmp,
             lse_context_tmp,
             get_dcp_group(),
             return_lse=True,
         )
-        lse_context = log2_lse_to_ln(lse_context.transpose(0, 1).contiguous())
+        _copy_ag2_dcp_trace(layer, "prefill_context_combined_output", output_context)
+        _copy_ag2_dcp_trace(layer, "prefill_context_combined_lse", lse_context)
+        _write_ag2_dcp_aux_pack(
+            layer,
+            "combined_output",
+            output_context,
+            dcp_output_pack,
+            dcp_lse_pack,
+            request_tail_indices=self._ag2_request_tail_indices,
+            request_tail_count=self._ag2_request_tail_count,
+            dcp_observer_meta=dcp_observer_meta,
+        )
+        _write_ag2_dcp_aux_pack(
+            layer,
+            "combined_lse",
+            lse_context,
+            dcp_output_pack,
+            dcp_lse_pack,
+            request_tail_indices=self._ag2_request_tail_indices,
+            request_tail_count=self._ag2_request_tail_count,
+            dcp_observer_meta=dcp_observer_meta,
+        )
+        del output_context_tmp, lse_context_tmp
+        lse_context = lse_context.transpose(0, 1).contiguous()
+
+        if getattr(layer, "dcp_full_kv_attention_heads", False):
+            local_kv_head_indices = getattr(layer, "dcp_local_kv_head_indices", None)
+            if local_kv_head_indices is None:
+                raise ValueError(
+                    "DCP full-KV attention requires local KV head indices."
+                )
+            key, value = self._select_local_kv_heads(
+                key,
+                value,
+                local_kv_head_indices,
+            )
+
+        if match_fp8_new_tokens:
+            key = _match_fp8_cache_representation(key, layer._k_scale)
+            value = _match_fp8_cache_representation(value, layer._v_scale)
+
+        _write_ag2_dcp_current_kv_and_scales(
+            layer,
+            key,
+            value,
+            request_indices=self._ag2_request_tail_indices,
+            request_count=self._ag2_request_tail_count,
+            current_kv_pack=dcp_current_kv_pack,
+            scale_pack=dcp_scale_pack,
+            observer_meta=dcp_observer_meta,
+            match_fp8_new_tokens=match_fp8_new_tokens,
+            sm_scale=self._ag2_sm_scale,
+        )
 
         output_query, lse_query = self._new_tokens.run(
             prefill_query,
             key,
             value,
+            q_scale=get_query_scale_for_flashinfer(
+                layer._q_scale_float,
+                prefill_query.dtype,
+            ),
             return_lse=True,
         )
-        lse_query = log2_lse_to_ln(lse_query.transpose(0, 1).contiguous())
+        lse_query = lse_query.transpose(0, 1).contiguous()
+        _copy_ag2_dcp_trace(layer, "prefill_query_output", output_query)
+        _copy_ag2_dcp_trace(layer, "prefill_query_lse", lse_query.transpose(0, 1))
+        _write_ag2_dcp_aux_pack(
+            layer,
+            "query_output",
+            output_query,
+            dcp_output_pack,
+            dcp_lse_pack,
+            request_tail_indices=self._ag2_request_tail_indices,
+            request_tail_count=self._ag2_request_tail_count,
+            dcp_observer_meta=dcp_observer_meta,
+        )
+        _write_ag2_dcp_aux_pack(
+            layer,
+            "query_lse",
+            lse_query.transpose(0, 1),
+            dcp_output_pack,
+            dcp_lse_pack,
+            request_tail_indices=self._ag2_request_tail_indices,
+            request_tail_count=self._ag2_request_tail_count,
+            dcp_observer_meta=dcp_observer_meta,
+        )
+
+        # FlashInfer returns base-2 LSE, while vLLM's generic
+        # merge_attn_states kernel consumes natural-log LSE.
+        if self._convert_log2_lse_for_merge:
+            lse_context = lse_context * 0.6931471805599453
+            lse_query = lse_query * 0.6931471805599453
 
         merge_attn_states(
             out,
@@ -390,6 +2633,706 @@ class BatchDCPPrefillWrapper:
             lse_context,
             output_query,
             lse_query,
+        )
+        _copy_ag2_dcp_trace(layer, "prefill_merged_output", out)
+        _write_ag2_dcp_aux_pack(
+            layer,
+            "merged_output",
+            out,
+            dcp_output_pack,
+            dcp_lse_pack,
+            request_tail_indices=self._ag2_request_tail_indices,
+            request_tail_count=self._ag2_request_tail_count,
+            dcp_observer_meta=dcp_observer_meta,
+        )
+        return out
+
+
+class BatchDCPPseudoPrefillWrapper:
+    """Read causal-clipped speculative rows from paged KV in one DCP phase."""
+
+    def __init__(
+        self,
+        kv_layout: str,
+        workspace_buffer: torch.Tensor | None = None,
+        dcp_a2a: bool = False,
+        *,
+        use_cuda_graph: bool = False,
+        qo_indptr_buffer: torch.Tensor | None = None,
+        paged_kv_indptr_buffer: torch.Tensor | None = None,
+        paged_kv_indices_buffer: torch.Tensor | None = None,
+        paged_kv_last_page_len_buffer: torch.Tensor | None = None,
+        int_workspace_buffer: torch.Tensor | None = None,
+    ):
+        if dcp_a2a:
+            self._dcp_combine = partial(dcp_a2a_lse_reduce, is_lse_base_on_e=False)
+        else:
+            self._dcp_combine = partial(cp_lse_ag_out_rs, is_lse_base_on_e=False)
+        self._paged = BatchPrefillWithPagedKVCacheWrapper(
+            workspace_buffer,
+            kv_layout,
+            use_cuda_graph=use_cuda_graph,
+            qo_indptr_buf=qo_indptr_buffer,
+            paged_kv_indptr_buf=paged_kv_indptr_buffer,
+            paged_kv_indices_buf=paged_kv_indices_buffer,
+            paged_kv_last_page_len_buf=paged_kv_last_page_len_buffer,
+        )
+        if use_cuda_graph:
+            if int_workspace_buffer is None:
+                raise ValueError(
+                    "DCP pseudo-prefill CUDA graph mode requires a persistent "
+                    "integer workspace"
+                )
+            self._paged.reset_workspace_buffer(workspace_buffer, int_workspace_buffer)
+        self._use_cuda_graph = use_cuda_graph
+        self._disable_split_kv_for_cuda_graph = (
+            use_cuda_graph
+            and os.environ.get("AG2_VLLM_FLASHINFER_DCP_PREFILL_NO_SPLIT", "0") == "1"
+        )
+        self._graph_rows = (
+            int(qo_indptr_buffer.numel() - 1) if qo_indptr_buffer is not None else None
+        )
+        self._ag2_window_left = -1
+        self._ag2_logits_soft_cap = 0.0
+        self._ag2_sm_scale = 1.0
+        self._ag2_plan_ready = False
+
+    def plan(
+        self,
+        qo_indptr_cpu: torch.Tensor,
+        paged_kv_indptr_cpu: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len_cpu: torch.Tensor,
+        page_size: int,
+        num_qo_heads: int,
+        dcp_world_size: int,
+        num_kv_heads: int,
+        head_dim: int,
+        sm_scale: float,
+        window_left: int,
+        logits_soft_cap: float | None,
+        q_data_type: torch.dtype,
+        kv_cache_dtype: torch.dtype,
+        prefill_fixed_split_size: int,
+        disable_split_kv: bool,
+    ) -> None:
+        rows = int(qo_indptr_cpu.numel() - 1)
+        if self._graph_rows is not None and rows != self._graph_rows:
+            raise ValueError(
+                "DCP pseudo-prefill graph row count changed: "
+                f"captured={self._graph_rows} planned={rows}"
+            )
+        self._ag2_plan_ready = False
+        self._paged.plan(
+            qo_indptr=qo_indptr_cpu,
+            paged_kv_indptr=paged_kv_indptr_cpu,
+            paged_kv_indices=paged_kv_indices,
+            paged_kv_last_page_len=paged_kv_last_page_len_cpu,
+            num_qo_heads=num_qo_heads * dcp_world_size,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            page_size=page_size,
+            # Every row's paged length is already clipped to its inclusive
+            # causal boundary, so no query-relative mask is needed.
+            causal=False,
+            sm_scale=sm_scale,
+            window_left=window_left,
+            logits_soft_cap=logits_soft_cap,
+            q_data_type=q_data_type,
+            kv_data_type=kv_cache_dtype,
+            fixed_split_size=prefill_fixed_split_size,
+            disable_split_kv=(
+                disable_split_kv or self._disable_split_kv_for_cuda_graph
+            ),
+        )
+        self._ag2_window_left = window_left
+        self._ag2_logits_soft_cap = logits_soft_cap or 0.0
+        self._ag2_sm_scale = sm_scale
+        self._ag2_plan_ready = True
+
+    def graph_state_signature(self) -> tuple[object, ...]:
+        """Expose stable wrapper ownership for lifecycle controls."""
+        return (self._use_cuda_graph, self._graph_rows, id(self._paged))
+
+    def assert_plan_contract(
+        self,
+        *,
+        window_left: int,
+        logits_soft_cap: float,
+        sm_scale: float,
+    ) -> None:
+        """Validate caller-owned plan state without FlashInfer private fields."""
+        assert self._ag2_plan_ready
+        assert self._ag2_window_left == window_left
+        assert self._ag2_logits_soft_cap == logits_soft_cap
+        assert self._ag2_sm_scale == sm_scale
+
+    def run(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        kv_cache_tuple: tuple[torch.Tensor, torch.Tensor],
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        query_across_dcp = get_dcp_group().all_gather(
+            query.contiguous(),
+            dim=1,
+        )
+        output_tmp, lse = self._paged.run(
+            query_across_dcp,
+            kv_cache_tuple,
+            q_scale=get_query_scale_for_flashinfer(
+                layer._q_scale_float,
+                query_across_dcp.dtype,
+            ),
+            k_scale=layer._k_scale_float,
+            v_scale=layer._v_scale_float,
+            return_lse=True,
+        )
+        del query_across_dcp
+        out.copy_(
+            self._dcp_combine(
+                output_tmp,
+                lse,
+                get_dcp_group(),
+            )
+        )
+        return out
+
+
+@dataclass(frozen=True)
+class DCPBatchedGraphFormKey:
+    """Complete capture-visible identity of one DCP qlen1 graph form."""
+
+    semantic_owner: str
+    physical_owner: str
+    physical_rows: int
+    query_len: int
+    dcp_world_size: int
+    dcp_combine: str
+    num_qo_heads: int
+    num_kv_heads: int
+    head_dim: int
+    page_size: int
+    q_dtype: str
+    kv_dtype: str
+    output_dtype: str
+    backend: str
+    fixed_split_size: int
+    disable_split_kv: bool
+    use_tensor_cores: bool
+    native_head_chunk_size: int | None
+
+
+class BatchDCPBatchedDecodeWrapper:
+    """Run every speculative target row in one fixed-split qlen1 batch."""
+
+    def __init__(
+        self,
+        kv_layout: str,
+        workspace_buffer: torch.Tensor,
+        fixed_split_size: int,
+        disable_split_kv: bool = False,
+        dcp_a2a: bool = False,
+        use_tensor_cores: bool = True,
+        native_head_chunk_size: int | None = None,
+        use_cuda_graph: bool = False,
+        paged_kv_indptr_buffer: torch.Tensor | None = None,
+        paged_kv_indices_buffer: torch.Tensor | None = None,
+        paged_kv_last_page_len_buffer: torch.Tensor | None = None,
+        graph_form_key: DCPBatchedGraphFormKey | None = None,
+    ):
+        if fixed_split_size < 1:
+            raise ValueError("batched DCP decode requires fixed_split_size >= 1")
+        if dcp_a2a:
+            self._dcp_combine = partial(dcp_a2a_lse_reduce, is_lse_base_on_e=False)
+        else:
+            self._dcp_combine = partial(cp_lse_ag_out_rs, is_lse_base_on_e=False)
+        self._fixed_split_size = fixed_split_size
+        self._disable_split_kv = disable_split_kv
+        self._use_tensor_cores = use_tensor_cores
+        self._native_head_chunk_size = native_head_chunk_size
+        self._use_cuda_graph = use_cuda_graph
+        self._native_backend = "auto"
+        self._graph_form_key = graph_form_key
+        self._graph_lease_state = "live"
+        self._graph_plan_fingerprint: tuple[int, ...] | None = None
+        self._graph_plan_generation = 0
+        self._logical_empty_mask: torch.Tensor | None = (
+            torch.empty(
+                graph_form_key.physical_rows,
+                dtype=torch.bool,
+                device=workspace_buffer.device,
+            )
+            if graph_form_key is not None
+            else None
+        )
+        self._dcp_combine_name = "a2a_lse_reduce" if dcp_a2a else "lse_reduce_scatter"
+        if use_cuda_graph != (graph_form_key is not None):
+            raise ValueError(
+                "graph-aware batched DCP decode requires exactly one graph form key"
+            )
+        self._native_head_stripes: list[list[int]] | None = None
+        if native_head_chunk_size is not None and use_tensor_cores:
+            raise ValueError("native head chunking requires native decode")
+        if native_head_chunk_size is not None and native_head_chunk_size < 1:
+            raise ValueError("native head chunk size must be positive")
+        self._decode = BatchDecodeWithPagedKVCacheWrapper(
+            workspace_buffer,
+            kv_layout,
+            use_cuda_graph=use_cuda_graph,
+            paged_kv_indptr_buffer=paged_kv_indptr_buffer,
+            paged_kv_indices_buffer=paged_kv_indices_buffer,
+            paged_kv_last_page_len_buffer=paged_kv_last_page_len_buffer,
+            use_tensor_cores=use_tensor_cores,
+            backend=self._native_backend,
+        )
+        self._num_rows = 0
+
+    def graph_storage_signature(self) -> tuple[int | None, ...]:
+        """Return every native address whose lifetime is captured by Graph."""
+
+        def data_ptr(name: str) -> int | None:
+            tensor = getattr(self._decode, name, None)
+            return tensor.data_ptr() if torch.is_tensor(tensor) else None
+
+        return (
+            data_ptr("_float_workspace_buffer"),
+            data_ptr("_int_workspace_buffer"),
+            data_ptr("_pin_memory_int_workspace_buffer"),
+            data_ptr("_qo_indptr_buf"),
+            data_ptr("_paged_kv_indptr_buf"),
+            data_ptr("_paged_kv_indices_buf"),
+            data_ptr("_paged_kv_last_page_len_buf"),
+            (
+                self._logical_empty_mask.data_ptr()
+                if self._logical_empty_mask is not None
+                else None
+            ),
+        )
+
+    def graph_contract(self) -> dict[str, object]:
+        return {
+            "use_cuda_graph": self._use_cuda_graph,
+            "form_key": self._graph_form_key,
+            "storage_signature": self.graph_storage_signature(),
+            "plan_fingerprint": self._graph_plan_fingerprint,
+            "structural_plan_fingerprint": self._graph_plan_fingerprint,
+            "plan_generation": self._graph_plan_generation,
+            "lease_state": self._graph_lease_state,
+        }
+
+    def retire_graph_lease(self) -> None:
+        self._graph_lease_state = "retired"
+
+    def _physicalize_empty_rows(
+        self,
+        paged_kv_indptr_cpu: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len_cpu: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Represent a logical empty DCP shard with one masked dummy KV row."""
+        indptr = paged_kv_indptr_cpu.tolist()
+        last_page_len = paged_kv_last_page_len_cpu.tolist()
+        physical_indptr = [0]
+        physical_indices: list[torch.Tensor] = []
+        empty_rows: list[bool] = []
+        for row, last in enumerate(last_page_len):
+            page_start, page_end = indptr[row], indptr[row + 1]
+            page_count = page_end - page_start
+            is_empty = page_count == 0
+            if is_empty != (last == 0):
+                raise ValueError(
+                    "batched DCP empty row requires zero pages and last_page_len=0"
+                )
+            if is_empty:
+                physical_indices.append(
+                    torch.zeros(
+                        1,
+                        dtype=paged_kv_indices.dtype,
+                        device=paged_kv_indices.device,
+                    )
+                )
+                page_count = 1
+            else:
+                physical_indices.append(paged_kv_indices[page_start:page_end])
+            empty_rows.append(is_empty)
+            physical_indptr.append(physical_indptr[-1] + page_count)
+
+        empty_mask_cpu = torch.tensor(empty_rows, dtype=torch.bool)
+        if self._logical_empty_mask is None:
+            self._logical_empty_mask = empty_mask_cpu.to(paged_kv_indices.device)
+        else:
+            if self._logical_empty_mask.numel() != len(empty_rows):
+                if self._use_cuda_graph:
+                    raise RuntimeError(
+                        "batched DCP empty mask changed CUDA Graph physical form"
+                    )
+                # The eager/PIECEWISE wrapper is intentionally shared across
+                # runtime row counts.  Its mask is not captured, so a changed
+                # logical batch must replace the storage instead of inheriting
+                # the fixed-address contract of a CUDA Graph form.
+                self._logical_empty_mask = empty_mask_cpu.to(paged_kv_indices.device)
+            else:
+                self._logical_empty_mask.copy_(empty_mask_cpu, non_blocking=False)
+        physical_last_page_len = paged_kv_last_page_len_cpu.clone()
+        physical_last_page_len[empty_mask_cpu] = 1
+        return (
+            torch.tensor(physical_indptr, dtype=torch.int32),
+            torch.cat(physical_indices),
+            physical_last_page_len,
+        )
+
+    def plan(
+        self,
+        qo_indptr_cpu: torch.Tensor,
+        paged_kv_indptr_cpu: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len_cpu: torch.Tensor,
+        page_size: int,
+        num_qo_heads: int,
+        dcp_world_size: int,
+        num_kv_heads: int,
+        head_dim: int,
+        sm_scale: float,
+        window_left: int,
+        logits_soft_cap: float | None,
+        q_data_type: torch.dtype,
+        kv_cache_dtype: torch.dtype,
+        prefill_fixed_split_size: int,
+        disable_split_kv: bool,
+    ) -> None:
+        del qo_indptr_cpu, prefill_fixed_split_size
+        num_rows = paged_kv_last_page_len_cpu.shape[0]
+        if self._use_cuda_graph:
+            if self._graph_lease_state != "live":
+                raise RuntimeError("batched DCP graph lease is not live")
+            expected_form = DCPBatchedGraphFormKey(
+                semantic_owner="mtp_decode",
+                physical_owner="dcp_batched_decode",
+                physical_rows=num_rows,
+                query_len=1,
+                dcp_world_size=dcp_world_size,
+                dcp_combine=self._dcp_combine_name,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                q_dtype=str(q_data_type),
+                kv_dtype=str(kv_cache_dtype),
+                output_dtype=str(q_data_type),
+                backend=self._native_backend,
+                fixed_split_size=self._fixed_split_size,
+                disable_split_kv=self._disable_split_kv or disable_split_kv,
+                use_tensor_cores=self._use_tensor_cores,
+                native_head_chunk_size=self._native_head_chunk_size,
+            )
+            if expected_form != self._graph_form_key:
+                raise RuntimeError(
+                    "batched DCP graph form changed before native plan: "
+                    f"captured={self._graph_form_key!r} current={expected_form!r}"
+                )
+        (
+            physical_kv_indptr_cpu,
+            physical_kv_indices,
+            physical_last_page_len_cpu,
+        ) = self._physicalize_empty_rows(
+            paged_kv_indptr_cpu,
+            paged_kv_indices,
+            paged_kv_last_page_len_cpu,
+        )
+        self._num_rows = num_rows
+        if paged_kv_indptr_cpu.shape[0] != self._num_rows + 1:
+            raise ValueError(
+                "batched DCP decode paged indptr must contain one entry per "
+                f"row plus the terminator, got {paged_kv_indptr_cpu.shape[0]} "
+                f"for {self._num_rows} rows"
+            )
+        if self._native_head_chunk_size is not None:
+            total_q_heads = num_qo_heads * dcp_world_size
+            if self._native_head_chunk_size % num_kv_heads:
+                raise ValueError(
+                    "native head chunk size must divide evenly across KV heads"
+                )
+            q_per_kv = total_q_heads // num_kv_heads
+            q_per_kv_per_stripe = self._native_head_chunk_size // num_kv_heads
+            if total_q_heads % num_kv_heads or q_per_kv % q_per_kv_per_stripe:
+                raise ValueError(
+                    "native head stripes must exactly preserve Q-to-KV groups"
+                )
+            self._native_head_stripes = [
+                [
+                    kv_head * q_per_kv + stripe_offset + local_offset
+                    for kv_head in range(num_kv_heads)
+                    for local_offset in range(q_per_kv_per_stripe)
+                ]
+                for stripe_offset in range(0, q_per_kv, q_per_kv_per_stripe)
+            ]
+        split_kwargs = (
+            {
+                "fixed_split_size": self._fixed_split_size,
+                "disable_split_kv": self._disable_split_kv or disable_split_kv,
+            }
+            if self._use_tensor_cores
+            else {}
+        )
+        self._decode.plan(
+            physical_kv_indptr_cpu,
+            physical_kv_indices,
+            physical_last_page_len_cpu,
+            num_qo_heads=(
+                self._native_head_chunk_size
+                if self._native_head_chunk_size is not None
+                else num_qo_heads * dcp_world_size
+            ),
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            window_left=window_left,
+            logits_soft_cap=logits_soft_cap,
+            q_data_type=q_data_type,
+            kv_data_type=kv_cache_dtype,
+            o_data_type=q_data_type,
+            sm_scale=sm_scale,
+            **split_kwargs,
+        )
+        if self._use_cuda_graph:
+            fingerprint = tuple(int(value) for value in self._decode._plan_info)
+            if (
+                self._graph_plan_fingerprint is not None
+                and fingerprint != self._graph_plan_fingerprint
+            ):
+                raise RuntimeError(
+                    "batched DCP graph structural plan changed: "
+                    f"captured={self._graph_plan_fingerprint} current={fingerprint}"
+                )
+            self._graph_plan_fingerprint = fingerprint
+            self._graph_plan_generation += 1
+
+    def run(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        kv_cache_tuple: tuple[torch.Tensor, torch.Tensor],
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        if query.shape[0] != self._num_rows:
+            raise ValueError(
+                f"batched DCP decode expected {self._num_rows} rows, "
+                f"received {query.shape[0]}"
+            )
+        query_across_dcp = get_dcp_group().all_gather(
+            query.contiguous(),
+            dim=1,
+        )
+        run_kwargs = {
+            "q_scale": get_query_scale_for_flashinfer(
+                layer._q_scale_float,
+                query_across_dcp.dtype,
+            ),
+            "k_scale": layer._k_scale_float,
+            "v_scale": layer._v_scale_float,
+            "return_lse": True,
+        }
+        if self._native_head_chunk_size is None:
+            output_tmp, lse = self._decode.run(
+                query_across_dcp,
+                kv_cache_tuple,
+                **run_kwargs,
+            )
+        else:
+            if self._native_head_stripes is None:
+                raise RuntimeError("native head stripes were not planned")
+            output_tmp = torch.empty_like(query_across_dcp)
+            lse = torch.empty(
+                query_across_dcp.shape[:2],
+                dtype=torch.float32,
+                device=query_across_dcp.device,
+            )
+            for head_indices in self._native_head_stripes:
+                query_chunk = query_across_dcp[:, head_indices]
+                chunk_output, chunk_lse = self._decode.run(
+                    query_chunk,
+                    kv_cache_tuple,
+                    **run_kwargs,
+                )
+                output_tmp[:, head_indices] = chunk_output
+                lse[:, head_indices] = chunk_lse
+        if self._logical_empty_mask is not None:
+            output_tmp.masked_fill_(self._logical_empty_mask[:, None, None], 0)
+            lse.masked_fill_(self._logical_empty_mask[:, None], -torch.inf)
+        del query_across_dcp
+        out.copy_(
+            self._dcp_combine(
+                output_tmp,
+                lse,
+                get_dcp_group(),
+            )
+        )
+        return out
+
+
+class BatchDCPSequentialDecodeWrapper:
+    """Run speculative target rows as phase-batched native qlen1 decode."""
+
+    def __init__(
+        self,
+        kv_layout: str,
+        workspace_buffer: torch.Tensor,
+        num_phases: int,
+        fixed_split_size: int,
+        dcp_a2a: bool = False,
+    ):
+        if num_phases < 2:
+            raise ValueError("sequential DCP decode requires at least two phases")
+        if fixed_split_size < 1:
+            raise ValueError("sequential DCP decode requires fixed_split_size >= 1")
+        if dcp_a2a:
+            self._dcp_combine = partial(dcp_a2a_lse_reduce, is_lse_base_on_e=False)
+        else:
+            self._dcp_combine = partial(cp_lse_ag_out_rs, is_lse_base_on_e=False)
+        self._num_phases = num_phases
+        self._fixed_split_size = fixed_split_size
+        phase_workspace_size = workspace_buffer.numel() // num_phases
+        minimum_phase_workspace = 128 * 1024 * 1024
+        if phase_workspace_size < minimum_phase_workspace:
+            raise ValueError(
+                "Sequential DCP decode requires at least 128 MiB of FlashInfer "
+                f"float workspace per phase; received {workspace_buffer.numel()} "
+                f"bytes for {num_phases} phases."
+            )
+        # FlashInfer stores split-K planning state in the float workspace.
+        # Give every phase a disjoint slice of the already-reserved global
+        # buffer; sharing it makes earlier plans deterministically wrong.
+        phase_workspaces = [
+            workspace_buffer.narrow(
+                0,
+                phase * phase_workspace_size,
+                phase_workspace_size,
+            )
+            for phase in range(num_phases)
+        ]
+        self._phases = [
+            BatchDecodeWithPagedKVCacheWrapper(
+                phase_workspace,
+                kv_layout,
+                use_tensor_cores=True,
+                backend="auto",
+            )
+            for phase_workspace in phase_workspaces
+        ]
+        self._num_requests = 0
+
+    def plan(
+        self,
+        qo_indptr_cpu: torch.Tensor,
+        paged_kv_indptr_cpu: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len_cpu: torch.Tensor,
+        page_size: int,
+        num_qo_heads: int,
+        dcp_world_size: int,
+        num_kv_heads: int,
+        head_dim: int,
+        sm_scale: float,
+        window_left: int,
+        logits_soft_cap: float | None,
+        q_data_type: torch.dtype,
+        kv_cache_dtype: torch.dtype,
+        prefill_fixed_split_size: int,
+        disable_split_kv: bool,
+    ) -> None:
+        del qo_indptr_cpu, prefill_fixed_split_size
+        num_rows = paged_kv_last_page_len_cpu.shape[0]
+        if num_rows % self._num_phases:
+            raise ValueError(
+                f"phase-major row count {num_rows} is not divisible by "
+                f"{self._num_phases}"
+            )
+        self._num_requests = num_rows // self._num_phases
+        for phase, wrapper in enumerate(self._phases):
+            request_start = phase * self._num_requests
+            request_end = request_start + self._num_requests
+            page_start = int(paged_kv_indptr_cpu[request_start])
+            page_end = int(paged_kv_indptr_cpu[request_end])
+            phase_indptr = (
+                paged_kv_indptr_cpu[request_start : request_end + 1] - page_start
+            )
+            wrapper.plan(
+                phase_indptr,
+                paged_kv_indices[page_start:page_end],
+                paged_kv_last_page_len_cpu[request_start:request_end],
+                num_qo_heads=num_qo_heads * dcp_world_size,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                window_left=window_left,
+                logits_soft_cap=logits_soft_cap,
+                q_data_type=q_data_type,
+                kv_data_type=kv_cache_dtype,
+                o_data_type=q_data_type,
+                sm_scale=sm_scale,
+                fixed_split_size=self._fixed_split_size,
+                disable_split_kv=disable_split_kv,
+            )
+
+    def run(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        kv_cache_tuple: tuple[torch.Tensor, torch.Tensor],
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        expected_rows = self._num_phases * self._num_requests
+        if query.shape[0] != expected_rows:
+            raise ValueError(
+                f"sequential DCP decode expected {expected_rows} rows, "
+                f"received {query.shape[0]}"
+            )
+        # Scheduler order is request-major. Metadata and kernel execution are
+        # phase-major so each wrapper sees one qlen1 row per request.
+        phase_major_query = (
+            query.view(self._num_requests, self._num_phases, *query.shape[1:])
+            .transpose(0, 1)
+            .contiguous()
+            .view(expected_rows, *query.shape[1:])
+        )
+        query_across_dcp = get_dcp_group().all_gather(
+            phase_major_query,
+            dim=1,
+        )
+        phase_outputs = []
+        phase_lses = []
+        for phase, wrapper in enumerate(self._phases):
+            row_start = phase * self._num_requests
+            row_end = row_start + self._num_requests
+            output_tmp, lse_tmp = wrapper.run(
+                query_across_dcp[row_start:row_end],
+                kv_cache_tuple,
+                q_scale=get_query_scale_for_flashinfer(
+                    layer._q_scale_float,
+                    query_across_dcp.dtype,
+                ),
+                k_scale=layer._k_scale_float,
+                v_scale=layer._v_scale_float,
+                return_lse=True,
+            )
+            phase_outputs.append(output_tmp)
+            phase_lses.append(lse_tmp)
+        del query_across_dcp
+        phase_major_output = self._dcp_combine(
+            torch.cat(phase_outputs),
+            torch.cat(phase_lses),
+            get_dcp_group(),
+        )
+        out.copy_(
+            phase_major_output.view(
+                self._num_phases,
+                self._num_requests,
+                *phase_major_output.shape[1:],
+            )
+            .transpose(0, 1)
+            .reshape_as(out)
         )
         return out
 
@@ -410,6 +3353,7 @@ class FlashInferBackend(AttentionBackend):
             state_content_bytes=hs_k * get_dtype_size(spec.dtype),
         )
 
+    supports_dcp_full_kv_attention_heads: ClassVar[bool] = True
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
@@ -553,7 +3497,14 @@ class FlashInferBackend(AttentionBackend):
 class FIPrefill:
     """Metadata for the native FlashInfer prefill pathway (non-TRTLLM)."""
 
-    wrapper: BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper
+    wrapper: (
+        BatchPrefillWithPagedKVCacheWrapper
+        | BatchDCPPrefillWrapper
+        | BatchDCPPseudoPrefillWrapper
+        | BatchDCPBatchedDecodeWrapper
+        | BatchDCPSequentialDecodeWrapper
+    )
+    match_fp8_new_tokens: bool = False
 
 
 @dataclass
@@ -561,6 +3512,7 @@ class FIDecode:
     """Metadata for the native FlashInfer decode pathway (non-TRTLLM)."""
 
     wrapper: BatchDecodeWithPagedKVCacheWrapper
+    dcp_local_seq_lens: torch.Tensor | None = None
 
 
 class FlashInferDecodeKernel(Enum):
@@ -671,6 +3623,25 @@ class FlashInferMetadata:
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None
 
 
+def _semantic_attention_token_counts(
+    physical_tokens: int,
+    qo_indptr_cpu: torch.Tensor,
+    num_decodes: int,
+) -> tuple[int, int, int]:
+    """Resolve semantic query rows inside a padded physical graph carrier."""
+    if qo_indptr_cpu.ndim != 1 or qo_indptr_cpu.numel() < num_decodes + 1:
+        raise ValueError("attention query indptr cannot resolve decode boundary")
+    semantic_decode = int(qo_indptr_cpu[num_decodes])
+    semantic_total = int(qo_indptr_cpu[-1])
+    if not 0 <= semantic_decode <= semantic_total <= physical_tokens:
+        raise ValueError(
+            "attention query rows exceed the physical graph carrier: "
+            f"decode={semantic_decode} total={semantic_total} "
+            f"physical={physical_tokens}"
+        )
+    return semantic_total, semantic_decode, semantic_total - semantic_decode
+
+
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     kv_cache_spec: AttentionSpec
     reorder_batch_threshold: int = 1
@@ -690,19 +3661,117 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self._prefill_wrapper: (
             BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper | None
         ) = None  # Wrapper for prefill/append
+        self._dcp_prefill_cudagraph_enabled = (
+            os.environ.get("AG2_VLLM_FLASHINFER_DCP_PREFILL_CUDAGRAPH", "0") == "1"
+        )
+        self._dcp_prefill_wrappers_cudagraph: dict[int, BatchDCPPrefillWrapper] = {}
+        self._dcp_pseudo_prefill_wrappers_cudagraph: dict[
+            int, BatchDCPPseudoPrefillWrapper
+        ] = {}
+        self._dcp_prefill_captured_wrappers: dict[
+            int, BatchDCPPrefillWrapper | BatchDCPPseudoPrefillWrapper
+        ] = {}
+        self._static_cudagraph_batch_sizes = frozenset(
+            vllm_config.compilation_config.cudagraph_capture_sizes or ()
+        )
+        self._dcp_prefill_qo_indptr_buffer: torch.Tensor | None = None
+        self._dcp_prefill_context_int_workspace: torch.Tensor | None = None
+        self._dcp_prefill_new_tokens_int_workspace: torch.Tensor | None = None
+        self._dcp_pseudo_prefill_wrapper: BatchDCPPseudoPrefillWrapper | None = None
+        self._dcp_batched_decode_wrapper: BatchDCPBatchedDecodeWrapper | None = None
+        self._dcp_batched_decode_wrappers_cudagraph: dict[
+            DCPBatchedGraphFormKey, BatchDCPBatchedDecodeWrapper
+        ] = {}
+        self._dcp_batched_decode_workspace: torch.Tensor | None = None
+        self._dcp_sequential_decode_wrapper: BatchDCPSequentialDecodeWrapper | None = (
+            None
+        )
         self._noncausal_prefill_wrapper: BatchPrefillWithPagedKVCacheWrapper | None = (
             None  # Wrapper for non-causal prefill (DFlash)
         )
         self._decode_wrapper = None  # Wrapper for decode (general shape)
 
+        prefill_batch_invariant = envs.VLLM_BATCH_INVARIANT or (
+            os.environ.get(
+                "AG2_VLLM_FLASHINFER_PREFILL_BATCH_INVARIANT",
+                "0",
+            )
+            == "1"
+        )
         if envs.VLLM_BATCH_INVARIANT:
             self.decode_fixed_split_size = 2048
-            self.prefill_fixed_split_size = 4096
-            self.disable_split_kv = True
+            self.decode_disable_split_kv = True
+            self.decode_fixed_split_spec_target_only = False
         else:
-            self.decode_fixed_split_size = -1
+            self.qlen1_fixed_split_size = int(
+                os.environ.get(
+                    "AG2_VLLM_FLASHINFER_Q1_FIXED_SPLIT_SIZE",
+                    "-1",
+                )
+            )
+            self.qlen1_disable_split_kv = (
+                os.environ.get(
+                    "AG2_VLLM_FLASHINFER_Q1_DISABLE_SPLIT_KV",
+                    "0",
+                )
+                == "1"
+            )
+            if self.qlen1_fixed_split_size == 0 or self.qlen1_fixed_split_size < -1:
+                raise ValueError(
+                    "FlashInfer qlen1 fixed split size must be -1 or positive"
+                )
+            if self.qlen1_fixed_split_size > 0:
+                logger.warning_once(
+                    "Research POC: FlashInfer qlen1 fixed-split planning is "
+                    "enabled (fixed_split_size=%d, disable_split_kv=%s). "
+                    "FULL CUDA Graphs remain enabled; long-context graph "
+                    "portability is not yet accepted.",
+                    self.qlen1_fixed_split_size,
+                    self.qlen1_disable_split_kv,
+                )
+            self.decode_fixed_split_size = int(
+                os.environ.get(
+                    "AG2_VLLM_FLASHINFER_SPEC_TARGET_FIXED_SPLIT_SIZE",
+                    "-1",
+                )
+            )
+            self.decode_disable_split_kv = (
+                os.environ.get(
+                    "AG2_VLLM_FLASHINFER_SPEC_TARGET_DISABLE_SPLIT_KV",
+                    "0",
+                )
+                == "1"
+            )
+            self.decode_fixed_split_spec_target_only = True
+            if self.decode_fixed_split_size == 0 or self.decode_fixed_split_size < -1:
+                raise ValueError(
+                    "FlashInfer speculative-target fixed split size must be "
+                    "-1 or positive"
+                )
+            if self.decode_fixed_split_size > 0:
+                logger.warning_once(
+                    "Research POC: FlashInfer fixed-split planning is enabled "
+                    "only for multi-token speculative target verification "
+                    "(fixed_split_size=%d, disable_split_kv=%s); qlen=1 "
+                    "decode and its FULL CUDA graphs are unchanged.",
+                    self.decode_fixed_split_size,
+                    self.decode_disable_split_kv,
+                )
+        if envs.VLLM_BATCH_INVARIANT:
+            self.qlen1_fixed_split_size = -1
+            self.qlen1_disable_split_kv = False
+        if prefill_batch_invariant:
+            self.prefill_fixed_split_size = 4096
+            self.prefill_disable_split_kv = True
+            if not envs.VLLM_BATCH_INVARIANT:
+                logger.warning_once(
+                    "Research POC: FlashInfer prefill-only batch-invariant "
+                    "planning is enabled (fixed_split_size=4096, "
+                    "disable_split_kv=True); decode and GDN are unchanged."
+                )
+        else:
             self.prefill_fixed_split_size = -1
-            self.disable_split_kv = False
+            self.prefill_disable_split_kv = False
 
         self.compilation_config = vllm_config.compilation_config
         self.max_num_batched_tokens = (
@@ -749,6 +3818,142 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.dcp_rank = 0
             self.dcp_kv_cache_interleave_size = 1
         self.use_dcp = self.dcp_world_size > 1
+        self._dcp_canonical_paged_prefill = (
+            os.environ.get("AG2_VLLM_DCP_CANONICAL_PAGED_PREFILL", "0") == "1"
+        )
+        self._dcp_absolute_segment_prefill = (
+            os.environ.get("AG2_VLLM_DCP_ABSOLUTE_SEGMENT_PREFILL", "0") == "1"
+        )
+        if self._dcp_canonical_paged_prefill and self._dcp_absolute_segment_prefill:
+            raise ValueError(
+                "Dense canonical paged and absolute-segment DCP prefill POCs "
+                "are mutually exclusive"
+            )
+        if self._dcp_canonical_paged_prefill:
+            if not self.use_dcp:
+                raise ValueError("AG2_VLLM_DCP_CANONICAL_PAGED_PREFILL requires DCP")
+            logger.warning_once(
+                "Research-only bounded canonical paged DCP prompt-prefill is "
+                "enabled. Actual causal prompt prefills with no cascade will "
+                "read the full just-updated paged KV through one custom-mask "
+                "FlashInfer call; target/MTP decode and non-causal paths are "
+                "unchanged."
+            )
+        if self._dcp_absolute_segment_prefill:
+            if not self.use_dcp:
+                raise ValueError("AG2_VLLM_DCP_ABSOLUTE_SEGMENT_PREFILL requires DCP")
+            logger.warning_once(
+                "Research-only absolute-segment DCP prompt-prefill is enabled. "
+                "Actual prompt rows use stable paged-history + ragged-current "
+                "phase trees; target/MTP decode and non-causal paths are unchanged."
+            )
+        if self._dcp_prefill_cudagraph_enabled:
+            if not self.use_dcp:
+                raise ValueError(
+                    "AG2_VLLM_FLASHINFER_DCP_PREFILL_CUDAGRAPH requires DCP."
+                )
+            if not self.enable_cuda_graph:
+                raise ValueError(
+                    "AG2_VLLM_FLASHINFER_DCP_PREFILL_CUDAGRAPH requires FULL "
+                    "CUDA graph mode."
+                )
+            self._dcp_prefill_qo_indptr_buffer = torch.empty(
+                max(max_num_reqs, self.max_num_batched_tokens) + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            # FlashInfer allocates 8 MiB per prefill wrapper by default. The
+            # plan/run lifecycle is sequential across graph shapes, so retain
+            # one persistent workspace per phase instead of one per shape.
+            self._dcp_prefill_context_int_workspace = torch.empty(
+                8 * 1024 * 1024,
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            self._dcp_prefill_new_tokens_int_workspace = torch.empty(
+                8 * 1024 * 1024,
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            logger.warning_once(
+                "Research-only FlashInfer DCP prefill CUDA Graph support is "
+                "enabled: qlen=%d, max_reqs=%d, persistent integer workspace="
+                "16 MiB per attention metadata builder.",
+                1 + int(num_spec_tokens or 0),
+                max_num_reqs,
+            )
+        self._dcp_pseudo_decode_enabled = (
+            os.environ.get("AG2_VLLM_MTP_DCP_PSEUDO_DECODE", "0") == "1"
+        )
+        self._dcp_sequential_decode_enabled = (
+            os.environ.get("AG2_VLLM_MTP_DCP_SEQUENTIAL_DECODE", "0") == "1"
+        )
+        self._dcp_batched_decode_enabled = (
+            os.environ.get("AG2_VLLM_MTP_DCP_BATCHED_DECODE", "0") == "1"
+        )
+        self._dcp_sequential_fixed_split_size = int(
+            os.environ.get(
+                "AG2_VLLM_MTP_DCP_SEQUENTIAL_FIXED_SPLIT_SIZE",
+                "4",
+            )
+        )
+        self._dcp_batched_workspace_mib = int(
+            os.environ.get(
+                "AG2_VLLM_MTP_DCP_BATCHED_WORKSPACE_MIB",
+                "132",
+            )
+        )
+        self._dcp_batched_fixed_split_size = int(
+            os.environ.get(
+                "AG2_VLLM_MTP_DCP_BATCHED_FIXED_SPLIT_SIZE",
+                "4",
+            )
+        )
+        self._dcp_batched_disable_split_kv = (
+            os.environ.get(
+                "AG2_VLLM_MTP_DCP_BATCHED_DISABLE_SPLIT_KV",
+                "0",
+            )
+            == "1"
+        )
+        self._dcp_match_fp8_new_tokens = (
+            os.environ.get("AG2_VLLM_MTP_DCP_MATCH_FP8_NEW_TOKENS", "0") == "1"
+        )
+        self._dcp_prefill_match_fp8_new_tokens = (
+            os.environ.get("AG2_VLLM_DCP_PREFILL_MATCH_FP8_NEW_TOKENS", "0") == "1"
+        )
+        enabled_special_paths = sum(
+            (
+                self._dcp_pseudo_decode_enabled,
+                self._dcp_sequential_decode_enabled,
+                self._dcp_batched_decode_enabled,
+            )
+        )
+        if enabled_special_paths > 1:
+            raise ValueError(
+                "DCP pseudo-prefill, sequential-decode and batched-decode "
+                "research paths are mutually exclusive."
+            )
+        if self._dcp_batched_decode_enabled and self._dcp_prefill_cudagraph_enabled:
+            raise ValueError(
+                "Batched causal qlen1 verification requires qlen>1 PIECEWISE "
+                "attention; disable AG2_VLLM_FLASHINFER_DCP_PREFILL_CUDAGRAPH."
+            )
+        self._dcp_special_decode_enabled = (
+            self._dcp_pseudo_decode_enabled
+            or self._dcp_sequential_decode_enabled
+            or self._dcp_batched_decode_enabled
+        )
+        self._dcp_pseudo_decode_query_len = 1 + int(num_spec_tokens or 0)
+        self._dcp_pseudo_decode_max_rows = (
+            1 + int(num_spec_tokens or 0)
+        ) * max_num_reqs
+        self._dcp_pseudo_decode_block_tables: torch.Tensor | None = None
+        self._dcp_pseudo_decode_row_to_req: torch.Tensor | None = None
+        if self._dcp_special_decode_enabled and not self.use_dcp:
+            raise ValueError(
+                "DCP speculative attention research paths require DCP world size > 1."
+            )
         self.dcp_a2a = (
             self.use_dcp and vllm_config.parallel_config.dcp_comm_backend == "a2a"
         )
@@ -761,6 +3966,40 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.num_kv_heads = self.kv_cache_spec.num_kv_heads
         self.head_dim = self.kv_cache_spec.head_size
         self.page_size = self.kv_cache_spec.block_size
+        if self._dcp_batched_decode_enabled:
+            if self._dcp_batched_workspace_mib < 1:
+                raise ValueError(
+                    "AG2_VLLM_MTP_DCP_BATCHED_WORKSPACE_MIB must be positive"
+                )
+            # Allocate this before final KV sizing. Allocating it on the first
+            # request would invalidate the published KV capacity.
+            self._dcp_batched_decode_workspace = torch.zeros(
+                self._dcp_batched_workspace_mib * 1024 * 1024,
+                dtype=torch.uint8,
+                device=self.device,
+            )
+        if self._dcp_special_decode_enabled:
+            # Worker-side hybrid block tables may reserve entries beyond the
+            # nominal max sequence for the currently scheduled token batch.
+            # The metadata builder receives only the kernel-sized spec, not
+            # the original hybrid storage geometry, so include one complete
+            # scheduler batch as a conservative pre-capture bound.
+            max_local_blocks = _dcp_pseudo_block_table_capacity(
+                self.model_config.max_model_len,
+                self.max_num_batched_tokens,
+                self.page_size,
+                self.dcp_world_size,
+            )
+            self._dcp_pseudo_decode_block_tables = torch.empty(
+                (self._dcp_pseudo_decode_max_rows, max_local_blocks),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._dcp_pseudo_decode_row_to_req = torch.empty(
+                self._dcp_pseudo_decode_max_rows,
+                dtype=torch.int64,
+                device=self.device,
+            )
 
         if self.kv_cache_spec.kv_quant_mode != KVQuantMode.NONE:
             self.cache_dtype = self.cache_config.cache_dtype
@@ -790,6 +4029,27 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.is_kvcache_nvfp4 = False
             assert self.kv_cache_spec.dtype == self.model_config.dtype
             self.kv_cache_dtype = self.kv_cache_spec.dtype
+
+        if (
+            self._dcp_match_fp8_new_tokens or self._dcp_prefill_match_fp8_new_tokens
+        ) and (not self.use_dcp or not self.cache_dtype.startswith("fp8")):
+            raise ValueError(
+                "Matching live new-token K/V to the FP8 cache "
+                "requires DCP and an FP8 KV cache."
+            )
+        if self._dcp_match_fp8_new_tokens:
+            logger.warning_once(
+                "Research-only DCP speculative new-token FP8 matching is enabled. "
+                "Only uniform target decode queries with is_prefilling=false "
+                "will round-trip live K/V through the cache representation."
+            )
+        if self._dcp_prefill_match_fp8_new_tokens:
+            logger.warning_once(
+                "Research-only causal DCP prefill new-token FP8 matching is enabled. "
+                "Every native causal DCP prefill will round-trip live K/V through "
+                "the cache representation to remove scheduler-dependent mixed "
+                "BF16/FP8 attention inputs."
+            )
 
         # Compute per-phase Q dtype.  On SM90 (XQA decode), the prefill and
         # decode phases require different Q dtypes when the KV cache is FP8
@@ -920,15 +4180,62 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.kv_cache_dtype,
             arch,
         )
+        if self._dcp_pseudo_decode_enabled:
+            logger.warning_once(
+                "Research-only DCP pseudo-decode is enabled: target qlen>1 "
+                "decode rows will alias the request block table and run as "
+                "independent causal-clipped qlen=1 rows through one paged-"
+                "prefill kernel and one DCP combine."
+            )
+        if self._dcp_sequential_decode_enabled:
+            if self.q_data_type_prefill != self.q_data_type_decode:
+                raise ValueError(
+                    "Sequential DCP decode currently requires identical "
+                    "prefill and decode query dtypes."
+                )
+            logger.warning_once(
+                "Research-only DCP sequential decode is enabled: target "
+                "qlen>1 rows will run as phase-batched native qlen=1 "
+                "FlashInfer decode operations with one DCP gather/combine."
+            )
+        if self._dcp_batched_decode_enabled:
+            logger.warning_once(
+                "Research-only batched causal qlen1 DCP verification is enabled: "
+                "uniform target qlen>1 rows use one native-decode batch, one "
+                "DCP gather/combine and PIECEWISE attention."
+            )
         # Preparing persistent buffers
-        self.paged_kv_indptr = CpuGpuBuffer(
-            max_num_reqs + 1, dtype=torch.int32, device=self.device, pin_memory=False
-        )
-        self.paged_kv_indices = torch.zeros(
-            max_num_pages, dtype=torch.int32, device=self.device
-        )
-        self.paged_kv_last_page_len = CpuGpuBuffer(
-            max_num_reqs, dtype=torch.int32, device=self.device, pin_memory=False
+        # Since we do not have explicit synchronization in ModelRunnerV2, we do not pin
+        # reused CPU buffers to avoid a race condition between step N async copies to
+        # GPU and step N+1 buffer updates.
+        self.pin_memory = not vllm_config.use_v2_model_runner and PIN_MEMORY
+        metadata_max_reqs = max_num_reqs
+        if self._dcp_special_decode_enabled:
+            metadata_max_reqs = self._dcp_pseudo_decode_max_rows
+            max_local_pages_per_row = cdiv(
+                self.model_config.max_model_len,
+                self.page_size * self.dcp_world_size,
+            )
+            max_num_pages = max(
+                max_num_pages,
+                metadata_max_reqs * max_local_pages_per_row,
+            )
+        self.paged_kv_indptr = self._make_buffer(metadata_max_reqs + 1)
+        self.paged_kv_indptr_cpu_buffer = torch.zeros_like(
+            self.paged_kv_indptr.cpu, pin_memory=self.pin_memory
+        )  # Extra buffer for mutable paged_kv_indptr.cpu in cuda graph mode
+        self.paged_kv_indices = self._make_buffer(max_num_pages)
+        self.paged_kv_last_page_len = self._make_buffer(metadata_max_reqs)
+
+    def _make_buffer(
+        self, *size: int | torch.SymInt, dtype: torch.dtype = torch.int32
+    ) -> CpuGpuBuffer:
+        return CpuGpuBuffer(
+            *size,
+            dtype=dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            with_numpy=True,
         )
 
     @property
@@ -985,8 +4292,20 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         SM90 XQA supports only single-token decode. SM12x uses the dedicated
         XQA API, which supports speculative and non-causal decode.
         """
+        if os.environ.get("AG2_VLLM_MTP_DCP_BATCHED_DECODE", "0") == "1":
+            # Exact live KV lengths are replanned for every causal qlen1 row.
+            # Uniform qlen>1 verification therefore remains an outer
+            # PIECEWISE attention breakpoint.
+            return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+
         if current_platform.is_device_capability(90):
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+
+        if (
+            os.environ.get("AG2_VLLM_FLASHINFER_DCP_PREFILL_CUDAGRAPH", "0") == "1"
+            and vllm_config.parallel_config.decode_context_parallel_size > 1
+        ):
+            return AttentionCGSupport.UNIFORM_BATCH
 
         is_sm12x = current_platform.is_device_capability_family(120)
         # XQA does not return LSE and therefore does not support DCP.
@@ -1018,33 +4337,70 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         else:
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
+    def get_workspace_buffer_size(self) -> int:
+        buffer_size = envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE
+        if envs.VLLM_BATCH_INVARIANT:
+            return FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT
+
+        # FlashInfer prefill temp buffers (batch_prefill_tmp_v, ...) scale
+        # with the prefill chunk and query-head footprint, NOT context length.
+        # Never shrink below the configured default.
+        est = (
+            self.max_num_batched_tokens
+            * self.num_qo_heads
+            * self.head_dim
+            * FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM
+        )
+        return max(buffer_size, est)
+
     def _get_workspace_buffer(self):
         if self._workspace_buffer is None:
-            buffer_size = envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE
-            if envs.VLLM_BATCH_INVARIANT:
-                buffer_size = FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT
-            else:
-                # FlashInfer prefill temp buffers (batch_prefill_tmp_v, ...)
-                # scale with the prefill chunk and query-head footprint, NOT
-                # context length. The fixed ~394 MiB default is too small for
-                # wide-head models at the default 8192-token chunk on some
-                # archs (e.g. sm_120), where FlashInfer hard-errors instead of
-                # growing. Size to the batch's head footprint; never shrink
-                # below the configured default.
-                est = (
-                    self.max_num_batched_tokens
-                    * self.num_qo_heads
-                    * self.head_dim
-                    * FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM
-                )
-                buffer_size = max(buffer_size, est)
+            buffer_size = self.get_workspace_buffer_size()
             self._workspace_buffer = torch.zeros(
                 buffer_size, dtype=torch.uint8, device=self.device
             )
         return self._workspace_buffer
 
     def set_workspace_buffer(self, workspace_buffer: torch.Tensor):
+        required = self.get_workspace_buffer_size()
+        if (
+            workspace_buffer.device != self.device
+            or workspace_buffer.dtype != torch.uint8
+            or workspace_buffer.numel() < required
+        ):
+            raise ValueError(
+                "incompatible FlashInfer workspace: "
+                f"device={workspace_buffer.device}, dtype={workspace_buffer.dtype}, "
+                f"bytes={workspace_buffer.numel()}, required={required}, "
+                f"expected_device={self.device}"
+            )
         self._workspace_buffer = workspace_buffer
+
+    def share_persistent_kernel_scratch_from(
+        self, source: "FlashInferMetadataBuilder"
+    ) -> None:
+        """Share scratch used only while an attention kernel is executing.
+
+        Attention groups execute sequentially, so one workspace per ubatch is
+        sufficient. Metadata tensors are deliberately excluded: all groups'
+        metadata can be prepared before model execution and must not alias.
+        """
+        if not isinstance(source, FlashInferMetadataBuilder):
+            raise TypeError("FlashInfer scratch source must be a FlashInfer builder")
+        self.set_workspace_buffer(source._get_workspace_buffer())
+
+        source_dcp = source._dcp_batched_decode_workspace
+        target_dcp = self._dcp_batched_decode_workspace
+        if (source_dcp is None) != (target_dcp is None):
+            raise ValueError("FlashInfer DCP scratch routes are incompatible")
+        if source_dcp is not None and target_dcp is not None:
+            if (
+                source_dcp.device != target_dcp.device
+                or source_dcp.dtype != target_dcp.dtype
+                or source_dcp.numel() < target_dcp.numel()
+            ):
+                raise ValueError("FlashInfer DCP scratch geometry is incompatible")
+            self._dcp_batched_decode_workspace = source_dcp
 
     @staticmethod
     def _get_flashinfer_trtllm_api_decode_kernel() -> FlashInferDecodeKernel:
@@ -1113,7 +4469,41 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     def _get_prefill_wrapper(
         self,
         causal: bool = True,
+        *,
+        cudagraph_batch_size: int | None = None,
     ) -> BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper:
+        if cudagraph_batch_size is not None:
+            if not causal or not self.use_dcp:
+                raise ValueError(
+                    "DCP prefill CUDA graph wrappers require causal DCP attention."
+                )
+            wrapper = self._dcp_prefill_wrappers_cudagraph.get(cudagraph_batch_size)
+            if wrapper is None:
+                qo_indptr = self._dcp_prefill_qo_indptr_buffer
+                context_int_workspace = self._dcp_prefill_context_int_workspace
+                new_tokens_int_workspace = self._dcp_prefill_new_tokens_int_workspace
+                assert qo_indptr is not None
+                assert context_int_workspace is not None
+                assert new_tokens_int_workspace is not None
+                wrapper = BatchDCPPrefillWrapper(
+                    kv_layout=get_flashinfer_layout_string(self.kv_cache_layout),
+                    workspace_buffer=self._get_workspace_buffer(),
+                    dcp_a2a=self.dcp_a2a,
+                    use_cuda_graph=True,
+                    qo_indptr_buffer=qo_indptr[: cudagraph_batch_size + 1],
+                    paged_kv_indptr_buffer=self.paged_kv_indptr.gpu[
+                        : cudagraph_batch_size + 1
+                    ],
+                    paged_kv_indices_buffer=self.paged_kv_indices.gpu,
+                    paged_kv_last_page_len_buffer=self.paged_kv_last_page_len.gpu[
+                        :cudagraph_batch_size
+                    ],
+                    context_int_workspace_buffer=context_int_workspace,
+                    new_tokens_int_workspace_buffer=new_tokens_int_workspace,
+                )
+                self._dcp_prefill_wrappers_cudagraph[cudagraph_batch_size] = wrapper
+            return wrapper
+
         if not causal:
             if self.use_dcp:
                 raise NotImplementedError(
@@ -1180,6 +4570,291 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         assert self._prefill_wrapper is not None
         return self._prefill_wrapper
 
+    def _dcp_prefill_cudagraph_batch_size(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_decodes: int,
+        num_prefills: int,
+        *,
+        for_cudagraph_capture: bool = False,
+    ) -> int | None:
+        """Return the fixed graph batch size for a uniform MTP verification."""
+        if (
+            not self._dcp_prefill_cudagraph_enabled
+            or not self.use_dcp
+            or not common_attn_metadata.full_cudagraph
+            or common_attn_metadata.causal is not True
+            or num_decodes != 0
+            or num_prefills <= 0
+        ):
+            return None
+
+        query_lens = (
+            common_attn_metadata.query_start_loc_cpu[1:]
+            - common_attn_metadata.query_start_loc_cpu[:-1]
+        )
+        active_rows = query_lens != 0
+        nonzero_query_lens = query_lens[active_rows]
+        if nonzero_query_lens.numel() == 0 or bool(
+            torch.any(nonzero_query_lens != self._dcp_pseudo_decode_query_len)
+        ):
+            return None
+
+        diagnostic_allow_unverified = (
+            os.environ.get(
+                "AG2_VLLM_DIAGNOSTIC_ALLOW_UNVERIFIED_DCP_PREFILL_GRAPH",
+                "0",
+            )
+            == "1"
+        )
+        if not for_cudagraph_capture and not diagnostic_allow_unverified:
+            num_decode_draft_tokens_cpu = (
+                common_attn_metadata.num_decode_draft_tokens_cpu
+            )
+            if num_decode_draft_tokens_cpu is None:
+                return None
+            if num_decode_draft_tokens_cpu.numel() != query_lens.numel():
+                return None
+            active_draft_counts = num_decode_draft_tokens_cpu[active_rows]
+            if bool(
+                torch.any(active_draft_counts != self._dcp_pseudo_decode_query_len - 1)
+            ):
+                return None
+
+        is_prefilling = common_attn_metadata.is_prefilling
+        if is_prefilling is not None:
+            if isinstance(is_prefilling, torch.Tensor):
+                if bool(torch.any(is_prefilling[active_rows]).item()):
+                    return None
+            elif bool(np.any(np.asarray(is_prefilling)[active_rows.numpy()])):
+                return None
+        return num_prefills
+
+    def build_for_cudagraph_capture(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> FlashInferMetadata:
+        """Build metadata with the same persistent wrapper replay will plan.
+
+        Capture batches are synthetic and therefore have no authoritative
+        per-request draft markers.  The capture role may select the qlen3
+        wrapper from physical shape, while ordinary runtime builds remain
+        fail-closed on ``num_decode_draft_tokens_cpu``.
+        """
+        return self.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+            for_cudagraph_capture=True,
+        )
+
+    def _get_dcp_pseudo_prefill_wrapper(
+        self,
+        cudagraph_batch_size: int | None = None,
+    ) -> BatchDCPPseudoPrefillWrapper:
+        if cudagraph_batch_size is None:
+            if self._dcp_pseudo_prefill_wrapper is None:
+                self._dcp_pseudo_prefill_wrapper = BatchDCPPseudoPrefillWrapper(
+                    kv_layout=get_flashinfer_layout_string(self.kv_cache_layout),
+                    workspace_buffer=self._get_workspace_buffer(),
+                    dcp_a2a=self.dcp_a2a,
+                )
+            return self._dcp_pseudo_prefill_wrapper
+
+        wrapper = self._dcp_pseudo_prefill_wrappers_cudagraph.get(cudagraph_batch_size)
+        if wrapper is None:
+            qo_indptr = self._dcp_prefill_qo_indptr_buffer
+            int_workspace = self._dcp_prefill_context_int_workspace
+            assert qo_indptr is not None
+            assert int_workspace is not None
+            wrapper = BatchDCPPseudoPrefillWrapper(
+                kv_layout=get_flashinfer_layout_string(self.kv_cache_layout),
+                workspace_buffer=self._get_workspace_buffer(),
+                dcp_a2a=self.dcp_a2a,
+                use_cuda_graph=True,
+                qo_indptr_buffer=qo_indptr[: cudagraph_batch_size + 1],
+                paged_kv_indptr_buffer=self.paged_kv_indptr.gpu[
+                    : cudagraph_batch_size + 1
+                ],
+                paged_kv_indices_buffer=self.paged_kv_indices.gpu,
+                paged_kv_last_page_len_buffer=self.paged_kv_last_page_len.gpu[
+                    :cudagraph_batch_size
+                ],
+                int_workspace_buffer=int_workspace,
+            )
+            self._dcp_pseudo_prefill_wrappers_cudagraph[cudagraph_batch_size] = wrapper
+        return wrapper
+
+    def _verify_dcp_prefill_cudagraph_wrapper_identity(
+        self,
+        batch_size: int,
+        wrapper: BatchDCPPrefillWrapper | BatchDCPPseudoPrefillWrapper,
+        *,
+        for_cudagraph_capture: bool,
+    ) -> None:
+        """Require capture and replay planning to target one wrapper object."""
+        if for_cudagraph_capture:
+            captured = self._dcp_prefill_captured_wrappers.setdefault(
+                batch_size, wrapper
+            )
+            if captured is not wrapper:
+                raise RuntimeError(
+                    "DCP prefill CUDA graph capture changed wrapper identity "
+                    f"for batch_size={batch_size}"
+                )
+            return
+
+        captured = self._dcp_prefill_captured_wrappers.get(batch_size)
+        if captured is None:
+            raise RuntimeError(
+                "DCP prefill CUDA graph runtime selected an uncaptured wrapper "
+                f"for batch_size={batch_size}"
+            )
+        if captured is not wrapper:
+            raise RuntimeError(
+                "DCP prefill CUDA graph capture/replay wrapper mismatch for "
+                f"batch_size={batch_size}"
+            )
+
+    def _select_captured_dcp_prefill_cudagraph_batch_size(
+        self,
+        batch_size: int | None,
+        *,
+        for_cudagraph_capture: bool,
+    ) -> int | None:
+        """Use graph storage only for a shape captured by this builder."""
+        if batch_size is None or for_cudagraph_capture:
+            return batch_size
+        if batch_size not in self._dcp_prefill_captured_wrappers:
+            return None
+        return batch_size
+
+    def trim_dynamic_cudagraph_wrappers(
+        self,
+        *,
+        keep_request_batch_sizes: frozenset[int],
+        keep_token_batch_sizes: frozenset[int],
+    ) -> int:
+        """Drop shape metadata after its dynamic Graph has been evicted.
+
+        FlashInfer wrappers are part of the address-stable CUDA Graph state,
+        even though the executable itself is owned by vLLM's graph manager.
+        Keeping one wrapper per shape after the executable is gone turns a
+        falling-X wave into monotonically growing allocator residency.  The
+        DCP prefill wrappers are keyed by request count, while tensor-core
+        decode wrappers are keyed by the physical token carrier passed to
+        ``_get_decode_wrapper``.  The caller supplies both domains for every
+        still-HOT graph across target and draft owners, so shared
+        target/MTP-prefill wrapper identity remains valid until the last
+        consumer is gone.
+        """
+        static_batch_sizes = self._static_cudagraph_batch_sizes
+        protected_request_batch_sizes = keep_request_batch_sizes | static_batch_sizes
+        protected_token_batch_sizes = keep_token_batch_sizes | static_batch_sizes
+        request_wrapper_maps = (
+            self._dcp_prefill_wrappers_cudagraph,
+            self._dcp_pseudo_prefill_wrappers_cudagraph,
+            self._dcp_prefill_captured_wrappers,
+        )
+        token_wrapper_maps = (self._decode_wrappers_cudagraph,)
+        removed_ids: set[int] = set()
+        for wrappers in request_wrapper_maps:
+            for batch_size in tuple(wrappers):
+                if batch_size in protected_request_batch_sizes:
+                    continue
+                removed_ids.add(id(wrappers.pop(batch_size)))
+        for wrappers in token_wrapper_maps:
+            for batch_size in tuple(wrappers):
+                if batch_size in protected_token_batch_sizes:
+                    continue
+                removed_ids.add(id(wrappers.pop(batch_size)))
+        for form_key in tuple(self._dcp_batched_decode_wrappers_cudagraph):
+            if form_key.physical_rows in protected_request_batch_sizes:
+                continue
+            wrapper = self._dcp_batched_decode_wrappers_cudagraph.pop(form_key)
+            wrapper.retire_graph_lease()
+            removed_ids.add(id(wrapper))
+        return len(removed_ids)
+
+    def _get_dcp_batched_decode_wrapper(
+        self,
+        *,
+        num_rows: int | None = None,
+        use_cudagraph: bool = False,
+    ) -> BatchDCPBatchedDecodeWrapper:
+        if self._dcp_batched_decode_workspace is None:
+            raise RuntimeError(
+                "batched DCP decode workspace was not charged before profiling"
+            )
+        if use_cudagraph:
+            if num_rows is None or num_rows < 1:
+                raise ValueError(
+                    "graph-aware batched DCP decode requires positive rows"
+                )
+            form_key = DCPBatchedGraphFormKey(
+                semantic_owner="mtp_decode",
+                physical_owner="dcp_batched_decode",
+                physical_rows=num_rows,
+                query_len=1,
+                dcp_world_size=self.dcp_world_size,
+                dcp_combine=(
+                    "a2a_lse_reduce" if self.dcp_a2a else "lse_reduce_scatter"
+                ),
+                num_qo_heads=self.num_qo_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                page_size=self.page_size,
+                q_dtype=str(self.q_data_type_prefill),
+                kv_dtype=str(self.kv_cache_dtype),
+                output_dtype=str(self.q_data_type_prefill),
+                backend="auto",
+                fixed_split_size=self._dcp_batched_fixed_split_size,
+                disable_split_kv=self._dcp_batched_disable_split_kv,
+                use_tensor_cores=True,
+                native_head_chunk_size=None,
+            )
+            wrapper = self._dcp_batched_decode_wrappers_cudagraph.get(form_key)
+            if wrapper is None:
+                wrapper = BatchDCPBatchedDecodeWrapper(
+                    kv_layout=get_flashinfer_layout_string(self.kv_cache_layout),
+                    workspace_buffer=self._dcp_batched_decode_workspace,
+                    fixed_split_size=self._dcp_batched_fixed_split_size,
+                    disable_split_kv=self._dcp_batched_disable_split_kv,
+                    dcp_a2a=self.dcp_a2a,
+                    use_cuda_graph=True,
+                    paged_kv_indptr_buffer=self.paged_kv_indptr.gpu[: num_rows + 1],
+                    # Empty rows consume one dummy entry, still within the
+                    # existing one-or-more-page-per-row block-table bound.
+                    paged_kv_indices_buffer=self.paged_kv_indices.gpu,
+                    paged_kv_last_page_len_buffer=self.paged_kv_last_page_len.gpu[
+                        :num_rows
+                    ],
+                    graph_form_key=form_key,
+                )
+                self._dcp_batched_decode_wrappers_cudagraph[form_key] = wrapper
+            return wrapper
+        if self._dcp_batched_decode_wrapper is None:
+            self._dcp_batched_decode_wrapper = BatchDCPBatchedDecodeWrapper(
+                kv_layout=get_flashinfer_layout_string(self.kv_cache_layout),
+                workspace_buffer=self._dcp_batched_decode_workspace,
+                fixed_split_size=self._dcp_batched_fixed_split_size,
+                disable_split_kv=self._dcp_batched_disable_split_kv,
+                dcp_a2a=self.dcp_a2a,
+            )
+        return self._dcp_batched_decode_wrapper
+
+    def _get_dcp_sequential_decode_wrapper(
+        self,
+    ) -> BatchDCPSequentialDecodeWrapper:
+        if self._dcp_sequential_decode_wrapper is None:
+            self._dcp_sequential_decode_wrapper = BatchDCPSequentialDecodeWrapper(
+                kv_layout=get_flashinfer_layout_string(self.kv_cache_layout),
+                workspace_buffer=self._get_workspace_buffer(),
+                num_phases=self._dcp_pseudo_decode_query_len,
+                fixed_split_size=self._dcp_sequential_fixed_split_size,
+                dcp_a2a=self.dcp_a2a,
+            )
+        return self._dcp_sequential_decode_wrapper
+
     def _get_decode_wrapper(self, batch_size: int, use_cudagraph: bool = False):
         if use_cudagraph:
             decode_wrapper = self._decode_wrappers_cudagraph.get(batch_size, None)
@@ -1189,7 +4864,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if decode_wrapper is None:
             if use_cudagraph:
                 paged_kv_indptr = self.paged_kv_indptr.gpu[: batch_size + 1]
-                paged_kv_indices = self.paged_kv_indices
+                paged_kv_indices = self.paged_kv_indices.gpu
                 paged_kv_last_page_len = self.paged_kv_last_page_len.gpu[:batch_size]
             else:
                 paged_kv_indptr = None
@@ -1229,6 +4904,145 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             )
         return self._cascade_wrapper
 
+    def _is_uniform_dcp_target_decode(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> bool:
+        if (
+            not self.use_dcp
+            or common_prefix_len != 0
+            or common_attn_metadata.causal is not True
+        ):
+            return False
+
+        query_lens = (
+            common_attn_metadata.query_start_loc_cpu[1:]
+            - common_attn_metadata.query_start_loc_cpu[:-1]
+        )
+        if query_lens.numel() == 0 or bool(torch.any(query_lens < 0)):
+            return False
+        active_rows = query_lens != 0
+        if not bool(torch.any(active_rows)) or bool(
+            torch.any(query_lens[active_rows] != self._dcp_pseudo_decode_query_len)
+        ):
+            return False
+        # An unpadded call has one fixed-width span per request.  A FULL graph
+        # tail keeps that same physical carrier while one or more spans become
+        # zero; both must retain the captured pseudo-decode dispatch family.
+        if (
+            common_attn_metadata.num_actual_tokens
+            != query_lens.numel() * self._dcp_pseudo_decode_query_len
+        ):
+            return False
+
+        is_prefilling = common_attn_metadata.is_prefilling
+        if is_prefilling is None:
+            return False
+        if isinstance(is_prefilling, torch.Tensor):
+            if bool(torch.any(is_prefilling[: query_lens.numel()][active_rows]).item()):
+                return False
+        elif bool(
+            np.any(np.asarray(is_prefilling)[: query_lens.numel()][active_rows.numpy()])
+        ):
+            return False
+
+        return True
+
+    def _should_match_fp8_new_tokens(
+        self,
+        *,
+        causal: bool,
+        num_prefills: int,
+        use_dcp_pseudo_decode: bool,
+        uniform_target_decode: bool,
+    ) -> bool:
+        if self._dcp_match_fp8_new_tokens and uniform_target_decode:
+            return True
+        return (
+            self._dcp_prefill_match_fp8_new_tokens
+            and self.use_dcp
+            and causal
+            and num_prefills > 0
+            and not use_dcp_pseudo_decode
+        )
+
+    def _can_use_dcp_pseudo_decode(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> bool:
+        if not self._dcp_special_decode_enabled or not (
+            self._is_uniform_dcp_target_decode(
+                common_prefix_len,
+                common_attn_metadata,
+            )
+        ):
+            return False
+        if common_attn_metadata.num_actual_tokens > self._dcp_pseudo_decode_max_rows:
+            raise ValueError(
+                "DCP pseudo-decode row capacity is too small: "
+                f"{common_attn_metadata.num_actual_tokens=} > "
+                f"{self._dcp_pseudo_decode_max_rows=}."
+            )
+        return True
+
+    def _prepare_dcp_pseudo_decode(
+        self,
+        seq_lens_cpu: torch.Tensor,
+        qo_indptr_cpu: torch.Tensor,
+        block_table_tensor: torch.Tensor,
+        *,
+        padded_num_rows: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        row_to_req_cpu, local_row_lens_cpu = _dcp_pseudo_decode_rows(
+            seq_lens_cpu,
+            qo_indptr_cpu,
+            self.dcp_world_size,
+            self.dcp_rank,
+            self.dcp_kv_cache_interleave_size,
+            padded_num_rows,
+        )
+        if self._dcp_sequential_decode_enabled:
+            num_rows = row_to_req_cpu.numel()
+            if num_rows % self._dcp_pseudo_decode_query_len:
+                raise ValueError(
+                    f"sequential DCP row count {num_rows} is not divisible by "
+                    f"{self._dcp_pseudo_decode_query_len}"
+                )
+            num_requests = num_rows // self._dcp_pseudo_decode_query_len
+            phase_major_order = (
+                torch.arange(num_rows)
+                .view(num_requests, self._dcp_pseudo_decode_query_len)
+                .transpose(0, 1)
+                .reshape(-1)
+            )
+            row_to_req_cpu = row_to_req_cpu[phase_major_order]
+            local_row_lens_cpu = local_row_lens_cpu[phase_major_order]
+        num_rows = row_to_req_cpu.numel()
+        block_table_width = block_table_tensor.shape[1]
+        pseudo_block_tables = self._dcp_pseudo_decode_block_tables
+        pseudo_row_to_req = self._dcp_pseudo_decode_row_to_req
+        assert pseudo_block_tables is not None
+        assert pseudo_row_to_req is not None
+        if block_table_width > pseudo_block_tables.shape[1]:
+            raise ValueError(
+                "DCP pseudo-decode block-table capacity is too small: "
+                f"{block_table_width=} > "
+                f"{pseudo_block_tables.shape[1]=}."
+            )
+
+        row_to_req = pseudo_row_to_req[:num_rows]
+        row_to_req.copy_(row_to_req_cpu, non_blocking=True)
+        selected_block_tables = pseudo_block_tables[:num_rows, :block_table_width]
+        torch.index_select(
+            block_table_tensor,
+            0,
+            row_to_req,
+            out=selected_block_tables,
+        )
+        return selected_block_tables, local_row_lens_cpu
+
     def _compute_flashinfer_kv_metadata(
         self,
         num_blocks_np: np.ndarray,
@@ -1246,6 +5060,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         Returns paged_kv_indices, a GPU tensor with shape [num_actual_pages].
         """
+        max_num_blocks = int(num_blocks_np.max(initial=0))
+        if max_num_blocks > block_table_tensor.shape[1]:
+            raise ValueError(
+                "FlashInfer paged-KV metadata requires more pages than the "
+                "block table provides: "
+                f"max_num_blocks={max_num_blocks}, "
+                f"block_table_width={block_table_tensor.shape[1]}, "
+                f"page_size={page_size}, num_reqs={num_reqs}."
+            )
         # write self.paged_kv_indptr_cpu inplace (0-index is always 0)
         np.cumsum(
             num_blocks_np,
@@ -1260,7 +5083,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         # write self.paged_kv_indices inplace
         num_actual_pages = self.paged_kv_indptr.np[num_reqs]
-        paged_kv_indices = self.paged_kv_indices[:num_actual_pages]
+        paged_kv_indices = self.paged_kv_indices.gpu[:num_actual_pages]
         _copy_page_indices_kernel[(num_reqs,)](
             paged_kv_indices,
             block_table_tensor,
@@ -1289,22 +5112,72 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
+        *,
+        for_cudagraph_capture: bool = False,
     ) -> FlashInferMetadata:
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         causal = common_attn_metadata.causal
         route_decode = causal or self.use_dedicated_xqa
         if route_decode:
-            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-                split_decodes_and_prefills(
-                    common_attn_metadata,
-                    decode_threshold=self.reorder_batch_threshold,
-                    require_uniform=not self.use_dedicated_xqa,
-                )
+            generic_split = split_decodes_and_prefills(
+                common_attn_metadata,
+                decode_threshold=self.reorder_batch_threshold,
+                require_uniform=not self.use_dedicated_xqa,
             )
         else:
+            generic_split = (0, num_reqs, 0, num_actual_tokens)
+        use_dcp_pseudo_decode = self._can_use_dcp_pseudo_decode(
+            common_prefix_len,
+            common_attn_metadata,
+        )
+        uniform_target_decode = self._is_uniform_dcp_target_decode(
+            common_prefix_len,
+            common_attn_metadata,
+        )
+        if not route_decode:
             num_decodes = 0
             num_prefills = num_reqs
+            num_decode_tokens = 0
+            num_prefill_tokens = num_actual_tokens
+            generic_split = (
+                num_decodes,
+                num_prefills,
+                num_decode_tokens,
+                num_prefill_tokens,
+            )
+            semantic_split = generic_split
+        semantic_split, canonical_paged_start_req, use_cascade = (
+            _ag2_resolve_canonical_prefill_route(
+                common_attn_metadata=common_attn_metadata,
+                generic_split=generic_split,
+                common_prefix_len=common_prefix_len,
+                enabled=(
+                    self._dcp_canonical_paged_prefill
+                    or self._dcp_absolute_segment_prefill
+                ),
+                causal=bool(causal),
+                use_dcp=self.use_dcp,
+                use_dcp_pseudo_decode=use_dcp_pseudo_decode,
+            )
+        )
+        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+            semantic_split
+        )
+        canonical_paged_prefill = canonical_paged_start_req is not None
+        match_fp8_new_tokens = self._should_match_fp8_new_tokens(
+            causal=causal,
+            num_prefills=num_prefills,
+            use_dcp_pseudo_decode=use_dcp_pseudo_decode,
+            uniform_target_decode=uniform_target_decode,
+        )
+        if use_dcp_pseudo_decode:
+            # Every flattened verification token becomes an independent
+            # single-query paged-prefill row. The output remains in the
+            # original flattened token order, so no permutation is required.
+            num_reqs = num_actual_tokens
+            num_decodes = 0
+            num_prefills = num_actual_tokens
             num_decode_tokens = 0
             num_prefill_tokens = num_actual_tokens
 
@@ -1314,29 +5187,115 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         block_table_tensor = common_attn_metadata.block_table_tensor
         qo_indptr = common_attn_metadata.query_start_loc
         qo_indptr_cpu = common_attn_metadata.query_start_loc_cpu
+        pseudo_seq_lens_cpu: torch.Tensor | None = None
+        if use_dcp_pseudo_decode:
+            original_seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+            (
+                block_table_tensor,
+                pseudo_seq_lens_cpu,
+            ) = self._prepare_dcp_pseudo_decode(
+                original_seq_lens_cpu,
+                qo_indptr_cpu,
+                block_table_tensor,
+                padded_num_rows=num_actual_tokens,
+            )
+            qo_indptr_cpu = torch.arange(
+                num_actual_tokens + 1,
+                dtype=torch.int32,
+                device="cpu",
+            )
+
+        # A captured DCP qlen>1 prefill graph can retain its physical carrier
+        # after one or more requests finish.  Only that dispatch consumes the
+        # ragged qo_indptr as the authoritative query-row count.  Native decode
+        # deliberately keeps its padded physical token count (for example,
+        # eleven live qlen1 requests replaying an M12 graph), so applying this
+        # conversion globally corrupts its request/token split.
+        semantic_prefill_graph = (
+            self._dcp_prefill_cudagraph_batch_size(
+                common_attn_metadata,
+                num_decodes,
+                num_prefills,
+                for_cudagraph_capture=for_cudagraph_capture,
+            )
+            is not None
+        )
+        if semantic_prefill_graph:
+            (
+                attention_num_actual_tokens,
+                attention_num_decode_tokens,
+                attention_num_prefill_tokens,
+            ) = _semantic_attention_token_counts(
+                num_actual_tokens,
+                qo_indptr_cpu,
+                num_decodes,
+            )
+            num_decode_tokens = attention_num_decode_tokens
+            num_prefill_tokens = attention_num_prefill_tokens
+        else:
+            attention_num_actual_tokens = num_actual_tokens
 
         # Step 1: Decide which dispatch modes to use:
         # - Cascade attention (distinct mode)
         # - Prefill (FI native or TRTLLM)
         # - Decode (FI native, XQA, or trtllm-gen)
-        use_cascade = common_prefix_len > 0
+        if (
+            (self._dcp_canonical_paged_prefill or self._dcp_absolute_segment_prefill)
+            and causal
+            and self.use_dcp
+        ):
+            is_prefilling = common_attn_metadata.is_prefilling
+            has_actual_prefill = False
+            if is_prefilling is not None:
+                active_lifecycle = is_prefilling[: common_attn_metadata.num_reqs]
+                has_actual_prefill = (
+                    bool(torch.any(active_lifecycle).item())
+                    if isinstance(active_lifecycle, torch.Tensor)
+                    else bool(np.any(active_lifecycle))
+                )
+            if has_actual_prefill:
+                _ag2_record_canonical_route_provenance(
+                    common_attn_metadata=common_attn_metadata,
+                    common_prefix_len=common_prefix_len,
+                    generic_split=generic_split,
+                    semantic_split=semantic_split,
+                    canonical_paged_prefill=canonical_paged_prefill,
+                    canonical_mode=(
+                        "absolute_segment"
+                        if self._dcp_absolute_segment_prefill
+                        and canonical_paged_prefill
+                        else (
+                            "dense_paged"
+                            if self._dcp_canonical_paged_prefill
+                            and canonical_paged_prefill
+                            else "off"
+                        )
+                    ),
+                    canonical_paged_start_req=canonical_paged_start_req,
+                    use_cascade=use_cascade,
+                    dcp_rank=self.dcp_rank,
+                    for_cudagraph_capture=for_cudagraph_capture,
+                )
         uses_spec_reorder = self.reorder_batch_threshold > 1
         # Page sizes >= 128 must use trtllm-gen; force it for prefill too.
         prefill_force_trtllm = (
             True if page_size >= 128 else self.attention_config.use_trtllm_attention
         )
-        prefill_use_trtllm = causal and use_trtllm_attention(
-            self.num_qo_heads,
-            self.num_kv_heads,
-            num_prefill_tokens,
-            max_seq_len,
-            self.dcp_world_size,
-            self.cache_dtype,
-            self.q_data_type_prefill,
-            is_prefill=True,
-            force_use_trtllm=prefill_force_trtllm,
-            has_sinks=self.has_sinks,
-            has_spec=uses_spec_reorder,
+        prefill_use_trtllm = not use_dcp_pseudo_decode and (
+            causal
+            and use_trtllm_attention(
+                self.num_qo_heads,
+                self.num_kv_heads,
+                num_prefill_tokens,
+                max_seq_len,
+                self.dcp_world_size,
+                self.cache_dtype,
+                self.q_data_type_prefill,
+                is_prefill=True,
+                force_use_trtllm=prefill_force_trtllm,
+                has_sinks=self.has_sinks,
+                has_spec=uses_spec_reorder,
+            )
         )
         decode_with_flashinfer_trtllm_api = self.use_trtllm_decode_attention and (
             causal or self.use_dedicated_xqa
@@ -1383,7 +5342,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # Leave prefill/decode/cascade_wrapper empty, to be populated
         # case by case depending on the batch contents and backend selection.
         attn_metadata = FlashInferMetadata(
-            num_actual_tokens=num_actual_tokens,
+            num_actual_tokens=attention_num_actual_tokens,
             slot_mapping=common_attn_metadata.slot_mapping,
             q_data_type_prefill=self.q_data_type_prefill,
             q_data_type_decode=self.q_data_type_decode,
@@ -1407,33 +5366,33 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if needs_seq_lens_cpu:
             with gpu_sync_allowed():
                 seq_lens_cpu = common_attn_metadata.seq_lens_cpu
-            seq_lens_np = seq_lens_cpu.numpy()
-            num_blocks_np = (seq_lens_np + (page_size - 1)) // page_size
         else:
             seq_lens_cpu = None
+        if use_dcp_pseudo_decode:
+            assert pseudo_seq_lens_cpu is not None
+            seq_lens_cpu = pseudo_seq_lens_cpu
+            seq_lens_np = seq_lens_cpu.numpy()
+            num_blocks_np = (seq_lens_np + (page_size - 1)) // page_size
+        elif seq_lens_cpu is not None:
+            (
+                seq_lens_cpu,
+                seq_lens_np,
+                num_blocks_np,
+            ) = _flashinfer_seq_lens_and_blocks_for_paged_kv(
+                seq_lens_cpu,
+                qo_indptr_cpu,
+                num_decodes,
+                num_prefills,
+                page_size,
+                use_dcp=self.use_dcp,
+                dcp_world_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                dcp_kv_cache_interleave_size=self.dcp_kv_cache_interleave_size,
+                include_prefill_query_from=canonical_paged_start_req,
+            )
+        else:
             seq_lens_np = None
             num_blocks_np = None
-
-        # Adjust seq_lens_cpu for DCP
-        if self.use_dcp:
-            assert seq_lens_cpu is not None
-            if num_prefills > 0:
-                qo_indptr_prefill_cpu = (
-                    qo_indptr_cpu[num_decodes:] - qo_indptr_cpu[num_decodes]
-                )
-                query_lens_prefill_cpu = (
-                    qo_indptr_prefill_cpu[1:] - qo_indptr_prefill_cpu[:-1]
-                )
-                seq_lens_cpu[num_decodes:] = (
-                    seq_lens_cpu[num_decodes:] - query_lens_prefill_cpu
-                )
-
-            seq_lens_cpu = get_dcp_local_seq_lens(
-                seq_lens_cpu,
-                self.dcp_world_size,
-                self.dcp_rank,
-                self.dcp_kv_cache_interleave_size,
-            )
 
         # Adjust num_block_np for cascade attention
         if use_cascade:
@@ -1449,6 +5408,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         needs_native_paged_decode = (
             num_decodes > 0 and not decode_with_flashinfer_trtllm_api
         )
+        if self.use_dcp and needs_native_paged_decode:
+            assert seq_lens_np is not None
+            assert num_blocks_np is not None
+            seq_lens_np, num_blocks_np, _ = _physicalize_empty_dcp_decode_rows(
+                seq_lens_np,
+                num_blocks_np,
+                num_decodes,
+            )
         needs_paged_kv_indices = (
             use_cascade or needs_native_paged_prefill or needs_native_paged_decode
         )
@@ -1563,7 +5530,51 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     max_seq_len=max_seq_len,
                 )
             else:
-                prefill_wrapper = self._get_prefill_wrapper(causal=attn_metadata.causal)
+                dcp_prefill_cudagraph_batch_size = (
+                    self._dcp_prefill_cudagraph_batch_size(
+                        common_attn_metadata,
+                        num_decodes,
+                        num_prefills,
+                        for_cudagraph_capture=for_cudagraph_capture,
+                    )
+                )
+                dcp_prefill_cudagraph_batch_size = (
+                    self._select_captured_dcp_prefill_cudagraph_batch_size(
+                        dcp_prefill_cudagraph_batch_size,
+                        for_cudagraph_capture=for_cudagraph_capture,
+                    )
+                )
+                prefill_wrapper = (
+                    (
+                        self._get_dcp_batched_decode_wrapper(
+                            num_rows=num_actual_tokens,
+                            use_cudagraph=common_attn_metadata.full_cudagraph,
+                        )
+                        if self._dcp_batched_decode_enabled
+                        else (
+                            self._get_dcp_sequential_decode_wrapper()
+                            if self._dcp_sequential_decode_enabled
+                            else self._get_dcp_pseudo_prefill_wrapper(
+                                dcp_prefill_cudagraph_batch_size
+                            )
+                        )
+                    )
+                    if use_dcp_pseudo_decode
+                    else self._get_prefill_wrapper(
+                        causal=attn_metadata.causal,
+                        cudagraph_batch_size=dcp_prefill_cudagraph_batch_size,
+                    )
+                )
+                if dcp_prefill_cudagraph_batch_size is not None:
+                    assert isinstance(
+                        prefill_wrapper,
+                        BatchDCPPrefillWrapper | BatchDCPPseudoPrefillWrapper,
+                    )
+                    self._verify_dcp_prefill_cudagraph_wrapper_identity(
+                        dcp_prefill_cudagraph_batch_size,
+                        prefill_wrapper,
+                        for_cudagraph_capture=for_cudagraph_capture,
+                    )
                 # Slicing CPU buffers that are only needed for FI native prefills
                 paged_kv_last_page_len_prefill_cpu = self.paged_kv_last_page_len.cpu[
                     prefill_start:num_reqs
@@ -1588,21 +5599,35 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # deriving them via get_seq_lens() into unpinned memory when
                 # seq_lens is not passed; pass an explicit pinned copy of the
                 # same values so that copy stays async too.
-                kv_lens_prefill_cpu = get_seq_lens(
-                    paged_kv_indptr_prefill_cpu,
-                    paged_kv_last_page_len_prefill_cpu,
-                    page_size,
-                )
-                if PIN_MEMORY:
-                    kv_lens_prefill_cpu = kv_lens_prefill_cpu.pin_memory()
+                kv_lens_prefill_cpu = None
+                if not self.use_dcp or isinstance(
+                    prefill_wrapper, BatchDCPPrefillWrapper
+                ):
+                    kv_lens_prefill_cpu = get_seq_lens(
+                        paged_kv_indptr_prefill_cpu,
+                        paged_kv_last_page_len_prefill_cpu,
+                        page_size,
+                    )
+                    if PIN_MEMORY:
+                        kv_lens_prefill_cpu = kv_lens_prefill_cpu.pin_memory()
+                prefill_lens_kwargs: dict[str, Any] = {}
+                if isinstance(prefill_wrapper, BatchDCPPrefillWrapper):
+                    assert kv_lens_prefill_cpu is not None
+                    prefill_lens_kwargs["kv_lens_cpu"] = kv_lens_prefill_cpu
                 if self.use_dcp:
-                    assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
+                    assert isinstance(
+                        prefill_wrapper,
+                        BatchDCPPrefillWrapper
+                        | BatchDCPPseudoPrefillWrapper
+                        | BatchDCPBatchedDecodeWrapper
+                        | BatchDCPSequentialDecodeWrapper,
+                    )
                     prefill_wrapper.plan(
                         qo_indptr_cpu=qo_indptr_prefill_cpu,
                         paged_kv_indptr_cpu=paged_kv_indptr_prefill_cpu,
                         paged_kv_indices=paged_kv_indices,
                         paged_kv_last_page_len_cpu=paged_kv_last_page_len_prefill_cpu,
-                        kv_lens_cpu=kv_lens_prefill_cpu,
+                        **prefill_lens_kwargs,
                         page_size=self.page_size,
                         num_qo_heads=self.num_qo_heads,
                         dcp_world_size=self.dcp_world_size,
@@ -1614,7 +5639,38 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         q_data_type=self.q_data_type_prefill,
                         kv_cache_dtype=self.kv_cache_dtype,
                         prefill_fixed_split_size=self.prefill_fixed_split_size,
-                        disable_split_kv=self.disable_split_kv,
+                        disable_split_kv=self.prefill_disable_split_kv,
+                        **(
+                            {
+                                "canonical_paged": (self._dcp_canonical_paged_prefill),
+                                "absolute_segmented": (
+                                    self._dcp_absolute_segment_prefill
+                                ),
+                                "canonical_paged_start_req": (
+                                    canonical_paged_start_req - prefill_start
+                                ),
+                                "global_seq_lens_cpu": (
+                                    common_attn_metadata.seq_lens_cpu[
+                                        prefill_start:num_reqs
+                                    ]
+                                ),
+                                "num_prompt_tokens_cpu": (
+                                    common_attn_metadata.num_prompt_tokens_cpu[
+                                        prefill_start:num_reqs
+                                    ]
+                                    if common_attn_metadata.num_prompt_tokens_cpu
+                                    is not None
+                                    else None
+                                ),
+                                "dcp_rank": self.dcp_rank,
+                                "dcp_kv_cache_interleave_size": (
+                                    self.dcp_kv_cache_interleave_size
+                                ),
+                            }
+                            if canonical_paged_prefill
+                            and isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
+                            else {}
+                        ),
                     )
                 else:
                     assert isinstance(
@@ -1645,9 +5701,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         kv_data_type=self.kv_cache_dtype,
                         o_data_type=o_dtype,
                         fixed_split_size=self.prefill_fixed_split_size,
-                        disable_split_kv=self.disable_split_kv,
+                        disable_split_kv=self.prefill_disable_split_kv,
                     )
-                attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
+                attn_metadata.prefill = FIPrefill(
+                    wrapper=prefill_wrapper,
+                    match_fp8_new_tokens=match_fp8_new_tokens,
+                )
 
         ## DECODE PATHWAY
         if num_decodes > 0:
@@ -1703,11 +5762,27 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
             else:
                 assert seq_lens_cpu is not None
+                (
+                    decode_fixed_split_size,
+                    decode_disable_split_kv,
+                    force_non_graph_wrapper,
+                ) = _resolve_decode_split_plan(
+                    num_decode_tokens=num_decode_tokens,
+                    num_decodes=num_decodes,
+                    fixed_split_size=self.decode_fixed_split_size,
+                    disable_split_kv=self.decode_disable_split_kv,
+                    spec_target_only=self.decode_fixed_split_spec_target_only,
+                    qlen1_fixed_split_size=self.qlen1_fixed_split_size,
+                    qlen1_disable_split_kv=self.qlen1_disable_split_kv,
+                )
                 pure_decode = num_prefills == 0
-                use_cudagraph = (
-                    self.enable_cuda_graph
-                    and pure_decode
-                    and num_decode_tokens <= self._decode_cudagraph_max_bs
+                use_cudagraph = _use_decode_cudagraph_wrapper(
+                    backend_enabled=self.enable_cuda_graph,
+                    full_cudagraph=common_attn_metadata.full_cudagraph,
+                    pure_decode=pure_decode,
+                    num_decode_tokens=num_decode_tokens,
+                    max_cudagraph_tokens=self._decode_cudagraph_max_bs,
+                    force_non_graph_wrapper=force_non_graph_wrapper,
                 )
                 num_input_tokens = num_decode_tokens
 
@@ -1761,10 +5836,19 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     q_data_type=self.q_data_type_decode,
                     kv_data_type=self.kv_cache_dtype,
                     o_data_type=o_dtype,
-                    fixed_split_size=self.decode_fixed_split_size,
-                    disable_split_kv=self.disable_split_kv,
+                    fixed_split_size=decode_fixed_split_size,
+                    disable_split_kv=decode_disable_split_kv,
                 )
-                attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
+                if self.use_dcp:
+                    assert common_attn_metadata.dcp_local_seq_lens is not None
+                attn_metadata.decode = FIDecode(
+                    wrapper=decode_wrapper,
+                    dcp_local_seq_lens=(
+                        common_attn_metadata.dcp_local_seq_lens[:num_decodes]
+                        if self.use_dcp
+                        else None
+                    ),
+                )
         return attn_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
@@ -1917,8 +6001,12 @@ class FlashInferImpl(AttentionImpl):
     def get_xqa_bmm1_scale(self, layer: torch.nn.Module, q_data_type: torch.dtype):
         bmm1_scale = self.scale
         if is_quantized_kv_cache(self.kv_cache_dtype):
-            if q_data_type in (torch.float8_e4m3fn, torch.float8_e5m2):
-                bmm1_scale *= layer._q_scale_float
+            q_scale = get_query_scale_for_flashinfer(
+                layer._q_scale_float,
+                q_data_type,
+            )
+            if q_scale is not None:
+                bmm1_scale *= q_scale
             bmm1_scale *= layer._k_scale_float
         return bmm1_scale
 
@@ -1956,6 +6044,14 @@ class FlashInferImpl(AttentionImpl):
         output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        dcp_output_pack: torch.Tensor | None = None,
+        dcp_lse_pack: torch.Tensor | None = None,
+        dcp_kv_history_pack: torch.Tensor | None = None,
+        dcp_kv_history_meta: torch.Tensor | None = None,
+        dcp_kv_page_indices_pack: torch.Tensor | None = None,
+        dcp_observer_meta: torch.Tensor | None = None,
+        dcp_current_kv_pack: torch.Tensor | None = None,
+        dcp_scale_pack: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass with FlashInfer.
 
@@ -2145,28 +6241,55 @@ class FlashInferImpl(AttentionImpl):
                 prefill_wrapper = attn_metadata.prefill.wrapper
                 assert prefill_wrapper is not None
                 if use_dcp:
-                    assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
-                    assert prefill_wrapper._context._window_left == self.window_left
-                    assert prefill_wrapper._context._logits_soft_cap == (
-                        self.logits_soft_cap or 0.0
-                    )
-                    assert prefill_wrapper._context._sm_scale == self.scale
-                    assert not prefill_wrapper._context._causal
-                    assert prefill_wrapper._new_tokens._window_left == self.window_left
-                    assert prefill_wrapper._new_tokens._logits_soft_cap == (
-                        self.logits_soft_cap or 0.0
-                    )
-                    assert prefill_wrapper._new_tokens._sm_scale == self.scale
-                    assert prefill_wrapper._new_tokens._causal
+                    if isinstance(
+                        prefill_wrapper,
+                        BatchDCPBatchedDecodeWrapper | BatchDCPSequentialDecodeWrapper,
+                    ):
+                        prefill_wrapper.run(
+                            layer,
+                            prefill_query,
+                            kv_cache_tuple,
+                            out=output[num_decode_tokens:],
+                        )
+                    elif isinstance(prefill_wrapper, BatchDCPPseudoPrefillWrapper):
+                        prefill_wrapper.assert_plan_contract(
+                            window_left=self.window_left,
+                            logits_soft_cap=self.logits_soft_cap or 0.0,
+                            sm_scale=self.scale,
+                        )
+                        prefill_wrapper.run(
+                            layer,
+                            prefill_query,
+                            kv_cache_tuple,
+                            out=output[num_decode_tokens:],
+                        )
+                    else:
+                        assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
+                        prefill_wrapper.assert_plan_contract(
+                            window_left=self.window_left,
+                            logits_soft_cap=self.logits_soft_cap or 0.0,
+                            sm_scale=self.scale,
+                        )
 
-                    prefill_wrapper.run(
-                        layer,
-                        prefill_query,
-                        kv_cache_tuple,
-                        key[num_decode_tokens:],
-                        value[num_decode_tokens:],
-                        out=output[num_decode_tokens:],
-                    )
+                        prefill_wrapper.run(
+                            layer,
+                            prefill_query,
+                            kv_cache_tuple,
+                            key[num_decode_tokens:],
+                            value[num_decode_tokens:],
+                            out=output[num_decode_tokens:],
+                            dcp_output_pack=dcp_output_pack,
+                            dcp_lse_pack=dcp_lse_pack,
+                            dcp_kv_history_pack=dcp_kv_history_pack,
+                            dcp_kv_history_meta=dcp_kv_history_meta,
+                            dcp_kv_page_indices_pack=dcp_kv_page_indices_pack,
+                            dcp_observer_meta=dcp_observer_meta,
+                            dcp_current_kv_pack=dcp_current_kv_pack,
+                            dcp_scale_pack=dcp_scale_pack,
+                            match_fp8_new_tokens=(
+                                attn_metadata.prefill.match_fp8_new_tokens
+                            ),
+                        )
                 else:
                     assert isinstance(
                         prefill_wrapper, BatchPrefillWithPagedKVCacheWrapper
@@ -2213,7 +6336,10 @@ class FlashInferImpl(AttentionImpl):
                         prefill_wrapper.run(
                             prefill_query,
                             kv_cache_for_fi,
-                            q_scale=layer._q_scale_float,
+                            q_scale=get_query_scale_for_flashinfer(
+                                layer._q_scale_float,
+                                prefill_query.dtype,
+                            ),
                             k_scale=layer._k_scale_float,
                             v_scale=layer._v_scale_float,
                             out=out_prefill,
@@ -2336,6 +6462,12 @@ class FlashInferImpl(AttentionImpl):
         if num_decode_tokens > 0:
             decode_query = query[:num_decode_tokens]
             assert decode_query.shape[0] == num_decode_tokens
+            if num_decode_tokens % attn_metadata.num_decodes != 0:
+                raise RuntimeError(
+                    "FlashInfer decode tokens must divide evenly across requests: "
+                    f"{num_decode_tokens=} {attn_metadata.num_decodes=}"
+                )
+            decode_query_len_per_req = num_decode_tokens // attn_metadata.num_decodes
 
             # Convert query to the expected dtype for decode if needed.
             decode_query = self.maybe_quant_query(
@@ -2367,6 +6499,39 @@ class FlashInferImpl(AttentionImpl):
                     out_decode = output[:num_decode_tokens]
 
                 if use_dcp:
+                    dcp_local_seq_lens = attn_metadata.decode.dcp_local_seq_lens
+                    assert dcp_local_seq_lens is not None
+                    _write_ag2_dcp_kv_history_pack(
+                        layer,
+                        kv_cache_tuple,
+                        attn_metadata.decode,
+                        get_flashinfer_layout_string(self.kv_cache_layout),
+                        dcp_kv_history_pack,
+                        dcp_kv_history_meta,
+                        dcp_kv_page_indices_pack,
+                        dcp_observer_meta,
+                        request_count=attn_metadata.num_decodes,
+                        request_row_stride=decode_query_len_per_req,
+                    )
+                    decode_request_rows = torch.arange(
+                        0,
+                        num_decode_tokens,
+                        decode_query_len_per_req,
+                        dtype=torch.long,
+                        device=key.device,
+                    )
+                    _write_ag2_dcp_current_kv_and_scales(
+                        layer,
+                        key,
+                        value,
+                        request_indices=decode_request_rows,
+                        request_count=attn_metadata.num_decodes,
+                        current_kv_pack=dcp_current_kv_pack,
+                        scale_pack=dcp_scale_pack,
+                        observer_meta=dcp_observer_meta,
+                        match_fp8_new_tokens=False,
+                        sm_scale=self.scale,
+                    )
                     decode_query = get_dcp_group().all_gather(
                         decode_query.contiguous(), dim=-2
                     )
@@ -2379,7 +6544,10 @@ class FlashInferImpl(AttentionImpl):
                     decode_wrapper.run(
                         decode_query,
                         kv_cache_for_fi,
-                        q_scale=layer._q_scale_float,
+                        q_scale=get_query_scale_for_flashinfer(
+                            layer._q_scale_float,
+                            decode_query.dtype,
+                        ),
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
                         out=output_tmp,
@@ -2388,16 +6556,106 @@ class FlashInferImpl(AttentionImpl):
                         kv_cache_sf=kv_cache_sf,
                         sinks=self.sinks,
                     )
-                    output[:num_decode_tokens] = self.dcp_combine(
+                    _copy_ag2_dcp_trace(layer, "decode_local_output", output_tmp)
+                    _copy_ag2_dcp_trace(layer, "decode_local_lse", lse)
+                    _write_ag2_dcp_aux_pack(
+                        layer,
+                        "local_output",
                         output_tmp,
-                        lse,
-                        get_dcp_group(),
+                        dcp_output_pack,
+                        dcp_lse_pack,
+                        request_tail_count=attn_metadata.num_decodes,
+                        request_row_stride=decode_query_len_per_req,
+                        dcp_observer_meta=dcp_observer_meta,
                     )
+                    _write_ag2_dcp_aux_pack(
+                        layer,
+                        "local_lse",
+                        lse,
+                        dcp_output_pack,
+                        dcp_lse_pack,
+                        request_tail_count=attn_metadata.num_decodes,
+                        request_row_stride=decode_query_len_per_req,
+                        dcp_observer_meta=dcp_observer_meta,
+                    )
+                    if getattr(layer, "_ag2_dcp_trace_enabled", False):
+                        combined_output, combined_lse = self.dcp_combine(
+                            output_tmp,
+                            lse,
+                            get_dcp_group(),
+                            return_lse=True,
+                            seq_lens=dcp_local_seq_lens,
+                        )
+                        _copy_ag2_dcp_trace(
+                            layer, "decode_combined_output", combined_output
+                        )
+                        _copy_ag2_dcp_trace(layer, "decode_combined_lse", combined_lse)
+                        _write_ag2_dcp_aux_pack(
+                            layer,
+                            "combined_output",
+                            combined_output,
+                            dcp_output_pack,
+                            dcp_lse_pack,
+                            request_tail_count=attn_metadata.num_decodes,
+                            request_row_stride=decode_query_len_per_req,
+                            dcp_observer_meta=dcp_observer_meta,
+                        )
+                        _write_ag2_dcp_aux_pack(
+                            layer,
+                            "combined_lse",
+                            combined_lse,
+                            dcp_output_pack,
+                            dcp_lse_pack,
+                            request_tail_count=attn_metadata.num_decodes,
+                            request_row_stride=decode_query_len_per_req,
+                            dcp_observer_meta=dcp_observer_meta,
+                        )
+                        output[:num_decode_tokens] = combined_output
+                    else:
+                        if dcp_output_pack is not None:
+                            combined_output, combined_lse = self.dcp_combine(
+                                output_tmp,
+                                lse,
+                                get_dcp_group(),
+                                return_lse=True,
+                                seq_lens=dcp_local_seq_lens,
+                            )
+                            _write_ag2_dcp_aux_pack(
+                                layer,
+                                "combined_output",
+                                combined_output,
+                                dcp_output_pack,
+                                dcp_lse_pack,
+                                request_tail_count=attn_metadata.num_decodes,
+                                request_row_stride=decode_query_len_per_req,
+                                dcp_observer_meta=dcp_observer_meta,
+                            )
+                            _write_ag2_dcp_aux_pack(
+                                layer,
+                                "combined_lse",
+                                combined_lse,
+                                dcp_output_pack,
+                                dcp_lse_pack,
+                                request_tail_count=attn_metadata.num_decodes,
+                                request_row_stride=decode_query_len_per_req,
+                                dcp_observer_meta=dcp_observer_meta,
+                            )
+                            output[:num_decode_tokens] = combined_output
+                        else:
+                            output[:num_decode_tokens] = self.dcp_combine(
+                                output_tmp,
+                                lse,
+                                get_dcp_group(),
+                                seq_lens=dcp_local_seq_lens,
+                            )
                 else:
                     decode_wrapper.run(
                         decode_query,
                         kv_cache_for_fi,
-                        q_scale=layer._q_scale_float,
+                        q_scale=get_query_scale_for_flashinfer(
+                            layer._q_scale_float,
+                            decode_query.dtype,
+                        ),
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
                         out=out_decode,
@@ -2562,11 +6820,89 @@ class FlashInferImpl(AttentionImpl):
                 if use_dcp:
                     assert isinstance(out, torch.Tensor)
                     assert lse is not None
-                    output[:num_decode_tokens] = self.dcp_combine(
+                    _copy_ag2_dcp_trace(layer, "decode_local_output", out)
+                    _copy_ag2_dcp_trace(layer, "decode_local_lse", lse)
+                    _write_ag2_dcp_aux_pack(
+                        layer,
+                        "local_output",
                         out,
-                        lse,
-                        get_dcp_group(),
+                        dcp_output_pack,
+                        dcp_lse_pack,
+                        request_tail_count=attn_metadata.num_decodes,
+                        request_row_stride=decode_query_len_per_req,
                     )
+                    _write_ag2_dcp_aux_pack(
+                        layer,
+                        "local_lse",
+                        lse,
+                        dcp_output_pack,
+                        dcp_lse_pack,
+                        request_tail_count=attn_metadata.num_decodes,
+                        request_row_stride=decode_query_len_per_req,
+                    )
+                    if getattr(layer, "_ag2_dcp_trace_enabled", False):
+                        combined_output, combined_lse = self.dcp_combine(
+                            out,
+                            lse,
+                            get_dcp_group(),
+                            return_lse=True,
+                        )
+                        _copy_ag2_dcp_trace(
+                            layer, "decode_combined_output", combined_output
+                        )
+                        _copy_ag2_dcp_trace(layer, "decode_combined_lse", combined_lse)
+                        _write_ag2_dcp_aux_pack(
+                            layer,
+                            "combined_output",
+                            combined_output,
+                            dcp_output_pack,
+                            dcp_lse_pack,
+                            request_tail_count=attn_metadata.num_decodes,
+                            request_row_stride=decode_query_len_per_req,
+                        )
+                        _write_ag2_dcp_aux_pack(
+                            layer,
+                            "combined_lse",
+                            combined_lse,
+                            dcp_output_pack,
+                            dcp_lse_pack,
+                            request_tail_count=attn_metadata.num_decodes,
+                            request_row_stride=decode_query_len_per_req,
+                        )
+                        output[:num_decode_tokens] = combined_output
+                    else:
+                        if dcp_output_pack is not None:
+                            combined_output, combined_lse = self.dcp_combine(
+                                out,
+                                lse,
+                                get_dcp_group(),
+                                return_lse=True,
+                            )
+                            _write_ag2_dcp_aux_pack(
+                                layer,
+                                "combined_output",
+                                combined_output,
+                                dcp_output_pack,
+                                dcp_lse_pack,
+                                request_tail_count=attn_metadata.num_decodes,
+                                request_row_stride=decode_query_len_per_req,
+                            )
+                            _write_ag2_dcp_aux_pack(
+                                layer,
+                                "combined_lse",
+                                combined_lse,
+                                dcp_output_pack,
+                                dcp_lse_pack,
+                                request_tail_count=attn_metadata.num_decodes,
+                                request_row_stride=decode_query_len_per_req,
+                            )
+                            output[:num_decode_tokens] = combined_output
+                        else:
+                            output[:num_decode_tokens] = self.dcp_combine(
+                                out,
+                                lse,
+                                get_dcp_group(),
+                            )
                 elif needs_fp8_out:
                     output[:num_decode_tokens].copy_(out)
         return output_padded

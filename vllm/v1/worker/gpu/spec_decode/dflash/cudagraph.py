@@ -86,6 +86,12 @@ class DFlashCudaGraphManager(CudaGraphManager):
         max_model_len: int,
         causal: bool | Mapping[int, bool],
         progress_bar_desc: str = "Capturing CUDA graphs",
+        capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]]
+        | None = None,
+        capture_complete_hook: Callable[
+            [BatchExecutionDescriptor, Callable[[CUDAGraphMode], None]], None
+        ]
+        | None = None,
     ) -> None:
         def create_forward_fn(
             desc: BatchExecutionDescriptor,
@@ -120,4 +126,9 @@ class DFlashCudaGraphManager(CudaGraphManager):
                 cg_mode,
             )
 
-        super().capture(create_forward_fn, progress_bar_desc)
+        super().capture(
+            create_forward_fn,
+            progress_bar_desc,
+            capture_descs=capture_descs,
+            capture_complete_hook=capture_complete_hook,
+        )

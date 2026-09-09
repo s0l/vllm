@@ -37,7 +37,7 @@ def test_mrv2_kv_pool_only_wraps_backing_allocation(monkeypatch) -> None:
     def bind(*args, **kwargs):
         assert not scope.active
 
-    monkeypatch.setattr(attn_utils, "allocate_kv_cache", allocate)
+    monkeypatch.setattr(attn_utils, "_allocate_kv_cache", allocate)
     monkeypatch.setattr(attn_utils, "bind_kv_cache", bind)
     monkeypatch.setattr(attn_utils, "get_shared_kv_cache_layers", lambda config: {})
 
@@ -49,7 +49,9 @@ def test_mrv2_kv_pool_only_wraps_backing_allocation(monkeypatch) -> None:
         [],
         {},
         SimpleNamespace(kv_cache_groups=[]),
+        [],
         torch.device("cpu"),
+        "auto",
         [],
         config,
         kv_cache_allocation_context=scope,

@@ -255,6 +255,76 @@ class TestLSEWeightedCombine:
         torch.testing.assert_close(masked_lse[1:5], torch.ones_like(masked_lse[1:5]))
         assert torch.isneginf(masked_lse[5:]).all()
 
+    @pytest.mark.parametrize(
+        ("max_native_rows", "num_rows", "expected_method"),
+        [
+            (0, 4, "chunked"),
+            (4, 4, "native"),
+            (4, 5, "chunked"),
+        ],
+    )
+    def test_ag_rs_selects_native_only_within_configured_row_limit(
+        self,
+        monkeypatch,
+        max_native_rows: int,
+        num_rows: int,
+        expected_method: str,
+    ):
+        import vllm.v1.attention.ops.dcp as dcp
+
+        class FakeGroup:
+            world_size = 2
+            rank_in_group = 0
+
+            def __init__(self):
+                self.called_method = None
+
+            def reduce_scatter(self, tensor, dim):
+                assert dim == 1
+                self.called_method = "native"
+                return tensor[:, :2]
+
+            def reduce_scatter_chunked(self, tensor, dim):
+                assert dim == 1
+                self.called_method = "chunked"
+                return tensor[:, :2]
+
+        monkeypatch.setenv("VLLM_DCP_NATIVE_RS_MAX_ROWS", str(max_native_rows))
+        monkeypatch.setattr(
+            dcp,
+            "_cp_lse_common",
+            lambda output, lse, *args, **kwargs: (output, lse),
+        )
+        group = FakeGroup()
+        output = torch.ones(num_rows, 4, 8)
+        lse = torch.ones(num_rows, 4)
+
+        actual = dcp.cp_lse_ag_out_rs(output, lse, group)
+
+        assert group.called_method == expected_method
+        assert actual.shape == (num_rows, 2, 8)
+
+    def test_ag_rs_rejects_negative_native_row_limit(self, monkeypatch):
+        import vllm.v1.attention.ops.dcp as dcp
+
+        class FakeGroup:
+            world_size = 2
+            rank_in_group = 0
+
+        monkeypatch.setenv("VLLM_DCP_NATIVE_RS_MAX_ROWS", "-1")
+        monkeypatch.setattr(
+            dcp,
+            "_cp_lse_common",
+            lambda output, lse, *args, **kwargs: (output, lse),
+        )
+
+        with pytest.raises(ValueError, match="must be non-negative"):
+            dcp.cp_lse_ag_out_rs(
+                torch.ones(1, 4, 8),
+                torch.ones(1, 4),
+                FakeGroup(),
+            )
+
     def test_mathematically_correct(self):
         """Verify mathematical correctness of LSE combination."""
         from vllm.v1.attention.ops.dcp import _lse_weighted_combine
@@ -603,3 +673,91 @@ def test_distributed_packed_a2a_with_workspace_matches_reference():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("world_size", [1, 3, 4])
+def test_correct_attn_warmup_retains_real_shard_count(world_size):
+    from vllm.v1.attention.ops.dcp import CorrectAttnCPOutKernel
+
+    kernel = CorrectAttnCPOutKernel()
+    key = kernel.dispatch(
+        output_dtype=torch.bfloat16,
+        lse_dtype=torch.float32,
+        num_tokens=4,
+        num_heads=4,
+        head_dim=128,
+        n_rounded=world_size,
+        lse_idx=0,
+        is_base_e=True,
+    )
+    assert key.n == world_size
+    assert key.n_rounded == 1 << (world_size - 1).bit_length()
+    assert kernel.warmup_inputs(key)["lses"].shape[0] == world_size
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernel control")
+@pytest.mark.parametrize("world_size", [1, 3, 4])
+@pytest.mark.parametrize("base_e", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_correct_attn_real_shards_graph_mutation_recovery(world_size, base_e, dtype):
+    """A partial Triton block must not read a fictitious fourth TP3 shard."""
+    from vllm.v1.attention.ops.dcp import CPTritonContext, correct_attn_out
+
+    generator = torch.Generator(device="cuda").manual_seed(4381)
+    original = torch.randn(4, 4, 128, device="cuda", dtype=dtype, generator=generator)
+    original_lses = torch.randn(world_size, 4, 4, device="cuda", generator=generator)
+    original_lses[:, 0, 0] = -float("inf")
+    original[0, 0] = float("nan")  # Undefined empty-shard output is neutral.
+    work = original.clone()
+    lses = original_lses.clone()
+    ctx = CPTritonContext()
+    factor = 1.0 if base_e else math.log(2.0)
+
+    def check(output, merged_lse, source, log_weights):
+        natural = log_weights.double() * factor
+        total = torch.logsumexp(natural, dim=0)
+        weight = torch.exp(natural[0] - total)
+        weight = torch.nan_to_num(weight, nan=0.0)
+        expected = torch.where(
+            weight[..., None] == 0,
+            0.0,
+            source.double() * weight[..., None],
+        ).to(dtype)
+        tolerance = 1e-5 if dtype == torch.float32 else 8e-3
+        torch.testing.assert_close(output, expected, atol=tolerance, rtol=tolerance)
+        torch.testing.assert_close(
+            merged_lse, (total / factor).float(), atol=1e-5, rtol=1e-5
+        )
+        assert torch.isfinite(output).all()
+
+    output, merged = correct_attn_out(work, lses, 0, ctx, base_e)
+    torch.accelerator.synchronize()
+    check(output, merged, original, original_lses)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        work.copy_(original)
+        correct_attn_out(work, lses, 0, ctx, base_e)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.accelerator.synchronize()
+    work.copy_(original)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output, graph_lse = correct_attn_out(work, lses, 0, ctx, base_e)
+    first = None
+    for mutation in (False, True, False):
+        source = original * (1.5 if mutation else 1.0)
+        log_weights = original_lses.clone()
+        if mutation:
+            log_weights[0, 1:, :] += 0.7
+        work.copy_(source)
+        lses.copy_(log_weights)
+        graph.replay()
+        torch.accelerator.synchronize()
+        check(graph_output, graph_lse, source, log_weights)
+        if first is None:
+            first = graph_output.clone()
+        elif mutation:
+            assert not torch.equal(first, graph_output)
+        else:
+            torch.testing.assert_close(graph_output, first, atol=0, rtol=0)
