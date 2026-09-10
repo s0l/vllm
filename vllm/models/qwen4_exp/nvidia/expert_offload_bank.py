@@ -368,6 +368,59 @@ def make_native_bank_consumer(bank, prefix):
     return layer
 
 
+class NativeMappedBankConsumer:
+    """Same CUTLASS MoE DAG with compact groups addressing leased bank rows.
+
+    Routing, publication and TP reduction belong to the provider/outer owner.
+    This consumer neither copies expert weights nor creates a model registry
+    entry. Its views are valid only for the bank geometry at construction.
+    """
+
+    def __init__(self, bank, expert_rows):
+        if bank.state != "READY" or expert_rows.shape != (bank.staging,):
+            raise RuntimeError("invalid mapped native consumer geometry")
+        self.bank, self.values, self.expert_rows = bank, bank.views, expert_rows
+
+    def __call__(self, hidden, weights, ids):
+        from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+        from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
+            run_cutlass_moe_fp4,
+        )
+
+        m, k = hidden.shape
+        n = self.bank.source.physical // self.bank.source.tp
+        values = self.values
+        output = torch.empty_like(hidden)
+        workspace13 = torch.empty(
+            (m, max(2 * n, k)), device=hidden.device, dtype=hidden.dtype
+        )
+        workspace2 = torch.empty((m, n), device=hidden.device, dtype=hidden.dtype)
+        run_cutlass_moe_fp4(
+            output=output,
+            a=hidden,
+            a1_gscale=values["a1_gscale"],
+            w1_fp4=values["w13_weight"],
+            w1_blockscale=values["w13_weight_scale"],
+            w1_alphas=values["w13_weight_scale_2"],
+            a2_gscale=values["a2_gscale"],
+            w2_fp4=values["w2_weight"],
+            w2_blockscale=values["w2_weight_scale"],
+            w2_alphas=values["w2_weight_scale_2"],
+            topk_weights=weights,
+            topk_ids=ids,
+            activation=MoEActivation.SILU,
+            workspace13=workspace13,
+            workspace2=workspace2,
+            m=m,
+            n=n,
+            k=k,
+            e=self.bank.staging,
+            device=hidden.device,
+            expert_rows=self.expert_rows,
+        )
+        return output
+
+
 class NativeBankCoordinator:
     """Rank-synchronous publication, with no CPU collective on HOT hits.
 

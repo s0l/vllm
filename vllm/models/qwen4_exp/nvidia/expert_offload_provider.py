@@ -15,7 +15,7 @@ from vllm.triton_utils import tl
 from vllm.triton_utils import triton as tr
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from .expert_offload_bank import NativeBankCoordinator, make_native_bank_consumer
+from .expert_offload_bank import NativeBankCoordinator, NativeMappedBankConsumer
 from .expert_offload_plan import plan
 
 
@@ -108,10 +108,18 @@ class NativeExpertProvider:
             max_tokens, self.topk, self.hidden, device=bank.device, dtype=torch.bfloat16
         )
         self.lane_ids = torch.empty(max_lanes, device=bank.device, dtype=torch.int64)
-        self.physical = torch.empty(max_lanes, 1, device=bank.device, dtype=torch.int32)
+        self.local_ids = torch.empty(
+            max_lanes, 1, device=bank.device, dtype=torch.int32
+        )
+        self.group_rows = torch.empty(
+            bank.staging, device=bank.device, dtype=torch.int32
+        )
         self.host_lanes = torch.empty(max_lanes, dtype=torch.int64, pin_memory=True)
-        self.host_physical = torch.empty(
+        self.host_local_ids = torch.empty(
             max_lanes, 1, dtype=torch.int32, pin_memory=True
+        )
+        self.host_group_rows = torch.empty(
+            bank.staging, dtype=torch.int32, pin_memory=True
         )
         self.expert_ids = torch.empty(
             bank.staging, device=bank.device, dtype=torch.int32
@@ -142,7 +150,8 @@ class NativeExpertProvider:
             self.x.zero_()
             self.weights.zero_()
             self.lane_ids.copy_(torch.arange(self.max_lanes, device=self.bank.device))
-            self.physical.zero_()
+            self.local_ids.zero_()
+            self.group_rows.zero_()
             _, graph = self._kernel(self.max_lanes)
             graph.replay()
             output.zero_()
@@ -157,13 +166,6 @@ class NativeExpertProvider:
             graph.reset()
             self.bank.graphs.discard(graph)
         self.kernels.clear()
-        if self.consumer is not None:
-            context = self.config.compilation_config
-            name = self.consumer.layer_name
-            if context.static_forward_context.get(name) is not self.consumer:
-                raise RuntimeError("native consumer ownership changed")
-            del context.static_forward_context[name]
-            context.static_all_moe_layers.remove(name)
         self.consumer = None
         self.consumer_rows = None
 
@@ -176,26 +178,17 @@ class NativeExpertProvider:
                 raise RuntimeError("native provider graphs require retirement")
             return self.kernels[bucket]
         if self.consumer is None:
-            self.consumer = make_native_bank_consumer(
-                self.bank, "flashnext_native_bank"
-            )
+            self.consumer = NativeMappedBankConsumer(self.bank, self.group_rows)
             self.consumer_rows = self.bank.rows
         consumer = self.consumer
-        lane_ids, physical = self.lane_ids[:bucket], self.physical[:bucket]
-        logits = torch.empty(1, self.bank.rows, device=self.bank.device).expand(
-            bucket, -1
-        )
-
-        def selected(*args, **kwargs):
-            weights = self.weights.flatten().index_select(0, lane_ids.clamp_min(0))
-            return (weights * (lane_ids >= 0)).unsqueeze(1), physical
+        lane_ids, local_ids = self.lane_ids[:bucket], self.local_ids[:bucket]
 
         def forward():
             compact = self.x.index_select(0, lane_ids.clamp_min(0) // self.topk)
-            y = consumer(compact, logits)
+            weights = self.weights.flatten().index_select(0, lane_ids.clamp_min(0))
+            y = consumer(compact, (weights * (lane_ids >= 0)).unsqueeze(1), local_ids)
             torch.ops.vllm.flashnext_native_scatter(y, lane_ids, self.lanes)
 
-        consumer.router.select_experts = selected
         with set_forward_context(None, self.config, num_tokens=bucket):
             compiled = torch.compile(forward, fullgraph=True)
             for _ in range(3):
@@ -206,9 +199,7 @@ class NativeExpertProvider:
                 compiled()
             self.bank.register_graph(graph)
 
-        # Direct control must restore this bucket's router closure too.
         def direct():
-            consumer.router.select_experts = selected
             with set_forward_context(None, self.config, num_tokens=bucket):
                 forward()
 
@@ -277,18 +268,27 @@ class NativeExpertProvider:
                     ticket = self.coordinator.stage(layer, demand)
                     lease = self.bank.acquire(ticket)
                     try:
+                        rows = np.asarray(ticket.routes, dtype=np.int32)
+                        if rows.shape != (len(wave.experts),) or np.any(
+                            (rows < 0) | (rows >= self.bank.rows)
+                        ):
+                            raise RuntimeError("invalid published native physical rows")
+                        self.host_group_rows.zero_()
+                        self.host_group_rows[: len(rows)].copy_(torch.from_numpy(rows))
+                        self.group_rows.copy_(self.host_group_rows, non_blocking=True)
                         for tile in wave.tiles(self.max_lanes):
                             size, bucket = len(tile.lanes), tile.bucket
                             host_lanes = self.host_lanes[:bucket]
-                            host_physical = self.host_physical[:bucket]
+                            host_local_ids = self.host_local_ids[:bucket]
                             host_lanes.fill_(-1)
-                            host_physical.zero_()
+                            host_local_ids.zero_()
                             host_lanes[:size].copy_(torch.from_numpy(tile.lanes.copy()))
-                            rows = np.asarray(ticket.routes, dtype=np.int32)[tile.slots]
-                            host_physical[:size, 0].copy_(torch.from_numpy(rows))
+                            host_local_ids[:size, 0].copy_(
+                                torch.from_numpy(tile.slots.copy())
+                            )
                             self.lane_ids[:bucket].copy_(host_lanes, non_blocking=True)
-                            self.physical[:bucket].copy_(
-                                host_physical, non_blocking=True
+                            self.local_ids[:bucket].copy_(
+                                host_local_ids, non_blocking=True
                             )
                             direct, graph = self._kernel(bucket)
                             if self.use_graphs:

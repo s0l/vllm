@@ -1043,6 +1043,7 @@ def cutlass_fp4_moe_mm(
     problem_sizes: torch.Tensor,
     expert_offsets: torch.Tensor,
     sf_offsets: torch.Tensor,
+    expert_rows: torch.Tensor | None = None,
 ):
     """
     An FP4 Blockscaled Group Gemm that takes in  a_tensors, b_tensors and runs
@@ -1060,6 +1061,20 @@ def cutlass_fp4_moe_mm(
     - problem_sizes: MxNxK sizes of each expert's multiplication in two grouped
                      MMs used in the fused MoE operation.
     """
+    if expert_rows is not None:
+        # Group metadata is compact; weights/scales remain in the global bank.
+        return torch.ops._C.cutlass_fp4_group_mm_mapped(
+            out_tensors,
+            a_tensors,
+            b_tensors,
+            a_scales,
+            b_scales,
+            alphas,
+            problem_sizes,
+            expert_offsets,
+            sf_offsets,
+            expert_rows,
+        )
     return torch.ops._C.cutlass_fp4_group_mm(
         out_tensors,
         a_tensors,
