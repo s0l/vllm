@@ -721,22 +721,10 @@ class Qwen4ExpForCausalLM(
     def get_gdn_mamba_state_shape_from_config(
         cls, vllm_config: VllmConfig
     ) -> tuple[tuple[int, int], tuple[int, int]]:
-        parallel_config = vllm_config.parallel_config
-        hf_config = vllm_config.model_config.hf_text_config
-        tp_size = parallel_config.tensor_parallel_size
-        num_spec = (
-            vllm_config.speculative_config.num_speculative_tokens
-            if vllm_config.speculative_config
-            else 0
-        )
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
-            tp_size,
-            hf_config.linear_num_key_heads,
-            hf_config.linear_num_value_heads,
-            hf_config.linear_key_head_dim,
-            hf_config.linear_value_head_dim,
-            hf_config.linear_conv_kernel_dim,
-            num_spec,
+        # Match the same non-interleaved GDN instance used by Qwen3.5,
+        # including padded non-uniform head ownership (16 K heads on TP3).
+        return Qwen3_5ForConditionalGeneration.get_mamba_state_shape_from_config(
+            vllm_config
         )
 
     @classmethod
