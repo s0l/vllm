@@ -174,17 +174,24 @@ def test_actual_separate_allocator_preserves_qsa_page_one_alias_and_side_state()
         assert k.data_ptr() == views[name].data_ptr()
         assert v.data_ptr() - k.data_ptr() == 256
         assert k.stride() == (1024, 1024, 512, 1)
-    # Independent dense owners must not alias each other or the side states.
-    addresses = [v.untyped_storage().data_ptr() for v in views.values()]
-    assert len(set(addresses)) == len(addresses)
+    # Equal-page groups overlay each lane but own distinct logical block IDs.
+    # The two lanes and two recurrent backings remain independent.
+    addresses = {
+        name: view.untyped_storage().data_ptr() for name, view in views.items()
+    }
+    assert addresses["main"] == addresses["raw"] == addresses["compressed"]
+    assert addresses["main2"] == addresses["raw2"] == addresses["compressed2"]
+    assert len(set(addresses.values())) == 4
     raw.bind_kv_cache(views["raw"])
     compressed.bind_kv_cache(views["compressed"])
     raw.key_cache[1, 3, 0].fill_(2)
     raw.rope_position_cache[1, 3, 0].copy_(torch.tensor([9, 4, 2]))
     assert torch.equal(views["raw"][1, 0, 3, :128], torch.full((128,), 2))
     assert raw.rope_position_cache[1, 3, 0].tolist() == [9, 4, 2]
-    assert views["main"].view(torch.uint8).count_nonzero() == 0
-    assert views["compressed"].count_nonzero() == 0
+    assert views["main"][[0, 2]].view(torch.uint8).count_nonzero() == 0
+    assert views["compressed"][[0, 3]].count_nonzero() == 0
+    assert views["main2"].view(torch.uint8).count_nonzero() == 0
+    assert raw.kv_cache_storage is compressed.kv_cache_storage
     assert raw.get_attn_backend().supported_kv_cache_layouts() == (KVCacheLayout.LBNHC,)
     assert KVCacheLayout.LBNHC not in QSAStateBackend.supported_kv_cache_layouts()
     assert QSAFlashInferBackend.supported_kv_cache_layouts() == (KVCacheLayout.LBNHC,)
