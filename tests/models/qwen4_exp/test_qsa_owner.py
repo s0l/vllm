@@ -41,6 +41,78 @@ def config():
     return cfg
 
 
+@pytest.mark.parametrize("tp", [1, 2, 3, 4, 6, 8])
+def test_engine_config_admits_qsa_sequence_ownership_without_relaxing_gqa(tp):
+    from vllm.config import ModelConfig
+
+    cfg = config()
+    cfg.parallel_config.tensor_parallel_size = tp
+    cfg.parallel_config.decode_context_parallel_size = tp
+    cfg.cache_config.cache_dtype = "fp8"
+    cfg.model_config.hf_text_config = SimpleNamespace(
+        model_type="qwen4_exp_text",
+        hidden_size=2560,
+        num_attention_heads=24,
+        num_key_value_heads=2,
+        head_dim=256,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+    )
+    cfg.model_config.model_arch_config = SimpleNamespace(
+        model_type="qwen4_exp_text", total_num_attention_heads=24
+    )
+    cfg.model_config.get_total_num_kv_heads = lambda: 2
+    cfg.model_config.use_mla = False
+    cfg.model_config.multimodal_config = None
+    assert cfg._uses_sequence_sharded_qsa()
+    ModelConfig.verify_with_parallel_config(
+        cfg.model_config, cfg.parallel_config, sequence_sharded_kv=True
+    )
+    if tp > 1:
+        with pytest.raises(ValueError, match="parallel"):
+            ModelConfig.verify_with_parallel_config(
+                cfg.model_config, cfg.parallel_config
+            )
+    cfg.additional_config.clear()
+    assert not cfg._uses_sequence_sharded_qsa()
+    cfg.additional_config["flashnext_qsa_dcp"] = True
+    cfg.model_config.hf_text_config.model_type = "other_model"
+    with pytest.raises(ValueError, match="FlashNext FP8 QSA"):
+        cfg._uses_sequence_sharded_qsa()
+    cfg.model_config.hf_text_config.model_type = "qwen4_exp_mtp"
+    assert cfg._uses_sequence_sharded_qsa()
+
+
+@pytest.mark.parametrize("invalid", ["dcp", "kv", "heads", "budget", "flag", "dbo"])
+def test_engine_qsa_sequence_ownership_rejects_invalid_profile(invalid):
+    cfg = config()
+    cfg.cache_config.cache_dtype = "fp8"
+    text = SimpleNamespace(
+        model_type="qwen4_exp_text",
+        hidden_size=2560,
+        num_attention_heads=24,
+        num_key_value_heads=2,
+        head_dim=256,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+    )
+    cfg.model_config.hf_text_config = text
+    if invalid == "dcp":
+        cfg.parallel_config.decode_context_parallel_size = 1
+    elif invalid == "kv":
+        cfg.cache_config.cache_dtype = "bfloat16"
+    elif invalid == "heads":
+        text.num_key_value_heads = 4
+    elif invalid == "budget":
+        text.indexer_budget = 1024
+    elif invalid == "flag":
+        cfg.additional_config["flashnext_qsa_dcp"] = "true"
+    elif invalid == "dbo":
+        cfg.parallel_config.enable_dbo = True
+    with pytest.raises(ValueError, match="FlashNext FP8 QSA"):
+        cfg._uses_sequence_sharded_qsa()
+
+
 def test_actual_separate_allocator_preserves_qsa_page_one_alias_and_side_state():
     from vllm.v1.core.kv_cache_utils import (
         get_kv_cache_config_from_groups,
