@@ -26,7 +26,7 @@ import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from copy import copy, deepcopy
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import numpy as np
 import torch
@@ -36,7 +36,7 @@ import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.config.compilation import CUDAGraphMode
+from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
@@ -353,7 +353,7 @@ def _elastic_mm_staging_fingerprint(staged: Any) -> str:
     staged_embeddings, _prepared_inputs = staged
     if staged_embeddings is None:
         encoder_outputs = _prepared_inputs.get("encoder_outputs", [])
-        payload = {
+        payload: dict[str, Any] = {
             "encoder_decoder_outputs": [
                 {"shape": list(tensor.shape), "dtype": str(tensor.dtype)}
                 for tensor in encoder_outputs
@@ -874,6 +874,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Finalize offloaded storage only after model weights and any
         # post-loading transformations are complete.
         get_offloader().post_init()
+        self._compile_loaded_models()
+
+    def _compile_loaded_models(self) -> None:
+        """Compile finalized modules without replacing shared owners or hooks."""
+        compilation = self.vllm_config.compilation_config
+        if compilation.mode != CompilationMode.STOCK_TORCH_COMPILE:
+            return
+
+        from vllm.env_override import _apply_constrain_to_fx_strides_patch
+
+        _apply_constrain_to_fx_strides_patch()
+        backend = compilation.init_backend(self.vllm_config)
+        options = (
+            dict(compilation.inductor_compile_config) if backend == "inductor" else None
+        )
+        models = [self.model]
+        draft = self.get_draft_model()
+        if draft is not None and draft is not self.model:
+            models.append(draft)
+        for model in models:
+            model.compile(fullgraph=True, backend=backend, options=options)
+            compilation_counter.stock_torch_compile_count += 1
 
     def get_model(self) -> nn.Module:
         return self.model
@@ -1030,6 +1052,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             not is_profiling and self._prepared_attn_groups is not None
         )
         if reuse_prepared_attn:
+            assert self._prepared_attn_groups is not None
             if (
                 self._attn_config_signature(self.kv_cache_config)
                 != self._prepared_attn_config_signature
@@ -2065,6 +2088,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         grammar_output: GrammarOutput | None,
         slot_mappings_by_layer: dict[str, torch.Tensor] | None = None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        sampler_output: SamplerOutput | None
         global_input_batch = input_batch
         global_sample_hidden_states = hidden_states[input_batch.logits_indices]
         if self.speculator is not None and hasattr(
@@ -2098,6 +2122,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     sample_hidden_states
                 )
                 if grammar_output is not None:
+                    assert self.structured_outputs_worker is not None
                     self.structured_outputs_worker.apply_grammar_bitmask(
                         local_logits,
                         input_batch,
@@ -2106,6 +2131,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         vocab_start=vocab_start,
                     )
                 assert self.speculator is not None
+                assert self.rejection_sampler is not None
                 sampler_output = self.rejection_sampler.sample_sparse_target_topk(
                     local_logits,
                     vocab_start,
@@ -2132,7 +2158,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 grammar_output.grammar_bitmask,
             )
 
-        sampler_output: SamplerOutput | None
         if use_sparse_target_topk:
             pass
         elif input_batch.num_reqs == 0:
@@ -2289,7 +2314,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Graph managers have already removed future consumers. Complete the
         # last possible replay before dropping FlashInfer wrapper generations;
         # their native metadata addresses are embedded in captured kernels.
-        torch.cuda.synchronize(self.device)
+        torch.accelerator.synchronize(self.device)
         removed = sum(
             builder.trim_dynamic_cudagraph_wrappers(
                 keep_request_batch_sizes=keep_request_batch_sizes,
@@ -2302,7 +2327,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             free_before = torch.accelerator.get_memory_info()[0]
             gc.collect()
             torch.accelerator.empty_cache()
-            torch.cuda.synchronize(self.device)
+            torch.accelerator.synchronize(self.device)
             reclaimed = max(0, torch.accelerator.get_memory_info()[0] - free_before)
             logger.info(
                 "Dynamic FlashInfer CUDA Graph metadata trimmed: "
@@ -2442,12 +2467,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             raise RuntimeError(
                 "cannot clear cuBLAS workspaces while dynamic CUDA Graphs are HOT"
             )
-        torch.cuda.synchronize(self.device)
+        torch.accelerator.synchronize(self.device)
         free_before = torch.accelerator.get_memory_info()[0]
         torch._C._cuda_clearCublasWorkspaces()
         gc.collect()
         torch.accelerator.empty_cache()
-        torch.cuda.synchronize(self.device)
+        torch.accelerator.synchronize(self.device)
         # All classic cuBLAS workspaces were explicitly released.  Rebuild the
         # baseline from surviving allocations: a non-cuBLAS block may happen
         # to have the same requested size, while freed workspace addresses are
@@ -2587,8 +2612,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             transient_peak = max(
                 0,
-                torch.cuda.max_memory_reserved(self.device) - baseline_reserved,
-                baseline_driver_free - torch.cuda.mem_get_info(self.device)[0],
+                torch.accelerator.memory.max_memory_reserved(self.device)
+                - baseline_reserved,
+                baseline_driver_free
+                - torch.accelerator.memory.get_memory_info(self.device)[0],
             )
             mm_overlap_peak = getattr(self, "_elastic_step_mm_overlap_peak_bytes", 0)
             local_peak_external = max(
@@ -2620,9 +2647,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 or active_graph_bytes_before > 0
                 or dynamic_wave
             ):
-                allocated = torch.cuda.memory_allocated(self.device)
-                reserved = torch.cuda.memory_reserved(self.device)
-                driver_free, driver_total = torch.cuda.mem_get_info(self.device)
+                allocated = torch.accelerator.memory.memory_allocated(self.device)
+                reserved = torch.accelerator.memory.memory_reserved(self.device)
+                driver_free, driver_total = torch.accelerator.memory.get_memory_info(
+                    self.device
+                )
                 logger.warning(
                     "Elastic X0 physical memory receipt: floor_bytes=%d "
                     "evicted_graph_bytes=%d "
@@ -2698,7 +2727,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _begin_elastic_step_measurement(self) -> None:
         """Start the physical high-water window after KV has been shrunk."""
         self._elastic_step_measurement_active = True
-        torch.cuda.synchronize(self.device)
+        torch.accelerator.synchronize(self.device)
         if getattr(self, "_elastic_cublas_workspace_baseline", None) is None:
             # Capture the immutable startup floor before this step can create
             # CUDA Graph or cuBLAS workspaces.  Initializing this lazily in the
@@ -2706,19 +2735,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._elastic_cublas_workspace_baseline = (
                 self._elastic_cublas_workspace_addresses()
             )
-        self._elastic_step_baseline_reserved_bytes = torch.cuda.memory_reserved(
-            self.device
+        self._elastic_step_baseline_reserved_bytes = (
+            torch.accelerator.memory.memory_reserved(self.device)
         )
-        self._elastic_step_baseline_driver_free_bytes = torch.cuda.mem_get_info(
-            self.device
-        )[0]
+        self._elastic_step_baseline_driver_free_bytes = (
+            torch.accelerator.memory.get_memory_info(self.device)[0]
+        )
         working_set = self._dynamic_graph_working_set()
         self._elastic_step_baseline_external_bytes = (
             working_set.resident_bytes
             + self._measure_elastic_cublas_workspace_bytes()
             + getattr(self, "_elastic_retained_transition_floor_bytes", 0)
         )
-        torch.cuda.reset_peak_memory_stats(self.device)
+        torch.accelerator.memory.reset_peak_memory_stats(self.device)
 
     @staticmethod
     def _elastic_mm_overlap_peak(
@@ -2741,8 +2770,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             raise RuntimeError("MM activation loan has no active measurement window")
         observed = max(
             0,
-            torch.cuda.max_memory_reserved(self.device) - baseline_reserved,
-            baseline_driver_free - torch.cuda.mem_get_info(self.device)[0],
+            torch.accelerator.memory.max_memory_reserved(self.device)
+            - baseline_reserved,
+            baseline_driver_free
+            - torch.accelerator.memory.get_memory_info(self.device)[0],
         )
         overlap = self._elastic_mm_overlap_peak(baseline_external, observed)
         self._elastic_step_mm_overlap_peak_bytes = max(
@@ -2789,10 +2820,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # remain cached even after incompatible Graph owners are gone.
             # Trim only on a real downward transition; equal plateaus avoid
             # synchronization and allocator churn entirely.
-            torch.cuda.synchronize(self.device)
+            torch.accelerator.synchronize(self.device)
             gc.collect()
             torch.accelerator.empty_cache()
-            torch.cuda.synchronize(self.device)
+            torch.accelerator.synchronize(self.device)
         effective_external = self.elastic_kv_controller.apply_scheduler_step(
             transition,
             requested_external,
@@ -3033,7 +3064,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             else 0
                         ),
                         phase=execution_manifest_phase_from_step_key(
-                            scheduler_output.elastic_graph_step_key
+                            cast(
+                                tuple[int, int, int, int, int],
+                                scheduler_output.elastic_graph_step_key,
+                            )
                         ),
                         max_num_batched_tokens=self.max_num_tokens,
                     )
@@ -3504,7 +3538,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not dummy_run and self.observability_config.cudagraph_metrics:
             cudagraph_stats = make_cudagraph_stats(batch_desc, num_toks)
         graph_receipt = None
-        if _AG2_GRAPH_MODE_RECEIPT and not dummy_run and not is_synthetic_warmup:
+        if (
+            _AG2_GRAPH_MODE_RECEIPT
+            and not dummy_run
+            and not is_synthetic_warmup
+            and self.cudagraph_manager is not None
+        ):
             graph_receipt_key = (
                 self.cudagraph_manager.dynamic_graph_owner,
                 batch_desc.cg_mode.name,
@@ -3652,6 +3691,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     else None
                 )
                 if mm_finalize_after_encoder and elastic_plan is not None:
+                    assert staged_mm_encoder is not None
                     self.model_state.validate_staged_mm_encoder(
                         scheduler_output.scheduled_encoder_inputs,
                         staged_mm_encoder,
@@ -3820,12 +3860,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             )
                         elif mm_finalize_after_encoder:
                             assert working_set is not None
+                            assert elastic_plan is not None
+                            assert completed_encoder is not None
+
+                            def commit_encoder() -> tuple[()]:
+                                self.model_state.commit_staged_mm_encoder(
+                                    completed_encoder
+                                )
+                                return ()
+
                             _prepare_elastic_local_staging_with_consensus(
-                                lambda: (
-                                    self.model_state.commit_staged_mm_encoder(
-                                        completed_encoder
-                                    ),
-                                ),
+                                commit_encoder,
                                 elastic_plan,
                                 working_set,
                                 consensus_phase="post_mm_encoder_commit",

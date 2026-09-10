@@ -445,17 +445,29 @@ class BreakableCUDAGraphWrapper:
         get_offloader().sync_prev_onload()
 
         capture = BreakableCUDAGraphCapture(pool=self.graph_pool)
-        with capture:
-            output = self.runnable(*args, **kwargs)
-            # Join the offloader's copy stream while we still hold the last
-            # segment open, so the join is captured into the graph (otherwise
-            # we get an "unjoined stream" error on subsequent forwards).
-            get_offloader().join_after_forward()
-            # Convert output to a weak ref *inside* the capture context so the
-            # strong ref is dropped before the last segment closes, letting
-            # the cudagraph pool reclaim/reuse that memory immediately for
-            # the next batch descriptor's capture.
-            output = weak_ref_tensors(output)
+        try:
+            with capture:
+                output = self.runnable(*args, **kwargs)
+                # Join the offloader's copy stream while we still hold the last
+                # segment open, so the join is captured into the graph (otherwise
+                # we get an "unjoined stream" error on subsequent forwards).
+                get_offloader().join_after_forward()
+                # Convert output to a weak ref *inside* the capture context so the
+                # strong ref is dropped before the last segment closes, letting
+                # the cudagraph pool reclaim/reuse that memory immediately for
+                # the next batch descriptor's capture.
+                output = weak_ref_tensors(output)
+        except BaseException:
+            # No entry owns these segments yet. Release them before the caller
+            # measures reclamation; its exception traceback still owns `capture`.
+            capture.reset()
+            entry.input_addresses = None
+            entry.first_replay_addresses_validated = False
+            # Pool identity is published only on success. A caller's
+            # pool-filtered eviction cannot find this unpublished entry.
+            if self.entries.get(entry.batch_descriptor) is entry:
+                del self.entries[entry.batch_descriptor]
+            raise
 
         entry.capture = capture
         entry.output = weak_ref_tensors(output)

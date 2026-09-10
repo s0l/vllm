@@ -734,7 +734,9 @@ class VllmConfig:
         )
 
         enabled = is_breakable_cudagraph_enabled()
-        if enabled:
+        if enabled and (
+            self.compilation_config.mode != CompilationMode.STOCK_TORCH_COMPILE
+        ):
             self.compilation_config.mode = CompilationMode.NONE
         return enabled
 
@@ -2621,7 +2623,14 @@ class VllmConfig:
         model_config = self.model_config
         speculative_config = self.speculative_config
 
-        if self.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE:
+        from vllm.compilation.breakable_cudagraph import (
+            is_breakable_cudagraph_enabled,
+        )
+
+        if (
+            self.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE
+            and not is_breakable_cudagraph_enabled()
+        ):
             unsupported.append("stock torch.compile")
 
         if (

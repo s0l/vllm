@@ -5,7 +5,6 @@ import gc
 import hashlib
 import itertools
 import os
-import re
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -15,6 +14,7 @@ from enum import Enum
 from itertools import product
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
+import regex as re
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -557,7 +557,7 @@ class DynamicGraphWorkingSet:
                 manager._dynamic_retention_ledger = ledger
                 manager._owns_dynamic_retention_ledger = index == 0
 
-            capture_states = []
+            capture_states: list[DynamicGraphCaptureState] = []
             for manager in managers:
                 state = getattr(manager, "_dynamic_capture_state", None)
                 if state is None:
@@ -1453,10 +1453,10 @@ class DynamicGraphWorkingSet:
         if not self.managers:
             return 0
         device = self.managers[0].device
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
         gc.collect()
         torch.accelerator.empty_cache()
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
         return self.resident_bytes
 
     def evict_unpinned_for_idle(self, transaction_id: str) -> int:
@@ -1652,6 +1652,7 @@ class CudaGraphManager:
             "dynamic_cudagraph_pinned_sizes",
         }
         if self.defer_startup_graphs:
+            assert isinstance(additional_config, dict)
             configured_legacy_keys = sorted(
                 legacy_elastic_graph_keys.intersection(additional_config)
             )
@@ -1920,15 +1921,11 @@ class CudaGraphManager:
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
         self.max_capture_tokens = 0
 
-        # Breakable CUDA graph (PW CUDA graph without torch.compile)
+        # Breakable piecewise Graphs can wrap an explicitly compiled model.
         self.use_breakable_cg = (
             is_breakable_cudagraph_enabled()
             and self.cudagraph_mode.has_piecewise_cudagraphs()
         )
-        if self.has_dynamic_capture_candidates and self.use_breakable_cg:
-            raise ValueError(
-                "dynamic CUDA graph residency does not yet support breakable graphs"
-            )
         self.breakable_cg_runner: BreakableCUDAGraphWrapper | None = None
 
         self._init_candidates()
@@ -2016,6 +2013,13 @@ class CudaGraphManager:
                     in {"target", "mtp_prefill", "mtp_decode"}
                 ),
             )
+            if expected is None:
+                logger.warning(
+                    "Ignoring unreachable CUDA Graph recipe row for %s: %s",
+                    self.dynamic_graph_owner,
+                    row,
+                )
+                continue
             descriptor = BatchExecutionDescriptor(
                 cg_mode=mode,
                 num_tokens=row["num_tokens"],
@@ -3136,7 +3140,7 @@ class CudaGraphManager:
         """Route every graph-producing layer to one descriptor-private pool."""
         from vllm.compilation.cuda_graph import CUDAGraphWrapper
 
-        wrappers = [
+        wrappers: list[CUDAGraphWrapper | BreakableCUDAGraphWrapper] = [
             *list(CUDAGraphWrapper._all_instances),
             *list(BreakableCUDAGraphWrapper._all_instances),
         ]
@@ -3215,7 +3219,7 @@ class CudaGraphManager:
             administrative=administrative,
         )
         if entry.state == DynamicGraphResidency.HOT:
-            torch.cuda.synchronize(self.device)
+            torch.accelerator.synchronize(self.device)
         released_capture_state = entry.local_capture_state_bytes
         free_before = torch.accelerator.get_memory_info()[0]
         evicted = self._destroy_dynamic_graphs(entry)
@@ -3228,7 +3232,7 @@ class CudaGraphManager:
         self._trim_cuda_graph_memory()
         gc.collect()
         torch.accelerator.empty_cache()
-        torch.cuda.synchronize(self.device)
+        torch.accelerator.synchronize(self.device)
         local_reclaimed = max(0, torch.accelerator.get_memory_info()[0] - free_before)
         pool_reclaimed = torch.tensor(
             int(local_reclaimed + (1 << 20) >= entry.local_pool_bytes),
@@ -3344,7 +3348,7 @@ class CudaGraphManager:
             # invert the global communicator order across ranks.  Retention
             # changes only on maintenance/capture/eviction, so establish the
             # consumer-complete boundary here, off the steady HOT path.
-            torch.cuda.synchronize(self.device)
+            torch.accelerator.synchronize(self.device)
         retained = torch.tensor(
             ledger.local_bytes,
             dtype=torch.int64,
@@ -3380,7 +3384,7 @@ class CudaGraphManager:
         self._trim_cuda_graph_memory()
         gc.collect()
         torch.accelerator.empty_cache()
-        torch.cuda.synchronize(self.device)
+        torch.accelerator.synchronize(self.device)
         local_reclaimed = max(0, torch.accelerator.get_memory_info()[0] - free_before)
         pool_reclaimed = torch.tensor(
             int(local_reclaimed + (1 << 20) >= local_pool_charge),
@@ -3448,10 +3452,10 @@ class CudaGraphManager:
         # sufficient, yet admission falsely rejects a smaller recapture before
         # capture gets a chance to run.  Purge only free allocator segments;
         # live tensors and live graph pools remain allocated.
-        torch.cuda.synchronize(self.device)
+        torch.accelerator.synchronize(self.device)
         gc.collect()
         torch.accelerator.empty_cache()
-        torch.cuda.synchronize(self.device)
+        torch.accelerator.synchronize(self.device)
         local_free = torch.accelerator.get_memory_info()[0]
         free_tensor = torch.tensor(local_free, dtype=torch.int64, device=self.device)
         if self.tp_size > 1:
@@ -3621,7 +3625,7 @@ class CudaGraphManager:
                         desc,
                     )
                     forward_fn(CUDAGraphMode.NONE)
-                    torch.cuda.synchronize(self.device)
+                    torch.accelerator.synchronize(self.device)
                     logger.debug(
                         "CUDA Graph capture phase: owner=%s rank=%d "
                         "phase=warmup_forward_end descriptor=%s",
@@ -3716,7 +3720,7 @@ class CudaGraphManager:
                             # forks copy_stream, but wait_prefetch only happens in
                             # the next forward pass.
                             get_offloader().join_after_forward()
-                        torch.cuda.synchronize(self.device)
+                        torch.accelerator.synchronize(self.device)
                         logger.debug(
                             "CUDA Graph capture phase: owner=%s rank=%d "
                             "phase=capture_end descriptor=%s",
@@ -4095,7 +4099,7 @@ class CudaGraphManager:
         diagnose_p3_graph = self._p3_crash_diagnostic and desc.uniform_token_count == 3
         sync_p3_graph = self._p3_global_sync and desc.uniform_token_count == 3
         if sync_p3_graph:
-            torch.cuda.synchronize(self.device)
+            torch.accelerator.synchronize(self.device)
         if diagnose_p3_graph:
             logger.warning("P3 CUDA graph replay begin: desc=%s", desc)
         prefix_diagnostic = desc in self._p3_prefix_diagnostic_descs
@@ -4129,7 +4133,7 @@ class CudaGraphManager:
                         active_cutoff,
                     )
                     self.graphs[desc].replay()
-                    torch.cuda.synchronize(self.device)
+                    torch.accelerator.synchronize(self.device)
                     logger.warning(
                         "P3 CUDA graph progressive prefix passed: "
                         "desc=%s prefix_nodes=%d cutoff=%d",
@@ -4139,7 +4143,7 @@ class CudaGraphManager:
                     )
             else:
                 self.graphs[desc].replay()
-                torch.cuda.synchronize(self.device)
+                torch.accelerator.synchronize(self.device)
             raise RuntimeError(
                 "P3 CUDA graph prefix diagnostic completed without a CUDA "
                 "fault: "
@@ -4149,7 +4153,7 @@ class CudaGraphManager:
             )
         self.graphs[desc].replay()
         if sync_p3_graph:
-            torch.cuda.synchronize(self.device)
+            torch.accelerator.synchronize(self.device)
         if diagnose_p3_graph:
             logger.warning("P3 CUDA graph replay end: desc=%s", desc)
 
@@ -4205,6 +4209,9 @@ class CudaGraphManager:
 
 class ModelCudaGraphManager(CudaGraphManager):
     """CudaGraphManager with model-specific capture and hidden state management."""
+
+    _max_full_descs_to_capture: int
+    _capture_mem_samples: list[int]
 
     def __init__(
         self,
@@ -4626,6 +4633,11 @@ class ModelCudaGraphManager(CudaGraphManager):
 
         from vllm.compilation.cuda_graph import CUDAGraphWrapper
 
+        # The private-pool scope snapshots existing wrappers. A fresh manager
+        # must register its wrapper before that snapshot, including when this
+        # entrypoint is used by the drafter's capture override.
+        if self.use_breakable_cg:
+            self.init_breakable_cg_runner(model)
         runtime_desc = self._runtime_batch_descriptor(desc)
         entry.graph_pool = current_platform.graph_pool_handle()
         start_free: int | None = None
@@ -4645,10 +4657,10 @@ class ModelCudaGraphManager(CudaGraphManager):
             # Keep the first baseline across warmup + fresh preparation: the
             # end-to-end physical delta then includes every retained byte and
             # excludes disposable state that has died by publication.
-            torch.cuda.synchronize(self.device)
+            torch.accelerator.synchronize(self.device)
             gc.collect()
             torch.accelerator.empty_cache()
-            torch.cuda.synchronize(self.device)
+            torch.accelerator.synchronize(self.device)
             start_free = torch.accelerator.get_memory_info()[0]
 
         def retain_capture_state(
@@ -4684,12 +4696,12 @@ class ModelCudaGraphManager(CudaGraphManager):
                     )
                 else:
                     capture_override(capture_descs, retain_capture_state)
-                torch.cuda.synchronize(self.device)
+                torch.accelerator.synchronize(self.device)
         except Exception:
             self._destroy_dynamic_graphs(entry)
             gc.collect()
             torch.accelerator.empty_cache()
-            torch.cuda.synchronize(self.device)
+            torch.accelerator.synchronize(self.device)
             self._dynamic_pending = None
             self._dynamic_capture_granted_bytes = 0
             self._cooldown_dynamic_entry(entry)
@@ -4977,7 +4989,7 @@ def _trim_device_graph_memory(device: torch.device) -> None:
 
     device_index = device.index
     if device_index is None:
-        device_index = torch.cuda.current_device()
+        device_index = torch.accelerator.current_device_index()
     result = cuda_runtime.cudaDeviceGraphMemTrim(device_index)
     if int(result[0]) != 0:
         raise RuntimeError(

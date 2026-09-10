@@ -8,6 +8,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
@@ -66,6 +67,14 @@ def _resolve_prefill_cudagraph_mode(
             return CUDAGraphMode.PIECEWISE
         return CUDAGraphMode.NONE
     return configured_mode
+
+
+def _resolve_decode_cudagraph_mode(configured_mode: CUDAGraphMode) -> CUDAGraphMode:
+    if configured_mode.decode_mode() == CUDAGraphMode.FULL:
+        return CUDAGraphMode.FULL_DECODE_ONLY
+    if is_breakable_cudagraph_enabled() and configured_mode.has_piecewise_cudagraphs():
+        return CUDAGraphMode.PIECEWISE
+    return CUDAGraphMode.NONE
 
 
 class AutoRegressiveSpeculator(DraftModelSpeculator):
@@ -269,11 +278,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             elastic_graph_token_source="step",
         )
 
-        # PIECEWISE cudagraphs are not supported for draft decodes.
-        if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
-            cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
-        else:
-            cudagraph_mode = CUDAGraphMode.NONE
+        cudagraph_mode = _resolve_decode_cudagraph_mode(cudagraph_mode)
 
         # Initialize cudagraph manager for draft decodes (draft positions > 0).
         self.decode_cudagraph_manager = SpeculatorCudaGraphManager(
@@ -403,6 +408,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.on_multi_step_decode_begin(self.max_num_reqs)
         # Capture either the fused decode loop or one decode step per graph.
         assert self.decode_cudagraph_manager is not None
+        if self.decode_cudagraph_manager.use_breakable_cg:
+            self.decode_cudagraph_manager.init_breakable_cg_runner(self.model)
         self.decode_cudagraph_manager.capture(
             self._decode_capture_fn(),
             self.model_state,
@@ -880,12 +887,13 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 # gated outside the graph.
                 model_inputs["return_ag2_mtp_trace"] = True
             if cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
-                # Draft prefill with PIECEWISE cudagraph (compiled PW or breakable),
-                # chosen inside run_pw_graph.
-                assert self.prefill_cudagraph_manager is not None
-                ret_hidden_states = self.prefill_cudagraph_manager.run_pw_graph(
-                    self.model, model_inputs
+                manager = (
+                    self.decode_cudagraph_manager
+                    if cudagraph_owner == "mtp_decode"
+                    else self.prefill_cudagraph_manager
                 )
+                assert manager is not None
+                ret_hidden_states = manager.run_pw_graph(self.model, model_inputs)
             else:
                 # Eager (NONE): call the raw model directly.
                 ret_hidden_states = self.model(**model_inputs)
