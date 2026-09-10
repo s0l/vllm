@@ -2382,6 +2382,135 @@ def test_physical_pool_capacity_planner_matches_legacy_formula():
         assert planner.max_primary_blocks(secondary_blocks, upper_bound=60) == legacy
 
 
+def test_physical_pool_capacity_with_loans_and_large_empty_tail(monkeypatch):
+    """Exact maximal fit must not walk a large virtual tail on each admission."""
+    planner = PhysicalPoolCapacityPlanner((17, 31, 64), 29, 100, 5000)
+    for secondary in (0, 1, 17, 200):
+        for external in (0, 1, 100, 301, 5001):
+            for upper in (0, 1, 31, 100):
+                expected = max(
+                    (
+                        n
+                        for n in range(upper + 1)
+                        if sum(((n * size + 99) // 100) * 100 for size in (17, 31, 64))
+                        + ((secondary * 29 + 99) // 100) * 100
+                        + ((external + 99) // 100) * 100
+                        <= 5000
+                    ),
+                    default=0,
+                )
+                assert (
+                    planner.max_primary_blocks(
+                        secondary, upper_bound=upper, external_bytes=external
+                    )
+                    == expected
+                )
+    original = PhysicalPoolCapacityPlanner.primary_mapped_bytes
+    calls = []
+
+    def measured(self, blocks):
+        calls.append(blocks)
+        return original(self, blocks)
+
+    monkeypatch.setattr(PhysicalPoolCapacityPlanner, "primary_mapped_bytes", measured)
+    assert planner.max_primary_blocks(0, upper_bound=10**9, external_bytes=5001) == 0
+    assert len(calls) <= 32
+
+
+@pytest.mark.parametrize("dcp", [1, 2, 3, 4, 6, 8])
+@pytest.mark.parametrize("compressed_head", [16, 7])
+def test_elastic_mixed_cache_admission_prices_physical_aliases(dcp, compressed_head):
+    """Unequal attention pages share slots only after page normalization."""
+    from vllm.v1.core import kv_cache_utils
+    from vllm.v1.kv_cache_interface import CircularBufferSpec, MLAAttentionSpec
+
+    cache = CacheConfig(block_size=64, mamba_cache_mode="align")
+    cache.kv_cache_layout = "LBNHC"
+    config = SimpleNamespace(
+        cache_config=cache,
+        model_config=SimpleNamespace(max_model_len=4096, original_max_model_len=4096),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp),
+        speculative_config=None,
+        num_speculative_tokens=3,
+        additional_config={
+            "gdn_separate_pool": True,
+            "elastic_gdn_backing": True,
+            "gdn_mtp_replay_commit": True,
+        },
+    )
+    specs = {
+        "gdn": MambaSpec(
+            block_size=64,
+            shapes=((28,),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+        ),
+        "ple": MambaSpec(
+            block_size=64,
+            shapes=((8,),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+            tp_replicated=True,
+        ),
+        "full": FullAttentionSpec(
+            block_size=64, num_kv_heads=1, head_size=16, dtype=torch.float8_e4m3fn
+        ),
+        "compressed": MLAAttentionSpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=compressed_head,
+            dtype=torch.bfloat16,
+            tokens_per_state=4,
+            dcp_replicated=True,
+        ),
+        "ring": CircularBufferSpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=16,
+            head_size_v=0,
+            dtype=torch.bfloat16,
+            dcp_replicated=True,
+        ),
+    }
+    groups = get_kv_cache_groups(config, copy.deepcopy(specs))
+    resolved = {n: g.kv_cache_spec for g in groups for n in g.layer_names}
+    assert resolved["gdn"].page_size_bytes == 112
+    assert resolved["ple"].page_size_bytes == 32
+    assert resolved["ring"].block_size == 8
+    if compressed_head == 16:
+        assert resolved["compressed"].block_size == 256
+        assert resolved["compressed"].num_states == 64
+        assert {
+            resolved[n].page_size_bytes for n in ("full", "compressed", "ring")
+        } == {2048}
+        primary_owners = 1
+    else:
+        # Non-divisible MLA cannot be padded; the existing mixed layout stays valid.
+        assert resolved["compressed"] == specs["compressed"]
+        assert resolved["ring"] == specs["ring"]
+        primary_owners = 3
+    # Every physical backing, including GDN, costs one 2MiB quantum here.
+    required = (primary_owners + 1) * (2 << 20)
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(config, groups) == required
+    )
+    with pytest.raises(ValueError, match="max seq len"):
+        get_kv_cache_configs(config, [copy.deepcopy(specs)], [required - 1])
+    accepted = get_kv_cache_configs(config, [copy.deepcopy(specs)], [required])[0]
+    owners = {t.backing_id: t for t in accepted.kv_cache_tensors}
+    assert sum(t.committed_size for t in owners.values()) == required
+    assert (
+        len([n for n in owners if n.startswith("elastic-attention-")]) == primary_owners
+    )
+    assert (
+        accepted.num_blocks
+        > kv_cache_utils.get_num_blocks_per_request_for_kv_cache_config(
+            config, accepted
+        )
+    )
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
@@ -4736,3 +4865,62 @@ def test_mixed_precision_kv_cache_with_uniform_type_specs():
 
     assert worker_config.needs_kv_cache_zeroing
     assert scheduler_config.needs_kv_cache_zeroing
+
+
+@pytest.mark.parametrize("dcp", [2, 3, 4, 6, 8])
+def test_dcp_replicated_ring_keeps_one_private_block(dcp):
+    from vllm.v1.kv_cache_interface import CircularBufferSpec
+
+    groups = [
+        KVCacheGroupSpec(
+            ["main"],
+            FullAttentionSpec(
+                block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float32
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["raw"],
+            CircularBufferSpec(
+                block_size=4,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                dcp_replicated=True,
+            ),
+        ),
+    ]
+    config = KVCacheConfig(num_blocks=32, kv_cache_tensors=[], kv_cache_groups=groups)
+    manager = KVCacheManager(
+        config,
+        max_model_len=4096,
+        scheduler_block_size=4 * dcp,
+        hash_block_size=4,
+        dcp_world_size=dcp,
+    )
+    first = make_request("first", list(range(64)), 4, hash_fn=sha256)
+    second = make_request("second", list(range(64)), 4, hash_fn=sha256)
+    a = manager.allocate_slots(first, num_new_tokens=4).get_block_ids()
+    b = manager.allocate_slots(second, num_new_tokens=4).get_block_ids()
+    assert len(a[1]) == len(b[1]) == 1 and a[1] != b[1]
+    first.num_computed_tokens = 4
+    manager.allocate_slots(first, num_new_tokens=28)
+    current = manager.get_blocks(first.request_id).get_block_ids()
+    assert current[1] == a[1] and len(current[0]) == (32 + 4 * dcp - 1) // (4 * dcp)
+    assert manager.get_blocks(second.request_id).get_block_ids()[1] == b[1]
+    exhausted = make_request("exhausted", list(range(4096)), 4, hash_fn=sha256)
+    assert manager.allocate_slots(exhausted, num_new_tokens=4096) is None
+    assert manager.get_blocks(first.request_id).get_block_ids() == current
+    manager.free(first)
+    manager.free(second)
+    recovered = manager.allocate_slots(first, num_new_tokens=4)
+    assert recovered is not None and len(recovered.get_block_ids()[1]) == 1
+    manager.free(first)
+    groups[1].kv_cache_spec = replace(groups[1].kv_cache_spec, dcp_replicated=False)
+    with pytest.raises(AssertionError, match="replicated circular"):
+        KVCacheManager(
+            config,
+            max_model_len=4096,
+            scheduler_block_size=4 * dcp,
+            hash_block_size=4,
+            dcp_world_size=dcp,
+        )
