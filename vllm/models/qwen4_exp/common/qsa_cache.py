@@ -754,8 +754,18 @@ class QSAStateBackend(AttentionBackend):
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
-        # QSA pages are packed beside the main KV pages within each block.
         return (KVCacheLayout.BLNHC, KVCacheLayout.BLHNC)
+
+
+class QSALayerCompactStateBackend(QSAStateBackend):
+    @staticmethod
+    def get_name() -> str:
+        return "QWEN4_EXP_QSA_ELASTIC_STATE"
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        # One KV head and explicit page strides permit independent backings.
+        return (KVCacheLayout.LBNHC,)
 
 
 class _QSAStateCache(nn.Module, AttentionLayerBase):
@@ -786,6 +796,10 @@ class _QSAStateCache(nn.Module, AttentionLayerBase):
         self.prefix = prefix
         self.compress_ratio = compress_ratio
         self.kv_cache = torch.tensor([])
+        extra = vllm_config.additional_config
+        self.layer_compact_state = isinstance(extra, dict) and bool(
+            extra.get("flashnext_qsa_dcp")
+        )
 
         static_context = vllm_config.compilation_config.static_forward_context
         if prefix in static_context:
@@ -807,7 +821,9 @@ class _QSAStateCache(nn.Module, AttentionLayerBase):
         super().bind_kv_cache(kv_cache.transpose(1, 2))
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        return QSAStateBackend
+        return (
+            QSALayerCompactStateBackend if self.layer_compact_state else QSAStateBackend
+        )
 
 
 class QSAKeyStateCache(_QSAStateCache):

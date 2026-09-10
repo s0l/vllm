@@ -5,14 +5,30 @@
 from __future__ import annotations
 
 import copy
+import itertools
 import math
+import weakref
+from dataclasses import dataclass
+from typing import ClassVar
 
 import torch
 
 from vllm.distributed.parallel_state import get_dcp_group, get_tp_group
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.v1.attention.backend import (
+    AttentionBackend,
+    AttentionCGSupport,
+    AttentionImpl,
+    AttentionMetadata,
+    AttentionMetadataBuilder,
+    CommonAttentionMetadata,
+    MultipleOf,
+)
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
-_plans: dict[int, SparseQSAPlan] = {}
+_plans: weakref.WeakValueDictionary[int, SparseQSAPlan] = weakref.WeakValueDictionary()
+_plan_ids = itertools.count()
+_pools: weakref.WeakValueDictionary[int, SparseQSAPool] = weakref.WeakValueDictionary()
 
 
 def canonical_dcp_block_indices(
@@ -169,6 +185,9 @@ class SparseQSAPlan:
         if (
             rows < 1
             or selection_width < 1
+            or num_heads < 1
+            or num_kv_heads < 1
+            or head_dim < 1
             or num_heads % num_kv_heads
             or not all(math.isfinite(s) and s > 0 for s in (k_scale, v_scale))
         ):
@@ -186,7 +205,8 @@ class SparseQSAPlan:
             rows, num_heads, head_dim, device="cuda", dtype=torch.bfloat16
         )
         self.lse = torch.empty(rows, num_heads, device="cuda", dtype=torch.float32)
-        if workspace is None:
+        owns_workspace = workspace is None
+        if owns_workspace:
             workspace = torch.empty(32 << 20, device="cuda", dtype=torch.uint8)
         self.wrapper = BatchPrefillWithPagedKVCacheWrapper(
             workspace,
@@ -202,7 +222,7 @@ class SparseQSAPlan:
             mask_indptr_buf=torch.empty(rows + 1, device="cuda", dtype=torch.int32),
             backend="fa2",
         )
-        self.wrapper.plan(
+        plan_args = (
             torch.arange(rows + 1, dtype=torch.int32),
             torch.arange(rows + 1, dtype=torch.int32) * self.width,
             torch.zeros(rows * self.width, dtype=torch.int32),
@@ -211,15 +231,38 @@ class SparseQSAPlan:
             num_kv_heads,
             head_dim,
             1,
+        )
+        plan_kwargs = dict(
             causal=False,
             custom_mask=torch.zeros(rows * self.width, device="cuda", dtype=torch.bool),
             q_data_type=torch.bfloat16,
             kv_data_type=torch.float8_e4m3fn,
         )
+        self.required_workspace_bytes = self.wrapper.workspace_size(
+            *plan_args, **plan_kwargs
+        )
+        required_float, required_int = self.required_workspace_bytes
+        if required_int > self.wrapper._int_workspace_buffer.numel():
+            raise ValueError(
+                "QSA persistent integer plan exceeds its reserved workspace"
+            )
+        assert workspace is not None
+        if required_float > workspace.numel():
+            if not owns_workspace:
+                raise ValueError("shared QSA workspace is smaller than the native plan")
+            workspace = torch.empty(
+                math.ceil(required_float / (2 << 20)) * (2 << 20),
+                device="cuda",
+                dtype=torch.uint8,
+            )
+            self.wrapper.reset_workspace_buffer(
+                workspace, self.wrapper._int_workspace_buffer
+            )
+        self.wrapper.plan(*plan_args, **plan_kwargs)
         expected = torch.arange(rows + 1, dtype=torch.int32) * (self.width // 8)
         if not torch.equal(self.wrapper._mask_indptr_buf.cpu(), expected):
             raise RuntimeError("FlashInfer sparse mask offsets are not byte offsets")
-        self.plan_id = len(_plans)
+        self.plan_id = next(_plan_ids)
         _plans[self.plan_id] = self
         self.metadata = [
             self.indices,
@@ -246,10 +289,14 @@ class SparseQSAPlan:
         cp_size: int,
         cp_rank: int,
         interleave: int,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> torch.Tensor:
         if (
             query.shape[0] != self.rows
             or packed.shape[0] != self.rows
+            or interleave < 1
+            or block_size < 1
             or block_size % interleave
             or not 0 <= cp_rank < cp_size
         ):
@@ -279,8 +326,8 @@ class SparseQSAPlan:
             self.workspaces,
             self.output,
             self.lse,
-            self.k_scale,
-            self.v_scale,
+            self.k_scale if k_scale is None else k_scale,
+            self.v_scale if v_scale is None else v_scale,
             self.plan_id,
         )
         present = valid.any(dim=1, keepdim=True)
@@ -300,3 +347,188 @@ class SparseQSAPlan:
         return merged[
             :, tp.rank_in_group * owned_heads : (tp.rank_in_group + 1) * owned_heads
         ].to(torch.bfloat16)
+
+
+class SparseQSAPool:
+    """Worker-lifetime plans shared by sequential target and draft QSA layers.
+
+    Persistent integer buffers contain each plan's geometry. Only the float
+    scratch is aliased across shapes. DBO/PP are excluded by owner admission;
+    the runner serializes forward/capture/replay on its compute stream.
+    """
+
+    def __init__(self) -> None:
+        self.plans: dict[int, SparseQSAPlan] = {}
+        self.workspace: torch.Tensor | None = None
+
+    @classmethod
+    def for_config(cls, vllm_config) -> SparseQSAPool:
+        key = id(vllm_config.compilation_config.static_forward_context)
+        pool = _pools.get(key)
+        if pool is None:
+            pool = cls()
+            _pools[key] = pool
+        return pool
+
+    def prepare(self) -> None:
+        if self.plans:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("QSA plans must be prepared before CUDA Graph capture")
+        largest = SparseQSAPlan(64, 2051)
+        workspace = largest.workspaces[0]
+        plans = {64: largest} | {
+            rows: SparseQSAPlan(rows, 2051, workspace=workspace)
+            for rows in (1, 2, 4, 8, 16, 32)
+        }
+        self.workspace, self.plans = workspace, plans
+
+    def run(
+        self,
+        query: torch.Tensor,
+        cache: torch.Tensor,
+        selected: torch.Tensor,
+        block_table: torch.Tensor,
+        token_to_req: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        block_size: int,
+        cp_size: int,
+        cp_rank: int,
+        interleave: int,
+        k_scale: float,
+        v_scale: float,
+    ) -> None:
+        self.prepare()
+        for start in range(0, query.shape[0], 64):
+            count = min(64, query.shape[0] - start)
+            rows = 1 << (count - 1).bit_length()
+            q = query[start : start + count]
+            packed = selected[start : start + count]
+            requests = token_to_req[start : start + count]
+            if rows != count:
+                q = torch.nn.functional.pad(q, (0, 0, 0, 0, 0, rows - count))
+                packed = torch.nn.functional.pad(
+                    packed, (0, 0, 0, rows - count), value=-1
+                )
+                packed[count:, -1] = 0
+                requests = torch.nn.functional.pad(
+                    requests, (0, rows - count), value=-1
+                )
+            result = self.plans[rows](
+                q,
+                cache,
+                packed,
+                block_table,
+                requests,
+                block_size=block_size,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+                interleave=interleave,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+            output[start : start + count].copy_(result[:count])
+
+
+@dataclass
+class QSAFlashInferMetadata(AttentionMetadata):
+    num_actual_tokens: int
+    max_query_len: int
+    block_table: torch.Tensor
+    slot_mapping: torch.Tensor
+
+
+class QSAFlashInferMetadataBuilder(AttentionMetadataBuilder[QSAFlashInferMetadata]):
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+
+    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self._init_reorder_batch_threshold(
+            1, supports_spec_as_decode=True, supports_dcp_with_varlen=True
+        )
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> QSAFlashInferMetadata:
+        return QSAFlashInferMetadata(
+            common_attn_metadata.num_actual_tokens,
+            common_attn_metadata.max_query_len,
+            common_attn_metadata.block_table_tensor,
+            common_attn_metadata.slot_mapping,
+        )
+
+
+class QSAFlashInferBackend(AttentionBackend):
+    supported_dtypes = [torch.bfloat16]
+    supported_kv_cache_dtypes = ["fp8", "fp8_e4m3"]
+    supports_dcp_full_kv_attention_heads = True
+
+    @staticmethod
+    def get_name() -> str:
+        return "QWEN4_EXP_QSA_FLASHINFER_DCP"
+
+    @staticmethod
+    def get_impl_cls():
+        return QSAFlashInferImpl
+
+    @staticmethod
+    def get_builder_cls():
+        return QSAFlashInferMetadataBuilder
+
+    @staticmethod
+    def get_supported_head_sizes() -> list[int]:
+        return [256]
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        return [MultipleOf(16)]
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        return (KVCacheLayout.LBNHC,)
+
+    @classmethod
+    def is_sparse(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_kv_connector(cls) -> bool:
+        return False
+
+
+class QSAFlashInferImpl(AttentionImpl[QSAFlashInferMetadata]):
+    supports_dcp = True
+    supports_mtp_with_cp_non_trivial_interleave_size = True
+    is_sparse = True
+    can_return_lse_for_decode = True
+    lse_base_on_e = False
+
+    def __init__(self, vllm_config):
+        self.num_heads, self.num_kv_heads, self.head_size = 8, 2, 256
+        self.scale = self.head_size**-0.5
+        self.kv_cache_dtype = vllm_config.cache_config.cache_dtype
+        self.interleave = vllm_config.parallel_config.cp_kv_cache_interleave_size
+        self.pool = SparseQSAPool.for_config(vllm_config)
+
+    def forward(self, *args, **kwargs):
+        raise RuntimeError("Sparse QSA requires its learned-index owner")
+
+    def forward_qsa(self, layer, query, cache, metadata, output, selected, requests):
+        self.pool.run(
+            query,
+            cache,
+            selected,
+            metadata.block_table,
+            requests,
+            output,
+            block_size=cache.shape[2],
+            cp_size=self.dcp_world_size,
+            cp_rank=self.dcp_rank,
+            interleave=self.interleave,
+            k_scale=layer._k_scale_float,
+            v_scale=layer._v_scale_float,
+        )
