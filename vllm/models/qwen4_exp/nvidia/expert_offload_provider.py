@@ -120,12 +120,14 @@ class NativeExpertProvider:
         self.group_rows = torch.empty(
             bank.staging, device=bank.device, dtype=torch.int32
         )
-        self.host_lanes = torch.empty(max_lanes, dtype=torch.int64, pin_memory=True)
+        self.host_lanes = torch.empty(
+            max_lanes, dtype=torch.int64, device="cpu", pin_memory=True
+        )
         self.host_local_ids = torch.empty(
-            max_lanes, 1, dtype=torch.int32, pin_memory=True
+            max_lanes, 1, dtype=torch.int32, device="cpu", pin_memory=True
         )
         self.host_group_rows = torch.empty(
-            bank.staging, dtype=torch.int32, pin_memory=True
+            bank.staging, dtype=torch.int32, device="cpu", pin_memory=True
         )
         self.expert_ids = torch.empty(
             bank.staging, device=bank.device, dtype=torch.int32
