@@ -16,6 +16,34 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
 from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 
 
+def test_inherited_trace_is_optional_without_legacy_constructor(monkeypatch):
+    from vllm.model_executor.models import qwen3_5
+    from vllm.models.qwen4_exp.nvidia.model import Qwen4ExpForConditionalGeneration
+
+    model = object.__new__(Qwen4ExpForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    # Disabled tracing must not inspect model inputs or require trace buffers.
+    model.maybe_save_ag2_layer0_trace(None, None, 5, "NONE")
+    model._ag2_layer0_trace_output = "enabled-diagnostic"
+    model._ag2_layer0_trace_saved_query_lens = set()
+    model._ag2_layer0_trace_query_lens = {1}
+    model._ag2_layer0_trace_token_id = 9
+    model._ag2_layer0_trace_position = 2
+    calls = []
+
+    def match(**kwargs):
+        calls.append(kwargs)
+        return None
+
+    monkeypatch.setattr(qwen3_5, "_ag2_layer0_trace_match_row", match)
+    model.maybe_save_ag2_layer0_trace(torch.tensor([9]), torch.tensor([2]), 1, "FULL")
+    assert len(calls) == 1 and calls[0]["token_ids"] == [9]
+    assert calls[0]["output"] == "enabled-diagnostic"
+    model._ag2_layer0_trace_output = None
+    model.maybe_save_ag2_layer0_trace(None, None, 5, "NONE")
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("mode", [None, *CompilationMode])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_breakable_explicit_stock_and_default(monkeypatch, mode, enabled):
