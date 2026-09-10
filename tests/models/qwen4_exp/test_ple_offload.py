@@ -7,7 +7,7 @@ import json
 import numpy as np
 import pytest
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 from vllm.models.qwen4_exp.nvidia.ple_offload import PleRowStore
 
@@ -112,3 +112,89 @@ def test_parent_reload_rejects_before_changing_any_model_weight():
         with pytest.raises(RuntimeError, match="new worker"):
             model_type.load_weights(model, incoming())
         assert not consumed
+
+
+def make_loader_owner(path):
+    from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpNGramEmbedding
+    from vllm.models.qwen4_exp.nvidia.ple_offload import MmapPLEEmbedding
+
+    owner = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    torch.nn.Module.__init__(owner)
+    owner._mmap_seen = set()
+    for name in (
+        "layer_multipliers",
+        "ngram_heads_offsets",
+        "ngram_heads_vocab_sizes",
+    ):
+        owner.register_buffer(name, torch.zeros(2, dtype=torch.int64))
+    owner.ngram_embedding = MmapPLEEmbedding(
+        32, 4, PREFIX.removesuffix(".ngram_embedding."), path, 2, 32, 64
+    )
+    hashes = [(name, torch.tensor([7, 13])) for name, _ in owner.named_buffers()]
+    hashes = [(name, tensor) for name, tensor in hashes if "." not in name]
+    rows = [
+        ("ngram_embedding." + name.removeprefix(PREFIX), tensor)
+        for name, tensor in load_file(str(path / "table.safetensors")).items()
+    ]
+    return owner, hashes, rows
+
+
+def test_whole_model_hook_seals_ple_after_interleaved_shard_visits(tmp_path):
+    from vllm.models.qwen4_exp.nvidia.model import (
+        Qwen4ExpForCausalLM,
+        Qwen4ExpForConditionalGeneration,
+    )
+
+    make_source(tmp_path)
+    owner, hashes, rows = make_loader_owner(tmp_path)
+    target = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
+    torch.nn.Module.__init__(target)
+    target.model = torch.nn.Module()
+    target.model.ple = owner
+    target.model.register_parameter("marker", torch.nn.Parameter(torch.zeros(1)))
+    # AutoWeightsLoader groups consecutive prefixes, not all tensors of a child.
+    stream = [("model.ple." + name, tensor) for name, tensor in hashes]
+    stream += [("model.marker", torch.tensor([9.0]))]
+    stream += [("model.ple." + name, tensor) for name, tensor in rows]
+    loaded = target.load_weights(iter(stream))
+    assert len(loaded) == len(stream)
+    assert target.model.marker.item() == 9.0
+    assert not owner.ngram_embedding.loaded
+    wrapper = torch.nn.Module()
+    wrapper.language_model = target
+    Qwen4ExpForConditionalGeneration.process_weights_after_loading(wrapper)
+    assert owner.ngram_embedding.loaded and owner.ngram_embedding.store.read_rows == 0
+    assert torch.equal(owner.layer_multipliers, torch.tensor([7, 13]))
+    with pytest.raises(RuntimeError, match="new worker"):
+        target.load_weights([("model.marker", torch.tensor([11.0]))])
+    assert target.model.marker.item() == 9.0
+    owner.ngram_embedding.store.close()
+
+
+@pytest.mark.parametrize("failure", ["hash", "shard", "duplicate", "source"])
+def test_partial_ple_load_cannot_be_promoted_and_new_owner_recovers(tmp_path, failure):
+    make_source(tmp_path)
+    owner, hashes, rows = make_loader_owner(tmp_path)
+    if failure == "hash":
+        hashes = hashes[:-1]
+    if failure == "shard":
+        rows = rows[:-1]
+    owner.load_weights(hashes)
+    owner.load_weights(rows)
+    with pytest.raises((ValueError, RuntimeError, OSError)):
+        if failure == "duplicate":
+            owner.load_weights(hashes[:1])
+        else:
+            if failure == "source":
+                index = tmp_path / "model.safetensors.index.json"
+                replacement = tmp_path / "replacement"
+                replacement.write_bytes(index.read_bytes())
+                replacement.replace(index)
+            owner.finish_mmap_load()
+    assert not owner.ngram_embedding.loaded and owner.ngram_embedding.store.closed
+    recovered, hashes, rows = make_loader_owner(tmp_path)
+    recovered.load_weights(hashes)
+    recovered.load_weights(rows)
+    recovered.finish_mmap_load()
+    assert recovered.ngram_embedding.loaded
+    recovered.ngram_embedding.store.close()

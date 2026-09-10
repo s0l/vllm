@@ -13,6 +13,7 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.states import RequestState
 
+from .expert_offload_moe import NativeOffloadedExperts
 from .ple_layer import Qwen4ExpNGramEmbedding
 from .ple_offload import MmapPLEEmbedding
 
@@ -28,6 +29,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
         device: torch.device,
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
+        self._initialize_native_providers(vllm_config, model)
         config = self.model_config.hf_text_config
         self.uses_ngram_embedding = bool(config.ple_layer_ids)
         self._mmap_ple_modules: tuple[Qwen4ExpNGramEmbedding, ...] = ()
@@ -68,6 +70,29 @@ class Qwen4ExpModelState(MambaHybridModelState):
             device=self.device,
         )
         self._initialize_mmap_staging(vllm_config, model)
+
+    def _initialize_native_providers(self, vllm_config, model):
+        owners = tuple(
+            m for m in model.modules() if isinstance(m, NativeOffloadedExperts)
+        )
+        declared = tuple(
+            m
+            for m in vllm_config.compilation_config.static_forward_context.values()
+            if isinstance(m, NativeOffloadedExperts)
+        )
+        if {id(m) for m in owners} != {id(m) for m in declared} or any(
+            not m.loaded for m in owners
+        ):
+            raise RuntimeError(
+                "native expert model/forward-context inventories disagree"
+            )
+        self._native_providers = tuple(
+            {id(m.provider): m.provider for m in owners}.values()
+        )
+
+    def _prepare_native_experts(self, *, dummy):
+        for provider in getattr(self, "_native_providers", ()):
+            provider.prepare_execution(dummy=dummy)
 
     def _initialize_mmap_staging(self, vllm_config, model):
         modules = tuple(
@@ -130,6 +155,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
         req_states: RequestState,
     ) -> dict[str, Any]:
         model_inputs = super().prepare_inputs(input_batch, req_states)
+        self._prepare_native_experts(dummy=False)
         if not self.uses_ngram_embedding:
             return model_inputs
 
@@ -158,6 +184,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
         num_tokens: int,
     ) -> dict[str, Any]:
         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
+        self._prepare_native_experts(dummy=True)
         if not self.uses_ngram_embedding:
             return model_inputs
 
@@ -196,6 +223,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
 
     def prepare_runtime_dummy_inputs(self, input_batch, req_states):
         model_inputs = super().prepare_inputs(input_batch, req_states)
+        self._prepare_native_experts(dummy=True)
         if self.uses_ngram_embedding:
             model_inputs.update(
                 self._prepare_dummy_ple(

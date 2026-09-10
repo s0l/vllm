@@ -320,6 +320,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         divisor = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab_size = ((total_vocab_size + divisor - 1) // divisor) * divisor
         if envs.VLLM_PLE_MMAP:
+            self._mmap_seen: set[str] = set()
             if not isinstance(
                 _get_ple_embedding_quant_method(
                     quant_config, f"{prefix}.ngram_embedding"
@@ -582,8 +583,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             )
         }
         try:
+            embedding.store.check_files()
             for name, weight in weights:
-                if name in loaded:
+                if name in self._mmap_seen:
                     raise ValueError(f"duplicate PLE tensor {name}")
                 if name in buffers:
                     target = buffers[name]
@@ -599,10 +601,30 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 else:
                     raise ValueError(f"unexpected bounded PLE tensor {name}")
                 loaded.add(name)
-            if not buffers.keys() <= loaded:
+                self._mmap_seen.add(name)
+            return loaded
+        except Exception:
+            embedding.store.close()
+            raise
+
+    def finish_mmap_load(self):
+        """Finalize once the model loader has consumed every checkpoint file."""
+        embedding = self.ngram_embedding
+        if not isinstance(embedding, MmapPLEEmbedding):
+            return
+        if embedding.loaded:
+            raise RuntimeError("PLE reload requires a new worker")
+        try:
+            if (
+                not {
+                    "layer_multipliers",
+                    "ngram_heads_offsets",
+                    "ngram_heads_vocab_sizes",
+                }
+                <= self._mmap_seen
+            ):
                 raise ValueError("PLE checkpoint is missing hash buffers")
             embedding.finish_load()
-            return loaded
         except Exception:
             embedding.store.close()
             raise

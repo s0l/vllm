@@ -76,9 +76,15 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from ..config import Qwen4ExpConfig
+from .expert_offload_moe import (
+    FlashNextNativeMoeBlock,
+    finish_native_expert_load,
+    native_experts_enabled,
+    reject_native_expert_reload,
+)
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
-from .ple_layer import Qwen4ExpPLELayer
+from .ple_layer import Qwen4ExpNGramEmbedding, Qwen4ExpPLELayer
 from .ple_offload import reject_mmap_reload
 from .qsa import Qwen4ExpQSAAttention
 
@@ -244,9 +250,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
             num_experts > 0 and absolute_layer_id % config.decoder_sparse_step == 0
         )
         if is_moe_layer:
-            self.mlp = Qwen4ExpSparseMoeBlock(
-                vllm_config=vllm_config, prefix=f"{prefix}.mlp"
+            moe_type = (
+                FlashNextNativeMoeBlock
+                if native_experts_enabled(vllm_config, prefix)
+                else Qwen4ExpSparseMoeBlock
             )
+            self.mlp = moe_type(vllm_config=vllm_config, prefix=f"{prefix}.mlp")
         else:
             self.mlp = Qwen3NextMLP(
                 hidden_size=config.hidden_size,
@@ -340,7 +349,7 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
         example_moe = None
         for layer in layers:
             if isinstance(layer, Qwen4ExpDecoderLayer) and isinstance(
-                layer.mlp, Qwen4ExpSparseMoeBlock
+                layer.mlp, (Qwen4ExpSparseMoeBlock, FlashNextNativeMoeBlock)
             ):
                 example_moe = layer.mlp
                 self.moe_mlp_layers.append(layer.mlp)
@@ -413,7 +422,7 @@ class Qwen4ExpModel(nn.Module):
         )
         self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
             self.layers,
-            Qwen4ExpSparseMoeBlock,
+            Qwen3NextSparseMoeBlock,
             "mlp",
         )
         intermediate_size = config.hidden_size * config.hc_count
@@ -551,6 +560,7 @@ class Qwen4ExpModel(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         reject_mmap_reload(self)
+        reject_native_expert_reload(self)
         weights = (
             (
                 _remap_qsa_cache_scale_name(name, self._qsa_layer_ids),
@@ -802,6 +812,7 @@ class Qwen4ExpForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         reject_mmap_reload(self)
+        reject_native_expert_reload(self)
         mapper = self.hf_to_vllm_mapper | WeightsMapper(
             orig_to_new_substr={"mtp.": None}
         )
@@ -810,6 +821,12 @@ class Qwen4ExpForCausalLM(
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         return loader.load_weights(weights, mapper=mapper)
+
+    def process_weights_after_loading(self) -> None:
+        for module in self.modules():
+            if isinstance(module, Qwen4ExpNGramEmbedding):
+                module.finish_mmap_load()
+        finish_native_expert_load(self)
 
 
 class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
@@ -971,8 +988,11 @@ class Qwen4ExpForConditionalGeneration(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        ready_rows: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
+        if ready_rows is not None:
+            raise ValueError("Qwen4Exp does not consume owner-prequant ready rows")
         if intermediate_tensors is not None:
             inputs_embeds = None
         if inputs_embeds is not None and get_pp_group().is_first_rank:
@@ -997,6 +1017,7 @@ class Qwen4ExpForConditionalGeneration(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         reject_mmap_reload(self)
+        reject_native_expert_reload(self)
         mapper = self.hf_to_vllm_mapper | WeightsMapper(
             orig_to_new_substr={"mtp.": None},
             orig_to_new_prefix={"visual.": None} if self.language_model_only else {},
