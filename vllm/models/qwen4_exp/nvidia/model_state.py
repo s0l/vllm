@@ -13,6 +13,9 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.states import RequestState
 
+from .ple_layer import Qwen4ExpNGramEmbedding
+from .ple_offload import MmapPLEEmbedding
+
 
 class Qwen4ExpModelState(MambaHybridModelState):
     """Add rollback-safe PLE n-gram context to the model inputs."""
@@ -27,6 +30,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
         super().__init__(vllm_config, model, encoder_cache, device)
         config = self.model_config.hf_text_config
         self.uses_ngram_embedding = bool(config.ple_layer_ids)
+        self._mmap_ple_modules: tuple[Qwen4ExpNGramEmbedding, ...] = ()
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
@@ -63,6 +67,34 @@ class Qwen4ExpModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
+        self._initialize_mmap_staging(vllm_config, model)
+
+    def _initialize_mmap_staging(self, vllm_config, model):
+        modules = tuple(
+            m
+            for m in model.modules()
+            if isinstance(m, Qwen4ExpNGramEmbedding)
+            and isinstance(m.ngram_embedding, MmapPLEEmbedding)
+        )
+        declared = tuple(
+            getattr(m, "ple_embedding", None)
+            for m in vllm_config.compilation_config.static_forward_context.values()
+        )
+        declared_ids = {
+            id(m)
+            for m in declared
+            if isinstance(m, Qwen4ExpNGramEmbedding)
+            and isinstance(m.ngram_embedding, MmapPLEEmbedding)
+        }
+        if {id(m) for m in modules} != declared_ids:
+            raise RuntimeError(
+                "PLE staging module/forward-context inventories disagree"
+            )
+        for module in modules:
+            module.ngram_embedding.initialize_staging(
+                self.max_num_tokens, module.ngram_heads, self.device
+            )
+        self._mmap_ple_modules = modules
 
     def _prepare_ngram_context(
         self,
@@ -106,10 +138,18 @@ class Qwen4ExpModelState(MambaHybridModelState):
         query_start_loc[: num_reqs_padded + 1].copy_(input_batch.query_start_loc)
         # Represent unused capacity as trailing zero-length requests.
         query_start_loc[num_reqs_padded + 1 :].copy_(input_batch.query_start_loc[-1])
+        context = self._prepare_ngram_context(input_batch, req_states)
         model_inputs.update(
             query_start_loc=query_start_loc,
-            ngram_context=self._prepare_ngram_context(input_batch, req_states),
+            ngram_context=context,
         )
+        for module in self._mmap_ple_modules:
+            module.prepare_mmap_rows(
+                input_batch.input_ids[: input_batch.num_tokens],
+                query_start_loc[: input_batch.num_reqs + 1],
+                context[: input_batch.num_reqs],
+                input_batch.num_tokens_after_padding,
+            )
         return model_inputs
 
     def prepare_dummy_inputs(
@@ -121,9 +161,19 @@ class Qwen4ExpModelState(MambaHybridModelState):
         if not self.uses_ngram_embedding:
             return model_inputs
 
+        model_inputs.update(self._prepare_dummy_ple(num_reqs, num_tokens))
+        return model_inputs
+
+    def _prepare_dummy_ple(self, num_reqs, num_tokens):
+        if (
+            not 0 <= num_reqs <= self.max_num_reqs
+            or not 0 <= num_tokens <= self.max_num_tokens
+            or (num_reqs == 0 and num_tokens != 0)
+        ):
+            raise ValueError("invalid PLE dummy batch dimensions")
         query_start_loc = self.ple_query_start_loc
         query_start_loc[0] = 0
-        tokens_per_req, num_extra_tokens = divmod(num_tokens, num_reqs)
+        tokens_per_req, num_extra_tokens = divmod(num_tokens, max(1, num_reqs))
         query_lens = torch.full(
             (num_reqs,),
             tokens_per_req,
@@ -137,10 +187,22 @@ class Qwen4ExpModelState(MambaHybridModelState):
 
         ngram_context = self.ngram_context
         ngram_context.fill_(self.ngram_eos_token_id)
-        model_inputs.update(
+        for module in self._mmap_ple_modules:
+            module.ngram_embedding.prepare_dummy(num_tokens)
+        return dict(
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
         )
+
+    def prepare_runtime_dummy_inputs(self, input_batch, req_states):
+        model_inputs = super().prepare_inputs(input_batch, req_states)
+        if self.uses_ngram_embedding:
+            model_inputs.update(
+                self._prepare_dummy_ple(
+                    input_batch.num_reqs_after_padding,
+                    input_batch.num_tokens_after_padding,
+                )
+            )
         return model_inputs
 
 

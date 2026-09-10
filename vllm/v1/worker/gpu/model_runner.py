@@ -3880,7 +3880,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return output
 
         if dummy_run:
-            prepared_model_inputs = self.model_state.prepare_inputs(
+            prepared_model_inputs = self.model_state.prepare_runtime_dummy_inputs(
                 input_batch, self.req_states
             )
         model_inputs = {

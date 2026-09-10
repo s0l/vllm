@@ -46,6 +46,8 @@ if TYPE_CHECKING:
     NO_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
+    VLLM_PLE_MMAP: bool = False
+    VLLM_PLE_MMAP_CACHE_MB: int = 64
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_DCP_NATIVE_RS_MAX_ROWS: int = 0
     VLLM_TP3_CE_REDUCE: bool = False
@@ -919,6 +921,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use the FlashInfer top-k / top-p sampler on CUDA. Enabled
     # by default when the hardware supports it — set to 0 to opt out
     # explicitly, which forces the PyTorch-native (Triton for bs>=8) path.
+    "VLLM_PLE_MMAP": lambda: bool(int(os.getenv("VLLM_PLE_MMAP", "0"))),
+    "VLLM_PLE_MMAP_CACHE_MB": lambda: int(os.getenv("VLLM_PLE_MMAP_CACHE_MB", "64")),
     "VLLM_USE_FLASHINFER_SAMPLER": lambda: (
         bool(int(os.environ["VLLM_USE_FLASHINFER_SAMPLER"]))
         if "VLLM_USE_FLASHINFER_SAMPLER" in os.environ

@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
@@ -47,6 +48,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
 
 from ..common.ple import PLEVocabParallelEmbedding
 from .ops.ple import ple_conv, ple_gate, ple_ngram_ids
+from .ple_offload import MmapPLEEmbedding
 
 
 class Qwen4ExpPLEGroupedNorm(nn.Module):
@@ -317,16 +319,38 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         divisor = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab_size = ((total_vocab_size + divisor - 1) // divisor) * divisor
-        self.ngram_embedding = PLEVocabParallelEmbedding(
-            padded_vocab_size,
-            self.head_dim,
-            params_dtype=params_dtype,
-            padding_size=divisor,
-            prefix=f"{prefix}.ngram_embedding",
-            quant_method=_get_ple_embedding_quant_method(
-                quant_config, f"{prefix}.ngram_embedding"
-            ),
-        )
+        if envs.VLLM_PLE_MMAP:
+            if not isinstance(
+                _get_ple_embedding_quant_method(
+                    quant_config, f"{prefix}.ngram_embedding"
+                ),
+                Qwen4ExpPLEFp8EmbeddingMethod,
+            ):
+                raise ValueError("Bounded PLE currently requires global-scale FP8")
+            runtime_config = get_current_vllm_config()
+            if not envs.VLLM_USE_V2_MODEL_RUNNER:
+                raise ValueError("Bounded PLE requires ModelRunnerV2 input preparation")
+            self.ngram_embedding = MmapPLEEmbedding(
+                padded_vocab_size,
+                self.head_dim,
+                prefix,
+                runtime_config.model_config.model,
+                self.split_ngram_parts,
+                envs.VLLM_PLE_MMAP_CACHE_MB << 20,
+                runtime_config.scheduler_config.max_num_batched_tokens
+                * self.ngram_heads,
+            )
+        else:
+            self.ngram_embedding = PLEVocabParallelEmbedding(
+                padded_vocab_size,
+                self.head_dim,
+                params_dtype=params_dtype,
+                padding_size=divisor,
+                prefix=f"{prefix}.ngram_embedding",
+                quant_method=_get_ple_embedding_quant_method(
+                    quant_config, f"{prefix}.ngram_embedding"
+                ),
+            )
 
     @staticmethod
     def _shift_precompute(
@@ -437,17 +461,49 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             id_blocks.append(ids[request_indices, adjusted_columns])
         return torch.cat(id_blocks, dim=-1)
 
+    def prepare_mmap_rows(
+        self, input_ids, query_start_loc, ngram_context, padded_tokens
+    ):
+        embedding = self.ngram_embedding
+        if not isinstance(embedding, MmapPLEEmbedding):
+            raise RuntimeError("PLE row preparation requires mmap backing")
+        if (
+            input_ids.ndim != 1
+            or embedding.raw is None
+            or not 0 <= input_ids.numel() <= padded_tokens <= embedding.capacity
+        ):
+            raise ValueError("PLE input exceeds initialized staging capacity")
+        if input_ids.numel():
+            ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
+        else:
+            ids = torch.empty(
+                (0, self.ngram_heads), dtype=torch.int64, device=input_ids.device
+            )
+        embedding.prepare(ids, padded_tokens)
+
     def forward(
         self,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
     ) -> torch.Tensor:
+        if isinstance(self.ngram_embedding, MmapPLEEmbedding):
+            embedding = self.ngram_embedding
+            if embedding.raw is None or not embedding.prepared:
+                raise RuntimeError("Bounded PLE rows were not prepared")
+            return (
+                embedding.raw[: input_ids.shape[0]]
+                .view(torch.float8_e4m3fn)
+                .flatten(-2)
+            )
         ngram_ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
         return self.ngram_embedding(ngram_ids).flatten(-2)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
+
+        if isinstance(self.ngram_embedding, MmapPLEEmbedding):
+            return self._load_mmap_weights(weights)
 
         persistent_buffers = {
             "layer_multipliers": self.layer_multipliers,
@@ -511,6 +567,45 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
         return loaded
+
+    def _load_mmap_weights(self, weights):
+        embedding = self.ngram_embedding
+        if embedding.loaded:
+            raise RuntimeError("PLE reload requires a new worker")
+        loaded = set()
+        buffers = {
+            name: getattr(self, name)
+            for name in (
+                "layer_multipliers",
+                "ngram_heads_offsets",
+                "ngram_heads_vocab_sizes",
+            )
+        }
+        try:
+            for name, weight in weights:
+                if name in loaded:
+                    raise ValueError(f"duplicate PLE tensor {name}")
+                if name in buffers:
+                    target = buffers[name]
+                    if weight.shape != target.shape or weight.dtype != torch.int64:
+                        raise ValueError(f"invalid PLE hash buffer {name}")
+                    target.copy_(weight)
+                elif name.startswith("ngram_embedding."):
+                    embedding.accept_weight(
+                        name.removeprefix("ngram_embedding."), weight
+                    )
+                elif name.startswith("hashstats_") or name == "token_lookup":
+                    continue
+                else:
+                    raise ValueError(f"unexpected bounded PLE tensor {name}")
+                loaded.add(name)
+            if not buffers.keys() <= loaded:
+                raise ValueError("PLE checkpoint is missing hash buffers")
+            embedding.finish_load()
+            return loaded
+        except Exception:
+            embedding.store.close()
+            raise
 
 
 class Qwen4ExpPLELayer(nn.Module, MambaBase):

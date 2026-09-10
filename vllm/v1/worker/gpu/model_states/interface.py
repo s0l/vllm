@@ -329,6 +329,12 @@ class ModelState(ABC):
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         raise NotImplementedError
 
+    def prepare_runtime_dummy_inputs(
+        self, input_batch: InputBatch, req_states: RequestState
+    ) -> dict[str, Any]:
+        """Prepare a profile/empty runtime batch, without real request-only I/O."""
+        return self.prepare_inputs(input_batch, req_states)
+
     @abstractmethod
     def prepare_attn(
         self,
