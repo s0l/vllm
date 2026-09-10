@@ -799,7 +799,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         query_len: int,
         cudagraph_mode: str,
     ) -> None:
-        output = self._ag2_layer0_trace_output
+        output = getattr(self, "_ag2_layer0_trace_output", None)
         if not output:
             return
         position_values = positions[0] if positions.ndim == 2 else positions
