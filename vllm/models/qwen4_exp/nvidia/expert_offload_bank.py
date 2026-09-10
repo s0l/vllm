@@ -16,8 +16,6 @@ from threading import RLock
 import numpy as np
 import torch
 
-from vllm.device_allocator.elastic_cumem import allocate_elastic_backing
-
 from . import expert_offload_tables as gp
 
 ARRAYS = ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale")
@@ -46,6 +44,8 @@ class NativeExpertBank:
     def __init__(
         self, source, device, *, hot_rows, max_hot_rows, staging=32, quantum=2 << 20
     ):
+        from vllm.device_allocator.elastic_cumem import allocate_elastic_backing
+
         if not 0 <= hot_rows <= max_hot_rows <= source.layers * source.experts:
             raise ValueError("invalid native HOT capacity")
         if staging < 1 or staging & (staging - 1):
@@ -396,6 +396,31 @@ class NativeBankCoordinator:
         )
         self.copy_vote = torch.empty(1, dtype=torch.int32, device=bank.device)
         self.plan_votes = self.copy_votes = self.hot_steps = 0
+
+    def admit_routes(self, layer, ids, weights, *, error=None, dummy=False):
+        """Agree the entire demand before entering a variable number of waves."""
+        digest = sha256()
+        if error is None:
+            digest.update(ids.tobytes())
+            digest.update(weights.tobytes())
+        payload = [
+            int(error is None and self.bank.state == "READY"),
+            self.bank.generation,
+            layer,
+            ids.shape[0] if error is None else -1,
+            ids.shape[1] if error is None else -1,
+            int(dummy),
+        ] + list(digest.digest())
+        payload += [-1] * (self.send.numel() - len(payload))
+        self.send.copy_(torch.tensor(payload, dtype=torch.int64))
+        torch.distributed.all_gather_into_tensor(
+            self.recv, self.send, group=self.group.device_group
+        )
+        peers = self.recv.view(self.ranks, -1)
+        common = bool(((peers == peers[:1]).all() & (peers[:, 0] == 1).all()).item())
+        if not common:
+            self.bank.state = "POISONED"
+            raise RuntimeError("rank-inconsistent native routing") from error
 
     def recover(self):
         """Agree a new generation after physical rollback and full invalidation.

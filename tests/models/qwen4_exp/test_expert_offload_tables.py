@@ -80,3 +80,76 @@ def test_invalid_inputs_fail_before_mutation_or_poison_the_epoch():
     assert not bool((buffers.routes >= 0).any())
     recovered, scratch = fresh()
     assert run(recovered, scratch, 0, [2]) == [(2, 0)]
+
+
+@pytest.mark.parametrize("tokens", [0, 1, 4, 32, 4096])
+@pytest.mark.parametrize("capacity", [1, 2, 32])
+def test_compact_provider_conserves_weighted_lanes_and_last_tile(tokens, capacity):
+    import numpy as np
+
+    from vllm.models.qwen4_exp.nvidia.expert_offload_plan import plan
+
+    rng = np.random.default_rng(1907)
+    ids = np.argsort(rng.random((tokens, 512)), axis=1)[:, :10].astype(np.int32)
+    weights = rng.random((tokens, 10))
+    actual = np.full(ids.size, np.nan)
+    seen = np.zeros(ids.size, dtype=np.int32)
+    for wave in plan(ids, 512, capacity):
+        for tile in wave.tiles(4096):
+            assert len(tile.experts) <= capacity
+            assert len(tile.lanes) <= tile.bucket <= 4096
+            experts = np.asarray(tile.experts)[tile.slots]
+            assert np.array_equal(experts, ids.flat[tile.lanes])
+            seen[tile.lanes] += 1
+            actual[tile.lanes] = (experts + 1) * weights.flat[tile.lanes]
+    assert np.all(seen == 1)
+    assert np.array_equal(actual.reshape(ids.shape), (ids + 1) * weights)
+
+
+def test_compact_provider_rejects_invalid_routes_and_recovers():
+    import numpy as np
+
+    from vllm.models.qwen4_exp.nvidia.expert_offload_plan import plan
+
+    valid = np.arange(10, dtype=np.int32)[None]
+    for invalid in (valid - 1, valid + 512, valid.astype(float), valid[0], valid * 0):
+        with pytest.raises(ValueError):
+            plan(invalid, 512, 32)
+        assert len(plan(valid, 512, 32)) == 1
+    wave = plan(np.tile(valid, (819, 1)), 512, 32)[0]
+    assert [len(t.lanes) for t in wave.tiles(4096)] == [4096, 4094]
+
+
+@pytest.mark.parametrize("failure", [None, "peer", "local"])
+def test_provider_votes_before_variable_wave_schedule(monkeypatch, failure):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from vllm.models.qwen4_exp.nvidia.expert_offload_bank import NativeBankCoordinator
+
+    coordinator = NativeBankCoordinator.__new__(NativeBankCoordinator)
+    coordinator.bank = SimpleNamespace(state="READY", generation=4)
+    coordinator.group = SimpleNamespace(device_group="control")
+    coordinator.ranks = 3
+    coordinator.send = torch.empty(64, dtype=torch.int64)
+    coordinator.recv = torch.empty(192, dtype=torch.int64)
+
+    def gather(out, incoming, *, group):
+        assert group == "control"
+        peers = out.view(3, -1)
+        peers.copy_(incoming.expand_as(peers))
+        if failure == "peer":
+            peers[1, 8] += 1
+
+    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", gather)
+    ids = np.arange(10, dtype=np.int32)[None]
+    weights = np.full((1, 10), 0.1, dtype=np.float32)
+    error = ValueError("invalid shape") if failure == "local" else None
+    if failure is None:
+        coordinator.admit_routes(3, ids, weights)
+        assert coordinator.bank.state == "READY"
+    else:
+        with pytest.raises(RuntimeError, match="rank-inconsistent native routing"):
+            coordinator.admit_routes(3, ids, weights, error=error)
+        assert coordinator.bank.state == "POISONED"
