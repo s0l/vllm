@@ -313,3 +313,55 @@ def test_provider_admits_configured_tp_and_rejects_stale_partition_before_alloca
     monkeypatch.setattr(module, "NativeBankCoordinator", allocation)
     with pytest.raises(ValueError if mismatch else Admitted):
         module.NativeExpertProvider(SimpleNamespace(source=source), group, cfg, topk=10)
+
+
+@pytest.mark.parametrize("default_device", ["cpu", "meta"])
+def test_provider_pinned_staging_owns_cpu_under_loader_device(
+    monkeypatch, default_device
+):
+    from types import SimpleNamespace
+
+    from vllm.models.qwen4_exp.nvidia import expert_offload_provider as module
+
+    source = SimpleNamespace(
+        geometry=NVFP4ExpertGeometry(2560, 640, 2),
+        tp=2,
+        rank=0,
+        hidden=2560,
+        experts=512,
+    )
+    bank = SimpleNamespace(source=source, device=torch.device("meta"), staging=32)
+    cfg = SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=2))
+    group = SimpleNamespace(device_group=object())
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda g: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda g: 0)
+    monkeypatch.setattr(module, "NativeBankCoordinator", lambda *args: object())
+    original_empty = torch.empty
+    pinned = []
+
+    def allocation(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            device = torch.device(kwargs.get("device", torch.get_default_device()))
+            assert device.type == "cpu", "pinned storage must own CPU"
+            pinned.append((args, kwargs["dtype"]))
+            # CPU-only control checks the requested pinning contract without
+            # needing a CUDA driver. The full loader proves real pinned storage.
+            kwargs["pin_memory"] = False
+        return original_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", allocation)
+    with torch.device(default_device):
+        provider = module.NativeExpertProvider(
+            bank, group, cfg, topk=10, max_tokens=4, max_lanes=32
+        )
+        with pytest.raises(AssertionError, match="pinned storage must own CPU"):
+            torch.empty(1, device="meta", pin_memory=True)
+    assert len(pinned) == 3
+    assert provider.x.device.type == "meta"
+    for tensor, shape, dtype in (
+        (provider.host_lanes, (32,), torch.int64),
+        (provider.host_local_ids, (32, 1), torch.int32),
+        (provider.host_group_rows, (32,), torch.int32),
+    ):
+        assert tensor.device.type == "cpu"
+        assert tensor.shape == shape and tensor.dtype == dtype
