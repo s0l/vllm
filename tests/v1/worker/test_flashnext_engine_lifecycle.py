@@ -16,6 +16,32 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
 from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 
 
+@pytest.mark.parametrize("mode", list(CUDAGraphMode))
+@pytest.mark.parametrize("provider", [None, "_native_providers", "_mmap_ple_modules"])
+def test_target_host_provider_capture_capability(monkeypatch, mode, provider):
+    from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
+
+    state = object.__new__(Qwen4ExpModelState)
+    if provider:
+        setattr(state, provider, (object(),))
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    expected = (
+        CUDAGraphMode.PIECEWISE if provider and mode != CUDAGraphMode.NONE else mode
+    )
+    assert state.resolve_cudagraph_mode(mode) == expected
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
+    if provider and mode != CUDAGraphMode.NONE:
+        with pytest.raises(RuntimeError, match="require breakable"):
+            state.resolve_cudagraph_mode(mode)
+    else:
+        assert state.resolve_cudagraph_mode(mode) == mode
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    assert state.resolve_cudagraph_mode(mode) == expected
+    if provider:
+        setattr(state, provider, ())
+    assert state.resolve_cudagraph_mode(mode) == mode
+
+
 def test_inherited_trace_is_optional_without_legacy_constructor(monkeypatch):
     from vllm.model_executor.models import qwen3_5
     from vllm.models.qwen4_exp.nvidia.model import Qwen4ExpForConditionalGeneration
