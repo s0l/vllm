@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.multimodal.utils import strip_covered_mm_data
+from vllm.v1.core.elastic_expert import ElasticExpertGrant
 from vllm.v1.core.elastic_graph import ElasticStepPlan
 
 if TYPE_CHECKING:
@@ -329,6 +330,10 @@ class SchedulerOutput:
     # Step-scoped physical bytes loaned from the elastic KV arena to dynamic
     # CUDA Graph pools and transient consumers. Zero restores the X1 KV baseline.
     elastic_external_memory_bytes: int = 0
+
+    # Revocable native expert growth above the bank paid during model profiling.
+    # This is separate from Graph/MM external allocations.
+    elastic_expert_grant: ElasticExpertGrant | None = None
 
     # Immutable breakdown of the aggregate external loan. The Graph endpoint
     # is absolute; the MM activation loan is incremental and step-scoped.

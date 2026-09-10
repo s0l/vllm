@@ -1241,8 +1241,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 len(self.kv_caches_for_block_copy),
             )
         if self.kv_cache_config.elastic_mapping_quantum:
+            native_base_bytes = 0
+            providers = getattr(self.model_state, "_native_providers", ())
+            if providers:
+                from vllm.models.qwen4_exp.nvidia.expert_offload_residency import (
+                    NativeExpertResidency,
+                )
+                from vllm.v1.core.elastic_expert import NativeExpertBudget
+
+                budget = NativeExpertBudget.from_config(self.vllm_config)
+                if len(providers) != 1 or budget is None:
+                    raise ValueError("expected one global native expert bank")
+                NativeExpertResidency(providers[0], self.elastic_kv_controller, budget)
+                native_base_bytes = budget.base_bytes
             self.elastic_kv_controller.configure_physical_budget(
-                self.kv_cache_config.elastic_budget_bytes,
+                self.kv_cache_config.elastic_budget_bytes + native_base_bytes,
                 self.kv_cache_config.elastic_mapping_quantum,
                 (
                     self.kv_cache_config.num_blocks,
@@ -2815,6 +2828,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Resolve it before the branch so startup profiling cannot observe an
         # unbound local.
         elastic_plan = scheduler_output.elastic_step_plan
+        if (
+            not dummy_run
+            and not is_profile
+            and not scheduler_output.is_synthetic_warmup
+        ):
+            owner = self.elastic_kv_controller.auxiliary_owner
+            if owner is not None:
+                owner.admit(scheduler_output)
+            elif scheduler_output.elastic_expert_grant is not None:
+                raise RuntimeError("scheduler expert grant without a worker bank")
         elastic_equal_kv_noop_validated = False
         is_synthetic_warmup = scheduler_output.is_synthetic_warmup
         if (

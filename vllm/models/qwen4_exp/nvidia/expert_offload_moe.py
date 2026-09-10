@@ -22,6 +22,7 @@ from vllm.model_executor.models.qwen3_next import (
     Qwen3NextSparseMoeBlock,
 )
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.v1.core.elastic_expert import NativeExpertBudget
 
 from .expert_offload_bank import NativeExpertBank
 from .expert_offload_provider import NativeExpertProvider
@@ -42,6 +43,8 @@ def native_experts_enabled(vllm_config, prefix):
 
 
 def get_native_provider(vllm_config):
+    budget = NativeExpertBudget.from_config(vllm_config)
+    assert budget is not None
     options = vllm_config.additional_config["flashnext_native_experts"]
     fields = {"hot_rows", "max_hot_rows", "staging", "ram_cache_bytes"}
     if not isinstance(options, dict) or options.keys() - fields:
@@ -82,10 +85,24 @@ def get_native_provider(vllm_config):
         bank = NativeExpertBank(
             source,
             device,
-            hot_rows=options.get("hot_rows", 0),
-            max_hot_rows=options.get("max_hot_rows", 8192),
-            staging=options.get("staging", 32),
+            hot_rows=0,
+            max_hot_rows=budget.max_hot_rows,
+            staging=budget.staging,
         )
+        if (
+            sum(bank.targets(0).values()) != budget.base_bytes
+            or tuple(
+                bank.strides[name]
+                for name in (
+                    "w13_weight",
+                    "w2_weight",
+                    "w13_weight_scale",
+                    "w2_weight_scale",
+                )
+            )
+            != budget.strides
+        ):
+            raise RuntimeError("native bank differs from scheduler byte geometry")
         provider = NativeExpertProvider(bank, get_tp_group(), vllm_config)
         _providers[key] = provider
     return provider

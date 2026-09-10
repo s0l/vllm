@@ -28,6 +28,7 @@ class ElasticKVController:
         # Non-KV owners publish exact mapped byte targets at a fenced boundary.
         # They must never absorb unused KV budget merely by lexical key order.
         self.auxiliary_targets: dict[str, int] = {}
+        self.auxiliary_owner: Any = None
         self._physical_budget_bytes: int | None = None
         self._mapping_quantum: int | None = None
         self._logical_transition: tuple[int, int] | None = None
@@ -182,6 +183,7 @@ class ElasticKVController:
         """
         if (
             transition is not None
+            or (self.auxiliary_owner is not None and self.auxiliary_owner.pending)
             or not self.backings
             or self._physical_budget_bytes is None
             or self._mapping_quantum is None
@@ -210,6 +212,25 @@ class ElasticKVController:
         return True
 
     def apply(
+        self,
+        transition: tuple[int, int] | None,
+        external_memory_bytes: int = 0,
+    ) -> None:
+        owner = self.auxiliary_owner
+        pending = owner is not None and owner.pending
+        if pending:
+            owner.prepare()
+        try:
+            self._apply(transition, external_memory_bytes)
+        except Exception:
+            if pending:
+                owner.finish(success=False)
+            raise
+        else:
+            if pending:
+                owner.finish(success=True)
+
+    def _apply(
         self,
         transition: tuple[int, int] | None,
         external_memory_bytes: int = 0,
@@ -356,7 +377,9 @@ class ElasticKVController:
             )
         returnable = min(current - requested, int(free.item()) // quantum * quantum)
         effective = current - returnable
-        if effective < current:
+        if effective < current or (
+            self.auxiliary_owner is not None and self.auxiliary_owner.pending
+        ):
             self.apply(None, effective)
 
         retained = effective - requested

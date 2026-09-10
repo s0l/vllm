@@ -18,6 +18,8 @@ from enum import Enum
 from functools import cached_property
 from typing import Any
 
+from vllm.v1.core.elastic_expert import ElasticExpertGrant
+
 
 class ElasticGraphError(RuntimeError):
     """An elastic graph state transition violated the admission contract."""
@@ -899,6 +901,7 @@ class ElasticStepPlan:
     successor_keys: tuple[PhysicalReplayKey, ...] = ()
     maintenance_execution: ElasticMaintenanceExecution | None = None
     reuse_rank_consensus: bool = False
+    expert_grant: ElasticExpertGrant | None = None
 
     def __post_init__(self) -> None:
         if not self.transaction_id:
@@ -1043,6 +1046,7 @@ class ElasticStepPlan:
             "current_dispatch": self.current_dispatch,
             "successor_keys": self.successor_keys,
             "maintenance_execution": self.maintenance_execution,
+            "expert_grant": self.expert_grant,
         }
         return _fingerprint(payload)
 

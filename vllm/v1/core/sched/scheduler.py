@@ -32,6 +32,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.v1.core.elastic_expert import ElasticExpertGrant, NativeExpertBudget
 from vllm.v1.core.elastic_graph import (
     ElasticAdmissionController,
     ElasticGraphError,
@@ -328,6 +329,13 @@ class Scheduler(SchedulerInterface):
         self.elastic_on_demand_graphs = ElasticRuntimeConfig.from_vllm_config(
             self.vllm_config
         ).enabled
+        self._elastic_native_budget = NativeExpertBudget.from_config(vllm_config)
+        self._elastic_native_hot_rows = 0
+        if self._elastic_native_budget is not None and (
+            not self.elastic_on_demand_graphs
+            or not kv_cache_config.elastic_mapping_quantum
+        ):
+            raise ValueError("native experts require the elastic scheduler budget")
         self._elastic_compiled_piecewise_sizes = configured_compiled_piecewise_sizes(
             self.vllm_config
         )
@@ -3273,6 +3281,12 @@ class Scheduler(SchedulerInterface):
         physical_quiescent: bool = False,
     ) -> SchedulerOutput:
         try:
+            # Re-offer the soft grant to admission. Only the final output
+            # below changes worker mappings, so a stable grant is a no-op.
+            if getattr(self, "_elastic_native_budget", None) is not None and not (
+                self.kv_cache_manager.coordinator.set_elastic_expert_memory(0)
+            ):
+                raise RuntimeError("could not reclaim the logical expert grant")
             self._refresh_elastic_cache_frontier()
             return self._schedule_with_prefix_leases(
                 throttle_prefills, physical_quiescent=physical_quiescent
@@ -3282,6 +3296,30 @@ class Scheduler(SchedulerInterface):
             # Failure, cancellation and maintenance-only steps retain none.
             self._release_elastic_prefix_hits()
             self._elastic_prefix_pressure_fallback = False
+
+    def _plan_elastic_expert_grant(
+        self, *, has_user_tokens: bool, minimum_free_primary_blocks: int
+    ) -> ElasticExpertGrant | None:
+        budget = getattr(self, "_elastic_native_budget", None)
+        if budget is None:
+            return None
+        coordinator = self.kv_cache_manager.coordinator
+        available = (
+            coordinator.max_elastic_external_memory(
+                minimum_free_primary_blocks=minimum_free_primary_blocks
+            )
+            - coordinator.elastic_external_memory_bytes
+        )
+        grant = budget.fit(
+            max(available, 0),
+            max_rows=None if has_user_tokens else self._elastic_native_hot_rows,
+        )
+        if not coordinator.set_elastic_expert_memory(
+            grant.borrowed_bytes, minimum_free_primary_blocks
+        ):
+            raise RuntimeError("expert grant disagrees with admitted free KV tail")
+        self._elastic_native_hot_rows = grant.hot_rows
+        return grant
 
     def _refresh_elastic_cache_frontier(self) -> None:
         """Price cache-preserving holes against future executable residency."""
@@ -4827,9 +4865,13 @@ class Scheduler(SchedulerInterface):
                 elastic_graph_step_grant,
             )
 
+        elastic_expert_grant = self._plan_elastic_expert_grant(
+            has_user_tokens=bool(num_scheduled_tokens),
+            minimum_free_primary_blocks=elastic_successor_primary_headroom,
+        )
         elastic_kv_transition = (
             self.kv_cache_manager.coordinator.take_elastic_transition()
-            if elastic_resource_commit
+            if elastic_resource_commit or elastic_expert_grant is not None
             else None
         )
         elastic_transaction_id = (
@@ -4960,6 +5002,7 @@ class Scheduler(SchedulerInterface):
                     )
                 elastic_step_plan = replace(
                     elastic_step_plan,
+                    expert_grant=elastic_expert_grant,
                     kv_transition=elastic_kv_transition,
                     capture_loan_bytes=elastic_graph_step_grant,
                     protected_keys=tuple(
@@ -4981,6 +5024,7 @@ class Scheduler(SchedulerInterface):
                     )
                 elastic_step_plan = replace(
                     elastic_step_plan,
+                    expert_grant=elastic_expert_grant,
                     kv_transition=elastic_kv_transition,
                     capture_loan_bytes=elastic_graph_step_grant,
                     protected_keys=tuple(
@@ -5055,6 +5099,7 @@ class Scheduler(SchedulerInterface):
                 raise RuntimeError("shape-less elastic plan is not a reclaim")
             elastic_step_plan = replace(
                 elastic_step_plan,
+                expert_grant=elastic_expert_grant,
                 kv_transition=elastic_kv_transition,
                 capture_loan_bytes=elastic_graph_step_grant,
             )
@@ -5119,6 +5164,7 @@ class Scheduler(SchedulerInterface):
             gdn_checkpoint_save=gdn_checkpoint_save or None,
             gdn_checkpoint_restore=gdn_checkpoint_restore or None,
             elastic_kv_transition=elastic_kv_transition,
+            elastic_expert_grant=elastic_expert_grant,
             elastic_external_memory_bytes=(elastic_graph_step_grant),
             elastic_graph_external_memory_bytes=(
                 elastic_graph_step_grant - elastic_mm_activation_loan
