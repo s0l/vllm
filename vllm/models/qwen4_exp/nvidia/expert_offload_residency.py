@@ -20,6 +20,9 @@ class NativeExpertResidency:
         self.resizes = self.rollbacks = 0
         if (
             controller.auxiliary_owner is not None
+            or self.bank.source.geometry != budget.geometry
+            or (self.bank.source.layers, self.bank.source.experts)
+            != (budget.layers, budget.experts)
             or self.bank.tables.pool_rows != 0
             or sum(self.bank.targets(0).values()) != budget.base_bytes
             or self.bank.max_rows != budget.max_hot_rows + budget.staging

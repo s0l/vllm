@@ -251,9 +251,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.hidden_size = int(config.hidden_size)
         tp_size = get_tensor_model_parallel_world_size()
         if self.fp8_dcp and (
-            tp_size != 3
-            or parallel_config.tensor_parallel_size != 3
-            or parallel_config.decode_context_parallel_size != 3
+            tp_size != parallel_config.tensor_parallel_size
+            or parallel_config.decode_context_parallel_size != tp_size
             or parallel_config.prefill_context_parallel_size != 1
             or parallel_config.pipeline_parallel_size != 1
             or parallel_config.enable_dbo
@@ -264,7 +263,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             or vllm_config.attention_config.resolve_indexer_kv_dtype("bf16") != "bf16"
         ):
             raise NotImplementedError(
-                "FlashNext FP8 QSA requires its admitted TP3/DCP3 geometry"
+                "FlashNext FP8 QSA requires matching TP/DCP groups and model geometry"
             )
         self.total_num_heads = int(config.num_attention_heads)
         if self.total_num_heads % tp_size:
@@ -381,7 +380,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             from .qsa_flashinfer import QSAFlashInferBackend, QSAFlashInferImpl
 
             self.attn_backend = QSAFlashInferBackend
-            self.impl = QSAFlashInferImpl(vllm_config)
+            self.impl = QSAFlashInferImpl(
+                vllm_config,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_dim,
+            )
         else:
             self.attn_backend = Qwen4ExpQSAFlashAttentionBackend
             self.impl = Qwen4ExpQSAFlashAttentionImpl(
@@ -568,7 +572,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        return_ag2_mtp_trace: bool = False,
+        *,
+        return_tp_partial: bool = False,
     ) -> torch.Tensor:
+        if return_ag2_mtp_trace or return_tp_partial:
+            raise ValueError("QSA owner does not expose dense attention trace carriers")
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
         num_tokens = hidden_states.shape[0]

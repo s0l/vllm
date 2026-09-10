@@ -52,16 +52,14 @@ def get_native_provider(vllm_config):
     parallel = vllm_config.parallel_config
     text = vllm_config.model_config.hf_text_config
     if (
-        parallel.tensor_parallel_size != 3
-        or parallel.decode_context_parallel_size != 3
-        or parallel.prefill_context_parallel_size != 1
+        parallel.prefill_context_parallel_size != 1
         or parallel.pipeline_parallel_size != 1
         or parallel.data_parallel_size != 1
         or parallel.enable_expert_parallel
         or parallel.enable_eplb
         or parallel.enable_dbo
         or parallel.use_sequence_parallel_moe
-        or get_tensor_model_parallel_world_size() != 3
+        or get_tensor_model_parallel_world_size() != parallel.tensor_parallel_size
         or (text.hidden_size, text.num_experts, text.num_experts_per_tok)
         != (2560, 512, 10)
         or (text.moe_intermediate_size, text.num_hidden_layers) != (640, 48)
@@ -69,7 +67,7 @@ def get_native_provider(vllm_config):
         or vllm_config.model_config.dtype != torch.bfloat16
     ):
         raise ValueError(
-            "native FlashNext experts require admitted TP3 CUTLASS geometry"
+            "native FlashNext experts require matching TP groups and CUTLASS geometry"
         )
     key = id(vllm_config.compilation_config.static_forward_context)
     provider = _providers.get(key)
@@ -78,8 +76,9 @@ def get_native_provider(vllm_config):
             vllm_config.model_config.model,
             get_tensor_model_parallel_rank(),
             options.get("ram_cache_bytes", 1 << 30),
-            layers=48,
-            experts=512,
+            layers=text.num_hidden_layers,
+            experts=text.num_experts,
+            geometry=budget.geometry,
         )
         device = get_tp_group().device
         bank = NativeExpertBank(
@@ -103,7 +102,9 @@ def get_native_provider(vllm_config):
             != budget.strides
         ):
             raise RuntimeError("native bank differs from scheduler byte geometry")
-        provider = NativeExpertProvider(bank, get_tp_group(), vllm_config)
+        provider = NativeExpertProvider(
+            bank, get_tp_group(), vllm_config, topk=text.num_experts_per_tok
+        )
         _providers[key] = provider
     return provider
 
@@ -178,21 +179,27 @@ class FlashNextNativeMoeBlock(Qwen3NextSparseMoeBlock):
             provider = get_native_provider(vllm_config)
         if config.shared_expert_intermediate_size != 640 or config.hidden_act != "silu":
             raise ValueError("unsupported native shared expert geometry")
-        self.tp_size, self.ep_size = 3, 1
+        self.tp_size = provider.bank.source.tp
+        self.ep_size = 1
         self.is_sequence_parallel = False
         self.enable_eplb = self.is_fused_shared_expert_enabled = False
         self.replicate_shared_expert = False
-        self.n_routed_experts = self.n_logical_experts = self.n_physical_experts = 512
-        self.n_local_physical_experts = 512
+        self.n_routed_experts = self.n_logical_experts = self.n_physical_experts = (
+            config.num_experts
+        )
+        self.n_local_physical_experts = config.num_experts
         self.n_shared_experts, self.n_redundant_experts = 1, 0
+        self.top_k = config.num_experts_per_tok
         self.renormalize = bool(getattr(config, "norm_topk_prob", True))
-        self.gate = ReplicatedLinear(2560, 512, bias=False, prefix=f"{prefix}.gate")
+        self.gate = ReplicatedLinear(
+            config.hidden_size, config.num_experts, bias=False, prefix=f"{prefix}.gate"
+        )
         self.shared_expert_gate = ReplicatedLinear(
-            2560, 1, bias=False, prefix=f"{prefix}.shared_expert_gate"
+            config.hidden_size, 1, bias=False, prefix=f"{prefix}.shared_expert_gate"
         )
         self.shared_expert = Qwen3NextMLP(
-            2560,
-            640,
+            config.hidden_size,
+            config.shared_expert_intermediate_size,
             "silu",
             reduce_results=False,
             expert_gate=self.shared_expert_gate,
@@ -209,7 +216,7 @@ class FlashNextNativeMoeBlock(Qwen3NextSparseMoeBlock):
             return hidden_states
         logits = self.gate(hidden_states)[0]
         weights, ids, _ = fused_topk(
-            hidden_states, logits.float(), 10, self.renormalize
+            hidden_states, logits.float(), self.top_k, self.renormalize
         )
         routed = self.experts(hidden_states, weights, ids)
         assert self.shared_expert is not None

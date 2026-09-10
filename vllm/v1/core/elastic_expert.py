@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Scheduler/worker contract for the admitted native FlashNext TP3 bank."""
+"""Scheduler/worker contract for the native FlashNext expert bank."""
 
 from dataclasses import dataclass
+
+from vllm.utils.nvfp4_expert_geometry import NVFP4ExpertGeometry
 
 
 @dataclass(frozen=True)
@@ -19,19 +21,21 @@ class ElasticExpertGrant:
 
 @dataclass(frozen=True)
 class NativeExpertBudget:
+    geometry: NVFP4ExpertGeometry
+    layers: int
+    experts: int
     max_hot_rows: int = 8192
     staging: int = 32
     quantum: int = 2 << 20
 
-    # Exact native row strides: W13, W2 and their swizzled block scales.
-    strides = (655360, 327680, 81920, 40960)
-
     def __post_init__(self):
+        self.geometry.validate_cutlass()
         if (
-            type(self.max_hot_rows) is not int
-            or not 0 <= self.max_hot_rows <= 48 * 512
+            any(type(v) is not int or v <= 0 for v in (self.layers, self.experts))
+            or type(self.max_hot_rows) is not int
+            or not 0 <= self.max_hot_rows <= self.layers * self.experts
             or type(self.staging) is not int
-            or not 1 <= self.staging <= 512
+            or not 1 <= self.staging <= min(self.experts, 1024)
             or self.staging & (self.staging - 1)
             or type(self.quantum) is not int
             or self.quantum != 2 << 20
@@ -52,7 +56,24 @@ class NativeExpertBudget:
             or options.get("hot_rows", 0) != 0
         ):
             raise ValueError("native elastic experts require zero initial HOT rows")
-        return cls(options.get("max_hot_rows", 8192), options.get("staging", 32))
+        text = config.model_config.hf_text_config
+        return cls(
+            NVFP4ExpertGeometry(
+                text.hidden_size,
+                text.moe_intermediate_size,
+                config.parallel_config.tensor_parallel_size,
+            ),
+            text.num_hidden_layers,
+            text.num_experts,
+            options.get(
+                "max_hot_rows", min(8192, text.num_hidden_layers * text.num_experts)
+            ),
+            options.get("staging", 32),
+        )
+
+    @property
+    def strides(self):
+        return self.geometry.strides
 
     def round(self, size):
         return (size + self.quantum - 1) // self.quantum * self.quantum

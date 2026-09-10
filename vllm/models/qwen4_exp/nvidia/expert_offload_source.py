@@ -16,6 +16,8 @@ from typing import Any
 import numpy as np
 import regex as re
 
+from vllm.utils.nvfp4_expert_geometry import NVFP4ExpertGeometry
+
 from .ple_offload import _header, fingerprint
 
 PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
@@ -45,7 +47,7 @@ def validate(bundle, hidden, width):
                 raise ValueError("nonfinite block scale")
 
 
-def split_bundle(bundle, *, hidden, width, physical, tp=3, selected_rank=None):
+def split_bundle(bundle, *, hidden, width, physical, tp, selected_rank=None):
     """Return independent rank bundles; immutable caller source, no requantization."""
     validate(bundle, hidden, width)
     if type(tp) is not int or tp <= 0 or physical < width or physical % tp:
@@ -141,11 +143,14 @@ class NativeExpertStore:
         *,
         layers,
         experts,
-        hidden=2560,
-        width=640,
-        physical=768,
-        tp=3,
+        geometry: NVFP4ExpertGeometry,
     ):
+        hidden, width, physical, tp = (
+            geometry.hidden,
+            geometry.width,
+            geometry.physical,
+            geometry.tp,
+        )
         if min(layers, experts, hidden, width, physical, tp) <= 0:
             raise ValueError("invalid expert source geometry")
         if not 0 <= rank < tp or cache_bytes < 0 or physical < width or physical % tp:
@@ -153,11 +158,12 @@ class NativeExpertStore:
         if hidden % 16 or width % 16 or physical // tp % 16:
             raise ValueError("expert source must align to NVFP4 scale blocks")
         self.root = Path(checkpoint).resolve(strict=True)
+        self.geometry = geometry
         self.rank, self.tp = rank, tp
         self.hidden, self.width, self.physical = hidden, width, physical
         self.layers, self.experts = layers, experts
         self.limit = cache_bytes
-        self.cache = OrderedDict()
+        self.cache: OrderedDict[tuple[int, int], dict[str, np.ndarray]] = OrderedDict()
         self.used = self.peak = self.read_bytes = self.hits = self.misses = 0
         self.closed = False
         self.lock = RLock()

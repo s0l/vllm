@@ -507,8 +507,12 @@ class QSAFlashInferImpl(AttentionImpl[QSAFlashInferMetadata]):
     can_return_lse_for_decode = True
     lse_base_on_e = False
 
-    def __init__(self, vllm_config):
-        self.num_heads, self.num_kv_heads, self.head_size = 8, 2, 256
+    def __init__(self, vllm_config, *, num_heads, num_kv_heads, head_size):
+        self.num_heads, self.num_kv_heads, self.head_size = (
+            num_heads,
+            num_kv_heads,
+            head_size,
+        )
         self.scale = self.head_size**-0.5
         self.kv_cache_dtype = vllm_config.cache_config.cache_dtype
         self.interleave = vllm_config.parallel_config.cp_kv_cache_interleave_size

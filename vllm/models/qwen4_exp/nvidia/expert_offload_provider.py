@@ -84,20 +84,26 @@ class NativeExpertProvider:
     bank; its transaction must call retire before changing physical mappings.
     """
 
-    def __init__(self, bank, group, vllm_config, *, max_tokens=4096, max_lanes=4096):
+    def __init__(
+        self, bank, group, vllm_config, *, topk, max_tokens=4096, max_lanes=4096
+    ):
+        bank.source.geometry.validate_cutlass()
         if (
-            max_tokens < 1
+            type(topk) is not int
+            or not 1 <= topk <= bank.source.experts
+            or max_tokens < 1
             or max_lanes < 1
             or max_lanes & (max_lanes - 1)
-            or max_lanes > max_tokens * 10
-            or bank.source.tp != 3
-            or bank.source.hidden != 2560
+            or max_lanes > max_tokens * topk
+            or bank.source.tp != vllm_config.parallel_config.tensor_parallel_size
+            or bank.source.tp != torch.distributed.get_world_size(group.device_group)
+            or bank.source.rank != torch.distributed.get_rank(group.device_group)
         ):
             raise ValueError("invalid compact native provider geometry")
         self.bank, self.config = bank, vllm_config
         self.coordinator = NativeBankCoordinator(bank, group)
         self.max_tokens, self.max_lanes = max_tokens, max_lanes
-        self.topk, self.hidden = 10, bank.source.hidden
+        self.topk, self.hidden = topk, bank.source.hidden
         self.x = torch.empty(
             max_tokens, self.hidden, device=bank.device, dtype=torch.bfloat16
         )
