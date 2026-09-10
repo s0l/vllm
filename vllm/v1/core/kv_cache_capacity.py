@@ -65,12 +65,16 @@ class PhysicalPoolCapacityPlanner:
             raise ValueError("primary block upper bound must be non-negative")
         secondary_bytes = self.secondary_mapped_bytes(secondary_blocks)
         external_mapped = self.external_mapped_bytes(external_bytes)
-        for primary_blocks in range(upper_bound, -1, -1):
+        lo, hi = 0, upper_bound
+        while lo < hi:
+            primary_blocks = (lo + hi + 1) // 2
             if (
                 self.primary_mapped_bytes(primary_blocks)
                 + secondary_bytes
                 + external_mapped
                 <= self.budget_bytes
             ):
-                return primary_blocks
-        return 0
+                lo = primary_blocks
+            else:
+                hi = primary_blocks - 1
+        return lo

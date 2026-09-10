@@ -23,6 +23,7 @@ from vllm.v1.core.kv_cache_capacity import PhysicalPoolCapacityPlanner
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KpoolTailSpec,
@@ -130,7 +131,7 @@ def _elastic_gdn_blocks_per_seq(vllm_config: VllmConfig, num_mamba_groups: int) 
         required_per_group
         if _use_gdn_mtp_replay_commit(vllm_config)
         else int(
-            vllm_config.additional_config.get(
+            _additional_config(vllm_config).get(
                 "elastic_gdn_blocks_per_seq", required_per_group
             )
         )
@@ -145,7 +146,7 @@ def _elastic_gdn_blocks_per_seq(vllm_config: VllmConfig, num_mamba_groups: int) 
 
 
 def _elastic_gdn_pool_blocks(vllm_config: VllmConfig, num_mamba_groups: int) -> int:
-    max_seqs = int(vllm_config.additional_config.get("elastic_gdn_max_seqs", 64))
+    max_seqs = int(_additional_config(vllm_config).get("elastic_gdn_max_seqs", 64))
     blocks_per_seq = _elastic_gdn_blocks_per_seq(vllm_config, num_mamba_groups)
     if max_seqs < 1:
         raise ValueError("elastic GDN max_seqs must be positive")
@@ -166,7 +167,7 @@ def _finalize_separate_gdn_pool_specs(
     pool_blocks = (
         _elastic_gdn_pool_blocks(vllm_config, num_mamba_groups)
         if _use_elastic_gdn_backing(vllm_config)
-        else int(vllm_config.additional_config.get("gdn_pool_blocks", 25))
+        else int(_additional_config(vllm_config).get("gdn_pool_blocks", 25))
     )
     if pool_blocks < 2:
         raise ValueError("gdn_pool_blocks must include at least one usable block")
@@ -1527,9 +1528,9 @@ def unify_kv_cache_spec_page_size(
     for layer_name, layer_spec in kv_cache_spec.items():
         if layer_spec.page_size_bytes == max_page_size:
             new_kv_cache_spec[layer_name] = layer_spec
-        elif isinstance(layer_spec, MambaSpec):
-            # MambaSpec's page size is determined by its state shapes and does
-            # not scale with block_size, so pad the page instead. This is the
+        elif isinstance(layer_spec, (MambaSpec, CircularBufferSpec)):
+            # Recurrent states and circular rings retain their logical extent;
+            # pad their page instead of increasing the ring capacity. This is the
             # same padding mechanism the platform uses to align Mamba pages
             # with the main model's attention page size; it is needed here
             # when another layer (e.g. from a draft model) has a larger page
@@ -1843,7 +1844,7 @@ def get_kv_cache_config_from_groups(
                 else (
                     vllm_config.scheduler_config.max_num_seqs
                     if requested_elastic
-                    else int(vllm_config.additional_config.get("gdn_pool_blocks", 25))
+                    else int(_additional_config(vllm_config).get("gdn_pool_blocks", 25))
                 )
             )
             mamba_buckets = _bucket_separate_pool_layers_by_page_size(mamba_groups)
@@ -1854,14 +1855,14 @@ def get_kv_cache_config_from_groups(
             if elastic:
                 quantum = (
                     int(
-                        vllm_config.additional_config.get(
+                        _additional_config(vllm_config).get(
                             "elastic_gdn_vmm_quantum_mb", 2
                         )
                     )
                     * 1024**2
                 )
                 min_seqs = int(
-                    vllm_config.additional_config.get("elastic_gdn_min_seqs", 1)
+                    _additional_config(vllm_config).get("elastic_gdn_min_seqs", 1)
                 )
                 blocks_per_seq = _elastic_gdn_blocks_per_seq(
                     vllm_config, len(mamba_groups)
@@ -1964,7 +1965,7 @@ def get_kv_cache_config_from_groups(
                     elastic_budget_bytes=elastic_budget,
                 )
 
-            mamba_tensors: list[KVCacheTensor] = []
+            mamba_tensors = []
             mamba_bytes = 0
             for page_size, slots in mamba_buckets.items():
                 for slot in slots:
@@ -2600,6 +2601,19 @@ def get_kv_cache_groups(
         if not isinstance(v, HiddenStateCacheSpec)
     }
 
+    if _use_separate_gdn_pool(vllm_config):
+        attention_specs = {
+            name: spec
+            for name, spec in filtered_spec.items()
+            if not isinstance(spec, MambaSpec)
+        }
+        try:
+            filtered_spec.update(unify_kv_cache_spec_page_size(attention_specs))
+        except NotImplementedError:
+            # Independently mapped page-size buckets remain valid when MLA
+            # rows cannot form a common page. Admission prices all buckets.
+            logger.info_once("Keeping separate elastic attention page-size buckets.")
+
     if packed_groups := _get_packed_kv_cache_groups(vllm_config, filtered_spec):
         # Block-outermost blocks are strided by the widest group, so hidden
         # groups need no page alignment.
@@ -2885,6 +2899,50 @@ def _max_memory_usage_bytes_from_groups(
         return 0
 
     if _use_separate_gdn_pool(vllm_config):
+        if _use_elastic_gdn_backing(vllm_config):
+            mamba_groups = [
+                g for g in kv_cache_groups if isinstance(g.kv_cache_spec, MambaSpec)
+            ]
+            attention_groups = [
+                g for g in kv_cache_groups if not isinstance(g.kv_cache_spec, MambaSpec)
+            ]
+            if mamba_groups and attention_groups:
+                attention_buckets = _bucket_separate_pool_layers_by_page_size(
+                    attention_groups
+                )
+                mamba_buckets = _bucket_separate_pool_layers_by_page_size(mamba_groups)
+                primary_blocks = 1 + sum(
+                    cdiv(
+                        g.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                        g.kv_cache_spec.page_size_bytes,
+                    )
+                    for g in attention_groups
+                )
+                min_seqs = max(
+                    1,
+                    int(_additional_config(vllm_config).get("elastic_gdn_min_seqs", 1)),
+                )
+                secondary_blocks = 1 + min_seqs * _elastic_gdn_blocks_per_seq(
+                    vllm_config, len(mamba_groups)
+                )
+                planner = PhysicalPoolCapacityPlanner(
+                    primary_block_sizes=tuple(
+                        page for page, slots in attention_buckets.items() for _ in slots
+                    ),
+                    secondary_block_stride=sum(
+                        page * len(slots) for page, slots in mamba_buckets.items()
+                    ),
+                    mapping_quantum=int(
+                        _additional_config(vllm_config).get(
+                            "elastic_gdn_vmm_quantum_mb", 2
+                        )
+                    )
+                    * 1024**2,
+                    budget_bytes=1,
+                )
+                return planner.primary_mapped_bytes(primary_blocks) + (
+                    planner.secondary_mapped_bytes(secondary_blocks)
+                )
         return sum(
             len(group.layer_names)
             * group.kv_cache_spec.max_memory_usage_bytes(vllm_config)
@@ -3174,7 +3232,14 @@ def get_kv_cache_configs(
     # the capacity check both plan against usable blocks. Allocation below
     # still uses the full memory.
     check_memory = [
-        avail_mem - _pool_bytes_per_block(groups) if groups else avail_mem
+        (
+            avail_mem
+            if _use_separate_gdn_pool(vllm_config)
+            and _use_elastic_gdn_backing(vllm_config)
+            else avail_mem - _pool_bytes_per_block(groups)
+        )
+        if groups
+        else avail_mem
         for groups, avail_mem in zip(projected_groups_per_worker, available_memory)
     ]
 

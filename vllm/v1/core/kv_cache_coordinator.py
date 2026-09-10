@@ -25,6 +25,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     get_manager_for_kv_cache_spec,
 )
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
@@ -76,7 +77,7 @@ class KVCacheBlockPoolRequirements(NamedTuple):
     def total(self) -> int:
         return self.primary + self.mamba
 
-    def __add__(
+    def __add__(  # type: ignore[override]  # Component sums, not tuple concatenation.
         self, other: "KVCacheBlockPoolRequirements"
     ) -> "KVCacheBlockPoolRequirements":
         return KVCacheBlockPoolRequirements(
@@ -114,6 +115,9 @@ class KVCacheCoordinator(ABC):
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
+        self.hash_block_size = hash_block_size
+        self.dcp_world_size = dcp_world_size
+        self.pcp_world_size = pcp_world_size
         # The scheduling granularity (LCM of all group block sizes), must be a multiple
         # of the hash_block_size and the block size of each group.
         assert scheduler_block_size % hash_block_size == 0 and all(
@@ -1457,13 +1461,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         )
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
         if dcp_world_size > 1:
-            # DCP shards full-attention KV across ranks and replicates Mamba
-            # state; other spec types (e.g. sliding window) have no DCP-aware
-            # handling yet, so reject them explicitly.
+            # DCP shards full-attention KV; Mamba and explicitly replicated
+            # circular state keep one complete owner on each rank.
             for g in kv_cache_config.kv_cache_groups:
-                assert isinstance(g.kv_cache_spec, (FullAttentionSpec, MambaSpec)), (
+                spec = g.kv_cache_spec
+                assert isinstance(spec, (FullAttentionSpec, MambaSpec)) or (
+                    isinstance(spec, CircularBufferSpec) and spec.dcp_replicated
+                ), (
                     "DCP with hybrid KV cache layouts only supports "
-                    "full-attention and Mamba groups, got: "
+                    "full-attention, Mamba and replicated circular groups, got: "
                     f"{type(g.kv_cache_spec).__name__}."
                 )
         # Fine-grained hash hits require Mamba "align" and compatible cache
