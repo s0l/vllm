@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 
 from vllm.distributed.parallel_state import (
     _should_use_tp3_ce,
     _should_use_tp3_ce_physical,
     _should_use_tp3_embedding_ce,
+    _should_use_tp3_flashnext_device_ce,
     _should_use_tp3_piecewise_device_ce,
     _should_use_tp3_sd_canonical_reduce,
     _should_use_tp3_sd_deterministic_reduce,
@@ -14,6 +16,59 @@ from vllm.distributed.parallel_state import (
     _tp3_sd_deterministic_reduce,
     _tp3_sd_deterministic_sum,
 )
+
+
+def test_flashnext_ce_requires_opt_in_runtime_and_exact_tp_shape():
+    args = dict(
+        enabled=True,
+        runtime_enabled=True,
+        tensor_dim=2,
+        hidden_size=2560,
+        tp_world_size=3,
+    )
+    assert _should_use_tp3_flashnext_device_ce(**args)
+    for key, value in [
+        ("enabled", False),
+        ("runtime_enabled", False),
+        ("tensor_dim", 1),
+        ("hidden_size", 5120),
+        ("hidden_size", 4096),
+        ("tp_world_size", 2),
+    ]:
+        assert not _should_use_tp3_flashnext_device_ce(**(args | {key: value}))
+
+
+def test_flashnext_ce_rejects_invalid_layout_before_collective(monkeypatch):
+    from vllm.distributed import parallel_state as ps
+
+    class Group:
+        world_size = 3
+
+    group = Group()
+    monkeypatch.setattr(ps, "_TP", group)
+    monkeypatch.setattr(ps, "_tp3_ce_runtime_enabled", True)
+    monkeypatch.setitem(ps._groups, "flashnext_test", lambda: group)
+    monkeypatch.setenv("AG2_VLLM_FLASHNEXT_DEVICE_CE", "1")
+    calls = []
+
+    def consume(tensor, owner):
+        assert owner is group
+        calls.append(tensor)
+        return tensor
+
+    monkeypatch.setattr(ps, "_tp3_device_ce_reduce", consume)
+    good = torch.zeros(1, 2560, dtype=torch.bfloat16)
+    assert ps.all_reduce(good, "flashnext_test") is good
+    for invalid in [
+        good.float(),
+        torch.zeros(2560, 2, dtype=torch.bfloat16).T,
+        good[:0],
+    ]:
+        with pytest.raises(ValueError, match="contiguous BF16"):
+            ps.all_reduce(invalid, "flashnext_test")
+    assert len(calls) == 1
+    assert ps.all_reduce(good, "flashnext_test") is good
+    assert len(calls) == 2
 
 
 def test_tp3_embedding_exact_nccl_override_is_shape_invariant():

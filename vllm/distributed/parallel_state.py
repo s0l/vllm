@@ -223,6 +223,22 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
+    if group is _TP and _should_use_tp3_flashnext_device_ce(
+        enabled=os.environ.get("AG2_VLLM_FLASHNEXT_DEVICE_CE", "0") == "1",
+        runtime_enabled=_tp3_ce_runtime_enabled,
+        tensor_dim=tensor.dim(),
+        hidden_size=tensor.shape[-1] if tensor.dim() else 0,
+        tp_world_size=group.world_size,
+    ):
+        if (
+            tensor.dtype != torch.bfloat16
+            or not tensor.is_contiguous()
+            or tensor.shape[0] <= 0
+        ):
+            raise ValueError(
+                "FlashNext device CE requires contiguous BF16 [rows>0,2560]"
+            )
+        return _tp3_device_ce_reduce(tensor, group)
     from vllm.forward_context import (
         get_forward_context,
         is_forward_context_available,
@@ -443,6 +459,23 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
         ):
             return _tp3_sd_canonical_reduce(tensor, group._all_reduce_out_place)
     return group._all_reduce_out_place(tensor)
+
+
+def _should_use_tp3_flashnext_device_ce(
+    *,
+    enabled: bool,
+    runtime_enabled: bool,
+    tensor_dim: int,
+    hidden_size: int,
+    tp_world_size: int,
+) -> bool:
+    return (
+        enabled
+        and runtime_enabled
+        and tensor_dim == 2
+        and hidden_size == 2560
+        and tp_world_size == 3
+    )
 
 
 def _should_use_tp3_piecewise_device_ce(
