@@ -106,6 +106,51 @@ IS_RMS_NORM = [True, False]
 SEEDS = [0, 42]
 
 
+@pytest.mark.parametrize(
+    "rows,is_rms_norm,norm_before_gate,activation,dtype",
+    [
+        (7, True, True, "sigmoid", torch.bfloat16),
+        (513, True, True, "sigmoid", torch.bfloat16),
+        (513, True, False, "silu", torch.bfloat16),
+        (513, False, True, "silu", torch.float32),
+        (7, False, False, "sigmoid", torch.float32),
+    ],
+)
+@pytest.mark.parametrize("eps", [1e-6, 1e-5])
+@torch.inference_mode()
+def test_layer_norm_compiled_scalar_precision(
+    rows, is_rms_norm, norm_before_gate, activation, dtype, eps
+):
+    """A wider compiler scalar ABI must preserve FP32 normalization math."""
+    torch._dynamo.reset()
+    set_random_seed(42)
+    x = torch.randn(rows, 128, device=DEVICE, dtype=dtype) * 0.01
+    z = torch.randn_like(x)
+    weight = torch.randn(128, device=DEVICE, dtype=dtype)
+    bias = None if is_rms_norm else torch.randn_like(weight)
+
+    def invoke(value, gate):
+        return layer_norm_fwd(
+            value,
+            weight,
+            bias,
+            eps,
+            z=gate,
+            is_rms_norm=is_rms_norm,
+            norm_before_gate=norm_before_gate,
+            activation=activation,
+        )[0]
+
+    compiled = torch.compile(invoke, fullgraph=True)
+    direct = invoke(x, z)
+    torch.testing.assert_close(compiled(x, z), direct, atol=0, rtol=0)
+    # Both paths must consume the new gate, not return a traced constant.
+    changed = invoke(x, -z)
+    assert not torch.equal(changed, direct)
+    torch.testing.assert_close(compiled(x, -z), changed, atol=0, rtol=0)
+    torch.testing.assert_close(compiled(x, z), direct, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("rows_per_token", [1, 2, 4, 8, 16])
 def test_layer_norm_fwd_warmup_keys_cover_qwen_gdn(
     rows_per_token: int,
