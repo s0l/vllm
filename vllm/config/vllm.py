@@ -1083,6 +1083,44 @@ class VllmConfig:
         if not self.use_v2_model_runner:
             raise ValueError("trace replay requires Model Runner V2")
 
+    def _uses_sequence_sharded_qsa(self) -> bool:
+        """Admit the opt-in QSA owner before generic KV-head DCP validation.
+
+        This owner retains every KV head on each rank and partitions positions.
+        Its backend still validates the actual process groups and cache views.
+        """
+        extra = self.additional_config
+        if not isinstance(extra, dict) or not extra.get("flashnext_qsa_dcp"):
+            return False
+        model = self.model_config
+        text = getattr(model, "hf_text_config", None)
+        parallel = self.parallel_config
+        tp = parallel.tensor_parallel_size
+        if (
+            extra["flashnext_qsa_dcp"] is not True
+            or getattr(text, "model_type", None)
+            not in {"qwen4_exp", "qwen4_exp_text", "qwen4_exp_mtp"}
+            or getattr(text, "hidden_size", None) != 2560
+            or getattr(text, "num_attention_heads", None) != 24
+            or getattr(text, "num_key_value_heads", None) != 2
+            or getattr(text, "head_dim", None) != 256
+            or getattr(text, "indexer_budget", None) != 2048
+            or getattr(text, "indexer_compress_ratio", None) != 4
+            or tp <= 0
+            or 24 % tp
+            or parallel.decode_context_parallel_size != tp
+            or parallel.prefill_context_parallel_size != 1
+            or parallel.pipeline_parallel_size != 1
+            or parallel.enable_dbo
+            or getattr(model, "dtype", None) != torch.bfloat16
+            or self.cache_config.cache_dtype not in ("fp8", "fp8_e4m3")
+            or self.attention_config.resolve_indexer_kv_dtype("bf16") != "bf16"
+        ):
+            raise ValueError(
+                "FlashNext FP8 QSA requires matching TP/DCP and model geometry"
+            )
+        return True
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -1101,7 +1139,10 @@ class VllmConfig:
         self.parallel_config.set_dcp_defaults()
 
         if self.model_config is not None:
-            self.model_config.verify_with_parallel_config(self.parallel_config)
+            self.model_config.verify_with_parallel_config(
+                self.parallel_config,
+                sequence_sharded_kv=self._uses_sequence_sharded_qsa(),
+            )
             self.model_config.verify_dual_chunk_attention_config(self.load_config)
 
             self.parallel_config.is_moe_model = self.model_config.is_moe

@@ -1417,6 +1417,8 @@ class ModelConfig:
     def verify_with_parallel_config(
         self,
         parallel_config: ParallelConfig,
+        *,
+        sequence_sharded_kv: bool = False,
     ) -> None:
         total_num_attention_heads = self.model_arch_config.total_num_attention_heads
         tensor_parallel_size = parallel_config.tensor_parallel_size
@@ -1442,11 +1444,10 @@ class ModelConfig:
         decode_context_parallel_size = parallel_config.decode_context_parallel_size
         if decode_context_parallel_size > 1 and not self.use_mla:
             total_num_kv_heads = self.get_total_num_kv_heads()
-            supports_sequence_sharded_gqa_dcp = self.model_arch_config.model_type in {
-                "qwen3_5",
-                "qwen3_5_text",
-                "qwen3_next",
-            }
+            supports_sequence_sharded_gqa_dcp = sequence_sharded_kv or (
+                self.model_arch_config.model_type
+                in {"qwen3_5", "qwen3_5_text", "qwen3_next"}
+            )
             if not supports_sequence_sharded_gqa_dcp:
                 if tensor_parallel_size <= total_num_kv_heads:
                     raise ValueError(
