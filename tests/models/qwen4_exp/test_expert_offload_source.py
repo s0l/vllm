@@ -9,7 +9,12 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from vllm.models.qwen4_exp.nvidia.expert_offload_source import NativeExpertStore
+from vllm.models.qwen4_exp.nvidia.expert_offload_source import (
+    NativeExpertStore,
+    prepare,
+    split_bundle,
+)
+from vllm.utils.nvfp4_expert_geometry import NVFP4ExpertGeometry
 
 
 def write_source(path, scale=1.0):
@@ -40,9 +45,7 @@ def store(path, budget=4096, rank=0):
         budget,
         layers=2,
         experts=3,
-        hidden=32,
-        width=16,
-        physical=48,
+        geometry=NVFP4ExpertGeometry(32, 16, tp=3, local_alignment=16),
     )
 
 
@@ -187,3 +190,126 @@ def test_native_model_does_not_silently_consume_dense_owner_prequant_rows():
         Qwen4ExpForConditionalGeneration.forward(
             torch.nn.Module(), None, None, ready_rows=torch.tensor([1])
         )
+
+
+@pytest.mark.parametrize("tp", [1, 2, 3, 4, 5, 8, 16])
+@pytest.mark.parametrize("hidden,width", [(2560, 640), (384, 656)])
+def test_tp_partition_preserves_source_tail_scales_and_exact_mapped_bytes(
+    tp, hidden, width
+):
+    from vllm.v1.core.elastic_expert import NativeExpertBudget
+
+    geometry = NVFP4ExpertGeometry(hidden, width, tp)
+    rng = np.random.default_rng(10277)
+    raw = {}
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        m, k = (hidden, width) if projection == "down_proj" else (width, hidden)
+        raw[projection + ".weight"] = rng.integers(0, 256, (m, k // 2), dtype=np.uint8)
+        raw[projection + ".weight_scale"] = rng.integers(
+            32, 64, (m, k // 16), dtype=np.uint8
+        )
+        raw[projection + ".weight_scale_2"] = np.asarray(0.5, dtype=np.float32)
+        raw[projection + ".input_scale"] = np.asarray(1.5, dtype=np.float32)
+    pristine = {k: v.copy() for k, v in raw.items()}
+    shards = split_bundle(
+        raw, hidden=hidden, width=width, physical=geometry.physical, tp=tp
+    )
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        axis = 1 if projection == "down_proj" else 0
+        for field, packing, pad in (("weight", 2, 0), ("weight_scale", 16, 56)):
+            name = projection + "." + field
+            joined = np.concatenate([s[name] for s in shards], axis=axis)
+            logical = width // packing if axis else width
+            source, padding = np.split(joined, [logical], axis=axis)
+            np.testing.assert_array_equal(source, raw[name])
+            assert np.all(padding == pad)
+        for field in ("weight_scale_2", "input_scale"):
+            name = projection + "." + field
+            assert all(np.array_equal(s[name], raw[name]) for s in shards)
+    assert all(np.array_equal(pristine[k], raw[k]) for k in raw)
+    # A dropped/shifted final source row cannot pass the reconstruction oracle.
+    last = np.concatenate([s["gate_proj.weight"] for s in shards])[:width].copy()
+    last[-1, 0] ^= 1
+    assert not np.array_equal(last, raw["gate_proj.weight"])
+    budget = NativeExpertBudget(geometry, 48, 512, max_hot_rows=128, staging=32)
+    for rank, shard in enumerate(shards):
+        assert all(
+            np.array_equal(a, b)
+            for a, b in zip(
+                shard.values(),
+                split_bundle(
+                    raw,
+                    hidden=hidden,
+                    width=width,
+                    physical=geometry.physical,
+                    tp=tp,
+                    selected_rank=rank,
+                )[0].values(),
+            )
+        )
+        prepared = prepare(shard)
+        arrays = [
+            prepared[k]
+            for k in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale")
+        ]
+        assert tuple(a.nbytes for a in arrays) == budget.strides
+        for hot in (0, 1, 31, 32, 127, 128):
+            sizes = [(hot + 32) * a.nbytes for a in arrays] + [(128 + 32) * 24]
+            q = 2 << 20
+            expected = sum((size + q - 1) // q * q for size in sizes)
+            assert budget.mapped_bytes(hot) == expected
+    if tp == 16:
+        assert all(not s["down_proj.weight"].any() for s in shards[11:])
+
+
+@pytest.mark.parametrize("tp", [0, -1, True, 1.5])
+def test_invalid_tp_rejected_before_checkpoint_access(tmp_path, tp):
+    with pytest.raises(ValueError, match="partition geometry"):
+        NativeExpertStore(
+            tmp_path,
+            0,
+            0,
+            layers=1,
+            experts=1,
+            geometry=NVFP4ExpertGeometry(2560, 640, tp),
+        )
+
+
+@pytest.mark.parametrize("tp", [1, 2, 3, 4, 8])
+@pytest.mark.parametrize("mismatch", [None, "group", "rank", "config"])
+def test_provider_admits_configured_tp_and_rejects_stale_partition_before_allocation(
+    monkeypatch, tp, mismatch
+):
+    from types import SimpleNamespace
+
+    from vllm.models.qwen4_exp.nvidia import expert_offload_provider as module
+
+    source = SimpleNamespace(
+        geometry=NVFP4ExpertGeometry(2560, 640, tp),
+        tp=tp,
+        rank=0,
+        hidden=2560,
+        experts=512,
+    )
+    group = SimpleNamespace(device_group=object())
+    cfg = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tp + (mismatch == "config")
+        )
+    )
+    monkeypatch.setattr(
+        torch.distributed, "get_world_size", lambda g: tp + (mismatch == "group")
+    )
+    monkeypatch.setattr(
+        torch.distributed, "get_rank", lambda g: int(mismatch == "rank")
+    )
+
+    class Admitted(Exception):
+        pass
+
+    def allocation(*args):
+        raise Admitted
+
+    monkeypatch.setattr(module, "NativeBankCoordinator", allocation)
+    with pytest.raises(ValueError if mismatch else Admitted):
+        module.NativeExpertProvider(SimpleNamespace(source=source), group, cfg, topk=10)

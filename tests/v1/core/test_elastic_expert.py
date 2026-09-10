@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm.utils.nvfp4_expert_geometry import NVFP4ExpertGeometry
 from vllm.v1.core.elastic_expert import ElasticExpertGrant, NativeExpertBudget
 from vllm.v1.core.elastic_graph import ElasticAdmissionController, RuntimeGeneration
 from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -21,9 +22,28 @@ from vllm.v1.kv_cache_interface import (
 )
 
 
+def make_budget(*, tp=3, **options):
+    return NativeExpertBudget(NVFP4ExpertGeometry(2560, 640, tp), 48, 512, **options)
+
+
+def make_config(options, tp=3):
+    return SimpleNamespace(
+        additional_config={"flashnext_native_experts": options},
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                hidden_size=2560,
+                moe_intermediate_size=640,
+                num_hidden_layers=48,
+                num_experts=512,
+            )
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=tp),
+    )
+
+
 @pytest.mark.parametrize("staging", [1, 2, 32])
 def test_native_quantum_curve_and_maximal_fit(staging):
-    budget = NativeExpertBudget(max_hot_rows=128, staging=staging)
+    budget = make_budget(max_hot_rows=128, staging=staging)
     previous = 0
     for hot in range(129):
         # Independently price the four native TP3 arrays and six FP32 scalars.
@@ -63,9 +83,21 @@ def test_native_quantum_curve_and_maximal_fit(staging):
 )
 def test_invalid_budget_rejected_before_source_or_device_allocation(options):
     with pytest.raises(ValueError):
-        NativeExpertBudget.from_config(
-            SimpleNamespace(additional_config={"flashnext_native_experts": options})
-        )
+        NativeExpertBudget.from_config(make_config(options))
+
+
+@pytest.mark.parametrize(
+    "tp,local", [(1, 640), (2, 320), (3, 256), (4, 192), (5, 128), (8, 128), (16, 64)]
+)
+def test_scheduler_budget_consumes_model_tp_configuration(tp, local):
+    budget = NativeExpertBudget.from_config(make_config({}, tp))
+    assert budget.geometry.local == local
+    assert budget.geometry.tp == tp
+    assert budget.geometry.physical == local * tp
+    assert budget.strides[0] == 2 * local * 1280
+    if tp == 3:
+        assert budget.strides == (655360, 327680, 81920, 40960)
+        assert budget.base_bytes == 38 << 20
 
 
 def make_coordinator():
@@ -114,7 +146,7 @@ def test_scheduler_reclaims_experts_before_live_kv_admission_and_recovers():
     coordinator = make_coordinator()
     s = object.__new__(Scheduler)
     s.kv_cache_manager = SimpleNamespace(coordinator=coordinator)
-    s._elastic_native_budget = NativeExpertBudget(max_hot_rows=128)
+    s._elastic_native_budget = make_budget(max_hot_rows=128)
     s._elastic_native_hot_rows = 0
     s._refresh_elastic_cache_frontier = Mock()
     s._release_elastic_prefix_hits = Mock()
@@ -175,7 +207,7 @@ def test_expert_grant_changes_both_plan_and_replay_epoch_identity():
     plan = controller.plan(
         "elastic-00000000000000000001", (), request_bytes=0, available_bytes=0
     )
-    budget = NativeExpertBudget(staging=1)
+    budget = make_budget(staging=1)
     # A geometry change may consume only already rounded staging slack.
     assert budget.grant(0).borrowed_bytes == budget.grant(1).borrowed_bytes
     a, b = (replace(plan, expert_grant=budget.grant(n)) for n in (0, 1))
@@ -191,7 +223,7 @@ def test_worker_admits_common_grant_before_retiring_or_mutating_bank(
         NativeExpertResidency,
     )
 
-    budget = NativeExpertBudget(max_hot_rows=128)
+    budget = make_budget(max_hot_rows=128)
     owner = NativeExpertResidency.__new__(NativeExpertResidency)
     owner.budget, owner.grant = budget, budget.grant(0)
     owner.last_sequence = 1 if failure == "stale" else 0

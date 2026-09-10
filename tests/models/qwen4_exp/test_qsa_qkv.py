@@ -19,7 +19,8 @@ def parameter_tp_metadata(monkeypatch):
     )
 
 
-def test_tp3_q_gate_heads_cover_source_once_and_kv_are_replicated():
+@pytest.mark.parametrize("tp", [1, 2, 3, 4, 6, 8])
+def test_tp_q_gate_heads_cover_source_once_and_kv_are_replicated(tp):
     hidden, heads, kv_heads, dim = 16, 24, 2, 8
     q = (
         torch.arange(heads * 2 * dim * hidden, dtype=torch.float32)
@@ -29,18 +30,21 @@ def test_tp3_q_gate_heads_cover_source_once_and_kv_are_replicated():
     k = torch.full((kv_heads * dim, hidden), -3, dtype=torch.bfloat16)
     v = torch.full_like(k, 7)
     local_q = []
-    for rank in range(3):
-        layer = QSAOwnedQKVLinear(hidden, heads, kv_heads, dim, tp_size=3, tp_rank=rank)
+    local_heads = heads // tp
+    for rank in range(tp):
+        layer = QSAOwnedQKVLinear(
+            hidden, heads, kv_heads, dim, tp_size=tp, tp_rank=rank
+        )
         for name, tensor in [("v", v), ("q", q), ("k", k)]:
             layer.weight.weight_loader(layer.weight, tensor, name)
         a, b, c = layer.weight.split(
-            [heads // 3 * 2 * dim, kv_heads * dim, kv_heads * dim]
+            [local_heads * 2 * dim, kv_heads * dim, kv_heads * dim]
         )
         local_q.append(a)
         assert torch.equal(b, k) and torch.equal(c, v)
         assert (
-            a.reshape(8, 2, dim, hidden)[0, 0, 0, 0]
-            == q.reshape(heads, 2, dim, hidden)[rank * 8, 0, 0, 0]
+            a.reshape(local_heads, 2, dim, hidden)[0, 0, 0, 0]
+            == q.reshape(heads, 2, dim, hidden)[rank * local_heads, 0, 0, 0]
         )
     assert torch.equal(torch.cat(local_q), q)
 

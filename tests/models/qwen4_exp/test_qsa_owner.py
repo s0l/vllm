@@ -196,7 +196,8 @@ def test_qsa_owner_rejects_unproven_geometry_before_weight_allocation(
     assert not cfg.compilation_config.static_forward_context
 
 
-def test_actual_owner_exposes_fp8_spec_before_allocator_binding(monkeypatch):
+@pytest.mark.parametrize("tp", [1, 2, 3, 4, 6, 8])
+def test_actual_owner_exposes_fp8_spec_before_allocator_binding(monkeypatch, tp):
     from vllm.config import set_current_vllm_config
     from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAAttention
 
@@ -205,9 +206,13 @@ def test_actual_owner_exposes_fp8_spec_before_allocator_binding(monkeypatch):
         "vllm.model_executor.layers.linear",
         "vllm.model_executor.parameter",
     ):
-        monkeypatch.setattr(module + ".get_tensor_model_parallel_world_size", lambda: 3)
+        monkeypatch.setattr(
+            module + ".get_tensor_model_parallel_world_size", lambda: tp
+        )
         monkeypatch.setattr(module + ".get_tensor_model_parallel_rank", lambda: 0)
     cfg = config()
+    cfg.parallel_config.tensor_parallel_size = tp
+    cfg.parallel_config.decode_context_parallel_size = tp
     cfg.additional_config["flashnext_qsa_dcp"] = True
     cfg.cache_config.cache_dtype = "fp8_e4m3"
     cfg.model_config.multimodal_config = None
@@ -237,6 +242,8 @@ def test_actual_owner_exposes_fp8_spec_before_allocator_binding(monkeypatch):
             vllm_config=cfg, config=text, layer_id=3, prefix="model.layers.3.self_attn"
         )
     spec = owner.get_kv_cache_spec(cfg)
+    assert owner.num_heads == owner.impl.num_heads == 24 // tp
+    assert owner.q_size == 24 // tp * 256
     assert spec.dtype == torch.float8_e4m3fn
     assert spec.num_kv_heads == 2 and spec.page_size_bytes == 65536
     good = (
@@ -248,3 +255,6 @@ def test_actual_owner_exposes_fp8_spec_before_allocator_binding(monkeypatch):
             owner.bind_kv_cache(invalid)
         assert owner.kv_cache is good
     assert not owner.impl.pool.plans
+    for option in ("return_ag2_mtp_trace", "return_tp_partial"):
+        with pytest.raises(ValueError, match="trace carriers"):
+            owner.forward(None, None, **{option: True})
