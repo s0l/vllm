@@ -25,6 +25,9 @@ class ElasticKVController:
         self.device = device
         self.backings: dict[str, ElasticCuMemBacking] = {}
         self.geometry: dict[str, int] = {}
+        # Non-KV owners publish exact mapped byte targets at a fenced boundary.
+        # They must never absorb unused KV budget merely by lexical key order.
+        self.auxiliary_targets: dict[str, int] = {}
         self._physical_budget_bytes: int | None = None
         self._mapping_quantum: int | None = None
         self._logical_transition: tuple[int, int] | None = None
@@ -82,6 +85,8 @@ class ElasticKVController:
                 f"{-slack} bytes"
             )
         for key in sorted(normalized):
+            if key in self.auxiliary_targets:
+                continue
             if slack == 0:
                 break
             info = self.backings[key].info
@@ -97,9 +102,13 @@ class ElasticKVController:
 
     def _apply_targets(self, targets: dict[str, int], fence: torch.cuda.Event) -> None:
         current = {key: owner.info.committed for key, owner in self.backings.items()}
-        donors = [[key, current[key] - targets[key]] for key in sorted(current)]
+        donors: list[list[Any]] = [
+            [key, current[key] - targets[key]] for key in sorted(current)
+        ]
         donors = [entry for entry in donors if entry[1] > 0]
-        receivers = [[key, targets[key] - current[key]] for key in sorted(current)]
+        receivers: list[list[Any]] = [
+            [key, targets[key] - current[key]] for key in sorted(current)
+        ]
         receivers = [entry for entry in receivers if entry[1] > 0]
 
         donor_idx = receiver_idx = 0
@@ -134,8 +143,23 @@ class ElasticKVController:
     ) -> dict[str, int]:
         """Derive the exact backing layout for one logical transition."""
         attention_blocks, gdn_blocks = transition
+        if self.auxiliary_targets.keys() - self.backings.keys():
+            raise ValueError("auxiliary elastic target without a backing")
         targets: dict[str, int] = {}
         for key, owner in self.backings.items():
+            if key in self.auxiliary_targets:
+                size = self.auxiliary_targets[key]
+                info = owner.info
+                if (
+                    key in self.geometry
+                    or type(size) is not int
+                    or size < 0
+                    or size > info.reserved
+                    or size % info.quantum
+                ):
+                    raise ValueError(f"invalid auxiliary elastic target: {key}")
+                targets[key] = size
+                continue
             block_bytes = self.geometry[key]
             blocks = gdn_blocks if key == "elastic-gdn" else attention_blocks
             targets[key] = (

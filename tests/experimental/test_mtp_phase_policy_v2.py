@@ -1359,6 +1359,51 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "divergent backing geometry"):
             controller.validate_equal_scheduler_step(None, 0)
 
+    def test_auxiliary_expert_geometry_is_fixed_and_does_not_absorb_slack(self):
+        controller = ElasticKVController(torch.device("cpu"))
+        controller.backings = {
+            "elastic-attention-0": _Owner(16),
+            "elastic-gdn": _Owner(8),
+            "aaa-native-weights": _Owner(8),
+            "aaa-native-scales": _Owner(4),
+        }
+        controller.geometry = {"elastic-attention-0": 4, "elastic-gdn": 4}
+        controller.auxiliary_targets = {"aaa-native-weights": 8, "aaa-native-scales": 4}
+        controller.configure_physical_budget(36, 4, (4, 2))
+        expected = controller._target_sizes((1, 1), 0)
+        self.assertEqual(expected["aaa-native-weights"], 8)
+        self.assertEqual(expected["aaa-native-scales"], 4)
+        self.assertEqual(sum(expected.values()), 36)
+        controller.auxiliary_targets["aaa-native-weights"] = 4
+        with (
+            patch.object(torch.cuda, "Event", return_value=_Event()),
+            patch.object(torch.cuda, "current_stream", return_value=object()),
+            patch.object(torch.distributed, "is_initialized", return_value=False),
+        ):
+            controller.apply((5, 2))
+        self.assertEqual(controller.backings["aaa-native-weights"].committed, 4)
+        self.assertEqual(controller.backings["elastic-attention-0"].committed, 20)
+        self.assertTrue(controller.validate_equal_scheduler_step(None, 0))
+        self.assertFalse(any(owner.resizes for owner in controller.backings.values()))
+
+    def test_invalid_auxiliary_target_fails_preflight_without_mapping_mutation(self):
+        controller = ElasticKVController(torch.device("cpu"))
+        controller.backings = {"elastic-attention-0": _Owner(16), "expert": _Owner(8)}
+        controller.geometry = {"elastic-attention-0": 4}
+        for targets in (
+            {"missing": 4},
+            {"expert": -4},
+            {"expert": 3},
+            {"expert": 68},
+            {"elastic-attention-0": 4},
+        ):
+            controller.auxiliary_targets = targets
+            with self.assertRaises(ValueError):
+                controller._target_sizes((4, 0), 0)
+        self.assertEqual(controller.backings["expert"].committed, 8)
+        controller.auxiliary_targets = {"expert": 8}
+        self.assertEqual(controller._target_sizes((4, 0), 0)["expert"], 8)
+
 
 if __name__ == "__main__":
     unittest.main()
