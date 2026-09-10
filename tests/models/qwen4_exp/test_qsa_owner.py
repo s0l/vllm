@@ -23,6 +23,74 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 
+@pytest.mark.parametrize("v2", [False, True])
+def test_qsa_warmup_follows_owner_backend_and_preserves_indexer(monkeypatch, v2):
+    from vllm.model_executor.warmup.qwen4_exp_qsa_warmup import (
+        qwen4_exp_qsa_triton_warmup,
+    )
+    from vllm.models.qwen4_exp.nvidia.indexer_qsa import QSAIndexer
+    from vllm.models.qwen4_exp.nvidia.ops import qsa, qsa_indexer
+    from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAAttention
+
+    owner = object.__new__(Qwen4ExpQSAAttention)
+    torch.nn.Module.__init__(owner)
+    owner.indexer = object.__new__(QSAIndexer)
+    torch.nn.Module.__init__(owner.indexer)
+    owner.indexer.compressed_key_cache = SimpleNamespace(
+        kv_cache=torch.empty((2, 64, 128), dtype=torch.bfloat16), prefix="index"
+    )
+    owner.indexer.index_n_heads = 8
+    owner.indexer.index_head_dim = 128
+    owner.indexer.token_topk = 2048
+    owner.indexer.compress_ratio = 4
+    owner.num_heads = 8
+    owner.layer_name = "main"
+    table = torch.zeros((4, 8), dtype=torch.int32)
+    runner = SimpleNamespace(
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(layer_names=[n]) for n in ("index", "main")
+            ]
+        ),
+        block_tables=SimpleNamespace(input_block_tables=[table, table]),
+        input_batch=SimpleNamespace(
+            block_table=[SimpleNamespace(get_device_tensor=lambda n: table)] * 2
+        ),
+        decode_query_len=4,
+        uniform_decode_query_len=4,
+        max_num_reqs=4,
+        max_num_tokens=128,
+    )
+    worker = SimpleNamespace(
+        get_model=lambda: owner, model_runner=runner, use_v2_model_runner=v2
+    )
+    calls = []
+
+    def index_warmup(cache, block_table, **kwargs):
+        assert cache is owner.indexer.compressed_key_cache.kv_cache
+        assert block_table is table
+        assert kwargs["max_decode_query_len"] == 4
+        calls.append("indexer")
+        return ()
+
+    def sparse_warmup(cache, block_table, **kwargs):
+        assert cache.dtype == torch.bfloat16, "unreachable FP8 Triton specialization"
+        assert block_table is table
+        calls.append("triton_sparse")
+        return ()
+
+    monkeypatch.setattr(qsa_indexer, "warmup_qsa_mqa_paged_decode", index_warmup)
+    monkeypatch.setattr(qsa, "warmup_qsa_sparse_paged_attention", sparse_warmup)
+    for fp8 in (False, True, False):
+        owner.fp8_dcp = fp8
+        owner.kv_cache = torch.empty(
+            (2, 2, 64, 512), dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16
+        )
+        calls.clear()
+        qwen4_exp_qsa_triton_warmup(worker)
+        assert calls == (["indexer"] if fp8 else ["indexer", "triton_sparse"])
+
+
 def config():
     cfg = VllmConfig(device_config=DeviceConfig("cpu"))
     cfg.cache_config.block_size = 64
