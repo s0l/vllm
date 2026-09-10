@@ -135,6 +135,13 @@ class ModelState(ABC):
         """
         return AttentionCGSupport.ALWAYS, None
 
+    def resolve_cudagraph_mode(self, mode: CUDAGraphMode) -> CUDAGraphMode:
+        """Apply this model's non-attention capture requirements to its manager.
+
+        Draft models resolve their own managers independently of this target.
+        """
+        return mode
+
     def preprocess_state(
         self,
         input_batch: InputBatch,

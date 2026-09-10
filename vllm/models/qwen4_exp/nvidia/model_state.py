@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
@@ -93,6 +94,24 @@ class Qwen4ExpModelState(MambaHybridModelState):
     def _prepare_native_experts(self, *, dummy):
         for provider in getattr(self, "_native_providers", ()):
             provider.prepare_execution(dummy=dummy)
+
+    def resolve_cudagraph_mode(self, mode: CUDAGraphMode) -> CUDAGraphMode:
+        if mode == CUDAGraphMode.NONE or not (
+            getattr(self, "_native_providers", ())
+            or getattr(self, "_mmap_ple_modules", ())
+        ):
+            return super().resolve_cudagraph_mode(mode)
+        from vllm.compilation.breakable_cudagraph import (
+            is_breakable_cudagraph_enabled,
+        )
+
+        if not is_breakable_cudagraph_enabled():
+            raise RuntimeError(
+                "FlashNext host weight providers require breakable Graphs"
+            )
+        # Host demand resolution and staging are ordered eager callbacks between
+        # GPU graph segments. Attention's FULL support cannot cover these edges.
+        return CUDAGraphMode.PIECEWISE
 
     def _initialize_mmap_staging(self, vllm_config, model):
         modules = tuple(

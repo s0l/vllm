@@ -1194,10 +1194,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_cache_config.effective_max_resident_seqs or self.max_num_reqs
             ),
         )
+        target_cudagraph_mode = self.model_state.resolve_cudagraph_mode(cudagraph_mode)
+        if target_cudagraph_mode != cudagraph_mode:
+            logger.info(
+                "Target model capture requirements select %s from backend mode %s",
+                target_cudagraph_mode.name,
+                cudagraph_mode.name,
+            )
         self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,
             self.device,
-            cudagraph_mode,
+            target_cudagraph_mode,
             decode_query_len=self.decode_query_len,
             lora_capture_cases=self.lora_capture_cases,
             varlen_decode=self.adaptive_verification is not None,
