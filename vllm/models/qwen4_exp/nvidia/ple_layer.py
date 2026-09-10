@@ -40,6 +40,12 @@ from vllm.model_executor.parameter import PerTensorScaleParameter
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _encode_layer_name,
+    _resolve_layer_name,
+    direct_register_custom_op,
+)
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionBackend,
@@ -884,8 +890,6 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 token_indices=non_spec_token_indices,
             )
 
-    # State routing consumes the current request metadata on every replay.
-    @eager_break_during_capture
     def _short_conv(self, inputs: torch.Tensor, residual: torch.Tensor) -> None:
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
@@ -961,8 +965,35 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             self.norm_conv.weight,
             self.norm_key.eps,
         )
-        self._short_conv(conv_input, gated_output)
+        torch.ops.vllm.qwen4_exp_ple_short_conv(
+            conv_input, gated_output, _encode_layer_name(self.prefix)
+        )
         return gated_output
+
+
+@eager_break_during_capture
+def _ple_short_conv(
+    inputs: torch.Tensor, residual: torch.Tensor, layer_name: LayerNameType
+) -> None:
+    # Resolve state routing at replay time, behind the compiler boundary.
+    owner = get_forward_context().no_compile_layers[_resolve_layer_name(layer_name)]
+    if not isinstance(owner, Qwen4ExpPLELayer):
+        raise TypeError("PLE short-conv dispatch requires a Qwen4ExpPLELayer owner")
+    owner._short_conv(inputs, residual)
+
+
+def _ple_short_conv_fake(
+    inputs: torch.Tensor, residual: torch.Tensor, layer_name: LayerNameType
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_short_conv",
+    op_func=_ple_short_conv,
+    mutates_args=["residual"],
+    fake_impl=_ple_short_conv_fake,
+)
 
 
 __all__ = [
