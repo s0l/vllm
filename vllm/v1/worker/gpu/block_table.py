@@ -28,6 +28,7 @@ class BlockTables:
         cp_rank: int = 0,
         cp_interleave: int = 1,
         slot_mapping_enabled: list[bool] | None = None,
+        cp_replicated: list[bool] | None = None,
     ):
         self.block_sizes = block_sizes
         self.kernel_block_sizes = kernel_block_sizes
@@ -45,6 +46,11 @@ class BlockTables:
             slot_mapping_enabled = [True] * self.num_kv_cache_groups
         assert len(slot_mapping_enabled) == self.num_kv_cache_groups
         self._slot_mapping_enabled = slot_mapping_enabled
+        if cp_replicated is None:
+            cp_replicated = [False] * self.num_kv_cache_groups
+        if len(cp_replicated) != self.num_kv_cache_groups:
+            raise ValueError("cache ownership must cover every block-table group")
+        self._cp_replicated = cp_replicated
 
         self.blocks_per_kv_block = [
             bs // kbs for bs, kbs in zip(block_sizes, kernel_block_sizes)
@@ -115,6 +121,9 @@ class BlockTables:
         )
         self.slot_mapping_enabled = torch.tensor(
             self._slot_mapping_enabled, dtype=torch.bool, device=self.device
+        )
+        self.cp_replicated = torch.tensor(
+            self._cp_replicated, dtype=torch.bool, device=self.device
         )
         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
 
@@ -221,6 +230,7 @@ class BlockTables:
             self.block_sizes_tensor,
             self.kernel_block_sizes_tensor,
             self.slot_mapping_enabled,
+            self.cp_replicated,
             slot_mappings,
             slot_mappings.stride(0),
             self.cp_rank,
@@ -294,6 +304,7 @@ def _compute_slot_mappings_kernel(
     block_sizes,  # [num_kv_cache_groups]
     kernel_block_sizes,  # [num_kv_cache_groups]
     slot_mapping_enabled,  # [num_kv_cache_groups]
+    cp_replicated,  # [num_kv_cache_groups]
     slot_mappings_ptr,  # [num_kv_cache_groups, max_num_tokens]
     slot_mappings_stride,
     cp_rank,
@@ -345,6 +356,9 @@ def _compute_slot_mappings_kernel(
             remainder = virtual_block_offsets % CP_INTERLEAVE
             local_offsets = rounds * CP_INTERLEAVE + remainder
             local_positions = virtual_block_indices * kv_block_size + local_offsets
+            replicated = tl.load(cp_replicated + group_id)
+            local_positions = tl.where(replicated, positions, local_positions)
+            is_local = replicated | is_local
 
         block_indices = tl.where(
             mapping_enabled, local_positions // kernel_block_size, 0

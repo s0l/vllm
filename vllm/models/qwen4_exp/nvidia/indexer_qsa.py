@@ -128,6 +128,9 @@ class QSAIndexer(nn.Module):
         # MTP step 0 selects the target-aligned rows; later steps reuse them
         # while continuing to update the QSA side cache.
         self.skip_topk = False
+        self.dcp_selection = (
+            vllm_config.parallel_config.decode_context_parallel_size > 1
+        )
 
         self.index_qk_proj = ReplicatedLinear(
             int(config.hidden_size),
@@ -442,6 +445,10 @@ class QSAIndexer(nn.Module):
                 block_indices[prefill_slice],
                 compressed_metadata.max_seq_len,
             )
+        if self.dcp_selection:
+            from .qsa_flashinfer import canonical_dcp_block_indices
+
+            block_indices = canonical_dcp_block_indices(block_indices, visible_blocks)
         expand_qsa_block_indices(
             block_indices,
             compressed_metadata.logical_positions[:num_tokens],

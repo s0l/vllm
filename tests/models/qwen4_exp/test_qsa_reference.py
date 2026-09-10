@@ -24,6 +24,47 @@ requires_qsa_kernels = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("interleave", [1, 16])
+def test_sparse_pages_follow_cp_ownership_and_do_not_read_count_as_index(interleave):
+    from vllm.models.qwen4_exp.nvidia.qsa_flashinfer import map_sparse_pages
+
+    positions = [0, 1, 15, 16, 63, 64, 191, 192, 383]
+    packed = torch.tensor([positions + [len(positions)]], dtype=torch.int32)
+    table = torch.tensor([[5, 2]], dtype=torch.int32)
+    for rank in range(3):
+        slots, valid = map_sparse_pages(
+            packed,
+            table,
+            torch.tensor([0]),
+            block_size=64,
+            cp_size=3,
+            cp_rank=rank,
+            interleave=interleave,
+            width=16,
+        )
+        expected = []
+        for position in positions:
+            owner = position // interleave % 3
+            local = position // (3 * interleave) * interleave + position % interleave
+            expected.append(
+                int(table[0, local // 64]) * 64 + local % 64 if owner == rank else -1
+            )
+        actual = torch.where(valid, slots, -1)[0].tolist()
+        assert actual == expected + [-1] * 7
+    packed[:, -1] = 0
+    _, valid = map_sparse_pages(
+        packed,
+        table,
+        torch.tensor([0]),
+        block_size=64,
+        cp_size=3,
+        cp_rank=0,
+        interleave=interleave,
+        width=16,
+    )
+    assert not valid.any()
+
+
 def test_qsa_mtp_index_share_updates_cache_but_skips_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -44,6 +85,7 @@ def test_qsa_mtp_index_share_updates_cache_but_skips_selection(
     selections = []
     indexer = SimpleNamespace(
         skip_topk=True,
+        dcp_selection=False,
         _metadata=lambda: (raw_metadata, compressed_metadata),
         index_n_heads=1,
         index_kv_heads=1,
@@ -495,6 +537,7 @@ def test_qsa_unfused_cache_update_ignores_padded_qk() -> None:
         skip_topk=True,
         index_kv_heads=1,
         use_fused_pre_indexer=False,
+        dcp_selection=False,
         index_n_heads=1,
         index_head_dim=64,
         indexer_dtype=torch.bfloat16,
@@ -1327,3 +1370,23 @@ def test_qsa_streaming_compression_and_compressor_state_store_match_reference() 
                 rope_cache[block, position % 4, 0],
                 position_row(request, position).to("cuda"),
             )
+
+
+def test_dcp_selection_uses_one_tie_owner_and_orders_only_valid_entries(monkeypatch):
+    from vllm.models.qwen4_exp.nvidia import qsa_flashinfer as fi
+
+    owner = torch.tensor([[9, 2, 6, 2147483647], [2147483647] * 4], dtype=torch.int32)
+
+    class Group:
+        def all_gather(self, local, dim):
+            assert dim == 0
+            assert (local[1] == 2147483647).all()
+            return torch.cat([owner, local, local])
+
+    monkeypatch.setattr(fi, "get_dcp_group", lambda: Group())
+    expected = torch.tensor([[2, 6, 9, -1], [-1] * 4], dtype=torch.int32)
+    for tie in (6, 8):
+        local = torch.tensor([[9, tie, 2, -998], [51, 63, 87, 21]], dtype=torch.int32)
+        assert torch.equal(
+            fi.canonical_dcp_block_indices(local, torch.tensor([3, 0])), expected
+        )

@@ -609,7 +609,9 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         device: torch.device,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        self._init_reorder_batch_threshold(
+            1, supports_spec_as_decode=True, supports_dcp_with_varlen=True
+        )
         assert self.reorder_batch_threshold is not None
         self.is_circular_buffer = isinstance(kv_cache_spec, CircularBufferSpec)
         if isinstance(kv_cache_spec, MLAAttentionSpec):

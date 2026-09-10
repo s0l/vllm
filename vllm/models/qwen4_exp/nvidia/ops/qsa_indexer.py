@@ -470,6 +470,14 @@ def expand_qsa_block_indices(
     )
 
 
+@torch.compiler.assume_constant_result
+def _supports_cooperative_topk() -> bool:
+    # Device capability is fixed for this worker/compiled graph's lifetime.
+    return current_platform.has_device_capability(
+        90
+    ) and not current_platform.is_device_capability_family(120)
+
+
 def _topk(
     logits: torch.Tensor,
     visible_blocks: torch.Tensor,
@@ -483,8 +491,7 @@ def _topk(
     use_cooperative_topk = (
         logits.shape[0] <= 64
         and logits.stride(0) % 4 == 0
-        and current_platform.has_device_capability(90)
-        and not current_platform.is_device_capability_family(120)
+        and _supports_cooperative_topk()
     )
     topk_op = (
         torch.ops._C.cooperative_topk
