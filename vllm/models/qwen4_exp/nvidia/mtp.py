@@ -20,12 +20,12 @@ import torch
 from torch import nn
 
 from vllm.config import VllmConfig, replace, set_current_vllm_config
-from vllm.distributed import get_pp_group
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
-from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.model_executor.layers.linear import PaddedMergedColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -34,6 +34,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.qwen3_5 import Qwen3_5Model
+from vllm.model_executor.models.qwen3_5_mtp import _mtp_fc_padded_output_size
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -57,6 +58,7 @@ from .model import (
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpSparseMoeBlock,
 )
+from .mtp_partition import partition_native_mtp
 
 
 def _remap_ignored_layers(
@@ -187,23 +189,34 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             vllm_config,
             self.mtp_start_layer_idx,
         )
+        draft_vllm_config, self._expert_loader = partition_native_mtp(
+            draft_vllm_config,
+            start_layer=self.mtp_start_layer_idx,
+            layers=self.num_mtp_layers,
+        )
+        tp = get_tensor_model_parallel_world_size()
+        if tp != draft_vllm_config.parallel_config.tensor_parallel_size:
+            raise ValueError("MTP tensor parallel group differs from configuration")
+        self.fc_padded_output_size = _mtp_fc_padded_output_size(self.hidden_size, tp)
         with set_current_vllm_config(draft_vllm_config, prefix=prefix):
             # residual_linear_shared fusion: fc_embedding projects the token
             # embedding, fc_hidden (shared across HC branches) projects the
             # backbone hidden; the embedding is added as a residual to every
             # branch (see mtp_residual_linear_shared.md).
-            self.fc_embedding = ColumnParallelLinear(
+            self.fc_embedding = PaddedMergedColumnParallelLinear(
                 self.hidden_size,
-                self.hidden_size,
+                [self.hidden_size],
+                [self.fc_padded_output_size],
                 gather_output=True,
                 bias=False,
                 return_bias=False,
                 quant_config=draft_vllm_config.quant_config,
                 prefix=f"{prefix}.fc_embedding",
             )
-            self.fc_hidden = ColumnParallelLinear(
+            self.fc_hidden = PaddedMergedColumnParallelLinear(
                 self.hidden_size,
-                self.hidden_size,
+                [self.hidden_size],
+                [self.fc_padded_output_size],
                 gather_output=True,
                 bias=False,
                 return_bias=False,
@@ -297,7 +310,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                 inputs_embeds = self.embed_input_ids(input_ids)
             # Embedding branch: pre-norm -> fc_embedding -> [T, H].
             inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
-            inputs_embeds = self.fc_embedding(inputs_embeds)
+            inputs_embeds = self.fc_embedding(inputs_embeds)[
+                ..., :hidden_size
+            ].contiguous()
 
             # Backbone hidden is multi-stream [T, hc_count*H] (scheme A:
             # the main model truly emits the pre-final-mixer multi stream
@@ -308,7 +323,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view(
                 num_tokens, hc_count, hidden_size
             )
-            hidden_states = self.fc_hidden(hidden_states)
+            hidden_states = self.fc_hidden(hidden_states)[
+                ..., :hidden_size
+            ].contiguous()
             hidden_states = hidden_states.flatten(-2)
             prev_block_output = inputs_embeds
         else:
@@ -346,6 +363,8 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         return sample_hidden_states, multi_hidden
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if self._expert_loader is not None:
+            weights = self._expert_loader.transform(weights)
         weights = maybe_fuse_shared_experts(
             weights,
             enabled=self.is_fused_shared_expert_enabled,
@@ -441,6 +460,11 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if self.model._expert_loader is not None and (
+            self.model._expert_loader.finished or self.model._expert_loader.closed
+        ):
+            raise RuntimeError("MTP expert reload requires a new worker")
+
         def remap_weight_names():
             for name, weight in weights:
                 remapped_name = _remap_mtp_weight_name(name)
@@ -454,7 +478,15 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(remap_weight_names(), mapper=mapper)
+        try:
+            loaded = loader.load_weights(remap_weight_names(), mapper=mapper)
+            if self.model._expert_loader is not None:
+                self.model._expert_loader.finish()
+        except BaseException:
+            if self.model._expert_loader is not None:
+                self.model._expert_loader.closed = True
+            raise
+        return loaded
 
 
 __all__ = ["Qwen4ExpMTP", "Qwen4ExpMultiTokenPredictor"]
