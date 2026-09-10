@@ -1405,5 +1405,72 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
         self.assertEqual(controller._target_sizes((4, 0), 0)["expert"], 8)
 
 
+class ElasticAuxiliaryLifecycleTests(unittest.TestCase):
+    def test_auxiliary_owner_publication_follows_commit_or_full_rollback(self):
+        for changed, failure in ((False, False), (True, False), (True, True)):
+            with self.subTest(changed=changed, failure=failure):
+                self._check_auxiliary_lifecycle(changed, failure)
+
+    def _check_auxiliary_lifecycle(self, changed, failure):
+        controller = ElasticKVController(torch.device("cpu"))
+        controller.backings = {
+            "elastic-attention-0": _Owner(16),
+            "elastic-gdn": _Owner(8),
+            "native-fixture": _Owner(8),
+        }
+        controller.geometry = {"elastic-attention-0": 4, "elastic-gdn": 4}
+        controller.auxiliary_targets = {"native-fixture": 8}
+        controller.configure_physical_budget(32, 4, (4, 2))
+        observed = lambda: {k: b.info.committed for k, b in controller.backings.items()}
+        before = observed()
+        expected = dict(before)
+        if changed:
+            expected.update({"elastic-attention-0": 12, "native-fixture": 12})
+        events = []
+        owner = SimpleNamespace(pending=True)
+
+        def prepare():
+            self.assertEqual(observed(), before)
+            events.append("closed")
+
+        def finish(*, success):
+            self.assertEqual(events[0], "closed")
+            self.assertEqual(observed(), expected if success else before)
+            events.append("published" if success else "invalidated")
+            controller.auxiliary_targets["native-fixture"] = (
+                expected if success else before
+            )["native-fixture"]
+            owner.pending = False
+
+        owner.prepare, owner.finish = prepare, finish
+        controller.auxiliary_owner = owner
+        controller.auxiliary_targets["native-fixture"] = expected["native-fixture"]
+        self.assertFalse(controller.validate_equal_scheduler_step(None, 0))
+        apply = controller._apply_targets
+        injected = False
+
+        def partial(targets, event):
+            nonlocal injected
+            self.assertEqual(events, ["closed"])
+            apply(targets, event)
+            if failure and not injected:
+                injected = True
+                raise RuntimeError("injected after physical mutation")
+
+        controller._apply_targets = partial
+        with (
+            patch.object(torch.cuda, "Event", return_value=_Event()),
+            patch.object(torch.cuda, "current_stream", return_value=object()),
+            patch.object(torch.distributed, "is_initialized", return_value=False),
+        ):
+            if failure:
+                with self.assertRaisesRegex(RuntimeError, "aborted"):
+                    controller.apply((3, 2))
+            else:
+                controller.apply((3, 2) if changed else None)
+        self.assertEqual(events, ["closed", "invalidated" if failure else "published"])
+        self.assertTrue(controller.validate_equal_scheduler_step(None, 0))
+
+
 if __name__ == "__main__":
     unittest.main()

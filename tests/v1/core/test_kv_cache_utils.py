@@ -2348,6 +2348,7 @@ def test_elastic_full_context_capacity_exact_fit_and_one_quantum_short():
         "effective_attention_token_equivalent_per_rank": (80,),
         "active_gdn_blocks": 4,
         "graph_external_bytes": 300,
+        "expert_borrowed_bytes": 0,
         "rank_budget_bytes": (1000,),
     }
 
