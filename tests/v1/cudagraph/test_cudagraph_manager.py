@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from copy import copy
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -66,6 +67,7 @@ def _create_vllm_config(
     vllm_config.parallel_config = ParallelConfig()
     vllm_config.model_config.multimodal_config = None
     vllm_config.model_config.enforce_eager = False
+    vllm_config.cache_config.use_kda_recoverssm = False
     vllm_config.speculative_config = None
     vllm_config.num_speculative_tokens = 0
     vllm_config.additional_config = additional_config
@@ -398,7 +400,9 @@ def test_capture_baseline_hook_runs_after_warmup(monkeypatch):
         yield None
 
     monkeypatch.setattr(gpu_cudagraph_utils, "graph_capture", fake_graph_capture)
-    monkeypatch.setattr(gpu_cudagraph_utils.torch.cuda, "synchronize", lambda *_: None)
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.torch.accelerator, "synchronize", lambda *_: None
+    )
     manager = gpu_cudagraph_utils.CudaGraphManager(
         vllm_config=_create_vllm_config(cudagraph_mode=CUDAGraphMode.PIECEWISE),
         device=torch.device("cpu"),
@@ -411,7 +415,7 @@ def test_capture_baseline_hook_runs_after_warmup(monkeypatch):
         num_tokens=4,
         num_reqs=None,
     )
-    events = []
+    events: list[Any] = []
 
     def create_forward_fn(capture_desc, warmup):
         events.append(("prepare", capture_desc, warmup))
@@ -457,7 +461,9 @@ def test_dynamic_capture_owner_lives_until_graph_reset(monkeypatch):
         yield None
 
     monkeypatch.setattr(gpu_cudagraph_utils, "graph_capture", fake_graph_capture)
-    monkeypatch.setattr(gpu_cudagraph_utils.torch.cuda, "synchronize", lambda *_: None)
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.torch.accelerator, "synchronize", lambda *_: None
+    )
     manager = gpu_cudagraph_utils.CudaGraphManager(
         vllm_config=_create_vllm_config(cudagraph_mode=CUDAGraphMode.PIECEWISE),
         device=torch.device("cpu"),
@@ -553,7 +559,9 @@ def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
     monkeypatch.setattr(
         gpu_cudagraph_utils.torch.cuda, "current_stream", lambda: capture_stream
     )
-    monkeypatch.setattr(gpu_cudagraph_utils.torch.cuda, "synchronize", lambda *_: None)
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.torch.accelerator, "synchronize", lambda *_: None
+    )
 
     def cuda_graph_enter(*args, **kwargs):
         assert pynccl_allocator._graph_pool_id is graph_pool
@@ -903,6 +911,15 @@ def test_elastic_recipe_restores_only_reachable_warm_metadata(monkeypatch):
         startup_plan,
         "load_cudagraph_recipe",
         lambda *args, **kwargs: [
+            {
+                "mode": "FULL",
+                "num_tokens": 2048,
+                "num_reqs": 2048,
+                "uniform_token_count": 1,
+                "num_active_loras": 0,
+                "physical_num_reqs": 2048,
+                "runtime_generation": "test-generation",
+            },
             {
                 "mode": "FULL",
                 "num_tokens": 4,
@@ -1682,7 +1699,7 @@ def test_idle_step_invalidates_decode_epoch(monkeypatch: pytest.MonkeyPatch) -> 
         "get_tp_group",
         lambda: SimpleNamespace(cpu_group=object()),
     )
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda _device: None)
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
     monkeypatch.setattr(gc, "collect", lambda: 0)
 
@@ -3148,10 +3165,10 @@ def test_dynamic_capture_admission_purges_free_allocator_cache(monkeypatch):
     manager.tp_size = 1
     manager._dynamic_capture_granted_bytes = 64
     candidate = SimpleNamespace(estimated_bytes=32)
-    events = []
+    events: list[Any] = []
 
     monkeypatch.setattr(
-        gpu_cudagraph_utils.torch.cuda,
+        gpu_cudagraph_utils.torch.accelerator,
         "synchronize",
         lambda device: events.append(("synchronize", device)),
     )
@@ -3206,7 +3223,9 @@ def test_elastic_capture_loan_uses_scheduler_measured_envelope(monkeypatch):
     assert not manager.prepare_pending_dynamic_capture(required - 1)
     assert manager.prepare_pending_dynamic_capture(required)
 
-    monkeypatch.setattr(gpu_cudagraph_utils.torch.cuda, "synchronize", lambda _d: None)
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.torch.accelerator, "synchronize", lambda _d: None
+    )
     monkeypatch.setattr(gpu_cudagraph_utils.gc, "collect", lambda: None)
     monkeypatch.setattr(
         gpu_cudagraph_utils.torch.accelerator, "empty_cache", lambda: None
@@ -3331,7 +3350,7 @@ def test_hot_replay_retention_reconcile_has_no_collective(monkeypatch):
     all_reduce = MagicMock()
     synchronize = MagicMock()
     monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
-    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
+    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
 
     assert manager._reconcile_dynamic_retained_cleanup(0) == 0
     all_reduce.assert_not_called()
@@ -3353,7 +3372,7 @@ def test_retention_collective_waits_for_captured_consumers(monkeypatch):
     retained.item.return_value = 41
     monkeypatch.setattr(torch, "tensor", lambda *args, **kwargs: retained)
     monkeypatch.setattr(
-        torch.cuda,
+        torch.accelerator,
         "synchronize",
         lambda device: events.append(("synchronize", device)),
     )
@@ -3453,11 +3472,12 @@ def test_working_set_reuses_one_lazy_capture_stream_across_owners(monkeypatch):
 
     stream = object()
     stream_calls = []
-    monkeypatch.setattr(
-        gpu_cudagraph_utils.torch.cuda,
-        "Stream",
-        lambda *, device: stream_calls.append(device) or stream,
-    )
+
+    def make_stream(*, device):
+        stream_calls.append(device)
+        return stream
+
+    monkeypatch.setattr(gpu_cudagraph_utils.torch.cuda, "Stream", make_stream)
 
     gpu_cudagraph_utils.DynamicGraphWorkingSet(tuple(managers))
     contexts = [manager._get_dynamic_graph_capture_context() for manager in managers]
@@ -3635,13 +3655,13 @@ def test_working_set_administrative_x0_evicts_only_unpinned_hot_entries():
 
 
 def test_working_set_idle_finish_releases_allocator_before_measurement(monkeypatch):
-    events = []
+    events: list[Any] = []
     manager = MagicMock()
     manager.device = torch.device("cuda:2")
     manager.dynamic_resident_bytes = 0
     manager.finish_dynamic_step.side_effect = lambda: events.append("finish")
     monkeypatch.setattr(
-        gpu_cudagraph_utils.torch.cuda,
+        gpu_cudagraph_utils.torch.accelerator,
         "synchronize",
         lambda device: events.append(("synchronize", device)),
     )
@@ -3667,13 +3687,13 @@ def test_working_set_idle_finish_releases_allocator_before_measurement(monkeypat
 
 
 def test_pre_consensus_idle_reclaim_preserves_active_plan(monkeypatch):
-    events = []
+    events: list[Any] = []
     manager = MagicMock()
     manager.device = torch.device("cuda:2")
     manager.dynamic_resident_bytes = 0
     manager.finish_dynamic_step.side_effect = lambda: events.append("finish")
     monkeypatch.setattr(
-        gpu_cudagraph_utils.torch.cuda,
+        gpu_cudagraph_utils.torch.accelerator,
         "synchronize",
         lambda device: events.append(("synchronize", device)),
     )

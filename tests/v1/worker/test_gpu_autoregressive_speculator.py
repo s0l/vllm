@@ -368,6 +368,9 @@ def _make_speculator(
 
 @pytest.mark.parametrize(("hc_mult", "expected"), [(None, 64), (4, 256)])
 def test_speculator_uses_draft_model_hidden_size(monkeypatch, hc_mult, expected):
+    from vllm.v1.worker.gpu import input_batch
+
+    monkeypatch.setattr(input_batch, "PIN_MEMORY", False)
     # Qwen4Exp targets expose multi-stream HC residuals to the drafter.
     monkeypatch.setattr(base_spec_module, "_target_feeds_hc_residual", lambda _: True)
     monkeypatch.setattr(spec_module, "get_tensor_model_parallel_rank", lambda: 0)
@@ -465,6 +468,7 @@ def test_load_model_keeps_mm_support_for_capable_drafter(monkeypatch):
     speculator.dtype = torch.float32
     speculator.device = torch.device("cpu")
     speculator._ag2_draft_capture = None
+    speculator._ag2_mtp_layer_capture = None
     draft_model = _MultimodalDraftModel()
     speculator.test_draft_model = draft_model
     _mock_base_model_load(monkeypatch)
@@ -486,6 +490,7 @@ def test_load_model_disables_mm_support_for_text_only_drafter(monkeypatch):
     speculator.inputs_embeds = None
     speculator.vllm_config = SimpleNamespace(model_config=object())
     speculator._ag2_draft_capture = None
+    speculator._ag2_mtp_layer_capture = None
     draft_model = _TextOnlyDraftModel()
     speculator.test_draft_model = draft_model
     warning_messages = []
@@ -594,6 +599,30 @@ def test_run_model_reuses_tensor_return_for_mtp(monkeypatch):
     assert actual_logits_hidden is hidden
     assert actual_feedback_hidden is hidden
     assert mtp_trace is None
+
+
+@pytest.mark.parametrize("owner", ["mtp_prefill", "mtp_decode"])
+def test_run_model_piecewise_selects_its_own_manager(monkeypatch, owner):
+    hidden = torch.full((4, 3), 1.0)
+    speculator = _make_speculator(monkeypatch, hidden)
+    speculator.prefill_cudagraph_manager = MagicMock()
+    speculator.decode_cudagraph_manager = MagicMock()
+    managers = {
+        "mtp_prefill": speculator.prefill_cudagraph_manager,
+        "mtp_decode": speculator.decode_cudagraph_manager,
+    }
+    managers[owner].run_pw_graph.return_value = hidden
+    result = speculator._run_model(
+        4,
+        None,
+        None,
+        None,
+        cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+        cudagraph_owner=owner,
+    )
+    assert result[0] is hidden
+    for name, manager in managers.items():
+        assert manager.run_pw_graph.call_count == int(name == owner)
 
 
 @pytest.mark.parametrize(
