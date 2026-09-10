@@ -856,6 +856,7 @@ class QSAKeyStateCache(_QSAStateCache):
             head_size=self.head_size,
             head_size_v=0,
             dtype=self.dtype,
+            dcp_replicated=True,
         )
 
 
@@ -870,6 +871,7 @@ class QSACompressedKeyCache(_QSAStateCache):
             head_size=self.head_size,
             dtype=self.dtype,
             tokens_per_state=self.compress_ratio,
+            dcp_replicated=True,
         )
 
 

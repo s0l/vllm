@@ -428,6 +428,10 @@ class AttentionSpec(KVCacheSpec):
     """Tokens covered by one stored state. Ints > 1 compress multiple tokens
     into one state (DSv4 sparse MLA); fractions < 1 store multiple states per
     token (Whisper block pooling: ``Fraction(1, block_pool_size)``)."""
+    dcp_replicated: bool = False
+    """Every DCP rank stores the full sequence for this attention state owner.
+    Used by a replicated sparse indexer alongside sequence-sharded main KV.
+    """
 
     def __post_init__(self):
         if self.head_size_v is None:
@@ -467,6 +471,8 @@ class AttentionSpec(KVCacheSpec):
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         parallel_config = vllm_config.parallel_config
         kv_shard_count = parallel_config.decode_context_parallel_size
+        if self.dcp_replicated:
+            kv_shard_count = 1
         return cdiv(max_len, self.block_size * kv_shard_count)
 
 
@@ -499,7 +505,7 @@ class FullAttentionSpec(AttentionSpec):
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
         dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
-        if dcp_world_size > 1:
+        if dcp_world_size > 1 and not self.dcp_replicated:
             max_model_len = cdiv(max_model_len, dcp_world_size)
         return cdiv(max_model_len, self.block_size) * self.page_size_bytes
 
@@ -547,6 +553,7 @@ class FullAttentionSpec(AttentionSpec):
             num_head_slots=specs[0].num_head_slots,
             state_content_bytes=specs[0].state_content_bytes,
             tokens_per_state=specs[0].tokens_per_state,
+            dcp_replicated=specs[0].dcp_replicated,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
             # If any layer in the group is non-causal, treat the group as
@@ -626,6 +633,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             state_content_bytes=specs[0].state_content_bytes,
             cache_dtype_str=cache_dtype_str_set.pop(),
             tokens_per_state=tokens_per_state_set.pop(),
+            dcp_replicated=specs[0].dcp_replicated,
             model_version=model_version_set.pop(),
             storage_block_size=storage_block_size_set.pop(),
             non_causal_multi_token_decode=any(
@@ -850,6 +858,9 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         model_version_set = set(spec.model_version for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
         extra_retained_set = set(spec.extra_retained_tokens for spec in specs)
+        assert len({spec.dcp_replicated for spec in specs}) == 1, (
+            "All attention layers in a group must have the same DCP ownership."
+        )
         assert (
             len(cache_dtype_str_set) == 1
             and len(tokens_per_state_set) == 1
@@ -871,6 +882,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             state_content_bytes=specs[0].state_content_bytes,
             sliding_window=sliding_window_set.pop(),
             extra_retained_tokens=extra_retained_set.pop(),
+            dcp_replicated=specs[0].dcp_replicated,
             cache_dtype_str=cache_dtype_str_set.pop(),
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
@@ -1077,6 +1089,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             head_size=specs[0].head_size,
             head_size_v=specs[0].head_size_v,
             sink_len=specs[0].sink_len,
+            dcp_replicated=specs[0].dcp_replicated,
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
@@ -1155,6 +1168,11 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         that inherit from FullAttentionSpec are treated as full attention.
         """
         block_sizes = set(spec.block_size for spec in kv_cache_specs.values())
+        ownership = {
+            getattr(spec, "dcp_replicated", False) for spec in kv_cache_specs.values()
+        }
+        if len(ownership) > 1:
+            return False
         if len(block_sizes) > 1:
             # Different block sizes, not uniform.
             return False

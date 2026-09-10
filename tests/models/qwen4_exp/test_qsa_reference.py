@@ -391,6 +391,17 @@ def test_qsa_state_caches_adapt_the_unified_logical_layout() -> None:
     assert compressed_cache.kv_cache.shape == (2, 8, 1, 64)
     assert raw_cache.kv_cache.data_ptr() == raw_view.data_ptr()
     assert compressed_cache.kv_cache.data_ptr() == compressed_view.data_ptr()
+    cfg = SimpleNamespace(
+        num_speculative_tokens=3,
+        parallel_config=SimpleNamespace(decode_context_parallel_size=3),
+        model_config=SimpleNamespace(max_model_len=1024),
+    )
+    raw_spec = raw_cache.get_kv_cache_spec(cfg)
+    compressed_spec = compressed_cache.get_kv_cache_spec(cfg)
+    assert raw_spec.dcp_replicated and compressed_spec.dcp_replicated
+    assert raw_spec.max_num_blocks_per_req(cfg, 1024) == 1
+    assert compressed_spec.max_num_blocks_per_req(cfg, 1024) == 32
+    assert compressed_spec.max_memory_usage_bytes(cfg) == 1024 // 4 * 64 * 2
 
 
 @pytest.mark.parametrize(
@@ -405,6 +416,7 @@ def test_qsa_ring_capacity_covers_one_speculative_step(
         block_size=48, compress_ratio=compress_ratio
     ).get_kv_cache_spec(SimpleNamespace(num_speculative_tokens=num_spec))
     assert spec.block_size == expected
+    assert spec.dcp_replicated
 
 
 @requires_qsa_kernels

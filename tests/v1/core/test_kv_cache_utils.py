@@ -1374,6 +1374,87 @@ def test_dcp_world_size_for_kv_cache_spec_shards_full_attention_only():
     assert kv_cache_utils.dcp_world_size_for_kv_cache_spec(full, 1) == 1
 
 
+def test_replicated_indexer_keeps_full_sequence_geometry_and_compression():
+    cfg = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=262144),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=3),
+        cache_config=SimpleNamespace(block_size=64),
+    )
+    compressed = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        tokens_per_state=4,
+        dcp_replicated=True,
+    )
+    sharded = replace(compressed, dcp_replicated=False)
+    wrapped = UniformTypeKVCacheSpecs(
+        block_size=64, kv_cache_specs={"indexer": compressed}
+    )
+    for spec in (compressed, wrapped):
+        assert spec.max_num_blocks_per_req(cfg, 262144) == 4096
+        assert kv_cache_utils.resolve_dcp_kv_block_size(spec, 3) == 64
+        assert kv_cache_utils.resolve_dcp_kv_cache_spec(spec, 3) is spec
+        assert kv_cache_utils.dcp_world_size_for_kv_cache_spec(spec, 3) == 1
+        assert spec.max_memory_usage_bytes(cfg) == 262144 // 4 * 128 * 2
+    assert sharded.max_num_blocks_per_req(cfg, 262144) == 1366
+    assert kv_cache_utils.resolve_dcp_kv_block_size(sharded, 3) == 192
+    assert MLAAttentionSpec.merge([compressed, compressed]) == compressed
+    groups = SimpleNamespace(
+        kv_cache_groups=[KVCacheGroupSpec(["indexer"], compressed)]
+    )
+    assert kv_cache_utils.resolve_kv_cache_block_sizes(groups, cfg) == (64, 64)
+    cfg.cache_config.enable_prefix_caching = True
+    cfg.cache_config.prefix_match_unit = None
+    cfg.kv_transfer_config = None
+    main = FullAttentionSpec(
+        block_size=64, num_kv_heads=2, head_size=256, dtype=torch.float8_e4m3fn
+    )
+    from vllm.v1.kv_cache_interface import CircularBufferSpec
+
+    raw = CircularBufferSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=140,
+        head_size_v=0,
+        dtype=torch.bfloat16,
+        dcp_replicated=True,
+    )
+    groups.kv_cache_groups += [
+        KVCacheGroupSpec(["main"], main),
+        KVCacheGroupSpec(["raw"], raw),
+    ]
+    assert kv_cache_utils.resolve_kv_cache_block_sizes(groups, cfg) == (192, 64)
+    assert kv_cache_utils.resolve_dcp_kv_block_size(raw, 3) == 8
+
+
+def test_mixed_replicated_and_sharded_owners_cannot_share_a_block_table():
+    main = FullAttentionSpec(
+        block_size=64,
+        num_kv_heads=2,
+        head_size=256,
+        dtype=torch.float8_e4m3fn,
+    )
+    replicated = replace(main, dcp_replicated=True)
+    specs = {"main": main, "replicated": replicated}
+    assert not UniformTypeKVCacheSpecs.is_uniform_type(specs)
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_page_size(specs)
+    assert sorted(sorted(g.layer_names) for g in groups) == [["main"], ["replicated"]]
+    assert sorted(
+        kv_cache_utils.dcp_world_size_for_kv_cache_spec(g.kv_cache_spec, 3)
+        for g in groups
+    ) == [1, 3]
+    with pytest.raises(AssertionError, match="same attention spec"):
+        FullAttentionSpec.merge([main, replicated])
+    invalid = UniformTypeKVCacheSpecs(block_size=64, kv_cache_specs=specs)
+    with pytest.raises(ValueError, match="mixed DCP ownership"):
+        kv_cache_utils.resolve_dcp_kv_block_size(invalid, 3)
+    with pytest.raises(ValueError, match="mixed DCP ownership"):
+        kv_cache_utils.dcp_world_size_for_kv_cache_spec(invalid, 3)
+    assert FullAttentionSpec.merge([replicated, replicated]) == replicated
+
+
 @pytest.mark.parametrize(
     "layer_type,dcp_size,expected_width",
     [

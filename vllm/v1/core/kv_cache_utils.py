@@ -781,6 +781,13 @@ def resolve_dcp_kv_block_size(spec: KVCacheSpec, dcp_world_size: int) -> int:
     if len(layer_specs) > 0 and all(
         isinstance(layer_spec, AttentionSpec) for layer_spec in layer_specs
     ):
+        ownership = {
+            getattr(layer_spec, "dcp_replicated", False) for layer_spec in layer_specs
+        }
+        if len(ownership) != 1:
+            raise ValueError("mixed DCP ownership in a uniform cache group")
+        if ownership == {True}:
+            return spec.block_size
         return spec.block_size * dcp_world_size
     return spec.block_size
 
@@ -810,16 +817,21 @@ def dcp_world_size_for_kv_cache_spec(spec: KVCacheSpec, dcp_world_size: int) -> 
     keep replicated per-rank state (Mamba, sliding window, chunked-local) and
     must keep ``dcp_world_size=1`` even when the process runs with DCP > 1.
 
-    Draft MLA groups on the sharded DSpark path are ``FullAttentionSpec`` /
-    ``MLAAttentionSpec`` and therefore keep the process DCP size. A replicated
-    draft group would need a different spec, not this helper.
+    An explicit ``dcp_replicated`` owner (for example a sparse indexer's
+    compressed keys) keeps full-sequence geometry even with an MLA layout.
     """
     if dcp_world_size <= 1:
         return 1
     inner = spec
     if isinstance(spec, UniformTypeKVCacheSpecs):
+        sizes = {
+            dcp_world_size_for_kv_cache_spec(s, dcp_world_size)
+            for s in spec.kv_cache_specs.values()
+        }
+        if len(sizes) != 1:
+            raise ValueError("mixed DCP ownership in a uniform cache group")
         inner = next(iter(spec.kv_cache_specs.values()))
-    if isinstance(inner, FullAttentionSpec):
+    if isinstance(inner, FullAttentionSpec) and not inner.dcp_replicated:
         return dcp_world_size
     return 1
 
@@ -848,6 +860,11 @@ def resolve_kv_cache_block_sizes(
 
     if len(groups) <= 1:
         bs = cache_config.block_size * dcp
+        if groups and all(
+            getattr(spec, "dcp_replicated", False)
+            for spec in iter_layer_specs(groups[0].kv_cache_spec)
+        ):
+            bs = groups[0].kv_cache_spec.block_size
         return bs, bs
 
     group_block_sizes = [
