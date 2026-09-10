@@ -141,6 +141,9 @@ def layer_norm_fwd_kernel(
         var = tl.sum(xbar * xbar, axis=1) / N  # Shape: [ROWS_PER_BLOCK]
         mean = 0.0  # Placeholder for RMS norm
 
+    # Inductor may pass Python float scalars through an FP64 kernel ABI.
+    # Keep the explicit FP32 accumulator contract in both execution paths.
+    eps = eps.to(tl.float32)
     rstd = tl.rsqrt(var + eps)  # Shape: [ROWS_PER_BLOCK]
 
     # Store rstd for each row
