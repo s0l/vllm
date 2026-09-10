@@ -9,7 +9,10 @@ import time
 import numpy as np
 import torch
 
-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.compilation.breakable_cudagraph import (
+    BreakableCUDAGraphCapture,
+    eager_break_during_capture,
+)
 from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.triton_utils import tl
 from vllm.triton_utils import triton as tr
@@ -55,6 +58,11 @@ def _native_experts(
     layer_name: str,
 ) -> None:
     owner = get_forward_context().no_compile_layers[layer_name]
+    if BreakableCUDAGraphCapture.is_active():
+        # The captured router has not executed yet. Only replay may read its
+        # demand; capture registers this callback without touching residency.
+        output.zero_()
+        return
     owner.provider.run(owner.layer_id, hidden, weights, ids, output)
 
 
