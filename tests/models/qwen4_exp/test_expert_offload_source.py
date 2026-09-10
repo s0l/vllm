@@ -365,3 +365,42 @@ def test_provider_pinned_staging_owns_cpu_under_loader_device(
     ):
         assert tensor.device.type == "cpu"
         assert tensor.shape == shape and tensor.dtype == dtype
+
+
+def test_native_callback_defers_unproduced_capture_routes_until_replay(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.models.qwen4_exp.nvidia import expert_offload_provider as module
+
+    calls = []
+
+    def run(layer, hidden, weights, ids, output):
+        module.plan(ids.numpy(), 3, 3)
+        calls.append(layer)
+        output.copy_(hidden)
+
+    owner = SimpleNamespace(provider=SimpleNamespace(run=run), layer_id=2)
+    monkeypatch.setattr(
+        module,
+        "get_forward_context",
+        lambda: SimpleNamespace(no_compile_layers={"owner": owner}),
+    )
+    x, weights = torch.ones(1, 4), torch.ones(1, 2)
+    ids, output = torch.zeros(1, 2, dtype=torch.int32), torch.ones_like(x)
+    capture_type = module.BreakableCUDAGraphCapture
+    # add_eager has closed its segment while retaining capture TLS.
+    with monkeypatch.context() as capture:
+        capture.setattr(
+            capture_type._tls,
+            "active",
+            SimpleNamespace(_capturing=False),
+            raising=False,
+        )
+        module._native_experts(x, weights, ids, output, "owner")
+        assert not calls and not output.count_nonzero()
+    with pytest.raises(ValueError, match="duplicate expert"):
+        module._native_experts(x, weights, ids, output, "owner")
+    assert not calls and not output.count_nonzero()
+    ids[0, 1] = 1
+    module._native_experts(x, weights, ids, output, "owner")
+    assert calls == [2] and torch.equal(output, x)
