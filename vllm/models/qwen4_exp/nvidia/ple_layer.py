@@ -631,6 +631,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
 
 class Qwen4ExpPLELayer(nn.Module, MambaBase):
+    # ple_conv keeps K candidate inputs after the base history in column 0.
+    # The shared conv-only commit shifts once and neutralizes acceptance.
+    supports_conv_only_spec_commit = True
+
     def __init__(
         self,
         config: Qwen4ExpTextConfig,
