@@ -49,6 +49,54 @@ def weights(experts=2):
     return result
 
 
+def test_moe_runner_load_receipt_resolves_actual_child_parameters():
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+    from vllm.model_executor.models.utils import AutoWeightsLoader
+
+    class ExpertWeights(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(2, 3), requires_grad=False)
+            self.scale = torch.nn.Parameter(torch.zeros(2, 1), requires_grad=False)
+
+        def load_weights(self, stream):
+            for name, tensor in stream:
+                parameter = self.get_parameter(name)
+                parameter.data.copy_(tensor)
+                yield name
+
+    def model():
+        root = torch.nn.Module()
+        root.experts = MoERunner.__new__(MoERunner)
+        torch.nn.Module.__init__(root.experts)
+        root.experts.routed_experts = ExpertWeights()
+        return root
+
+    source = [
+        ("experts.weight", torch.full((2, 3), 7.0)),
+        ("experts.scale", torch.full((2, 1), 3.0)),
+    ]
+    root = model()
+    loaded = AutoWeightsLoader(root).load_weights(iter(source))
+    assert loaded == {name for name, _ in root.named_parameters()}
+    for name in loaded:
+        assert root.get_parameter(name) is not None
+    assert torch.equal(root.experts.routed_experts.weight, source[0][1])
+    assert torch.equal(root.experts.routed_experts.scale, source[1][1])
+
+    incomplete = model()
+    received = AutoWeightsLoader(incomplete).load_weights(iter(source[:1]))
+    assert {name for name, _ in incomplete.named_parameters()} - received == {
+        "experts.routed_experts.scale"
+    }
+    with pytest.raises(RuntimeError):
+        AutoWeightsLoader(model()).load_weights(
+            iter([source[0], ("experts.scale", torch.ones(7))])
+        )
+    recovered = model()
+    assert AutoWeightsLoader(recovered).load_weights(iter(source)) == loaded
+
+
 @pytest.mark.parametrize("tp", [1, 2, 3, 4, 5, 8, 16])
 def test_fp8_complete_source_padding_survives_real_tp_loader(tp):
     owner = loader(tp)
