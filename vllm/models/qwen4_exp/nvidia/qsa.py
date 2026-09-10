@@ -53,7 +53,12 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
 )
 
-from ..common.qsa_cache import QSAForwardMetadata
+from ..common.qsa_cache import (
+    QSAForwardMetadata,
+    qsa_cache_operands,
+    qsa_cache_storage,
+    qsa_cache_view,
+)
 from .indexer_qsa import QSAIndexer
 
 
@@ -65,13 +70,29 @@ def _qsa_fp8_owner(
     key: torch.Tensor,
     value: torch.Tensor,
     caches: list[torch.Tensor],
+    cache_indices: list[int],
     selection: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
 ) -> None:
     layer = get_forward_context().no_compile_layers[layer_name]
+    templates = (
+        layer.kv_cache,
+        layer.indexer.raw_key_cache.kv_cache,
+        layer.indexer.compressed_key_cache.kv_cache,
+    )
     layer._run_fp8_qsa(
-        projected_qk, positions, query, key, value, caches, selection, output
+        projected_qk,
+        positions,
+        query,
+        key,
+        value,
+        [
+            qsa_cache_view(caches[index], view)
+            for index, view in zip(cache_indices, templates, strict=True)
+        ],
+        selection,
+        output,
     )
 
 
@@ -82,6 +103,7 @@ def _qsa_fp8_owner_fake(
     key: torch.Tensor,
     value: torch.Tensor,
     caches: list[torch.Tensor],
+    cache_indices: list[int],
     selection: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
@@ -373,6 +395,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise NotImplementedError("Qwen4Exp QSA requires BF16 cache storage")
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
+        self.kv_cache_storage = qsa_cache_storage(self.kv_cache)
         set_default_quant_scales(self, register_buffer=True)
 
         self.attn_backend: type[AttentionBackend]
@@ -440,6 +463,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             if kv_cache.shape[1] != self.num_kv_heads:
                 raise ValueError("QSA cache must contain both global KV heads")
         self.kv_cache = kv_cache
+        self.kv_cache_storage = qsa_cache_storage(kv_cache)
 
     def _run_fp8_qsa(
         self, projected_qk, positions, query, key, value, caches, selection, output
@@ -588,17 +612,21 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         # Keep the index projection outside the eager break.
         projected_qk, _ = self.indexer.index_qk_proj(hidden_states)
         if self.fp8_dcp:
+            storages, cache_indices = qsa_cache_operands(
+                [
+                    self.kv_cache_storage,
+                    self.indexer.raw_key_cache.kv_cache_storage,
+                    self.indexer.compressed_key_cache.kv_cache_storage,
+                ]
+            )
             torch.ops.vllm.qsa_fp8_owner(
                 projected_qk,
                 positions,
                 query,
                 key,
                 value,
-                [
-                    self.kv_cache,
-                    self.indexer.raw_key_cache.kv_cache,
-                    self.indexer.compressed_key_cache.kv_cache,
-                ],
+                storages,
+                cache_indices,
                 self.topk_indices_buffer[:num_tokens],
                 attn_output,
                 self.layer_name,

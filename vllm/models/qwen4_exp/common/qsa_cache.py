@@ -12,6 +12,7 @@ shared by the generic cache-layout planner.
 """
 
 import math
+import weakref
 from dataclasses import dataclass
 from functools import cache
 from typing import ClassVar
@@ -43,6 +44,59 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
 )
+
+_cache_storages: weakref.WeakValueDictionary[tuple[int, int], torch.Tensor] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def qsa_cache_storage(cache: torch.Tensor) -> torch.Tensor:
+    """One byte carrier per complete storage, shared by every logical view.
+
+    AOT cannot merge mutated FP8/BF16 aliases. Repeated *tensor identity*
+    also avoids synthetic-base reconstruction of padded virtual arenas.
+    Owners retain carriers; this weak registry never retains an old KV pool.
+    Call only when binding cache views, outside compiled execution.
+    """
+    storage = cache.untyped_storage()
+    key = (storage._cdata, storage.nbytes())
+    carrier = _cache_storages.get(key)
+    if carrier is None:
+        carrier = cache.view(torch.uint8).as_strided((storage.nbytes(),), (1,), 0)
+        carrier = _cache_storages.setdefault(key, carrier)
+    return carrier
+
+
+def qsa_cache_view(storage: torch.Tensor, template: torch.Tensor) -> torch.Tensor:
+    """Interpret the operator's actual byte operand using bound cache geometry."""
+    if (
+        storage.dtype != torch.uint8
+        or storage.ndim != 1
+        or storage.stride() != (1,)
+        or storage.storage_offset() != 0
+        or storage.numel() != template.untyped_storage().nbytes()
+    ):
+        raise ValueError("QSA cache carrier differs from its bound storage extent")
+    return storage.view(template.dtype).as_strided(
+        template.shape, template.stride(), template.storage_offset()
+    )
+
+
+def qsa_cache_operands(
+    caches: list[torch.Tensor],
+) -> tuple[list[torch.Tensor], list[int]]:
+    """Pass each mutable storage once, including with functionalization V1."""
+    unique: list[torch.Tensor] = []
+    indices: list[int] = []
+    for carrier in caches:
+        for index, existing in enumerate(unique):
+            if carrier is existing:
+                indices.append(index)
+                break
+        else:
+            indices.append(len(unique))
+            unique.append(carrier)
+    return unique, indices
 
 
 def canonical_qsa_rope_positions(positions: torch.Tensor) -> torch.Tensor:
@@ -796,6 +850,7 @@ class _QSAStateCache(nn.Module, AttentionLayerBase):
         self.prefix = prefix
         self.compress_ratio = compress_ratio
         self.kv_cache = torch.tensor([])
+        self.kv_cache_storage = qsa_cache_storage(self.kv_cache)
         extra = vllm_config.additional_config
         self.layer_compact_state = isinstance(extra, dict) and bool(
             extra.get("flashnext_qsa_dcp")
@@ -819,6 +874,7 @@ class _QSAStateCache(nn.Module, AttentionLayerBase):
                 f"{kv_cache.shape[3]} != {self.head_size})"
             )
         super().bind_kv_cache(kv_cache.transpose(1, 2))
+        self.kv_cache_storage = qsa_cache_storage(self.kv_cache)
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return (
