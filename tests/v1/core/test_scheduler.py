@@ -16696,7 +16696,7 @@ def test_elastic_restore_idle_exposes_reclaim_as_scheduler_work():
 @pytest.mark.parametrize(
     "restore,resident,pending,preserve,grant",
     [
-        (True, 88, False, False, 0),
+        (True, 88, False, True, 88),
         (False, 88, False, True, 88),
         (True, 88, True, True, 88),
         (True, 0, False, True, 0),
@@ -16720,6 +16720,13 @@ def test_elastic_finished_drain_keeps_loan_and_graph_intent_consistent(
     controller = scheduler._elastic_admission_controller
     controller.resident_bytes = resident
     controller.evictable_resident_bytes = resident
+    scheduler._elastic_graph_execution_policy = _current_q4_piecewise_policy()
+    if resident:
+        key = scheduler._resolve_elastic_step_physical_keys((0, 3, 1, 4, 0))[0]
+        controller.publish_hot(
+            key, GraphPrice(resident, resident, "drain"), pinned=False
+        )
+        controller.install_reclaim_group(ReclaimGroup("drain", (key,), resident))
     if pending:
         controller.reserve_loan(None, resident)
     coordinator = scheduler.kv_cache_manager.coordinator
@@ -16742,11 +16749,49 @@ def test_elastic_finished_drain_keeps_loan_and_graph_intent_consistent(
     assert output.elastic_external_memory_bytes == grant
     assert controller.latest_loan.grant_bytes == grant
     assert output.elastic_preserve_graph_residency is preserve
-    if pending:
-        # A preceding FIFO consumer prevents reclaim. Once both loans settle,
-        # the next drain can release the same HOT residency in one output.
+    while controller.pending_loans:
         controller.settle_next_loan()
-        controller.settle_next_loan()
+    if restore and resident:
+        # EngineCore can now arm the typed reclaim transaction. Finished IDs
+        # and every preceding FIFO consumer have already reached the worker.
+        assert not scheduler.has_finished_requests()
+        assert scheduler.prepare_elastic_restore_idle_reclaim()
         recovered = scheduler.schedule()
         assert recovered.elastic_external_memory_bytes == 0
         assert not recovered.elastic_preserve_graph_residency
+        assert recovered.elastic_step_plan is not None
+        assert recovered.elastic_step_plan.kind == ElasticPlanKind.RECLAIM
+        assert recovered.elastic_step_plan.victim_keys == (key,)
+        from vllm.v1.worker.gpu.cudagraph_utils import DynamicGraphWorkingSet
+
+        manager = Mock(
+            dynamic_graph_owner=key.logical.owner,
+            runtime_generation=key.generation.value,
+            tp_size=1,
+            dynamic_resident_bytes=resident,
+            _dynamic_pending=None,
+        )
+        working_set = DynamicGraphWorkingSet((manager,))
+        monkeypatch.setattr(
+            working_set, "_release_idle_allocator_cache", Mock(return_value=0)
+        )
+        working_set.begin_step()
+        # Reproduce continuous-v2 with the real lifecycle controller, then
+        # recover through the actual scheduler-produced maintenance plan.
+        with pytest.raises(RuntimeError, match="active non-decode step"):
+            working_set.prepare_idle_reclaim_before_post_consensus()
+        plan = recovered.elastic_step_plan
+        working_set.begin_admitted_step(plan)
+        assert working_set.prepare_idle_reclaim_before_post_consensus() == 0
+        assert working_set._active_step_plan_fingerprint == plan.fingerprint
+        working_set.require_post_materialization_consensus(
+            plan, phase="post_state_application"
+        )
+        working_set.finish_step()
+        assert working_set._active_step_plan_fingerprint is None
+        manager.evict_physical_key.assert_called_once_with(
+            key,
+            transaction_id=plan.transaction_id,
+            reason="elastic_admission_plan",
+            administrative=True,
+        )
