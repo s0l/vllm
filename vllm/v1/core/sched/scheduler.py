@@ -4833,6 +4833,15 @@ class Scheduler(SchedulerInterface):
         elastic_successor_primary_headroom = self._elastic_successor_primary_headroom(
             num_scheduled_tokens
         )
+        # The loan planner appends this output to pending_loans, which makes
+        # the idle-reclaim predicate false. Freeze its worker intent first:
+        # a zero reclaim loan must not preserve the Graph pages returned to KV.
+        elastic_preserve_graph_residency = (
+            self.elastic_on_demand_graphs
+            and elastic_graph_step_key is None
+            and maintenance_plan is None
+            and not self._needs_elastic_idle_reclaim()
+        )
         elastic_graph_step_grant = self._plan_elastic_graph_loan(
             elastic_graph_step_key,
             minimum_free_primary_blocks=elastic_successor_primary_headroom,
@@ -5177,12 +5186,7 @@ class Scheduler(SchedulerInterface):
             elastic_plan_fingerprint=(
                 elastic_step_plan.fingerprint if elastic_step_plan is not None else None
             ),
-            elastic_preserve_graph_residency=(
-                self.elastic_on_demand_graphs
-                and elastic_graph_step_key is None
-                and elastic_step_plan is None
-                and not self._needs_elastic_idle_reclaim()
-            ),
+            elastic_preserve_graph_residency=elastic_preserve_graph_residency,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
         self._elastic_preflight_waiting_ignore_prefix_request_ids = ()
