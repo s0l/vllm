@@ -4833,14 +4833,12 @@ class Scheduler(SchedulerInterface):
         elastic_successor_primary_headroom = self._elastic_successor_primary_headroom(
             num_scheduled_tokens
         )
-        # The loan planner appends this output to pending_loans, which makes
-        # the idle-reclaim predicate false. Freeze its worker intent first:
-        # a zero reclaim loan must not preserve the Graph pages returned to KV.
+        # Administrative outputs have no admitted reclaim plan. Preserve both
+        # Graph ownership and its loan until the explicit maintenance tick.
         elastic_preserve_graph_residency = (
             self.elastic_on_demand_graphs
             and elastic_graph_step_key is None
             and maintenance_plan is None
-            and not self._needs_elastic_idle_reclaim()
         )
         elastic_graph_step_grant = self._plan_elastic_graph_loan(
             elastic_graph_step_key,
@@ -6969,10 +6967,15 @@ class Scheduler(SchedulerInterface):
             self._elastic_admission_controller.reserve_loan(step_key, step_grant)
             self._elastic_admission_controller.mark_recapture(residency_step_key)
             return step_grant
-        if step_key is None and not self._needs_elastic_idle_reclaim():
+        if step_key is None and (
+            pending_maintenance is None
+            or pending_maintenance.kind
+            not in {ElasticPlanKind.RECLAIM, ElasticPlanKind.PRESSURE_RECLAIM}
+        ):
             # There is no next execution shape yet, so neither graph nor KV is
             # a useful consumer. Preserve the last settled HOT working set and
-            # defer eviction until real admission can price the successor.
+            # its loan. Only an admitted RECLAIM may evict before KV growth;
+            # an idle-work predicate does not supply that worker transaction.
             step_grant = max(unsettled_grant, current_external)
             self._elastic_admission_controller.reserve_loan(None, step_grant)
             return step_grant
