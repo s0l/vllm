@@ -285,9 +285,13 @@ def _build_qsa_metadata_kernel(
     TOKEN_BLOCK_SIZE: tl.constexpr,
     REQUEST_SCAN_SIZE: tl.constexpr,
     WORK_BLOCK_SIZE: tl.constexpr,
+    REPLAY_QUERY_COUNT: tl.constexpr = False,
 ):
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
+
+    if REPLAY_QUERY_COUNT:
+        num_mapped_tokens = tl.load(query_start_loc_ptr + num_reqs)
 
     pid = tl.program_id(0)
     token_idx = pid * TOKEN_BLOCK_SIZE + tl.arange(0, TOKEN_BLOCK_SIZE)
@@ -452,10 +456,13 @@ def build_qsa_metadata_triton(
     circular_buffer_size: int = 0,
     k_work_metadata_buffer: torch.Tensor | None = None,
     request_capacity: int | None = None,
+    replay_query_count: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build QSA side-cache and optional pre-indexer work metadata."""
     num_tokens = common_attn_metadata.num_actual_tokens
-    num_mapped_tokens = int(common_attn_metadata.query_start_loc_cpu[-1])
+    num_mapped_tokens = (
+        0 if replay_query_count else int(common_attn_metadata.query_start_loc_cpu[-1])
+    )
     token_to_req = token_to_req_buffer[:num_tokens]
     logical_positions = logical_positions_buffer[:num_tokens]
     visible_blocks = visible_blocks_buffer[:num_tokens]
@@ -511,6 +518,7 @@ def build_qsa_metadata_triton(
         TOKEN_BLOCK_SIZE=128,
         REQUEST_SCAN_SIZE=request_scan_size,
         WORK_BLOCK_SIZE=256,
+        REPLAY_QUERY_COUNT=replay_query_count,
         num_warps=4,
     )
     if circular_buffer_size == 0 and compress_ratio == 1:
@@ -648,6 +656,7 @@ class QSAForwardMetadata(AttentionMetadata):
     max_seq_len: int
     storage_block_size: int
     compress_ratio: int
+    draft_common: CommonAttentionMetadata | None = None
 
 
 class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
@@ -692,6 +701,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         )
         max_requests = vllm_config.scheduler_config.max_num_seqs
         self.request_capacity = max_requests
+        self.supports_draft_decode_metadata_update = current_platform.is_cuda()
         if not self.is_circular_buffer and self.compress_ratio != 1:
             max_k_work = (
                 max_tokens + (self.compress_ratio - 1) * max_requests
@@ -777,6 +787,31 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             max_seq_len=common_attn_metadata.max_seq_len,
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
+            draft_common=common_attn_metadata,
+        )
+
+    def update_draft_decode_metadata(self, metadata: QSAForwardMetadata) -> None:
+        common = metadata.draft_common
+        if common is None or metadata.max_query_len != 1 or metadata.num_prefills:
+            raise ValueError("QSA draft metadata update requires uniform q1 decode")
+        # update_draft_inputs already advanced seq_lens; generic block tables
+        # already refreshed common.slot_mapping. Recompute only QSA-derived
+        # device tensors, retaining every address consumed by the draft graph.
+        build_k_work = not self.is_circular_buffer and self.compress_ratio != 1
+        build_qsa_metadata_triton(
+            common,
+            metadata.token_to_req,
+            metadata.logical_positions,
+            metadata.visible_blocks,
+            metadata.slot_mapping,
+            storage_block_size=self.storage_block_size,
+            compress_ratio=self.compress_ratio,
+            circular_buffer_size=(
+                self.kv_cache_spec.block_size if self.is_circular_buffer else 0
+            ),
+            k_work_metadata_buffer=metadata.k_work_metadata if build_k_work else None,
+            request_capacity=self.request_capacity if build_k_work else None,
+            replay_query_count=True,
         )
 
 

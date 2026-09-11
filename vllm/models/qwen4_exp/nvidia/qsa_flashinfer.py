@@ -441,6 +441,7 @@ class QSAFlashInferMetadata(AttentionMetadata):
 
 class QSAFlashInferMetadataBuilder(AttentionMetadataBuilder[QSAFlashInferMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    supports_draft_decode_metadata_update = True
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
@@ -460,6 +461,13 @@ class QSAFlashInferMetadataBuilder(AttentionMetadataBuilder[QSAFlashInferMetadat
             common_attn_metadata.block_table_tensor,
             common_attn_metadata.slot_mapping,
         )
+
+    def update_draft_decode_metadata(self, metadata: QSAFlashInferMetadata) -> None:
+        if metadata.max_query_len != 1:
+            raise ValueError("QSA FlashInfer draft update requires uniform q1 decode")
+        # Both tensors alias the persistent generic block/slot tables. The
+        # fused loop updates them before this hook; QSA has no local seq-length
+        # derivative or FlashInfer plan in this metadata object to rebuild.
 
 
 class QSAFlashInferBackend(AttentionBackend):
