@@ -191,7 +191,7 @@ def test_provider_votes_before_variable_wave_schedule(monkeypatch, failure):
         if failure == "peer":
             peers[1, 8] += 1
 
-    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", gather)
+    monkeypatch.setattr(torch.distributed, "all_gather_single", gather)
     ids = np.arange(10, dtype=np.int32)[None]
     weights = np.full((1, 10), 0.1, dtype=np.float32)
     error = ValueError("invalid shape") if failure == "local" else None

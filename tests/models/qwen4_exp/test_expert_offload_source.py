@@ -38,7 +38,7 @@ def write_source(path, scale=1.0):
     )
 
 
-def store(path, budget=4096, rank=0):
+def store(path, budget=4096, rank=0, **kwargs):
     return NativeExpertStore(
         path,
         rank,
@@ -46,12 +46,13 @@ def store(path, budget=4096, rank=0):
         layers=2,
         experts=3,
         geometry=NVFP4ExpertGeometry(32, 16, tp=3, local_alignment=16),
+        **kwargs,
     )
 
 
 def test_source_cache_identity_eviction_padding_and_invalid_id_recovery(tmp_path):
     write_source(tmp_path)
-    source = store(tmp_path)
+    source = store(tmp_path, cache_policy="lru")
     first = source.get(0, 1)
     assert len(first) == 10
     assert np.all(first["w13_weight"] == 2)
@@ -101,6 +102,90 @@ def test_incomplete_inventory_and_nonfinite_scale_fail_closed(tmp_path):
     with pytest.raises(ValueError, match="invalid global scale"):
         source.get(0, 0)
     assert source.closed and source.used == 0
+
+
+def test_frequency_admission_survives_scans_and_adapts_to_new_demand(tmp_path):
+    write_source(tmp_path)
+    probe = store(tmp_path, budget=0)
+    size = sum(a.nbytes for a in probe.get(0, 0).values())
+    probe.close()
+    sources = {
+        policy: store(tmp_path, budget=size * 3, cache_policy=policy)
+        for policy in ("lru", "frequency")
+    }
+    keys = [(layer, expert) for layer in range(2) for expert in range(3)]
+    for source in sources.values():
+        for _ in range(3):
+            for key in keys:
+                source.get(*key)
+        assert source.used == size * 3
+    assert sources["lru"].hits == 0
+    assert sources["frequency"].hits >= 6
+    source = sources["frequency"]
+    new_key = next(k for k in keys if k not in source.cache)
+    for _ in range(8):
+        source.get(*new_key)
+    read = source.read_bytes
+    assert source.get(*new_key) is source.cache[new_key]
+    assert source.read_bytes == read
+    for source in sources.values():
+        source.close()
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2])
+def test_batched_reads_preserve_order_duplicates_and_live_evicted_values(
+    tmp_path, rank
+):
+    write_source(tmp_path)
+    control = store(tmp_path, budget=0, rank=rank, io_workers=1)
+    source = store(tmp_path, budget=4096, rank=rank, io_workers=4)
+    expected = [control.get(1, expert) for expert in (2, 0, 2, 1)]
+    actual = source.get_many(1, (2, 0, 2, 1))
+    assert actual[0] is actual[2]
+    assert source.misses == 3
+    for a, b in zip(actual, expected):
+        assert a.keys() == b.keys()
+        assert all(np.array_equal(a[k], b[k]) for k in a)
+        assert all(not value.flags.writeable for value in a.values())
+    source.close()
+    control.close()
+    assert source.used == 0 and not source._fds
+    assert all(np.array_equal(actual[0][k], expected[0][k]) for k in actual[0])
+
+
+def test_partial_concurrent_read_never_publishes_and_fresh_source_recovers(
+    tmp_path, monkeypatch
+):
+    from vllm.models.qwen4_exp.nvidia import expert_offload_source as module
+
+    write_source(tmp_path)
+    source = store(tmp_path)
+    original = module.os.pread
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            module.os, "pread", lambda fd, n, offset: original(fd, n, offset)[:-1]
+        )
+        with pytest.raises(OSError, match="truncated"):
+            source.get_many(0, (0, 1, 2))
+    assert source.closed and not source.cache and not source._fds
+    recovered = store(tmp_path)
+    assert len(recovered.get_many(0, (0, 1, 2))) == 3
+    recovered.close()
+
+
+def test_bad_batch_recovers_without_io_and_cached_source_mutation_rejects(tmp_path):
+    write_source(tmp_path)
+    source = store(tmp_path)
+    before = source.get_many(0, (0, 1))
+    read = source.read_bytes
+    with pytest.raises(ValueError, match="unknown checkpoint expert"):
+        source.get_many(0, (0, 1, 4))
+    assert source.read_bytes == read and source.get_many(0, (0, 1)) == before
+    assert source.get_many(0, ()) == []
+    write_source(tmp_path, scale=2.0)
+    with pytest.raises(OSError, match="source identity changed"):
+        source.get_many(0, (0, 1))
+    assert source.closed and not source._fds
 
 
 def test_model_expert_loader_accounts_metadata_without_resident_parameters():
@@ -416,3 +501,213 @@ def test_native_callback_defers_unproduced_capture_routes_until_replay(monkeypat
     padding.zero_()
     with pytest.raises(ValueError, match="expert outside"):
         module._native_experts(x, weights, ids, output, "owner", padding)
+
+
+def test_provider_retirement_starts_a_fresh_graph_pool_epoch(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from vllm.models.qwen4_exp.nvidia import expert_offload_provider as module
+
+    provider = module.NativeExpertProvider.__new__(module.NativeExpertProvider)
+    graph = Mock()
+    provider.bank = SimpleNamespace(
+        graphs={graph}, stable_graphs={graph}, close_prefetch=Mock()
+    )
+    provider.kernels = {16: (object(), graph)}
+    provider.quiesce = Mock()
+    provider.graph_pool = object()
+    fresh = object()
+    monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: fresh)
+    provider.retire()
+    provider.quiesce.assert_called_once_with()
+    graph.reset.assert_called_once_with()
+    assert provider.graph_pool is fresh
+    assert not (provider.kernels or provider.bank.graphs or provider.bank.stable_graphs)
+    assert provider.consumer is None and provider.consumer_rows is None
+
+
+def _prefetch_bank(source, sample=None):
+    from threading import RLock
+
+    from vllm.models.qwen4_exp.nvidia.expert_offload_bank import NativeExpertBank
+
+    bank = NativeExpertBank.__new__(NativeExpertBank)
+    bank.source, bank.lock = source, RLock()
+    bank.state, bank.staging, bank.leases = "READY", 4, {object()}
+    bank.host_hot = {(1, 0): 0}
+    bank.prefetch_reader = bank.prefetch_future = bank.prefetch_layer = None
+    bank.prefetch_error = None
+    bank.prefetch_ids = ()
+    bank.next_demand = None
+    bank.prepared = {}
+    bank.prefetch_experts = bank.prefetch_consumed = 0
+    sample = source.get(0, 0) if sample is None else sample
+    bank.shapes = {name: value.shape for name, value in sample.items()}
+
+    def buffers():
+        arrays = {
+            name: np.zeros((4, *a.shape), dtype=a.dtype) for name, a in sample.items()
+        }
+        return {name: torch.from_numpy(a) for name, a in arrays.items()}, arrays
+
+    bank._allocate_pinned = buffers
+    bank.pinned, bank.pinned_numpy = buffers()
+    bank.next_pinned = bank.next_pinned_numpy = None
+    return bank
+
+
+def test_exact_prefetch_excludes_hot_and_retains_bypassed_rows(tmp_path):
+    write_source(tmp_path)
+    source = store(tmp_path, budget=0)
+    bank = _prefetch_bank(source)
+    misses = source.misses
+    try:
+        bank.prefetch(1, (0, 1, 2))
+        bank._finish_prefetch(1)
+        assert set(bank.prepared) == {1, 2}
+        assert source.misses - misses == 2 and not source.cache
+        assert bank.prefetch_experts == 2
+        for expert, position in bank.prepared.items():
+            expected = source.get(1, expert)
+            for name, value in expected.items():
+                np.testing.assert_array_equal(bank.pinned_numpy[name][position], value)
+        bank.drain_prefetch()
+        assert not bank.prepared and bank.prefetch_future is None
+        with pytest.raises(ValueError, match="one staging wave"):
+            bank.prefetch(1, (1, 2, 3, 4, 5))
+    finally:
+        bank.close_prefetch()
+        source.close()
+    assert bank.prefetch_reader is None
+
+
+def test_prefetch_error_and_stale_epoch_are_joined_before_recovery(tmp_path):
+    write_source(tmp_path)
+    source = store(tmp_path, budget=0)
+    bank = _prefetch_bank(source)
+    try:
+        bank.prefetch(1, (1, 2))
+        with pytest.raises(RuntimeError, match="stale native prefetch"):
+            bank._finish_prefetch(0)
+        assert not bank.prepared and bank.prefetch_future is None
+        bank.prefetch(1, (1, 2))
+        bank._finish_prefetch(1)
+        assert set(bank.prepared) == {1, 2}
+        bank.prefetch(1, (9,))
+        with pytest.raises(ValueError, match="unknown checkpoint"):
+            bank._finish_prefetch(1)
+        assert not bank.prepared and bank.prefetch_future is None
+    finally:
+        bank.close_prefetch()
+        source.close()
+
+
+def test_prefetch_cancellation_waits_for_outstanding_source_reader():
+    from threading import Event, Thread
+    from types import SimpleNamespace
+
+    entered, release, closed = Event(), Event(), Event()
+    from vllm.models.qwen4_exp.nvidia.expert_offload_bank import COMPONENTS, SCALARS
+
+    sample = {
+        name: np.ones((), dtype=np.float32)
+        if name in SCALARS
+        else np.ones((1,), dtype=np.uint8)
+        for name in COMPONENTS
+    }
+
+    def read(layer, experts):
+        entered.set()
+        assert release.wait(5)
+        return [sample for _ in experts]
+
+    bank = _prefetch_bank(SimpleNamespace(get_many=read), sample)
+    bank.prefetch(1, (1,))
+    assert entered.wait(5)
+
+    def close():
+        bank.close_prefetch()
+        closed.set()
+
+    thread = Thread(target=close)
+    thread.start()
+    try:
+        assert not closed.wait(0.05)
+    finally:
+        release.set()
+        thread.join(5)
+    assert closed.is_set() and not thread.is_alive()
+    assert bank.prefetch_future is bank.prefetch_reader is None
+    assert not bank.prepared
+
+
+def test_prefetch_tracks_provisional_victims_and_swaps_pinned_generations(tmp_path):
+    from types import SimpleNamespace
+
+    from vllm.models.qwen4_exp.nvidia.expert_offload_bank import NativeBankPlan
+
+    write_source(tmp_path)
+    source = store(tmp_path, budget=0)
+    bank = _prefetch_bank(source)
+    original = bank.pinned
+    bank.state = "LOADING"
+    bank.tables = SimpleNamespace(pool_rows=1)
+    # Row0 previously held next-wave expert(1,0); this pending copy evicts it.
+    bank.plan = NativeBankPlan(1, 0, (0,), ((2, 0),))
+    try:
+        bank.prefetch(1, (0, 1))
+        bank._finish_prefetch(1)
+        assert set(bank.prepared) == {0, 1}
+        assert bank.pinned is not original and bank.next_pinned is original
+        first = {name: a.copy() for name, a in bank.pinned_numpy.items()}
+        bank.prefetch(0, (1, 2))
+        bank.prefetch_future.result()
+        assert all(
+            np.array_equal(a, first[name]) for name, a in bank.pinned_numpy.items()
+        )
+        bank._finish_prefetch(0)
+        assert bank.pinned is original
+        for expert, position in bank.prepared.items():
+            for name, value in source.get(0, expert).items():
+                np.testing.assert_array_equal(bank.pinned_numpy[name][position], value)
+        # Allocation errors must surface at the common next-stage boundary.
+        bank.next_demand = (1, (0, 1, 2, 3, 4))
+        bank.start_next()
+        with pytest.raises(ValueError, match="one staging wave"):
+            bank._finish_prefetch(1)
+    finally:
+        bank.close_prefetch()
+        source.close()
+
+
+def test_parallel_reads_keep_preparation_on_owner_and_bound_raw_queue():
+    from threading import Lock, get_ident
+
+    source = NativeExpertStore.__new__(NativeExpertStore)
+    source._reader, source.io_workers = None, 2
+    owner = get_ident()
+    lock = Lock()
+    buffered = peak = 0
+
+    def read(key):
+        nonlocal buffered, peak
+        assert get_ident() != owner
+        with lock:
+            buffered += 1
+            peak = max(peak, buffered)
+        return key, 1, 1
+
+    def prepare(raw):
+        nonlocal buffered
+        assert get_ident() == owner
+        with lock:
+            buffered -= 1
+        return raw
+
+    source._read_raw, source._prepare_raw = read, prepare
+    try:
+        assert source._read_many(list(range(32))) == [(key, 1, 1) for key in range(32)]
+        assert buffered == 0 and peak <= source.io_workers * 2 + 1
+    finally:
+        source._reader.shutdown(wait=True, cancel_futures=True)

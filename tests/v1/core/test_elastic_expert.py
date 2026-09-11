@@ -82,6 +82,13 @@ def test_native_quantum_curve_and_maximal_fit(staging):
         {"ram_cache_total_bytes": -1},
         {"ram_cache_total_bytes": 1.5},
         {"ram_cache_total_bytes": 32 << 30, "ram_cache_bytes": 1 << 30},
+        {"pin_ram_cache": 1},
+        {"pin_ram_cache": "true"},
+        {"pin_ram_cache": None},
+        {"hot_read": 1},
+        {"prepared_archive": 1},
+        {"prepared_archive": "relative/archive"},
+        {"prepared_archive": ""},
         {"unknown": 1},
     ],
 )
@@ -108,8 +115,19 @@ def test_scheduler_budget_consumes_model_tp_configuration(tp, local):
 def test_total_host_cache_budget_splits_by_configured_tp_and_recovers(tp):
     total = 32 << 30
     budget = NativeExpertBudget.from_config(
-        make_config({"ram_cache_total_bytes": total}, tp)
+        make_config(
+            {
+                "ram_cache_total_bytes": total,
+                "pin_ram_cache": True,
+                "hot_read": True,
+                "prepared_archive": "/archive",
+            },
+            tp,
+        )
     )
+    assert budget.pin_ram_cache is True
+    assert budget.hot_read is True and budget.prepared_archive == "/archive"
+    assert NativeExpertBudget.from_config(make_config({}, tp)).pin_ram_cache is False
     assert budget.ram_cache_bytes * tp <= total
     assert total - budget.ram_cache_bytes * tp < tp
     assert (
@@ -271,7 +289,7 @@ def test_worker_admits_common_grant_before_retiring_or_mutating_bank(
         group=SimpleNamespace(device_group=object()),
     )
     owner.provider = SimpleNamespace(
-        active=False, coordinator=coordinator, retire=Mock()
+        active=False, coordinator=coordinator, retire=Mock(), quiesce=Mock()
     )
     owner.controller = SimpleNamespace(
         auxiliary_targets={"native-fixture": budget.base_bytes}
@@ -314,3 +332,4 @@ def test_worker_admits_common_grant_before_retiring_or_mutating_bank(
         ] == budget.mapped_bytes(64)
     assert owner.bank.tables.pool_rows == 0
     owner.provider.retire.assert_not_called()
+    owner.provider.quiesce.assert_not_called()
