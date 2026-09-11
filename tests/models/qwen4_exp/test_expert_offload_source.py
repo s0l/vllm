@@ -374,8 +374,13 @@ def test_native_callback_defers_unproduced_capture_routes_until_replay(monkeypat
 
     calls = []
 
-    def run(layer, hidden, weights, ids, output):
-        module.plan(ids.numpy(), 3, 3)
+    def run(layer, hidden, weights, ids, output, *, is_padding=None):
+        module.plan(
+            ids.numpy(),
+            3,
+            3,
+            is_padding=None if is_padding is None else is_padding.numpy(),
+        )
         calls.append(layer)
         output.copy_(hidden)
 
@@ -404,3 +409,10 @@ def test_native_callback_defers_unproduced_capture_routes_until_replay(monkeypat
     ids[0, 1] = 1
     module._native_experts(x, weights, ids, output, "owner")
     assert calls == [2] and torch.equal(output, x)
+    padding = torch.ones(1, dtype=torch.bool)
+    ids.fill_(-1)
+    module._native_experts(x, weights, ids, output, "owner", padding)
+    assert calls == [2, 2]
+    padding.zero_()
+    with pytest.raises(ValueError, match="expert outside"):
+        module._native_experts(x, weights, ids, output, "owner", padding)

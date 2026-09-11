@@ -120,6 +120,55 @@ def test_compact_provider_rejects_invalid_routes_and_recovers():
     assert [len(t.lanes) for t in wave.tiles(4096)] == [4096, 4094]
 
 
+@pytest.mark.parametrize("tokens", [0, 1, 4, 33])
+@pytest.mark.parametrize("mask_kind", ["none", "tail", "interior", "all"])
+def test_compact_provider_conserves_only_explicit_live_lanes(tokens, mask_kind):
+    import numpy as np
+
+    from vllm.models.qwen4_exp.nvidia.expert_offload_plan import plan
+
+    rng = np.random.default_rng(6721)
+    ids = np.argsort(rng.random((tokens, 512)), axis=1)[:, :10].astype(np.int32)
+    padding = np.zeros(tokens, dtype=np.bool_)
+    if mask_kind == "tail":
+        padding[-1:] = True
+    elif mask_kind == "interior":
+        padding[::3] = True
+    elif mask_kind == "all":
+        padding[:] = True
+    ids[padding] = -1
+    seen = np.zeros(ids.size, dtype=np.int32)
+    for wave in plan(ids, 512, 7, is_padding=padding):
+        for tile in wave.tiles(16):
+            experts = np.asarray(tile.experts)[tile.slots]
+            assert np.array_equal(experts, ids.flat[tile.lanes])
+            seen[tile.lanes] += 1
+    assert np.array_equal(
+        seen.reshape(ids.shape), np.broadcast_to(~padding[:, None], ids.shape)
+    )
+
+
+def test_compact_padding_does_not_hide_live_corruption_and_recovers():
+    import numpy as np
+
+    from vllm.models.qwen4_exp.nvidia.expert_offload_plan import plan
+
+    valid = np.tile(np.arange(10, dtype=np.int32), (4, 1))
+    padding = np.array([False, True, False, True])
+    valid[padding] = -1
+    for bad_mask in (padding.astype(np.int32), padding[:, None], padding[:-1]):
+        with pytest.raises(ValueError, match="padding mask"):
+            plan(valid, 512, 32, is_padding=bad_mask)
+    for row, value in ((0, -1), (0, 512), (0, 1), (1, 0)):
+        bad = valid.copy()
+        bad[row, 0] = value
+        with pytest.raises(ValueError):
+            plan(bad, 512, 32, is_padding=padding)
+        assert len(plan(valid, 512, 32, is_padding=padding)) == 1
+    with pytest.raises(ValueError, match="expert outside"):
+        plan(valid, 512, 32)
+
+
 @pytest.mark.parametrize("failure", [None, "peer", "local"])
 def test_provider_votes_before_variable_wave_schedule(monkeypatch, failure):
     from types import SimpleNamespace
