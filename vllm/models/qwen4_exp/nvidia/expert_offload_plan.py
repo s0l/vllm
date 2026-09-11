@@ -28,7 +28,7 @@ class Wave:
         )
 
 
-def plan(ids, num_experts, capacity):
+def plan(ids, num_experts, capacity, *, is_padding=None):
     """Preserve each token/top-k lane once; only expert loads are deduplicated."""
     if (
         not isinstance(ids, np.ndarray)
@@ -38,13 +38,26 @@ def plan(ids, num_experts, capacity):
         or not 1 <= ids.shape[1] <= num_experts
     ):
         raise ValueError("invalid compact route geometry")
-    if ids.size and (ids.min() < 0 or ids.max() >= num_experts):
+    active_ids = ids
+    if is_padding is not None:
+        if (
+            not isinstance(is_padding, np.ndarray)
+            or is_padding.dtype != np.bool_
+            or is_padding.shape != (ids.shape[0],)
+        ):
+            raise ValueError("invalid native padding mask")
+        if np.any(ids[is_padding] != -1):
+            raise ValueError("padding row has a live expert")
+        active_ids = ids[~is_padding]
+    if active_ids.size and (active_ids.min() < 0 or active_ids.max() >= num_experts):
         raise ValueError("expert outside logical layer")
-    ordered = np.sort(ids, axis=1)
+    ordered = np.sort(active_ids, axis=1)
     if np.any(ordered[:, 1:] == ordered[:, :-1]):
         raise ValueError("duplicate expert in one token's top-k")
     flat = ids.reshape(-1)
     order = np.argsort(flat, kind="stable")
+    if is_padding is not None:
+        order = order[flat[order] >= 0]
     demand, starts, counts = np.unique(
         flat[order], return_index=True, return_counts=True
     )

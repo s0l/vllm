@@ -56,6 +56,7 @@ def _native_experts(
     ids: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
+    is_padding: torch.Tensor | None = None,
 ) -> None:
     owner = get_forward_context().no_compile_layers[layer_name]
     if BreakableCUDAGraphCapture.is_active():
@@ -63,7 +64,9 @@ def _native_experts(
         # demand; capture registers this callback without touching residency.
         output.zero_()
         return
-    owner.provider.run(owner.layer_id, hidden, weights, ids, output)
+    owner.provider.run(
+        owner.layer_id, hidden, weights, ids, output, is_padding=is_padding
+    )
 
 
 def _native_experts_fake(
@@ -72,6 +75,7 @@ def _native_experts_fake(
     ids: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
+    is_padding: torch.Tensor | None = None,
 ) -> None:
     pass
 
@@ -222,7 +226,7 @@ class NativeExpertProvider:
         self.kernels[bucket] = direct, graph
         return direct, graph
 
-    def run(self, layer, hidden, weights, ids, output):
+    def run(self, layer, hidden, weights, ids, output, *, is_padding=None):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("native expert demand requires breakable Graph capture")
         if self.active:
@@ -234,7 +238,7 @@ class NativeExpertProvider:
         steps, tiles, useful = 0, 0, 0
         try:
             error = None
-            cpu_ids = cpu_weights = None
+            cpu_ids = cpu_weights = cpu_padding = None
             try:
                 if (
                     hidden.ndim != 2
@@ -250,13 +254,28 @@ class NativeExpertProvider:
                     or not 0 <= layer < self.bank.source.layers
                 ):
                     raise ValueError("invalid native provider inputs")
+                if is_padding is not None and (
+                    is_padding.shape != (hidden.shape[0],)
+                    or is_padding.dtype != torch.bool
+                    or is_padding.device != self.bank.device
+                ):
+                    raise ValueError("invalid native padding mask")
                 if not self.dummy:
                     cpu_ids = ids.cpu().numpy()
                     cpu_weights = weights.cpu().numpy()
+                    if is_padding is not None:
+                        cpu_padding = is_padding.cpu().numpy()
+                        cpu_weights = cpu_weights.copy()
+                        cpu_weights[cpu_padding] = 0
                     if not np.isfinite(cpu_weights).all() or np.any(cpu_weights < 0):
                         raise ValueError("invalid native routing weights")
                     # Validate before consensus; actual per-chunk schedules follow.
-                    plan(cpu_ids, self.bank.source.experts, self.bank.staging)
+                    plan(
+                        cpu_ids,
+                        self.bank.source.experts,
+                        self.bank.staging,
+                        is_padding=cpu_padding,
+                    )
             except Exception as exc:
                 error = exc
             if self.dummy and error is None:
@@ -273,10 +292,21 @@ class NativeExpertProvider:
                 count = min(self.max_tokens, hidden.shape[0] - start)
                 self.x[:count].copy_(hidden[start : start + count])
                 self.weights[:count].copy_(weights[start : start + count])
+                padding = (
+                    None if cpu_padding is None else cpu_padding[start : start + count]
+                )
+                if padding is not None and padding.any():
+                    padding_rows = torch.as_tensor(
+                        np.flatnonzero(padding), device=self.bank.device
+                    )
+                    self.x[:count].index_fill_(0, padding_rows, 0)
+                    self.weights[:count].index_fill_(0, padding_rows, 0)
+                    self.lanes[:count].index_fill_(0, padding_rows, 0)
                 waves = plan(
                     cpu_ids[start : start + count],
                     self.bank.source.experts,
                     self.bank.staging,
+                    is_padding=padding,
                 )
                 for wave in waves:
                     demand = self.expert_ids[: len(wave.experts)]

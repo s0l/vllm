@@ -15,7 +15,10 @@ from vllm.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
-from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
+from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
+    _get_padding_mask,
+    fused_topk,
+)
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models.qwen3_next import (
     Qwen3NextMLP,
@@ -166,7 +169,12 @@ class NativeOffloadedExperts(nn.Module):
             raise RuntimeError("native expert weights are not admitted")
         output = torch.empty_like(hidden)
         torch.ops.vllm.flashnext_native_experts(
-            hidden, weights, ids, output, self.layer_name
+            hidden,
+            weights,
+            ids,
+            output,
+            self.layer_name,
+            _get_padding_mask(hidden.shape[0]),
         )
         return output
 
