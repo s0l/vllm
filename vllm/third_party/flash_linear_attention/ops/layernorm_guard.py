@@ -27,7 +27,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     triton_scalar_specialization_rep,
 )
 from vllm.triton_utils import tl, triton
-from vllm.utils.math_utils import cdiv, next_power_of_2
+from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import num_compute_units
 
 from .utils import input_guard
@@ -181,9 +181,13 @@ def layer_norm_fwd_kernel(
 
 def calc_rows_per_block(M: int, device: torch.device) -> int:
     sm_count = num_compute_units(device.index)
-    rows_per_block = next_power_of_2(cdiv(M, 2 * sm_count))
-    rows_per_block = min(rows_per_block, 4)
-    return rows_per_block
+    # Bound the selector before tracing: bit_length() on the uncapped ceil
+    # value specializes every new M even when the launch still uses four rows.
+    if M <= 2 * sm_count:
+        return 1
+    if M <= 4 * sm_count:
+        return 2
+    return 4
 
 
 class LayerNormFwdKernel(VllmJitKernel["LayerNormFwdKernel.CompileKey"]):
