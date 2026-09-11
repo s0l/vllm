@@ -137,7 +137,7 @@ def _auto_calibrate_missing_catalog(owner: Any) -> None:
     current_owner_generation = elastic_catalog_owner_generation(
         owner.vllm_config, scheduler.kv_cache_config
     )
-    checkpoint_generation = current_owner_generation
+    checkpoint_generation: str | None = current_owner_generation
     if receipt_path.exists():
         if receipt_path.is_symlink() or not receipt_path.is_file():
             raise RuntimeError(
@@ -392,6 +392,65 @@ def prepare_elastic_runtime(
     )
 
 
+def restore_profiled_graph_carrier(owner: Any) -> None:
+    """Restore measured native owners without manufacturing model requests."""
+    from vllm.v1.engine.elastic_memory_profile import replay_allocation_profile
+
+    scheduler = owner.scheduler
+    coverage = scheduler._elastic_graph_catalog_coverage
+    x = coverage["decode_max_x"]
+    if (
+        coverage.get("serving_carrier_contract")
+        != "retained-terminal-mtp-no-cold-serving-v1"
+        or coverage.get("serving_carrier_owner") != "mtp_decode"
+        or type(x) is not int
+        or not 1 <= x <= scheduler.max_num_running_reqs
+        or scheduler.has_unfinished_requests()
+    ):
+        raise RuntimeError("invalid request-free startup carrier contract")
+    previous_mode = scheduler._elastic_restore_mode
+    scheduler._elastic_restore_mode = True
+    try:
+        owner._reclaim_elastic_restore_hotset_before_wave()
+        for query_len in (1, scheduler.num_spec_tokens + 1):
+            # Preserve semantic q for the independent MTP prefill manager,
+            # even when the target's catalog key is token-major PIECEWISE.
+            key = (0, scheduler.num_spec_tokens, x, x * query_len, query_len)
+            owner._prepare_elastic_restore_capture(key)
+            scheduler.assert_elastic_restore_captures_hot((key,))
+            receipts = owner.collective_rpc(replay_allocation_profile, args=(key,))
+            if not receipts or any(
+                receipt["source_reads"] or receipt["stable_replays"] < 1
+                for receipt in receipts
+            ):
+                raise RuntimeError("request-free carrier replay failed its profile")
+            carriers = scheduler.resolve_elastic_serving_carrier_physical_keys((key,))
+            retention = scheduler.retain_elastic_restore_captures((key,))
+            try:
+                # This publishes the serving lease and consumes the temporary
+                # restore retention before any request-free reclaim is legal.
+                scheduler.promote_elastic_restore_retention_to_serving(
+                    retention, carriers
+                )
+            finally:
+                if scheduler._elastic_restore_retention_id == retention:
+                    scheduler.release_elastic_restore_retention(retention)
+            owner._reclaim_elastic_restore_hotset_before_wave()
+        if not scheduler._elastic_serving_carrier_keys or any(
+            not scheduler._elastic_admission_controller.entries[key].hot
+            for key in scheduler._elastic_serving_carrier_keys
+        ):
+            raise RuntimeError("request-free startup lost its serving carrier")
+        scheduler.max_num_running_reqs = coverage["mixed_max_x"]
+        logger.info(
+            "Restored profiled MTP carrier without model requests: X=%d owners=%d",
+            x,
+            len(scheduler._elastic_serving_carrier_keys),
+        )
+    finally:
+        scheduler._elastic_restore_mode = previous_mode
+
+
 def complete_elastic_startup(owner: Any) -> str:
     """Restore an exact sealed elastic runtime and publish its residency."""
     from vllm.v1.engine.elastic_calibrator import ElasticCalibrationRestartRequired
@@ -415,7 +474,17 @@ def complete_elastic_startup(owner: Any) -> str:
                 "representation", "pinned_full_family"
             )
             if representation == "bounded_exact_hotset":
-                owner._restore_elastic_bounded_hotset()
+                from vllm.v1.core.elastic_memory_profile import CONTRACT
+
+                if (
+                    scheduler._elastic_graph_catalog_coverage.get(
+                        "memory_evidence_contract"
+                    )
+                    == CONTRACT
+                ):
+                    restore_profiled_graph_carrier(owner)
+                else:
+                    owner._restore_elastic_bounded_hotset()
             else:
                 owner._restore_elastic_pinned_full_family()
         except ElasticCalibrationRestartRequired:

@@ -6,7 +6,7 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, cast
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
@@ -42,6 +42,7 @@ from vllm.v1.core.elastic_graph import (
     ElasticRuntimeConfig,
     ElasticStepPlan,
     GraphExecutionPolicy,
+    OwnerDispatch,
     PhysicalReplayKey,
     RuntimeGeneration,
     SemanticGraphStep,
@@ -73,6 +74,7 @@ from vllm.v1.core.kv_cache_manager import (
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
     BlockHashListWithBlockSize,
     KVCacheBlock,
     get_num_blocks_per_request_for_kv_cache_config,
@@ -179,6 +181,13 @@ def _elastic_catalog_cold_residency_envelope(row: Mapping[str, Any]) -> int:
 
 
 class Scheduler(SchedulerInterface):
+    _elastic_graph_execution_policy: GraphExecutionPolicy | None
+    _elastic_preflight_admission_grant: ElasticAdmissionGrant | None
+    _elastic_restore_retention_id: str | None
+    _elastic_restore_execution_step_key: tuple[int, ...] | None
+    _elastic_restore_wave_step_key: tuple[int, ...] | None
+    _elastic_last_defer_reason: str | None
+
     @staticmethod
     def _validate_elastic_batch_lifecycle(
         async_scheduling: bool, max_concurrent_batches: int
@@ -350,7 +359,7 @@ class Scheduler(SchedulerInterface):
                     "identity-bound replay keys"
                 )
             self._validate_elastic_batch_lifecycle(
-                self.scheduler_config.async_scheduling,
+                cast(bool, self.scheduler_config.async_scheduling),
                 self.vllm_config.max_concurrent_batches,
             )
             policy_payload = kv_cache_config.elastic_graph_execution_policy
@@ -409,7 +418,7 @@ class Scheduler(SchedulerInterface):
         # its later verification steps, including while the current step is a
         # mixed/prefill shape.
         self._elastic_graph_carrier_step_key: tuple[int, ...] | None = None
-        self._elastic_last_execution_shape: tuple[int, int] | None = None
+        self._elastic_last_execution_shape: tuple[object, ...] | None = None
         # A sealed serving runtime reuses one terminal decode carrier for all
         # semantic cohorts up to MaxX. Calibration leaves this unset so every
         # declared exact shape remains independently measurable.
@@ -1753,7 +1762,7 @@ class Scheduler(SchedulerInterface):
         joint_remaining_encoder_budget = remaining_encoder_budget
         joint_encoder_overlay = encoder_wave_overlay
         joint_waiting_count = 0
-        waiting_candidates: Sequence[Request] = ()
+        waiting_candidates: Sequence[Request] | None = ()
         joint_waiting_supported = (
             bool(prospective_tokens)
             and bool(self.waiting or self.skipped_waiting)
@@ -1838,7 +1847,7 @@ class Scheduler(SchedulerInterface):
                             request, shared_boundary
                         ),
                     )
-                encoder_inputs: Sequence[int] | None = None
+                encoder_inputs = None
                 candidate_encoder_budget = joint_remaining_encoder_budget
                 candidate_encoder_overlay = joint_encoder_overlay
                 if request.has_encoder_inputs:
@@ -1954,18 +1963,21 @@ class Scheduler(SchedulerInterface):
                     ),
                     allow_maintenance=True,
                     **(
-                        {
-                            "mm_activation_loan_bytes": (
-                                self._elastic_mm_activation_loan_bytes
-                            )
-                        }
-                        if running_wave_encoder_inputs
-                        else {}
+                        cast(
+                            dict[str, Any],
+                            {
+                                "mm_activation_loan_bytes": (
+                                    self._elastic_mm_activation_loan_bytes
+                                )
+                            }
+                            if running_wave_encoder_inputs
+                            else {},
+                        )
                     ),
                 )
             )
             if running_fits and self._reserve_elastic_admission(
-                running_key,
+                cast(tuple[int, ...], running_key),
                 external_memory_bytes=running_required,
                 minimum_free_primary_blocks=running_minimum_free_primary_blocks,
                 requirements=running_requirements,
@@ -1978,19 +1990,19 @@ class Scheduler(SchedulerInterface):
                     == ElasticMaintenanceExecution.GRAPH_ONLY
                 ):
                     self._arm_deferred_mm_wave(
-                        step_key=running_key,
+                        step_key=cast(tuple[int, ...], running_key),
                         scheduled_tokens=running_wave_tokens,
                         scheduled_encoder_inputs=running_wave_encoder_inputs,
                     )
                     return running_key, True
                 if self._reserve_pending_elastic_maintenance_admission(
-                    running_key,
+                    cast(tuple[int, ...], running_key),
                     minimum_free_primary_blocks=(running_minimum_free_primary_blocks),
                     requirements=running_requirements,
                 ):
                     return running_key, True
             self._observe_elastic_running_wave_defer(
-                running_key,
+                cast(tuple[int, ...], running_key),
                 required_external=running_required,
                 available_external=running_available,
                 physical_quiescent=physical_quiescent,
@@ -1998,7 +2010,7 @@ class Scheduler(SchedulerInterface):
             if (
                 not running_wave_encoder_inputs
                 and self._prepare_elastic_cold_form_reclaim(
-                    running_key,
+                    cast(tuple[int, ...], running_key),
                     required_external=running_required,
                     available_external=running_available,
                     physical_quiescent=physical_quiescent,
@@ -2042,7 +2054,9 @@ class Scheduler(SchedulerInterface):
                 self.kv_cache_manager.estimate_uncached_full_sequence_requirements(
                     request
                 ).primary
-                for request in waiting_candidates[:joint_waiting_count]
+                for request in cast(Sequence[Request], waiting_candidates)[
+                    :joint_waiting_count
+                ]
             )
             if self._prepare_elastic_waiting_deficit_reclaim(
                 joint_waiting_primary,
@@ -2205,7 +2219,7 @@ class Scheduler(SchedulerInterface):
                                 0,
                                 shared_prefix_boundary=0,
                             )
-                        encoder_inputs: Sequence[int] | None = None
+                        encoder_inputs = None
                         next_encoder_budget = candidate_encoder_budget
                         next_encoder_overlay = candidate_encoder_overlay
                         if request.has_encoder_inputs:
@@ -2279,13 +2293,16 @@ class Scheduler(SchedulerInterface):
                         allow_maintenance=True,
                         preview_only=True,
                         **(
-                            {
-                                "mm_activation_loan_bytes": (
-                                    self._elastic_mm_activation_loan_bytes
-                                )
-                            }
-                            if candidate_encoder_inputs
-                            else {}
+                            cast(
+                                dict[str, Any],
+                                {
+                                    "mm_activation_loan_bytes": (
+                                        self._elastic_mm_activation_loan_bytes
+                                    )
+                                }
+                                if candidate_encoder_inputs
+                                else {},
+                            )
                         ),
                     )
                 )
@@ -2322,7 +2339,9 @@ class Scheduler(SchedulerInterface):
                 computed_overrides,
             ) = selected_state
             joint_waiting_count = selected_prefix
-            waiting_candidates = waiting_candidates[:selected_prefix]
+            waiting_candidates = cast(Sequence[Request], waiting_candidates)[
+                :selected_prefix
+            ]
             self._elastic_preflight_joint_waiting_request_ids = waiting_ids[
                 :selected_prefix
             ]
@@ -2377,9 +2396,12 @@ class Scheduler(SchedulerInterface):
             ),
             allow_maintenance=True,
             **(
-                {"mm_activation_loan_bytes": self._elastic_mm_activation_loan_bytes}
-                if prospective_encoder_inputs
-                else {}
+                cast(
+                    dict[str, Any],
+                    {"mm_activation_loan_bytes": self._elastic_mm_activation_loan_bytes}
+                    if prospective_encoder_inputs
+                    else {},
+                )
             ),
         )
         if fits:
@@ -2455,7 +2477,7 @@ class Scheduler(SchedulerInterface):
                             0,
                             shared_prefix_boundary=0,
                         )
-                    encoder_inputs: Sequence[int] | None = None
+                    encoder_inputs = None
                     candidate_encoder_budget = remaining_encoder_budget
                     candidate_encoder_overlay = encoder_wave_overlay
                     if request.has_encoder_inputs:
@@ -2524,13 +2546,16 @@ class Scheduler(SchedulerInterface):
                         ),
                         allow_maintenance=True,
                         **(
-                            {
-                                "mm_activation_loan_bytes": (
-                                    self._elastic_mm_activation_loan_bytes
-                                )
-                            }
-                            if prospective_encoder_inputs
-                            else {}
+                            cast(
+                                dict[str, Any],
+                                {
+                                    "mm_activation_loan_bytes": (
+                                        self._elastic_mm_activation_loan_bytes
+                                    )
+                                }
+                                if prospective_encoder_inputs
+                                else {},
+                            )
                         ),
                     )
                 )
@@ -2540,7 +2565,7 @@ class Scheduler(SchedulerInterface):
                     conservative_ids
                 )
                 if fits and self._reserve_elastic_admission(
-                    final_key,
+                    cast(tuple[int, ...], final_key),
                     external_memory_bytes=required_external,
                     minimum_free_primary_blocks=minimum_free_primary_blocks,
                     requirements=remaining_requirements,
@@ -2550,7 +2575,7 @@ class Scheduler(SchedulerInterface):
                     self._elastic_admission_controller.pending_maintenance_plan
                     is not None
                     and self._reserve_pending_elastic_maintenance_admission(
-                        final_key,
+                        cast(tuple[int, ...], final_key),
                         minimum_free_primary_blocks=minimum_free_primary_blocks,
                         requirements=remaining_requirements,
                     )
@@ -2896,13 +2921,16 @@ class Scheduler(SchedulerInterface):
                         allow_maintenance=True,
                         preview_only=True,
                         **(
-                            {
-                                "mm_activation_loan_bytes": (
-                                    self._elastic_mm_activation_loan_bytes
-                                )
-                            }
-                            if candidate_encoder_inputs
-                            else {}
+                            cast(
+                                dict[str, Any],
+                                {
+                                    "mm_activation_loan_bytes": (
+                                        self._elastic_mm_activation_loan_bytes
+                                    )
+                                }
+                                if candidate_encoder_inputs
+                                else {},
+                            )
                         ),
                     )
                 )
@@ -2983,9 +3011,12 @@ class Scheduler(SchedulerInterface):
             ),
             allow_maintenance=True,
             **(
-                {"mm_activation_loan_bytes": self._elastic_mm_activation_loan_bytes}
-                if prospective_encoder_inputs
-                else {}
+                cast(
+                    dict[str, Any],
+                    {"mm_activation_loan_bytes": self._elastic_mm_activation_loan_bytes}
+                    if prospective_encoder_inputs
+                    else {},
+                )
             ),
         )
         if fits:
@@ -3137,19 +3168,22 @@ class Scheduler(SchedulerInterface):
                         ),
                         allow_maintenance=True,
                         **(
-                            {
-                                "mm_activation_loan_bytes": (
-                                    self._elastic_mm_activation_loan_bytes
-                                )
-                            }
-                            if prospective_encoder_inputs
-                            else {}
+                            cast(
+                                dict[str, Any],
+                                {
+                                    "mm_activation_loan_bytes": (
+                                        self._elastic_mm_activation_loan_bytes
+                                    )
+                                }
+                                if prospective_encoder_inputs
+                                else {},
+                            )
                         ),
                     )
                 )
                 request_ids = tuple(prospective_tokens)
                 if fits and self._reserve_elastic_admission(
-                    final_key,
+                    cast(tuple[int, ...], final_key),
                     external_memory_bytes=required_external,
                     minimum_free_primary_blocks=minimum_free_primary_blocks,
                     requirements=remaining_requirements,
@@ -3171,7 +3205,7 @@ class Scheduler(SchedulerInterface):
                         == ElasticMaintenanceExecution.GRAPH_ONLY
                     ):
                         self._arm_deferred_mm_wave(
-                            step_key=final_key,
+                            step_key=cast(tuple[int, ...], final_key),
                             scheduled_tokens=prospective_tokens,
                             scheduled_encoder_inputs=prospective_encoder_inputs,
                         )
@@ -3180,7 +3214,7 @@ class Scheduler(SchedulerInterface):
                         )
                         return final_key, True, request_ids
                     if self._reserve_pending_elastic_maintenance_admission(
-                        final_key,
+                        cast(tuple[int, ...], final_key),
                         minimum_free_primary_blocks=minimum_free_primary_blocks,
                         requirements=remaining_requirements,
                     ):
@@ -4503,7 +4537,9 @@ class Scheduler(SchedulerInterface):
                     if (
                         checkpoint_key is not None
                         and coordinator is not None
-                        and coordinator.has_gdn_checkpoint(checkpoint_key, touch=True)
+                        and coordinator.has_gdn_checkpoint(
+                            cast(BlockHash, checkpoint_key), touch=True
+                        )
                     ):
                         gdn_checkpoint_restore[request_id] = checkpoint_key
                         logger.debug(
@@ -4814,7 +4850,9 @@ class Scheduler(SchedulerInterface):
                     maintenance_step_key,
                 )
             elastic_graph_step_key = maintenance_step_key
-            if elastic_graph_step_key is None and maintenance_plan.kind not in {
+            if elastic_graph_step_key is None and cast(
+                ElasticStepPlan, maintenance_plan
+            ).kind not in {
                 ElasticPlanKind.RECLAIM,
                 ElasticPlanKind.PRESSURE_RECLAIM,
             }:
@@ -4850,19 +4888,21 @@ class Scheduler(SchedulerInterface):
             ElasticPlanKind.RECLAIM,
             ElasticPlanKind.PRESSURE_RECLAIM,
         }:
-            coordinator = self.kv_cache_manager.coordinator
+            maintenance_coordinator = self.kv_cache_manager.coordinator
             retained_pinned = (
                 self._elastic_pressure_floor_external_bytes()
                 if maintenance_plan.kind == ElasticPlanKind.PRESSURE_RECLAIM
                 else self._elastic_admission_controller.pinned_resident_bytes
             )
-            elastic_graph_step_grant = coordinator.normalize_elastic_external_memory(
-                max(
-                    retained_pinned,
-                    maintenance_plan.capture_loan_bytes,
+            elastic_graph_step_grant = (
+                maintenance_coordinator.normalize_elastic_external_memory(
+                    max(
+                        retained_pinned,
+                        maintenance_plan.capture_loan_bytes,
+                    )
                 )
             )
-            if not coordinator.set_elastic_external_memory(
+            if not maintenance_coordinator.set_elastic_external_memory(
                 elastic_graph_step_grant,
                 minimum_free_primary_blocks=elastic_successor_primary_headroom,
             ):
@@ -4887,8 +4927,8 @@ class Scheduler(SchedulerInterface):
             else self._next_elastic_transaction_id()
         )
         execution_manifest = None
-        current_dispatch = ()
-        successor_keys = ()
+        current_dispatch: tuple[OwnerDispatch, ...] = ()
+        successor_keys: tuple[PhysicalReplayKey, ...] = ()
         if elastic_graph_step_key is not None and num_scheduled_tokens:
             policy = self._elastic_graph_execution_policy
             if policy is None:
@@ -4911,7 +4951,7 @@ class Scheduler(SchedulerInterface):
                 elastic_graph_step_key
             )
             execution_manifest, current_dispatch = build_execution_manifest(
-                step_key=elastic_graph_step_key,
+                step_key=cast(tuple[int, int, int, int, int], elastic_graph_step_key),
                 request_ids=ordered_execution_ids,
                 per_request_query_lens=tuple(
                     num_scheduled_tokens[request_id]
@@ -4930,7 +4970,12 @@ class Scheduler(SchedulerInterface):
                 executed_drafter_k=(
                     self.num_spec_tokens if num_spec_tokens_to_schedule > 0 else 0
                 ),
-                phase=execution_manifest_phase_from_step_key(elastic_graph_step_key),
+                phase=cast(
+                    str,
+                    execution_manifest_phase_from_step_key(
+                        cast(tuple[int, int, int, int, int], elastic_graph_step_key)
+                    ),
+                ),
                 generation=self._elastic_admission_controller.generation,
                 policy=policy,
                 max_num_batched_tokens=(self.scheduler_config.max_num_batched_tokens),
@@ -5487,7 +5532,7 @@ class Scheduler(SchedulerInterface):
         self, step_key: tuple[int, ...] | None
     ) -> tuple[PhysicalReplayKey, ...]:
         resolved = resolve_step_physical_keys(
-            step_key,
+            cast(tuple[int, int, int, int, int] | None, step_key),
             self._elastic_admission_controller.generation,
             self.scheduler_config.max_num_batched_tokens,
             getattr(self, "_elastic_compiled_piecewise_sizes", frozenset()),
@@ -5966,13 +6011,13 @@ class Scheduler(SchedulerInterface):
                     return combined
         envelopes = self._elastic_admission_controller.capture_envelopes
         envelope = envelopes.get(owner_key)
-        selected_owner_key = owner_key
+        selected_owner_key: tuple[int, ...] | None = owner_key
         if envelope is None and (
             not physical_keys
             or any(key.logical.mode == "PIECEWISE" for key in physical_keys)
         ):
             selected_owner_key = self._elastic_graph_global_owner_key(step_key)
-            envelope = envelopes.get(selected_owner_key)
+            envelope = envelopes.get(cast(tuple[int, ...], selected_owner_key))
         if envelope is not None:
             assert selected_owner_key is not None
             return (
@@ -6197,7 +6242,9 @@ class Scheduler(SchedulerInterface):
         floor_value, floor_keys = self._elastic_piecewise_physical_floor_evidence(
             step_key
         )
-        measured = self._elastic_admission_controller.measured_bytes.get(step_key)
+        measured = self._elastic_admission_controller.measured_bytes.get(
+            cast(tuple[int, ...], step_key)
+        )
         prior_selected = prior_value is not None and prior_value == desired_external
         floor_selected = floor_value > 0 and floor_value == desired_external
         unknown_selected = (
@@ -6965,7 +7012,9 @@ class Scheduler(SchedulerInterface):
                     "planned maintenance capture loan could not be committed"
                 )
             self._elastic_admission_controller.reserve_loan(step_key, step_grant)
-            self._elastic_admission_controller.mark_recapture(residency_step_key)
+            self._elastic_admission_controller.mark_recapture(
+                cast(tuple[int, ...], residency_step_key)
+            )
             return step_grant
         if step_key is None and (
             pending_maintenance is None
@@ -7051,7 +7100,9 @@ class Scheduler(SchedulerInterface):
                     f"step_key={step_key!r} owner_key={owner_key!r} "
                     f"current_step_key={self._elastic_admission_controller.step_key!r}"
                 )
-            self._elastic_admission_controller.mark_recapture(residency_step_key)
+            self._elastic_admission_controller.mark_recapture(
+                cast(tuple[int, ...], residency_step_key)
+            )
         elif calibration_step:
             # PIECEWISE graph identity intentionally coalesces request-length
             # distributions. Their eager attention/sampling workspaces can
@@ -7111,7 +7162,7 @@ class Scheduler(SchedulerInterface):
             # discovery into a permanent fake reserve on every recapture.
             assert owner_key is not None
             self._record_elastic_capture_envelope(
-                residency_step_key,
+                cast(tuple[int, ...], residency_step_key),
                 (
                     step_grant,
                     self._elastic_admission_controller.floor_bytes,
@@ -7343,14 +7394,47 @@ class Scheduler(SchedulerInterface):
             )
             complete = elastic_graph_catalog_row_complete(
                 step_key,
-                {**row, "cold_peak_bytes": cold_peak},
+                row
+                if "allocation_profile" in row
+                else {**row, "cold_peak_bytes": cold_peak},
                 representation=representation,
             )
             if not complete:
                 continue
             complete_shapes += 1
             x = step_key[2]
-            if step_key[0]:
+            decode_shape = bool(step_key[0])
+            policy = getattr(self, "_elastic_graph_execution_policy", None)
+            if not decode_shape and isinstance(policy, GraphExecutionPolicy):
+                # FULL/PIECEWISE describes execution, not semantic phase.
+                # Resolve the terminal verification shape through the same
+                # policy consumed by dispatch, including token-major decode.
+                k = step_key[1]
+                decode_shape = (
+                    step_key
+                    == canonical_graph_step_key(
+                        SemanticGraphStep(
+                            k,
+                            x,
+                            x * (k + 1),
+                            k + 1,
+                            "decode",
+                            ("target",)
+                            + tuple(
+                                owner.owner
+                                for owner in policy.owners
+                                if owner.owner != "target"
+                                and (owner.activation == "always" or k > 0)
+                            ),
+                        ),
+                        policy,
+                        physical_num_reqs=x,
+                        max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+                    )
+                    if x * (k + 1) <= self.scheduler_config.max_num_batched_tokens
+                    else False
+                )
+            if decode_shape:
                 if (
                     step_key[1] == product_prefill_k
                     and sealed_decode_max
@@ -7374,7 +7458,10 @@ class Scheduler(SchedulerInterface):
                         cold_peak,
                         by_k[step_key[1]]["full_context"].get(x, 0),
                     )
-            elif step_key[3] == self.scheduler_config.max_num_batched_tokens:
+            if (
+                not step_key[0]
+                and step_key[3] == self.scheduler_config.max_num_batched_tokens
+            ):
                 if (
                     step_key[1] == product_k
                     and sealed_mixed_max
@@ -7390,7 +7477,9 @@ class Scheduler(SchedulerInterface):
         # witness at MixedMaxX, while the intersecting decode row continues to
         # carry the physical Graph/KV envelope.  A zero here means "no distinct
         # Graph owner", not "execution is free".
-        compiled_sizes = getattr(self, "_elastic_compiled_piecewise_sizes", frozenset())
+        compiled_sizes: frozenset[int] = getattr(
+            self, "_elastic_compiled_piecewise_sizes", frozenset()
+        )
         max_b = self.scheduler_config.max_num_batched_tokens
         if max_b in compiled_sizes and sealed_mixed_max:
             by_k[product_prefill_k]["mixed_b"][sealed_mixed_max] = 0
@@ -7404,7 +7493,7 @@ class Scheduler(SchedulerInterface):
             if k == product_k and coverage:
                 if decode_max != sealed_decode_max:
                     raise RuntimeError(
-                        "sealed DecodeMaxX lacks an exact complete FULL row: "
+                        "sealed DecodeMaxX lacks an exact complete decode row: "
                         f"sealed={sealed_decode_max} catalog={decode_max} K={k}"
                     )
                 if (
@@ -9910,8 +9999,8 @@ class Scheduler(SchedulerInterface):
                 # The bool proof above makes this non-optional.
                 # Keep the expression local so stale waves can never select
                 # unrelated request IDs for terminal recovery.
-                *deferred_mm_wave.running_request_ids,
-                *deferred_mm_wave.waiting_request_ids,
+                *cast(DeferredMMWave, deferred_mm_wave).running_request_ids,
+                *cast(DeferredMMWave, deferred_mm_wave).waiting_request_ids,
             )
         )
 
