@@ -1002,6 +1002,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                     query_start_loc,
                     positions,
                     batch_desc.num_tokens,
+                    is_padding=self.input_buffers.is_padding,
                 )
                 slot_mappings_by_layer = build_slot_mappings_by_layer(
                     slot_mappings, self.kv_cache_config
@@ -1059,6 +1060,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 query_start_loc,
                 positions,
                 batch_desc.num_tokens,
+                is_padding=self.input_buffers.is_padding,
             )
             if batch_desc.cg_mode != CUDAGraphMode.FULL:
                 slot_mappings_by_layer = build_slot_mappings_by_layer(
@@ -1129,6 +1131,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                     query_start_loc,
                     positions,
                     num_tokens_padded,
+                    is_padding=self.input_buffers.is_padding,
                 )
                 for attn_group in attn_groups:
                     attn_group.update_draft_decode_metadata(attn_metadata)

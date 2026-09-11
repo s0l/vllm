@@ -214,6 +214,7 @@ class BlockTables:
         positions: torch.Tensor,
         num_tokens_padded: int,
         out: torch.Tensor | None = None,
+        is_padding: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.num_kv_cache_groups == 0:
             return (self.slot_mappings if out is None else out)[:, :num_tokens_padded]
@@ -231,12 +232,14 @@ class BlockTables:
             self.kernel_block_sizes_tensor,
             self.slot_mapping_enabled,
             self.cp_replicated,
+            is_padding,
             slot_mappings,
             slot_mappings.stride(0),
             self.cp_rank,
             CP_SIZE=self.cp_size,
             CP_INTERLEAVE=self.cp_interleave,
             PAD_ID=PAD_SLOT_ID,
+            HAS_PADDING_MASK=is_padding is not None,
             TRITON_BLOCK_SIZE=1024,  # type: ignore
         )
         return slot_mappings[:, :num_tokens_padded]
@@ -305,12 +308,14 @@ def _compute_slot_mappings_kernel(
     kernel_block_sizes,  # [num_kv_cache_groups]
     slot_mapping_enabled,  # [num_kv_cache_groups]
     cp_replicated,  # [num_kv_cache_groups]
+    is_padding,  # optional [max_num_tokens]
     slot_mappings_ptr,  # [num_kv_cache_groups, max_num_tokens]
     slot_mappings_stride,
     cp_rank,
     CP_SIZE: tl.constexpr,
     CP_INTERLEAVE: tl.constexpr,
     PAD_ID: tl.constexpr,
+    HAS_PADDING_MASK: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
     # kv cache group id
@@ -340,7 +345,10 @@ def _compute_slot_mappings_kernel(
     end_idx = tl.load(query_start_loc + batch_idx + 1)
     for i in range(start_idx, end_idx, TRITON_BLOCK_SIZE):
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
-        positions = tl.load(pos + offset, mask=offset < end_idx, other=0)
+        valid = offset < end_idx
+        if HAS_PADDING_MASK:
+            valid &= ~tl.load(is_padding + offset, mask=valid, other=True)
+        positions = tl.load(pos + offset, mask=valid, other=0)
 
         if CP_SIZE == 1:
             # Common case: Context parallelism is not used.
@@ -366,12 +374,12 @@ def _compute_slot_mappings_kernel(
         block_offsets = local_positions % kernel_block_size
         block_numbers = tl.load(
             block_table_ptr + req_state_idx * block_table_stride + block_indices,
-            mask=is_local,
+            mask=is_local & valid,
             other=0,
         )
         slot_ids = block_numbers * kernel_block_size + block_offsets
         if CP_SIZE != 1:
             slot_ids = tl.where(is_local, slot_ids, PAD_ID)
 
-        slot_ids = tl.where(mapping_enabled, slot_ids, PAD_ID)
+        slot_ids = tl.where(mapping_enabled & valid, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
