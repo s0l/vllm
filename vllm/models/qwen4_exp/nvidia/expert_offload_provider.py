@@ -158,6 +158,7 @@ class NativeExpertProvider:
         self.use_prefetch = False
         self.use_hot_path = False
         self.hot_path = None
+        self.hybrid_path = None
         self.dummy = False
         self.active = False
         self.forward_count = 0
@@ -170,6 +171,19 @@ class NativeExpertProvider:
         if self.active or self.bank.leases or self.bank.state != "READY":
             raise RuntimeError("cannot prepare an unavailable expert provider")
         self.dummy = bool(dummy)
+
+    def enable_cpu_experts(self, executor):
+        """Attach an admitted bounded CPU executor before profiling/serving."""
+        self.quiesce()
+        if self.hybrid_path is not None:
+            raise RuntimeError("CPU expert executor already attached")
+        from .expert_offload_hot import NativeHotRead
+        from .expert_offload_hybrid import NativeHybridRead
+
+        if self.hot_path is None:
+            self.hot_path = NativeHotRead(self)
+        self.hybrid_path = NativeHybridRead(self, executor)
+        self.use_hot_path = True
 
     def _profile(self, layer, hidden, output):
         # Explicit dummy mode is supplied by ModelState, never inferred from
@@ -210,6 +224,9 @@ class NativeExpertProvider:
             self.bank.graphs.discard(graph)
             self.bank.stable_graphs.discard(graph)
         self.kernels.clear()
+        if self.hybrid_path is not None:
+            self.hybrid_path.close()
+            self.hybrid_path = None
         self.hot_path = None
         # The allocator releases a pool when its last Graph is reset. A later
         # recovery capture needs a fresh pool epoch, even at the same addresses.
@@ -317,8 +334,13 @@ class NativeExpertProvider:
                             from .expert_offload_hot import NativeHotRead
 
                             self.hot_path = NativeHotRead(self)
-                        self.hot_path.propose(layer, validated_waves)
-                        resident = self.hot_path
+                        resident = (
+                            self.hybrid_path
+                            if self.hybrid_path is not None
+                            and hidden.shape[0] <= self.hybrid_path.max_tokens
+                            else self.hot_path
+                        )
+                        resident.propose(layer, validated_waves)
             except Exception as exc:
                 error = exc
             if self.dummy and error is None:
@@ -363,7 +385,10 @@ class NativeExpertProvider:
                 assert waves is not None
                 if all_hot:
                     assert resident is not None
-                    resident.run(layer, waves, cpu_ids)
+                    if self.hybrid_path is not None and resident is self.hybrid_path:
+                        resident.run(layer, waves, cpu_ids, cpu_weights)
+                    else:
+                        resident.run(layer, waves, cpu_ids)
                     output[:count].copy_(resident.output[:count])
                     steps += len(waves)
                     tiles += 1
