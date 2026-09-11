@@ -11,7 +11,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from vllm.v1.core.elastic_graph import (
     GraphExecutionPolicy,
@@ -140,11 +140,19 @@ def expected_semantic_token_witnesses(
 
 def elastic_graph_catalog_row_complete(
     step_key: tuple[int, ...] | list[int],
-    row: dict[str, int],
+    row: dict[str, Any],
     *,
     representation: str,
 ) -> bool:
     """Validate evidence for the reachable replay lifecycle."""
+    if "allocation_profile" in row:
+        from vllm.v1.core.elastic_memory_profile import validate_allocation_envelope_row
+
+        try:
+            validate_allocation_envelope_row(step_key, row)
+        except (ValueError, KeyError, TypeError):
+            return False
+        return representation == "bounded_exact_hotset"
     cold_complete = bool(
         row.get("cold_peak_bytes")
         and row.get("cold_observations", 0) >= 2
@@ -370,7 +378,7 @@ def _validate_catalog_structure(payload: dict[str, Any]) -> None:
         raise RuntimeError("catalog source required-shape count is inconsistent")
     if payload.get("complete_shapes") != len(shapes):
         raise RuntimeError("catalog source complete-shape count is inconsistent")
-    if payload.get("schema") >= 6:
+    if cast(int, payload.get("schema")) >= 6:
         witnesses = coverage.get("semantic_token_witnesses")
         if coverage.get(
             "semantic_witness_contract"

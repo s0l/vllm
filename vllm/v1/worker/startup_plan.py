@@ -375,7 +375,7 @@ def _catalog_policy_row_metadata(
     from vllm.v1.core.elastic_graph import RuntimeGeneration, resolve_step_physical_keys
 
     keys = resolve_step_physical_keys(
-        tuple(step_key),
+        tuple(step_key),  # type: ignore[arg-type]  # validated five-field wire key
         RuntimeGeneration("catalog-policy-projection"),
         max_num_batched_tokens,
         compiled_piecewise_sizes,
@@ -601,7 +601,7 @@ def load_elastic_graph_catalog(
                 "elastic Graph catalog row has stale representation lineage: "
                 f"step_key={key!r}"
             )
-        fields = {
+        fields: dict[str, Any] = {
             name: row.get(name)
             for name in (
                 "cold_peak_bytes",
@@ -638,6 +638,22 @@ def load_elastic_graph_catalog(
                 f"step_key={key!r}"
             ) from error
         complete_row = dict(fields)
+        if "allocation_profile" in row:
+            from vllm.v1.core.elastic_memory_profile import (
+                validate_allocation_envelope_row,
+            )
+
+            try:
+                validate_allocation_envelope_row(
+                    key,
+                    row,
+                    policy=policy.fingerprint,
+                    budget=vllm_config.scheduler_config.max_num_batched_tokens,
+                )
+            except (ValueError, KeyError, TypeError) as error:
+                raise RuntimeError("invalid allocation profile catalog row") from error
+            fields["allocation_profile"] = row["allocation_profile"]
+            complete_row["allocation_profile"] = row["allocation_profile"]
         if finalized_pinned_owner_set:
             complete_row["finalized_pinned_owner_set"] = finalized_pinned_owner_set
         if not elastic_graph_catalog_row_complete(

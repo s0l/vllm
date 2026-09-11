@@ -338,6 +338,14 @@ def publish_measured_catalog(
         "residency_intent_contract": "current-dispatch-hot-successor-union-v1",
         "speculative_depth_contract": "scheduled-requested-executed-k-v1",
     }
+    profiles: list[Any] = [row.get("allocation_profile") for row in catalog.values()]
+    if any(profile is not None for profile in profiles):
+        if any(profile != profiles[0] for profile in profiles):
+            raise RuntimeError("catalog mixes different allocation envelopes")
+        coverage["memory_evidence_contract"] = profiles[0]["contract"]
+        coverage["executed_model_requests"] = 0
+        coverage["physical_allocation_samples"] = len(profiles[0]["samples"])
+        coverage["logical_price_method"] = "conservative-envelope"
     if source_surface_schema is not None:
         migrated_source_set = set(migrated_source_keys)
         witness_key_set = set(witness_keys)
