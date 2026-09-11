@@ -5,6 +5,7 @@ import json
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -21,6 +22,65 @@ from vllm.v1.core.elastic_price_identity import (
     validate_calibration_request,
     validate_price_identity,
 )
+
+
+@pytest.mark.parametrize(
+    "producer",
+    [
+        "vllm.third_party.flash_linear_attention.ops.layernorm_guard",
+        "vllm.models.qwen4_exp.nvidia.model",
+        "vllm.models.qwen4_exp.nvidia.mtp",
+        "vllm.models.qwen4_exp.nvidia.expert_offload_bank",
+        "vllm.models.qwen4_exp.nvidia.qsa_flashinfer",
+    ],
+)
+def test_flashnext_producer_mutation_invalidates_budgets_and_prices(
+    tmp_path, monkeypatch, producer
+):
+    """A model edit cannot reuse the same-config pre-edit memory receipts."""
+    from vllm.v1.core import elastic_runtime as runtime
+
+    locate = runtime.importlib.util.find_spec
+    source = Path(locate(producer).origin).read_text()
+    altered = tmp_path / "producer.py"
+    altered.write_text(source)
+    monkeypatch.setattr(
+        runtime,
+        "importlib",
+        SimpleNamespace(
+            util=SimpleNamespace(
+                find_spec=lambda name: (
+                    SimpleNamespace(origin=str(altered))
+                    if name == producer
+                    else locate(name)
+                )
+            )
+        ),
+    )
+    before = runtime.elastic_catalog_physical_source_hashes()
+    budget_before = runtime.elastic_runtime_source_hashes()
+    assert producer in before and producer in budget_before
+    altered.write_text(source + "\n# formatting-only control\n")
+    assert runtime.elastic_catalog_physical_source_hashes() == before
+    altered.write_text(source + "\nFLASHNEXT_PRODUCER_MUTATION = 1\n")
+    after = runtime.elastic_catalog_physical_source_hashes()
+    budget_after = runtime.elastic_runtime_source_hashes()
+    assert {name for name in before if before[name] != after[name]} == {producer}
+    assert {
+        name for name in budget_before if budget_before[name] != budget_after[name]
+    } == {producer}
+    # The historical inventory omitted this producer and could not detect it.
+    assert {k: v for k, v in before.items() if k != producer} == {
+        k: v for k, v in after.items() if k != producer
+    }
+    altered.unlink()
+    with pytest.raises(FileNotFoundError):
+        runtime.elastic_catalog_physical_source_hashes()
+    with pytest.raises(FileNotFoundError):
+        runtime.elastic_runtime_source_hashes()
+    altered.write_text(source)
+    assert runtime.elastic_catalog_physical_source_hashes() == before
+    assert runtime.elastic_runtime_source_hashes() == budget_before
 
 
 def test_flashinfer_tactics_bind_contents_not_location(tmp_path, monkeypatch):
@@ -92,7 +152,9 @@ def test_native_price_binds_flashinfer_packaged_kernel_record(tmp_path, monkeypa
 
 
 def test_price_identity_survives_json_policy_roundtrip():
-    factors = {"graph_execution_policy": {"owners": ({"full_query_lens": (1,)},)}}
+    factors: dict[str, Any] = {
+        "graph_execution_policy": {"owners": ({"full_query_lens": (1,)},)}
+    }
     live = price_identity(factors)
     stored = json.loads(json.dumps(live))
     assert live["fingerprint"] == stored["fingerprint"]
