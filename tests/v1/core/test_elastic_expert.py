@@ -78,6 +78,10 @@ def test_native_quantum_curve_and_maximal_fit(staging):
         {"staging": True},
         {"max_hot_rows": -1},
         {"ram_cache_bytes": 1.5},
+        {"ram_cache_total_bytes": True},
+        {"ram_cache_total_bytes": -1},
+        {"ram_cache_total_bytes": 1.5},
+        {"ram_cache_total_bytes": 32 << 30, "ram_cache_bytes": 1 << 30},
         {"unknown": 1},
     ],
 )
@@ -98,6 +102,31 @@ def test_scheduler_budget_consumes_model_tp_configuration(tp, local):
     if tp == 3:
         assert budget.strides == (655360, 327680, 81920, 40960)
         assert budget.base_bytes == 38 << 20
+
+
+@pytest.mark.parametrize("tp", [1, 2, 3, 4, 5, 8, 16])
+def test_total_host_cache_budget_splits_by_configured_tp_and_recovers(tp):
+    total = 32 << 30
+    budget = NativeExpertBudget.from_config(
+        make_config({"ram_cache_total_bytes": total}, tp)
+    )
+    assert budget.ram_cache_bytes * tp <= total
+    assert total - budget.ram_cache_bytes * tp < tp
+    assert (
+        NativeExpertBudget.from_config(
+            make_config({"ram_cache_total_bytes": 0}, tp)
+        ).ram_cache_bytes
+        == 0
+    )
+    assert (
+        NativeExpertBudget.from_config(
+            make_config({"ram_cache_bytes": 123}, tp)
+        ).ram_cache_bytes
+        == 123
+    )
+    assert (
+        NativeExpertBudget.from_config(make_config({}, tp)).ram_cache_bytes == 1 << 30
+    )
 
 
 def make_coordinator():

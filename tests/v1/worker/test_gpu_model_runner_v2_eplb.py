@@ -12,6 +12,7 @@ import torch
 from vllm.config.offload import OffloadConfig
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 from vllm.v1.core.elastic_graph import ElasticPlanKind
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.worker.gpu import eplb_utils as eplb
 from vllm.v1.worker.gpu import model_runner as mrv2
@@ -108,9 +109,15 @@ def test_idle_dynamic_graph_step_reports_physical_memory_floor(monkeypatch, capl
     runner._record_elastic_x0_allocation_delta = MagicMock()
     runner._measure_elastic_cublas_workspace_bytes = MagicMock(return_value=0)
     runner._elastic_step_measurement_active = True
-    monkeypatch.setattr(mrv2.torch.cuda, "memory_allocated", lambda _device: 101)
-    monkeypatch.setattr(mrv2.torch.cuda, "memory_reserved", lambda _device: 202)
-    monkeypatch.setattr(mrv2.torch.cuda, "mem_get_info", lambda _device: (303, 404))
+    monkeypatch.setattr(
+        mrv2.torch.accelerator.memory, "memory_allocated", lambda _device: 101
+    )
+    monkeypatch.setattr(
+        mrv2.torch.accelerator.memory, "memory_reserved", lambda _device: 202
+    )
+    monkeypatch.setattr(
+        mrv2.torch.accelerator.memory, "get_memory_info", lambda _device: (303, 404)
+    )
 
     assert runner._finish_dynamic_graph_step(release_idle_cache=True) == (37, 17, 17)
     working_set.finish_idle_step.assert_called_once_with()
@@ -154,9 +161,15 @@ def test_idle_dynamic_graph_step_reports_zero_floor_after_graph_eviction(
     runner._clear_elastic_cublas_workspaces = MagicMock(return_value=0)
     runner._measure_elastic_cublas_workspace_bytes = MagicMock(return_value=0)
     runner._elastic_step_measurement_active = True
-    monkeypatch.setattr(mrv2.torch.cuda, "memory_allocated", lambda _device: 101)
-    monkeypatch.setattr(mrv2.torch.cuda, "memory_reserved", lambda _device: 202)
-    monkeypatch.setattr(mrv2.torch.cuda, "mem_get_info", lambda _device: (303, 404))
+    monkeypatch.setattr(
+        mrv2.torch.accelerator.memory, "memory_allocated", lambda _device: 101
+    )
+    monkeypatch.setattr(
+        mrv2.torch.accelerator.memory, "memory_reserved", lambda _device: 202
+    )
+    monkeypatch.setattr(
+        mrv2.torch.accelerator.memory, "get_memory_info", lambda _device: (303, 404)
+    )
 
     assert runner._finish_dynamic_graph_step(release_idle_cache=True) == (0, 0, 0)
     runner.elastic_kv_controller.reconcile_external_memory.assert_called_once_with(0)
@@ -197,6 +210,68 @@ def test_idle_x0_preserves_global_workspace_while_pinned_graph_is_hot():
     working_set.evict_unpinned_for_idle.assert_called_once_with("x0-18")
     working_set.reconcile_retained_cleanup.assert_called_once_with(41)
     runner._clear_elastic_cublas_workspaces.assert_not_called()
+
+
+@pytest.mark.parametrize("preserve,grant", [(False, 0), (True, 88), (True, 0)])
+def test_elastic_finished_drain_consumes_preservation_before_kv_growth(
+    preserve: bool, grant: int
+):
+    """Exercise execute_model's X0 branch with a finite physical byte ledger."""
+    runner = MagicMock()
+    runner.elastic_kv_controller.auxiliary_owner = None
+    runner.elastic_kv_controller.external_memory_bytes = 88
+    runner.gdn_checkpoint_manager = None
+    runner.vllm_config.additional_config = {}
+    runner.decode_query_len = 4
+    runner._elastic_last_step_peak_external_bytes = 88
+    runner.kv_connector.no_forward.return_value = EMPTY_MODEL_RUNNER_OUTPUT
+    runner._finish_dynamic_graph_step.return_value = (0, 0, 0)
+    runner._current_dynamic_graph_receipt.return_value = (88, 0, 0)
+    runner._merge_ec_connector_no_forward.side_effect = lambda _step, value: value
+    working_set = MagicMock(active_graph_bytes=88, resident_bytes=88, managers=())
+    working_set.pending_managers.return_value = ()
+    runner._dynamic_graph_working_set.return_value = working_set
+    events = []
+
+    def release_graphs(_transaction):
+        events.append("release")
+        working_set.active_graph_bytes = working_set.resident_bytes = 0
+        return 88
+
+    working_set.evict_unpinned_for_idle.side_effect = release_graphs
+    runner._trim_dynamic_attention_cudagraph_state.return_value = (0, 0)
+    runner._measure_elastic_cublas_workspace_bytes.return_value = 0
+    runner._prepare_dynamic_graph_idle_kv_return.side_effect = (
+        lambda working_set, transaction: (
+            mrv2.GPUModelRunner._prepare_dynamic_graph_idle_kv_return(
+                runner, working_set, transaction
+            )
+        )
+    )
+
+    def apply_kv(_transition, external):
+        # A full KV target plus retained Graph bytes exceeds this pool.
+        assert working_set.resident_bytes <= external, "unfunded Graph residency"
+        events.append("kv")
+        return external
+
+    runner._apply_next_elastic_kv_step.side_effect = apply_kv
+    runner.elastic_kv_controller.apply_scheduler_step.side_effect = apply_kv
+    output = SchedulerOutput.make_empty()
+    output.finished_req_ids = {"finished-prefill"}
+    output.elastic_transaction_id = "finished-drain"
+    output.elastic_preserve_graph_residency = preserve
+    output.elastic_external_memory_bytes = grant
+    if preserve and grant == 0:
+        with pytest.raises(AssertionError, match="unfunded Graph residency"):
+            mrv2.GPUModelRunner.execute_model(runner, output)
+        assert events == []
+        # Re-deliver the corrected intent before any request-state mutation.
+        runner.finish_requests.assert_not_called()
+        output.elastic_preserve_graph_residency = False
+    mrv2.GPUModelRunner.execute_model(runner, output)
+    assert events == (["kv"] if preserve and grant else ["release", "kv"])
+    runner.finish_requests.assert_called_once_with(output)
 
 
 def test_synthetic_warmup_does_not_settle_dynamic_graph_lifecycle():
@@ -259,7 +334,7 @@ def test_next_elastic_step_trims_only_on_real_downward_transition(monkeypatch):
     synchronize = MagicMock()
     empty_cache = MagicMock()
     collect = MagicMock(return_value=0)
-    monkeypatch.setattr(mrv2.torch.cuda, "synchronize", synchronize)
+    monkeypatch.setattr(mrv2.torch.accelerator, "synchronize", synchronize)
     monkeypatch.setattr(mrv2.torch.accelerator, "empty_cache", empty_cache)
     monkeypatch.setattr(mrv2.gc, "collect", collect)
 
@@ -285,7 +360,7 @@ def test_next_elastic_step_surfaces_retryable_physical_floor(monkeypatch):
     controller.external_memory_bytes = 200
     controller.apply_scheduler_step.return_value = 140
     runner.elastic_kv_controller = controller
-    monkeypatch.setattr(mrv2.torch.cuda, "synchronize", lambda _device: None)
+    monkeypatch.setattr(mrv2.torch.accelerator, "synchronize", lambda _device: None)
     monkeypatch.setattr(mrv2.torch.accelerator, "empty_cache", lambda: None)
     monkeypatch.setattr(mrv2.gc, "collect", lambda: 0)
 
@@ -344,11 +419,15 @@ def test_elastic_step_captures_cublas_baseline_before_measurement(monkeypatch):
         return_value=SimpleNamespace(resident_bytes=7)
     )
     runner._measure_elastic_cublas_workspace_bytes = MagicMock(return_value=5)
-    monkeypatch.setattr(mrv2.torch.cuda, "synchronize", lambda _device: None)
-    monkeypatch.setattr(mrv2.torch.cuda, "memory_reserved", lambda _device: 11)
-    monkeypatch.setattr(mrv2.torch.cuda, "mem_get_info", lambda _device: (22, 33))
+    monkeypatch.setattr(mrv2.torch.accelerator, "synchronize", lambda _device: None)
     monkeypatch.setattr(
-        mrv2.torch.cuda, "reset_peak_memory_stats", lambda _device: None
+        mrv2.torch.accelerator.memory, "memory_reserved", lambda _device: 11
+    )
+    monkeypatch.setattr(
+        mrv2.torch.accelerator.memory, "get_memory_info", lambda _device: (22, 33)
+    )
+    monkeypatch.setattr(
+        mrv2.torch.accelerator.memory, "reset_peak_memory_stats", lambda _device: None
     )
 
     runner._begin_elastic_step_measurement()
@@ -384,7 +463,7 @@ def test_elastic_cublas_clear_reclaims_only_after_graph_eviction(monkeypatch):
     )
     clear = MagicMock()
     free_bytes = iter((100, 180))
-    monkeypatch.setattr(mrv2.torch.cuda, "synchronize", lambda _device: None)
+    monkeypatch.setattr(mrv2.torch.accelerator, "synchronize", lambda _device: None)
     monkeypatch.setattr(
         mrv2.torch.accelerator,
         "get_memory_info",
@@ -433,7 +512,7 @@ def test_dynamic_attention_graph_state_keeps_request_and_token_key_domains(
         events.append("draft_trim") or 1
     )
     monkeypatch.setattr(
-        mrv2.torch.cuda,
+        mrv2.torch.accelerator,
         "synchronize",
         lambda _device: events.append("synchronize"),
     )
@@ -555,6 +634,7 @@ def _make_runner(**overrides: Any) -> Any:
         model_config=runner.model_config,
         offload_config=OffloadConfig(),
     )
+    runner._compile_loaded_models = MagicMock()
     runner.lora_config = None
     runner.aux_hidden_trace = SimpleNamespace(enabled=False)
     runner.use_aux_hidden_state_outputs = False

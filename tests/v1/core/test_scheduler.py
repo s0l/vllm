@@ -16691,3 +16691,62 @@ def test_elastic_restore_idle_exposes_reclaim_as_scheduler_work():
 
     assert scheduler._needs_elastic_idle_reclaim()
     assert scheduler.has_requests()
+
+
+@pytest.mark.parametrize(
+    "restore,resident,pending,preserve,grant",
+    [
+        (True, 88, False, False, 0),
+        (False, 88, False, True, 88),
+        (True, 88, True, True, 88),
+        (True, 0, False, True, 0),
+    ],
+)
+def test_elastic_finished_drain_keeps_loan_and_graph_intent_consistent(
+    monkeypatch: pytest.MonkeyPatch,
+    restore: bool,
+    resident: int,
+    pending: bool,
+    preserve: bool,
+    grant: int,
+):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    scheduler = create_scheduler(max_num_seqs=1, max_num_batched_tokens=64)
+    scheduler.elastic_on_demand_graphs = True
+    scheduler._elastic_restore_mode = restore
+    scheduler.finished_req_ids.add("finished-prefill")
+    controller = scheduler._elastic_admission_controller
+    controller.resident_bytes = resident
+    controller.evictable_resident_bytes = resident
+    if pending:
+        controller.reserve_loan(None, resident)
+    coordinator = scheduler.kv_cache_manager.coordinator
+    coordinator.elastic_external_memory_bytes = resident
+    monkeypatch.setattr(
+        coordinator, "normalize_elastic_external_memory", lambda value: value
+    )
+
+    def commit_external(requested, **_kwargs):
+        coordinator.elastic_external_memory_bytes = requested
+        return True
+
+    monkeypatch.setattr(coordinator, "set_elastic_external_memory", commit_external)
+    output = scheduler.schedule()
+
+    assert output.finished_req_ids == {"finished-prefill"}
+    assert output.total_num_scheduled_tokens == 0
+    assert output.elastic_step_plan is None
+    assert output.elastic_graph_step_key is None
+    assert output.elastic_external_memory_bytes == grant
+    assert controller.latest_loan.grant_bytes == grant
+    assert output.elastic_preserve_graph_residency is preserve
+    if pending:
+        # A preceding FIFO consumer prevents reclaim. Once both loans settle,
+        # the next drain can release the same HOT residency in one output.
+        controller.settle_next_loan()
+        controller.settle_next_loan()
+        recovered = scheduler.schedule()
+        assert recovered.elastic_external_memory_bytes == 0
+        assert not recovered.elastic_preserve_graph_residency
