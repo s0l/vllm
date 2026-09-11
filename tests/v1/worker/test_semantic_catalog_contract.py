@@ -292,7 +292,10 @@ class SimulatedExecution:
 @pytest.mark.parametrize(
     "k,x,full", [(3, 1, False), (3, 3, False), (1, 3, False), (3, 5, True)]
 )
-def test_actual_producers_publish_load_and_restore(k, x, full, tmp_path, monkeypatch):
+@pytest.mark.parametrize("allocation_profile", [False, True])
+def test_actual_producers_publish_load_and_restore(
+    k, x, full, tmp_path, monkeypatch, allocation_profile
+):
     sim = SimulatedExecution(k, x, full=full)
     source = sim.surface()
     if full:
@@ -303,6 +306,33 @@ def test_actual_producers_publish_load_and_restore(k, x, full, tmp_path, monkeyp
     assert sim.scheduler._elastic_graph_catalog is before and before == {}
     assert not sim.scheduler.requests and not sim.retentions
     assert any(call[0] == "decode" for call in sim.calls)
+    if allocation_profile:
+        from vllm.v1.core.elastic_memory_profile import (
+            allocation_envelope_proof,
+            allocation_envelope_row,
+            allocation_profile_shapes,
+        )
+
+        corners, holdouts = allocation_profile_shapes(k, x, 32)
+        proof = allocation_envelope_proof(
+            k=k,
+            max_x=x,
+            budget=32,
+            policy=sim.scheduler._elastic_graph_execution_policy.fingerprint,
+            samples=[
+                dict(
+                    step_key=list(key),
+                    capture_peak_bytes=1000,
+                    resident_bytes=900,
+                    floor_bytes=0,
+                    replay_extra_bytes=100,
+                    source_reads=0,
+                    stable_replays=1,
+                )
+                for key in corners + holdouts
+            ],
+        )
+        catalog = {key: allocation_envelope_row(proof) for key in surface.required}
     monkeypatch.setenv("VLLM_ENABLE_STARTUP_PLAN", "1")
     monkeypatch.setattr(
         startup_plan,
@@ -342,6 +372,32 @@ def test_actual_producers_publish_load_and_restore(k, x, full, tmp_path, monkeyp
         sim.config, kv, catalog_path=str(destination)
     )
     assert set(loaded) == set(surface.required)
+    if allocation_profile:
+        assert all(row["cold_observations"] == 0 for row in loaded.values())
+        assert all(row["allocation_profile"] == proof for row in loaded.values())
+        original = json.loads(destination.read_text())
+        for mutation in ("price", "source_read", "missing_sample", "credit", "policy"):
+            bad = copy.deepcopy(original)
+            row = bad["shapes"][0]
+            if mutation == "price":
+                row["cold_peak_bytes"] -= 1
+            elif mutation == "source_read":
+                row["allocation_profile"]["samples"][0]["source_reads"] = 1
+            elif mutation == "missing_sample":
+                row["allocation_profile"]["samples"].pop()
+            elif mutation == "credit":
+                row["resident_key_bytes"] = [["a" * 64, 1]]
+            else:
+                row["allocation_profile"]["policy"] = "wrong"
+            negative = tmp_path / (mutation + ".json")
+            negative.write_text(json.dumps(bad))
+            with pytest.raises(RuntimeError):
+                startup_plan.load_elastic_graph_catalog(
+                    sim.config, kv, catalog_path=str(negative)
+                )
+            startup_plan.load_elastic_graph_catalog(
+                sim.config, kv, catalog_path=str(destination)
+            )
     assert coverage["restore_decode"] == dict(k=k, x=x, query_len=1)
     sim.scheduler._elastic_graph_catalog = loaded
     sim.scheduler._elastic_graph_catalog_coverage = coverage
