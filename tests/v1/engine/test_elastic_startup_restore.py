@@ -124,6 +124,7 @@ def test_bounded_restart_retains_complete_terminal_serving_carrier() -> None:
         _elastic_graph_catalog_coverage={
             "representation": "bounded_exact_hotset",
             "mixed_max_x": 39,
+            "decode_max_x": 1,
             "required_step_keys": [piecewise, bridge, verification],
             "restore_step_keys": [piecewise, bridge],
             "serving_carrier_step_keys": [piecewise, bridge, verification],
@@ -150,6 +151,11 @@ def test_bounded_restart_retains_complete_terminal_serving_carrier() -> None:
         max_num_running_reqs=64,
     )
     core.scheduler = scheduler
+    core._elastic_restore_decode_key = MagicMock(
+        side_effect=lambda *, query_len, **_kwargs: (
+            tuple(bridge) if query_len == 1 else tuple(verification)
+        )
+    )
     core._elastic_restore_execution_step_keys = MagicMock(
         side_effect=lambda *, query_len, **_kwargs: (
             (tuple(piecewise), tuple(bridge))
@@ -192,6 +198,7 @@ def test_bounded_restart_second_wave_failure_preserves_pre_ready_boundary() -> N
         _elastic_graph_catalog_coverage={
             "representation": "bounded_exact_hotset",
             "mixed_max_x": 39,
+            "decode_max_x": 1,
             "required_step_keys": [list(prefill), list(q1), list(q4)],
             "serving_carrier_step_keys": [list(prefill), list(q1), list(q4)],
             "serving_carrier_contract": ("retained-terminal-mtp-no-cold-serving-v1"),
@@ -202,6 +209,9 @@ def test_bounded_restart_second_wave_failure_preserves_pre_ready_boundary() -> N
         max_num_running_reqs=64,
     )
     core.scheduler = scheduler
+    core._elastic_restore_decode_key = MagicMock(
+        side_effect=lambda *, query_len, **_kwargs: q1 if query_len == 1 else q4
+    )
     core._elastic_restore_execution_step_keys = MagicMock(
         side_effect=lambda *, query_len, **_kwargs: (
             (prefill, q1) if query_len == 1 else (prefill, q4)
@@ -228,6 +238,7 @@ def test_bounded_restart_rejects_same_k_x_wrong_m_before_wave() -> None:
         _elastic_graph_catalog_coverage={
             "representation": "bounded_exact_hotset",
             "mixed_max_x": 39,
+            "decode_max_x": 1,
             "required_step_keys": [wrong_m_piecewise, bridge, verification],
             "restore_step_keys": [wrong_m_piecewise, bridge],
             "serving_carrier_step_keys": [
@@ -246,6 +257,11 @@ def test_bounded_restart_rejects_same_k_x_wrong_m_before_wave() -> None:
         max_num_running_reqs=64,
     )
     core.scheduler = scheduler
+    core._elastic_restore_decode_key = MagicMock(
+        side_effect=lambda *, query_len, **_kwargs: (
+            tuple(bridge) if query_len == 1 else tuple(verification)
+        )
+    )
     core._elastic_restore_execution_step_keys = MagicMock(
         return_value=(expected_piecewise, tuple(bridge), tuple(verification))
     )

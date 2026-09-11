@@ -10,6 +10,7 @@ import pytest
 
 from vllm.v1.core.elastic_catalog import (
     ELASTIC_GRAPH_CATALOG_SCHEMA_VERSION,
+    expected_semantic_token_witnesses,
     load_sealed_catalog,
     write_json_exclusive,
 )
@@ -612,10 +613,10 @@ def test_publish_measured_catalog_is_atomic_and_complete(tmp_path, monkeypatch):
 
     policy = SimpleNamespace(
         fingerprint="policy",
-        verifier_contract="verifier",
+        verifier_contract="batched-causal-q1-v1",
         verifier_configuration="verifier-config",
         math_contract="math",
-        mode_for=lambda _owner, _query_len: "PIECEWISE",
+        mode_for=lambda _owner, query_len: "FULL" if query_len == 1 else "PIECEWISE",
         to_payload=lambda: {"fingerprint": "policy"},
     )
     monkeypatch.setattr(
@@ -634,7 +635,7 @@ def test_publish_measured_catalog_is_atomic_and_complete(tmp_path, monkeypatch):
     monkeypatch.setattr(
         elastic_graph, "configured_compiled_piecewise_sizes", lambda _config: set()
     )
-    key = (0, 3, 1, 1, 0)
+    key = (0, 3, 1, 2, 0)
     full_key = (1, 3, 1, 1, 1)
     verification_key = (0, 3, 1, 4, 4)
     row = {
@@ -649,18 +650,27 @@ def test_publish_measured_catalog_is_atomic_and_complete(tmp_path, monkeypatch):
         "hot_stable_replays": 1,
     }
     config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=1),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
         num_speculative_tokens=3,
         speculative_config=None,
     )
 
+    witnesses = expected_semantic_token_witnesses(
+        configured_k=3,
+        max_num_seqs=1,
+        max_num_batched_tokens=4,
+    )
+    required = tuple(
+        sorted({key, full_key, verification_key, *(k for k, _ in witnesses)})
+    )
+    rows = {item: dict(row) for item in required}
     destination = publish_measured_catalog(
         config,
         object(),
-        {key: row, full_key: row, verification_key: row},
-        required=(key, full_key, verification_key),
+        rows,
+        required=required,
         restore=(key, full_key),
-        semantic_token_witnesses=((key, 1),),
+        semantic_token_witnesses=witnesses,
         decode_max_x=1,
         mixed_max_x=1,
         full_context_max_x=1,
@@ -679,7 +689,7 @@ def test_publish_measured_catalog_is_atomic_and_complete(tmp_path, monkeypatch):
     assert load_sealed_catalog(destination, require_migration=False) == payload
     assert payload["sealed"] is True
     assert payload["finalized_offline"] is True
-    assert payload["complete_shapes"] == 3
+    assert payload["complete_shapes"] == 5
     assert payload["coverage"]["serving_carrier_step_keys"] == [
         list(key),
         list(verification_key),
@@ -693,7 +703,7 @@ def test_publish_measured_catalog_is_atomic_and_complete(tmp_path, monkeypatch):
         shape["resident_key_bytes"] == [["a" * 64, 1]] for shape in payload["shapes"]
     )
     assert payload["coverage"]["semantic_token_witnesses"] == [
-        {"step_key": [0, 3, 1, 1, 0], "live_num_tokens": 1}
+        {"step_key": list(step), "live_num_tokens": live} for step, live in witnesses
     ]
     assert payload["coverage"]["mixed_query_witnesses"] == []
     assert (
@@ -710,7 +720,7 @@ def test_publish_measured_catalog_is_atomic_and_complete(tmp_path, monkeypatch):
         list(full_key),
         list(verification_key),
     ]
-    assert payload["coverage"]["schema6_added_witness_shapes"] == 0
+    assert payload["coverage"]["schema6_added_witness_shapes"] == 2
     assert (
         payload["coverage"]["surface_migration_contract"]
         == "schema5-full-owner-evidence-and-bounded-alias-v1"
@@ -765,10 +775,10 @@ def test_publish_measured_catalog_is_atomic_and_complete(tmp_path, monkeypatch):
         publish_measured_catalog(
             config,
             object(),
-            {key: invalid_provenance},
-            required=(key,),
-            restore=(key,),
-            semantic_token_witnesses=((key, 1),),
+            {**rows, key: invalid_provenance},
+            required=required,
+            restore=(key, full_key),
+            semantic_token_witnesses=witnesses,
             decode_max_x=1,
             mixed_max_x=1,
             full_context_max_x=1,
@@ -782,17 +792,17 @@ def test_publish_measured_catalog_is_atomic_and_complete(tmp_path, monkeypatch):
             publish_measured_catalog(
                 config,
                 object(),
-                {key: invalid_provenance},
-                required=(key,),
-                restore=(key,),
-                semantic_token_witnesses=((key, 1),),
+                {**rows, key: invalid_provenance},
+                required=required,
+                restore=(key, full_key),
+                semantic_token_witnesses=witnesses,
                 decode_max_x=1,
                 mixed_max_x=1,
                 full_context_max_x=1,
                 calibration_wall_seconds=1.0,
                 output_root=tmp_path,
             )
-    for required, restore in (
+    for bad_required, restore in (
         ((key, key), (key,)),
         ((key,), (key, key)),
     ):
@@ -801,7 +811,7 @@ def test_publish_measured_catalog_is_atomic_and_complete(tmp_path, monkeypatch):
                 config,
                 object(),
                 {key: row},
-                required=required,
+                required=bad_required,
                 restore=restore,
                 semantic_token_witnesses=((key, 1),),
                 decode_max_x=1,
@@ -814,10 +824,10 @@ def test_publish_measured_catalog_is_atomic_and_complete(tmp_path, monkeypatch):
         publish_measured_catalog(
             config,
             object(),
-            {key: row, full_key: row, verification_key: row},
-            required=(key, full_key, verification_key),
+            rows,
+            required=required,
             restore=(key, full_key),
-            semantic_token_witnesses=((key, 1),),
+            semantic_token_witnesses=witnesses,
             decode_max_x=1,
             mixed_max_x=1,
             full_context_max_x=1,
@@ -1287,6 +1297,10 @@ def test_calibrator_measures_every_surface_family(monkeypatch):
         is_pooling_model=False,
         async_scheduling=False,
         _elastic_restore_prefill_prompt_len=lambda: 2,
+        _elastic_restore_wave_step_keys=lambda **_kwargs: (
+            (0, 3, 2, 8, 4),
+            (1, 3, 4, 4, 1),
+        ),
     )
     calls = []
 
@@ -1379,6 +1393,7 @@ def test_calibrator_measures_restore_owner_only_through_full_lifecycle(monkeypat
         is_pooling_model=False,
         async_scheduling=False,
         _elastic_restore_prefill_prompt_len=lambda: 2,
+        _elastic_restore_wave_step_keys=lambda **_kwargs: (piecewise, full),
     )
     calibrator = ElasticCatalogCalibrator(owner)
     monkeypatch.setattr(
@@ -1441,6 +1456,7 @@ def test_calibrator_checkpoints_partial_restore_family_before_restart(monkeypatc
         is_pooling_model=False,
         async_scheduling=False,
         _elastic_restore_prefill_prompt_len=lambda: 2,
+        _elastic_restore_wave_step_keys=lambda **_kwargs: (piecewise, full),
     )
     calibrator = ElasticCatalogCalibrator(owner)
     monkeypatch.setattr(
