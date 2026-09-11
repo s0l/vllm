@@ -6,12 +6,15 @@ The raw TP transform and backend-finalized schema were admitted against
 independent GPU finalization; no model repack or resident full-layer tensor.
 """
 
+import heapq
 import json
 import math
-from collections import OrderedDict
+import os
+from collections import OrderedDict, deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Any, BinaryIO
 
 import numpy as np
 import regex as re
@@ -144,6 +147,10 @@ class NativeExpertStore:
         layers,
         experts,
         geometry: NVFP4ExpertGeometry,
+        cache_policy="frequency",
+        io_workers=4,
+        pin_cache=False,
+        archive_path=None,
     ):
         hidden, width, physical, tp = (
             geometry.hidden,
@@ -157,6 +164,13 @@ class NativeExpertStore:
             raise ValueError("invalid expert source rank/budget")
         if hidden % 16 or width % 16 or physical // tp % 16:
             raise ValueError("expert source must align to NVFP4 scale blocks")
+        if (
+            cache_policy not in ("lru", "frequency")
+            or type(io_workers) is not int
+            or not 1 <= io_workers <= 16
+            or type(pin_cache) is not bool
+        ):
+            raise ValueError("invalid expert cache policy or I/O concurrency")
         self.root = Path(checkpoint).resolve(strict=True)
         self.geometry = geometry
         self.rank, self.tp = rank, tp
@@ -164,8 +178,17 @@ class NativeExpertStore:
         self.layers, self.experts = layers, experts
         self.limit = cache_bytes
         self.cache: OrderedDict[tuple[int, int], dict[str, np.ndarray]] = OrderedDict()
+        self.cache_policy, self.io_workers = cache_policy, io_workers
+        self.pin_cache, self.pinned_pool = pin_cache, None
+        self.frequency = np.zeros((layers, experts), dtype=np.uint16)
+        self.accesses = 0
+        self.cache_heap: list[tuple[int, tuple[int, int]]] = []
+        self.cache_bypasses = self.read_calls = 0
+        self._reader: ThreadPoolExecutor | None = None
+        self._fds: dict[str, BinaryIO] = {}
         self.used = self.peak = self.read_bytes = self.hits = self.misses = 0
         self.closed = False
+        self.archive = None
         self.lock = RLock()
         index = self.root / "model.safetensors.index.json"
         self.files = {str(index): fingerprint(index)}
@@ -228,76 +251,239 @@ class NativeExpertStore:
         ):
             raise ValueError("incomplete native expert checkpoint inventory")
         self.check_files(self.files)
+        if archive_path is not None:
+            from .expert_offload_archive import PreparedExpertArchive
+
+            self.archive = PreparedExpertArchive(archive_path, self)
+            self.files.update(self.archive.files)
 
     def check_files(self, paths):
         if any(fingerprint(p) != self.files[p] for p in paths):
             raise OSError("expert source identity changed; restart required")
 
+    def _access(self, key):
+        if self.cache_policy == "lru":
+            return
+        self.accesses += 1
+        if self.accesses % max(1, self.layers * self.experts * 2) == 0:
+            self.frequency >>= 1
+            self._rebuild_heap()
+        self.frequency[key] = min(int(self.frequency[key]) + 1, 65535)
+        if key in self.cache:
+            heapq.heappush(self.cache_heap, (int(self.frequency[key]), key))
+        if len(self.cache_heap) > max(16, len(self.cache) * 4):
+            self._rebuild_heap()
+
+    def _rebuild_heap(self):
+        self.cache_heap = [(int(self.frequency[k]), k) for k in self.cache]
+        heapq.heapify(self.cache_heap)
+
+    def _retain(self, key, prepared):
+        size = sum(a.nbytes for a in prepared.values())
+        limit = self.limit
+        if self.pin_cache and size <= limit:
+            if self.pinned_pool is None:
+                import torch
+
+                from .expert_offload_pinned import PinnedExpertPool
+
+                self.pinned_pool = PinnedExpertPool(
+                    prepared, limit, device=torch.accelerator.current_device_index()
+                )
+            limit = self.pinned_pool.capacity * size
+        if size > limit:
+            return prepared
+        while self.used + size > limit:
+            if self.cache_policy == "frequency":
+                while self.cache_heap and (
+                    self.cache_heap[0][1] not in self.cache
+                    or self.cache_heap[0][0]
+                    != int(self.frequency[self.cache_heap[0][1]])
+                ):
+                    heapq.heappop(self.cache_heap)
+                score, victim = self.cache_heap[0]
+                # Equal-frequency scans must not replace the entire working set.
+                if int(self.frequency[key]) <= score:
+                    self.cache_bypasses += 1
+                    return prepared
+                heapq.heappop(self.cache_heap)
+                old = self.cache.pop(victim)
+            else:
+                _, old = self.cache.popitem(last=False)
+            self.used -= sum(a.nbytes for a in old.values())
+            del old  # Release an unobserved pinned victim before requesting a slot.
+        if self.pinned_pool is not None:
+            pinned = self.pinned_pool.retain(prepared)
+            if pinned is None:
+                self.cache_bypasses += 1
+                return prepared
+            prepared = pinned
+        self.cache[key] = prepared
+        self.used += size
+        self.peak = max(self.peak, self.used)
+        if self.cache_policy == "frequency":
+            heapq.heappush(self.cache_heap, (int(self.frequency[key]), key))
+        return prepared
+
+    def _read_raw(self, key):
+        if self.archive is not None:
+            return self.archive.read(key, self._fds[self.archive.paths[key[0]]])
+        entries = self.entries[key]
+        spans: list[list[Any]] = []
+        for name, entry in sorted(entries.items(), key=lambda e: (e[1][0], e[1][1])):
+            path, offset, size, shape, dtype = entry
+            if spans and spans[-1][0] == path and spans[-1][2] == offset:
+                spans[-1][2] += size
+                spans[-1][3].append((name, entry))
+            else:
+                spans.append([path, offset, offset + size, [(name, entry)]])
+        raw, read_bytes = {}, 0
+        for path, start, end, fields in spans:
+            blob = os.pread(self._fds[path].fileno(), end - start, start)
+            if len(blob) != end - start:
+                raise OSError("truncated native expert source")
+            read_bytes += len(blob)
+            for name, (_, offset, size, shape, dtype) in fields:
+                raw[name] = np.frombuffer(
+                    blob,
+                    dtype="<f4" if dtype == "F32" else "u1",
+                    offset=offset - start,
+                    count=math.prod(shape),
+                ).reshape(shape)
+        return raw, read_bytes, len(spans)
+
+    def _prepare_raw(self, raw):
+        if self.archive is not None:
+            return raw
+        prepared = prepare(
+            split_bundle(
+                raw,
+                hidden=self.hidden,
+                width=self.width,
+                physical=self.physical,
+                tp=self.tp,
+                selected_rank=self.rank,
+            )[0]
+        )
+        for array in prepared.values():
+            array.setflags(write=False)
+        return prepared
+
+    def _read_expert(self, key):
+        raw, read_bytes, read_calls = self._read_raw(key)
+        return self._prepare_raw(raw), read_bytes, read_calls
+
+    def _read_many(self, missing, destinations=None):
+        if self._reader is None:
+            self._reader = ThreadPoolExecutor(
+                max_workers=self.io_workers, thread_name_prefix="expert-io"
+            )
+        keys = iter(missing)
+        pending: deque[Future[Any]] = deque()
+
+        def read(key):
+            if destinations is None:
+                return self._read_raw(key)
+            assert self.archive is not None
+            return self.archive.read(
+                key, self._fds[self.archive.paths[key[0]]], destinations[key]
+            )
+
+        for _ in range(min(len(missing), self.io_workers * 2)):
+            pending.append(self._reader.submit(read, next(keys)))
+        rows = []
+        while pending:
+            raw, read_bytes, read_calls = pending.popleft().result()
+            key = next(keys, None)
+            if key is not None:
+                pending.append(self._reader.submit(read, key))
+            rows.append((self._prepare_raw(raw), read_bytes, read_calls))
+        return rows
+
     def get(self, layer, expert):
+        return self.get_many(layer, (expert,))[0]
+
+    def get_many(self, layer, experts):
+        """Fetch one bounded demand batch; readers never mutate cache ownership."""
+        return self._get_many(layer, experts)
+
+    def get_many_into(self, layer, experts, arrays, positions):
+        """Miss views may borrow caller staging until its next fenced reuse."""
+        if self.archive is None or (not self.pin_cache and self.limit):
+            raise ValueError("borrowed rows require a pinned or disabled RAM cache")
+        if len(positions) != len(experts) or len(set(positions)) != len(positions):
+            raise ValueError("invalid prepared destination positions")
+        destinations: dict[tuple[int, int], dict[str, np.ndarray]] = {}
+        spans = []
+        for expert, position in zip(experts, positions):
+            if type(position) is not int or position < 0:
+                raise ValueError("invalid prepared destination position")
+            values = {
+                name: array[position : position + 1].reshape(
+                    self.archive.fields[name]["shape"]
+                )
+                for name, array in arrays.items()
+            }
+            spans.extend(self.archive.validate_buffers(values))
+            destinations.setdefault((layer, expert), values)
+        spans.sort()
+        if any(left[1] > right[0] for left, right in zip(spans, spans[1:])):
+            raise ValueError("overlapping prepared read destinations")
+        return self._get_many(layer, experts, destinations)
+
+    def _get_many(self, layer, experts, destinations=None):
         with self.lock:
             if self.closed:
                 raise RuntimeError("native expert source is closed")
-            if (layer, expert) not in self.entries:
+            keys = [(layer, expert) for expert in experts]
+            if len(keys) > 1024:
+                raise ValueError("expert source batch exceeds bounded queue")
+            if any(key not in self.entries for key in keys):
                 raise ValueError("unknown checkpoint expert")
-            entries = self.entries[layer, expert]
-            files = {e[0] for e in entries.values()} | {
+            files = {e[0] for key in keys for e in self.entries[key].values()} | {
                 str(self.root / "model.safetensors.index.json")
             }
+            if self.archive is not None:
+                files |= {str(self.archive.root / "manifest.json")}
+                files |= {self.archive.paths[key[0]] for key in keys}
             try:
                 self.check_files(files)
-                key = layer, expert
-                if key in self.cache:
-                    self.hits += 1
-                    self.cache.move_to_end(key)
-                    return self.cache[key]
-                spans: list[list[Any]] = []
-                for name, entry in sorted(
-                    entries.items(), key=lambda e: (e[1][0], e[1][1])
-                ):
-                    path, offset, size, shape, dtype = entry
-                    if spans and spans[-1][0] == path and spans[-1][2] == offset:
-                        spans[-1][2] += size
-                        spans[-1][3].append((name, entry))
+                result, missing = {}, []
+                for key in dict.fromkeys(keys):
+                    self._access(key)
+                    if key in self.cache:
+                        self.hits += 1
+                        self.cache.move_to_end(key)
+                        result[key] = self.cache[key]
                     else:
-                        spans.append([path, offset, offset + size, [(name, entry)]])
-                raw = {}
-                for path, start, end, fields in spans:
-                    with open(path, "rb") as f:
-                        f.seek(start)
-                        blob = f.read(end - start)
-                    if len(blob) != end - start:
-                        raise OSError("truncated native expert source")
-                    self.read_bytes += len(blob)
-                    for name, (_, offset, size, shape, dtype) in fields:
-                        raw[name] = np.frombuffer(
-                            blob,
-                            dtype="<f4" if dtype == "F32" else "u1",
-                            offset=offset - start,
-                            count=math.prod(shape),
-                        ).reshape(shape)
-                prepared = prepare(
-                    split_bundle(
-                        raw,
-                        hidden=self.hidden,
-                        width=self.width,
-                        physical=self.physical,
-                        tp=self.tp,
-                        selected_rank=self.rank,
-                    )[0]
-                )
+                        missing.append(key)
+                for key in missing:
+                    paths = (
+                        (self.archive.paths[key[0]],)
+                        if self.archive is not None
+                        else {entry[0] for entry in self.entries[key].values()}
+                    )
+                    for path in paths:
+                        if path not in self._fds:
+                            # Store owns these handles until close; FileIO also
+                            # closes them if an unused store is garbage-collected.
+                            self._fds[path] = open(path, "rb", buffering=0)  # noqa: SIM115
+                if (
+                    len(missing) > 1 and self.io_workers > 1
+                ) or destinations is not None:
+                    # Overlap blocking reads, but prepare on the owning thread.
+                    # Concurrent TP ranks already parallelize this CPU transform;
+                    # running it in every I/O worker oversubscribes the CPU budget.
+                    rows = self._read_many(missing, destinations)
+                else:
+                    rows = [self._read_expert(key) for key in missing]
                 self.check_files(files)
-                for array in prepared.values():
-                    array.setflags(write=False)
-                self.misses += 1
-                size = sum(a.nbytes for a in prepared.values())
-                if size <= self.limit:
-                    while self.used + size > self.limit:
-                        _, old = self.cache.popitem(last=False)
-                        self.used -= sum(a.nbytes for a in old.values())
-                    self.cache[key] = prepared
-                    self.used += size
-                    self.peak = max(self.peak, self.used)
-                return prepared
+                for key, (prepared, read_bytes, read_calls) in zip(missing, rows):
+                    self.misses += 1
+                    self.read_bytes += read_bytes
+                    self.read_calls += read_calls
+                    result[key] = self._retain(key, prepared)
+                return [result[key] for key in keys]
             except Exception:
                 self.close()
                 raise
@@ -305,5 +491,14 @@ class NativeExpertStore:
     def close(self):
         with self.lock:
             self.closed = True
+            if self._reader is not None:
+                self._reader.shutdown(wait=True, cancel_futures=True)
+                self._reader = None
+            for handle in self._fds.values():
+                handle.close()
+            self._fds.clear()
             self.cache.clear()
+            self.cache_heap.clear()
             self.used = 0
+            if self.pinned_pool is not None:
+                self.pinned_pool.close()

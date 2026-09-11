@@ -78,6 +78,8 @@ def get_native_provider(vllm_config):
             layers=text.num_hidden_layers,
             experts=text.num_experts,
             geometry=budget.geometry,
+            pin_cache=budget.pin_ram_cache,
+            archive_path=budget.prepared_archive,
         )
         device = get_tp_group().device
         bank = NativeExpertBank(
@@ -104,6 +106,7 @@ def get_native_provider(vllm_config):
         provider = NativeExpertProvider(
             bank, get_tp_group(), vllm_config, topk=text.num_experts_per_tok
         )
+        provider.use_hot_path = budget.hot_read
         _providers[key] = provider
     return provider
 

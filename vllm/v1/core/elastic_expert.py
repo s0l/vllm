@@ -3,6 +3,7 @@
 """Scheduler/worker contract for the native FlashNext expert bank."""
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from vllm.utils.nvfp4_expert_geometry import NVFP4ExpertGeometry
 
@@ -28,6 +29,9 @@ class NativeExpertBudget:
     staging: int = 32
     quantum: int = 2 << 20
     ram_cache_bytes: int = 1 << 30
+    pin_ram_cache: bool = False
+    hot_read: bool = False
+    prepared_archive: str | None = None
 
     def __post_init__(self):
         self.geometry.validate_cutlass()
@@ -42,6 +46,15 @@ class NativeExpertBudget:
             or self.quantum != 2 << 20
             or type(self.ram_cache_bytes) is not int
             or self.ram_cache_bytes < 0
+            or type(self.pin_ram_cache) is not bool
+            or type(self.hot_read) is not bool
+            or (
+                self.prepared_archive is not None
+                and (
+                    type(self.prepared_archive) is not str
+                    or not Path(self.prepared_archive).is_absolute()
+                )
+            )
         ):
             raise ValueError("unsupported native expert budget geometry")
 
@@ -60,8 +73,17 @@ class NativeExpertBudget:
                 "staging",
                 "ram_cache_bytes",
                 "ram_cache_total_bytes",
+                "pin_ram_cache",
+                "hot_read",
+                "prepared_archive",
             }
-            or any(type(v) is not int or v < 0 for v in options.values())
+            or any(
+                type(v) is not int or v < 0
+                for key, v in options.items()
+                if key not in {"pin_ram_cache", "hot_read", "prepared_archive"}
+            )
+            or type(options.get("pin_ram_cache", False)) is not bool
+            or type(options.get("hot_read", False)) is not bool
             or options.get("hot_rows", 0) != 0
             or {"ram_cache_bytes", "ram_cache_total_bytes"} <= options.keys()
         ):
@@ -85,6 +107,9 @@ class NativeExpertBudget:
                 if "ram_cache_total_bytes" in options
                 else options.get("ram_cache_bytes", 1 << 30)
             ),
+            pin_ram_cache=options.get("pin_ram_cache", False),
+            hot_read=options.get("hot_read", False),
+            prepared_archive=options.get("prepared_archive"),
         )
 
     @property

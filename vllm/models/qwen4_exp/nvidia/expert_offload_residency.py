@@ -113,7 +113,7 @@ class NativeExpertResidency:
     def prepare(self):
         error = None
         try:
-            self.provider.retire()
+            self.provider.quiesce()
             self.bank.prepare_resize(self.grant.hot_rows)
         except Exception as exc:
             error = exc

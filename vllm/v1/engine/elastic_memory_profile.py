@@ -73,7 +73,10 @@ def _replay_allocation_profile(
         import numpy as np
 
         for provider in providers:
-            if len(provider.kernels) == provider.max_lanes.bit_length():
+            if all(
+                (1 << exponent) in provider.kernels
+                for exponent in range(provider.max_lanes.bit_length())
+            ):
                 continue
             ids = np.full((1, provider.topk), -1, dtype=np.int32)
             provider.coordinator.admit_routes(

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import time
 
 import numpy as np
@@ -93,7 +95,7 @@ class NativeExpertProvider:
 
     Inner Graphs consume stable staging addresses, independent of which outer
     layer or request owns the input/output. Only the scheduler may resize the
-    bank; its transaction must call retire before changing physical mappings.
+    bank; its transaction must quiesce readers before changing physical mappings.
     """
 
     def __init__(
@@ -147,11 +149,22 @@ class NativeExpertProvider:
         self.consumer = None
         self.consumer_rows = None
         self.kernels = {}
+        # No captured intermediate escapes forward: the persistent lane buffer
+        # owns the consumed output. These Graphs never execute concurrently.
+        self.graph_pool = torch.cuda.graph_pool_handle()
+        self.graph_captures = 0
         self.use_graphs = True
+        # Standalone opt-in until the full source/copy DAG shows a benefit.
+        self.use_prefetch = False
+        self.use_hot_path = False
+        self.hot_path = None
         self.dummy = False
         self.active = False
         self.forward_count = 0
         self.last_step = {}
+        self.trace_path = os.environ.get("AG2_VLLM_EXPERT_TRACE", "")
+        self.trace_layers = []
+        self.trace_steps = 0
 
     def prepare_execution(self, *, dummy):
         if self.active or self.bank.leases or self.bank.state != "READY":
@@ -174,18 +187,33 @@ class NativeExpertProvider:
             self.group_rows.zero_()
             _, graph = self._kernel(self.max_lanes)
             graph.replay()
+            if self.use_hot_path:
+                if self.hot_path is None:
+                    from .expert_offload_hot import NativeHotRead
+
+                    self.hot_path = NativeHotRead(self)
+                self.hot_path.profile()
             output.zero_()
         finally:
             self.bank.release(lease, self.bank.fence())
 
-    def retire(self):
+    def quiesce(self):
         if self.active or self.bank.leases:
             raise RuntimeError("cannot retire an active expert provider")
         self.bank.fence().synchronize()
+
+    def retire(self):
+        self.quiesce()
+        self.bank.close_prefetch()
         for _, graph in self.kernels.values():
             graph.reset()
             self.bank.graphs.discard(graph)
+            self.bank.stable_graphs.discard(graph)
         self.kernels.clear()
+        self.hot_path = None
+        # The allocator releases a pool when its last Graph is reset. A later
+        # recovery capture needs a fresh pool epoch, even at the same addresses.
+        self.graph_pool = torch.cuda.graph_pool_handle()
         self.consumer = None
         self.consumer_rows = None
 
@@ -193,13 +221,13 @@ class NativeExpertProvider:
         if bucket in self.kernels:
             if (
                 self.kernels[bucket][1] not in self.bank.graphs
-                or self.consumer_rows != self.bank.rows
+                or self.consumer_rows != self.bank.max_rows
             ):
                 raise RuntimeError("native provider graphs require retirement")
             return self.kernels[bucket]
         if self.consumer is None:
             self.consumer = NativeMappedBankConsumer(self.bank, self.group_rows)
-            self.consumer_rows = self.bank.rows
+            self.consumer_rows = self.bank.max_rows
         consumer = self.consumer
         lane_ids, local_ids = self.lane_ids[:bucket], self.local_ids[:bucket]
 
@@ -215,9 +243,10 @@ class NativeExpertProvider:
                 compiled()
             self.bank.fence().synchronize()
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph, pool=self.graph_pool):
                 compiled()
-            self.bank.register_graph(graph)
+            self.bank.register_graph(graph, stable_views=True)
+            self.graph_captures += 1
 
         def direct():
             with set_forward_context(None, self.config, num_tokens=bucket):
@@ -234,11 +263,15 @@ class NativeExpertProvider:
         self.active = True
         before_bytes = self.bank.copy_bytes
         before_read = self.bank.source.read_bytes
+        before_hits, before_misses = self.bank.source.hits, self.bank.source.misses
+        before_prefetch = self.bank.prefetch_experts
+        before_consumed = self.bank.prefetch_consumed
         started = time.perf_counter()
-        steps, tiles, useful = 0, 0, 0
+        steps, tiles, useful, hot_calls = 0, 0, 0, 0
         try:
             error = None
             cpu_ids = cpu_weights = cpu_padding = None
+            validated_waves = resident = None
             try:
                 if (
                     hidden.ndim != 2
@@ -269,20 +302,35 @@ class NativeExpertProvider:
                         cpu_weights[cpu_padding] = 0
                     if not np.isfinite(cpu_weights).all() or np.any(cpu_weights < 0):
                         raise ValueError("invalid native routing weights")
-                    # Validate before consensus; actual per-chunk schedules follow.
-                    plan(
+                    validated_waves = plan(
                         cpu_ids,
                         self.bank.source.experts,
                         self.bank.staging,
                         is_padding=cpu_padding,
                     )
+                    if (
+                        self.use_hot_path
+                        and 0 < hidden.shape[0] <= 64
+                        and validated_waves
+                    ):
+                        if self.hot_path is None:
+                            from .expert_offload_hot import NativeHotRead
+
+                            self.hot_path = NativeHotRead(self)
+                        self.hot_path.propose(layer, validated_waves)
+                        resident = self.hot_path
             except Exception as exc:
                 error = exc
             if self.dummy and error is None:
                 self._profile(layer, hidden, output)
                 return
-            self.coordinator.admit_routes(
-                layer, cpu_ids, cpu_weights, error=error, dummy=self.dummy
+            all_hot = self.coordinator.admit_routes(
+                layer,
+                cpu_ids,
+                cpu_weights,
+                error=error,
+                dummy=self.dummy,
+                resident=resident,
             )
             assert cpu_ids is not None
             if hidden.shape[0] == 0:
@@ -302,13 +350,32 @@ class NativeExpertProvider:
                     self.x[:count].index_fill_(0, padding_rows, 0)
                     self.weights[:count].index_fill_(0, padding_rows, 0)
                     self.lanes[:count].index_fill_(0, padding_rows, 0)
-                waves = plan(
-                    cpu_ids[start : start + count],
-                    self.bank.source.experts,
-                    self.bank.staging,
-                    is_padding=padding,
+                waves = (
+                    validated_waves
+                    if hidden.shape[0] <= self.max_tokens
+                    else plan(
+                        cpu_ids[start : start + count],
+                        self.bank.source.experts,
+                        self.bank.staging,
+                        is_padding=padding,
+                    )
                 )
-                for wave in waves:
+                assert waves is not None
+                if all_hot:
+                    assert resident is not None
+                    resident.run(layer, waves, cpu_ids)
+                    output[:count].copy_(resident.output[:count])
+                    steps += len(waves)
+                    tiles += 1
+                    useful += sum(len(wave.lanes) for wave in waves)
+                    hot_calls += 1
+                    continue
+                for wave_index, wave in enumerate(waves):
+                    self.bank.next_demand = (
+                        (layer, waves[wave_index + 1].experts)
+                        if self.use_prefetch and wave_index + 1 < len(waves)
+                        else None
+                    )
                     demand = self.expert_ids[: len(wave.experts)]
                     demand.copy_(torch.tensor(wave.experts, dtype=torch.int32))
                     ticket = self.coordinator.stage(layer, demand)
@@ -355,6 +422,12 @@ class NativeExpertProvider:
             self.bank.state = "POISONED"
             raise
         finally:
+            drain_error = None
+            try:
+                self.bank.drain_prefetch()
+            except Exception as exc:
+                self.bank.state = "POISONED"
+                drain_error = exc
             self.active = False
             self.last_step = dict(
                 layer=layer,
@@ -363,7 +436,46 @@ class NativeExpertProvider:
                 useful_lanes=useful,
                 h2d_expert_bytes=self.bank.copy_bytes - before_bytes,
                 source_read_bytes=self.bank.source.read_bytes - before_read,
+                prefetched_experts=self.bank.prefetch_experts - before_prefetch,
+                consumed_prefetch=self.bank.prefetch_consumed - before_consumed,
                 wall_ms=(time.perf_counter() - started) * 1000,
                 state=self.bank.state,
                 dummy=self.dummy,
+                hot_calls=hot_calls,
+                hot_rows=self.bank.tables.pool_rows,
+                source_hits=self.bank.source.hits - before_hits,
+                source_misses=self.bank.source.misses - before_misses,
+                ram_retained_bytes=self.bank.source.used,
+                tokens=hidden.shape[0],
             )
+            self._trace_last_step()
+            if drain_error is not None:
+                raise RuntimeError(
+                    "native prefetch failed while draining"
+                ) from drain_error
+
+    def _trace_last_step(self):
+        if self.trace_path and not self.dummy and self.trace_steps < 64:
+            if self.last_step["layer"] == 0:
+                self.trace_layers.clear()
+            self.trace_layers.append(dict(self.last_step))
+            if self.last_step["layer"] == self.bank.source.layers - 1:
+                row = dict(
+                    schema="native-expert-step-v1",
+                    rank=self.bank.source.rank,
+                    step=self.trace_steps,
+                    unix=time.time(),
+                    layers=self.trace_layers,
+                )
+                try:
+                    with open(
+                        f"{self.trace_path}-rank{self.bank.source.rank}.jsonl", "a"
+                    ) as handle:
+                        handle.write(json.dumps(row) + "\n")
+                except OSError as error:
+                    from vllm.logger import init_logger
+
+                    init_logger(__name__).warning("Expert trace failed: %s", error)
+                    self.trace_path = ""
+                self.trace_steps += 1
+                self.trace_layers.clear()
