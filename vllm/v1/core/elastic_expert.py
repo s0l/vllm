@@ -27,6 +27,7 @@ class NativeExpertBudget:
     max_hot_rows: int = 8192
     staging: int = 32
     quantum: int = 2 << 20
+    ram_cache_bytes: int = 1 << 30
 
     def __post_init__(self):
         self.geometry.validate_cutlass()
@@ -39,6 +40,8 @@ class NativeExpertBudget:
             or self.staging & (self.staging - 1)
             or type(self.quantum) is not int
             or self.quantum != 2 << 20
+            or type(self.ram_cache_bytes) is not int
+            or self.ram_cache_bytes < 0
         ):
             raise ValueError("unsupported native expert budget geometry")
 
@@ -51,9 +54,16 @@ class NativeExpertBudget:
         if (
             not isinstance(options, dict)
             or options.keys()
-            - {"hot_rows", "max_hot_rows", "staging", "ram_cache_bytes"}
+            - {
+                "hot_rows",
+                "max_hot_rows",
+                "staging",
+                "ram_cache_bytes",
+                "ram_cache_total_bytes",
+            }
             or any(type(v) is not int or v < 0 for v in options.values())
             or options.get("hot_rows", 0) != 0
+            or {"ram_cache_bytes", "ram_cache_total_bytes"} <= options.keys()
         ):
             raise ValueError("native elastic experts require zero initial HOT rows")
         text = config.model_config.hf_text_config
@@ -69,6 +79,12 @@ class NativeExpertBudget:
                 "max_hot_rows", min(8192, text.num_hidden_layers * text.num_experts)
             ),
             options.get("staging", 32),
+            ram_cache_bytes=(
+                options["ram_cache_total_bytes"]
+                // config.parallel_config.tensor_parallel_size
+                if "ram_cache_total_bytes" in options
+                else options.get("ram_cache_bytes", 1 << 30)
+            ),
         )
 
     @property

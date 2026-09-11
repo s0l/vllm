@@ -48,10 +48,6 @@ def native_experts_enabled(vllm_config, prefix):
 def get_native_provider(vllm_config):
     budget = NativeExpertBudget.from_config(vllm_config)
     assert budget is not None
-    options = vllm_config.additional_config["flashnext_native_experts"]
-    fields = {"hot_rows", "max_hot_rows", "staging", "ram_cache_bytes"}
-    if not isinstance(options, dict) or options.keys() - fields:
-        raise ValueError("invalid FlashNext native expert options")
     parallel = vllm_config.parallel_config
     text = vllm_config.model_config.hf_text_config
     if (
@@ -78,7 +74,7 @@ def get_native_provider(vllm_config):
         source = NativeExpertStore(
             vllm_config.model_config.model,
             get_tensor_model_parallel_rank(),
-            options.get("ram_cache_bytes", 1 << 30),
+            budget.ram_cache_bytes,
             layers=text.num_hidden_layers,
             experts=text.num_experts,
             geometry=budget.geometry,
