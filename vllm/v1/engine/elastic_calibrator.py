@@ -16,8 +16,10 @@ from typing import Any, cast
 from vllm.logger import init_logger
 from vllm.v1.core.elastic_catalog import (
     ELASTIC_GRAPH_CATALOG_SCHEMA_VERSION,
+    RestoreDecodeGeometry,
     elastic_graph_catalog_row_complete,
     expected_semantic_token_witnesses,
+    resolve_restore_decode_geometry,
     validate_elastic_catalog_key_inventory,
 )
 from vllm.v1.core.elastic_graph import (
@@ -72,6 +74,7 @@ class CalibrationSurface:
     migrated_source_keys: tuple[tuple[int, int, int, int, int], ...] = ()
     source_sha256: str | None = None
     owner_evidence_keys: tuple[tuple[int, int, int, int, int], ...] = ()
+    restore_decode: RestoreDecodeGeometry | None = None
 
     @classmethod
     def from_payload(
@@ -141,15 +144,17 @@ class CalibrationSurface:
             raise RuntimeError(
                 "calibration surface required-shape count is inconsistent"
             )
-        if (
-            len(restore) != 2
-            or sum(key[0] == 0 for key in restore) != 1
-            or sum(key[0] == 1 for key in restore) != 1
-        ):
-            raise RuntimeError(
-                "calibration surface requires one FULL/PIECEWISE restore pair"
-            )
+        restore_decode = (
+            RestoreDecodeGeometry.from_payload(coverage["restore_decode"])
+            if "restore_decode" in coverage
+            else resolve_restore_decode_geometry(restore)
+        )
         effective_prefill_k = configured_k if prefill_k is None else prefill_k
+        restore_decode.validate_runtime(
+            configured_k=configured_k,
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=max_num_batched_tokens,
+        )
         if any(
             key[1] != (configured_k if key[0] == 1 else effective_prefill_k)
             or key[2] < 1
@@ -173,6 +178,7 @@ class CalibrationSurface:
             or mixed_max_x > decode_max_x
             or full_context_max_x > decode_max_x
             or max(key[2] for key in required) > decode_max_x
+            or restore_decode.x > cast(int, decode_max_x)
         ):
             raise RuntimeError("calibration surface boundaries are inconsistent")
         migration_contract = None
@@ -335,6 +341,7 @@ class CalibrationSurface:
             migrated_source_keys=migrated_source_keys,
             source_sha256=source_sha256,
             owner_evidence_keys=owner_evidence_keys,
+            restore_decode=restore_decode,
         )
 
 
@@ -703,12 +710,14 @@ class ElasticCatalogCalibrator:
                     f"declared={key!r} derived={actual!r}"
                 )
 
-        full_key = next(key for key in surface.restore if key[0] == 1)
+        geometry = surface.restore_decode or resolve_restore_decode_geometry(
+            surface.restore
+        )
         expected_restore = set(
             self.owner._elastic_restore_wave_step_keys(
-                k=full_key[1],
-                x=full_key[2],
-                query_len=full_key[4],
+                k=geometry.k,
+                x=geometry.x,
+                query_len=geometry.query_len,
             )
         )
         if set(surface.restore) != expected_restore:
@@ -989,30 +998,38 @@ class ElasticCatalogCalibrator:
                 rebuild_inventory(surface.decode_max_x)
             self._validate_surface_before_mutation(surface)
 
-            # The restore PIECEWISE row is physical owner evidence for the
-            # paired FULL decode lifecycle, not an assertion that the same X
+            # The restore prefill row is physical owner evidence for the
+            # paired decode lifecycle, not an assertion that the same X
             # can be admitted as a fresh balanced-prefill cohort.  Measure the
             # pair through its actual producer first.  The ordinary required
             # loop will then observe both rows as complete and will not turn
             # the owner-only row into a stricter, unrelated product workload.
-            restore_full = next((key for key in surface.restore if key[0] == 1), None)
-            if restore_full is not None and any(
+            geometry = surface.restore_decode
+            if geometry is None and any(key[0] == 1 for key in surface.restore):
+                geometry = resolve_restore_decode_geometry(surface.restore)
+            if geometry is not None and any(
                 not self._complete(key) for key in surface.restore
             ):
-                restore_prefill = next(key for key in surface.restore if key[0] == 0)
+                restore_prefill, restore_decode = (
+                    self.owner._elastic_restore_wave_step_keys(
+                        k=geometry.k,
+                        x=geometry.x,
+                        query_len=geometry.query_len,
+                    )
+                )
                 for _ in range(4):
                     if all(self._complete(key) for key in surface.restore):
                         break
                     actual, admitted = self.owner._run_elastic_full_restore_wave(
-                        k=restore_full[1],
-                        x=restore_full[2],
-                        query_len=restore_full[4],
+                        k=geometry.k,
+                        x=geometry.x,
+                        query_len=geometry.query_len,
                         serial=self._next_serial(),
                     )
-                    if actual != restore_full or admitted != restore_full[2]:
+                    if actual != restore_decode or admitted != geometry.x:
                         raise RuntimeError(
                             "calibration contracted accepted restore boundary: "
-                            f"expected={restore_full!r} actual={actual!r} "
+                            f"expected={restore_decode!r} actual={actual!r} "
                             f"admitted={admitted}"
                         )
                     checkpoint_progress(
@@ -1321,6 +1338,7 @@ def calibrate_and_publish_catalog(
             migrated_source_keys=surface.migrated_source_keys,
             source_surface_sha256=surface.source_sha256,
             owner_evidence_keys=surface.owner_evidence_keys,
+            restore_decode=surface.restore_decode,
         )
     return CalibrationResult(
         destination=destination,

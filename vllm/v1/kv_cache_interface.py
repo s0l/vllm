@@ -20,6 +20,9 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.core.elastic_graph import (
+    elastic_piecewise_token_boundary as elastic_piecewise_token_boundary,
+)
 from vllm.v1.kv_cache_layout import _DIM_B, _DIM_L, KVCacheLayout
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
@@ -29,21 +32,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _SpecT = TypeVar("_SpecT", bound="KVCacheSpec")
-
-
-def elastic_piecewise_token_boundary(num_tokens: int, max_tokens: int) -> int:
-    """Return a runtime-derived PIECEWISE Graph class.
-
-    Logical M values are canonicalized to powers of two plus the configured B
-    tail. The class list is derived from ``max_num_batched_tokens`` and is
-    never supplied by an env capture-size list.
-    """
-    if num_tokens <= 0 or max_tokens <= 0 or num_tokens > max_tokens:
-        raise ValueError(
-            "elastic PIECEWISE tokens must satisfy 0 < num_tokens <= max_tokens"
-        )
-    boundary = 1 << (num_tokens - 1).bit_length()
-    return min(boundary, max_tokens)
 
 
 # ---------------------------------------------------------------------------

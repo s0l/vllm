@@ -9,10 +9,105 @@ import json
 import os
 import uuid
 from collections.abc import Mapping
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from vllm.v1.core.elastic_graph import (
+    GraphExecutionPolicy,
+    SemanticGraphStep,
+    canonical_graph_step_key,
+)
+
 ELASTIC_GRAPH_CATALOG_SCHEMA_VERSION = 6
+ELASTIC_RESTORE_PREFILL_PROMPT_LEN = 2
+
+
+@dataclass(frozen=True)
+class RestoreDecodeGeometry:
+    """Semantic restore role, independent of the target Graph representation."""
+
+    k: int
+    x: int
+    query_len: int
+
+    def __post_init__(self) -> None:
+        if (
+            any(type(value) is not int for value in (self.k, self.x, self.query_len))
+            or self.k < 0
+            or self.x < 1
+            or not 1 <= self.query_len <= self.k + 1
+        ):
+            raise ValueError("restore decode has invalid K/X/query_len")
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> RestoreDecodeGeometry:
+        if not isinstance(payload, dict) or set(payload) != {"k", "x", "query_len"}:
+            raise RuntimeError("restore decode geometry is malformed")
+        return cls(**payload)
+
+    def to_payload(self) -> dict[str, int]:
+        return asdict(self)
+
+    def validate_runtime(
+        self,
+        *,
+        configured_k: int,
+        max_num_seqs: int,
+        max_num_batched_tokens: int,
+    ) -> None:
+        if (
+            self.k != configured_k
+            or self.x > max_num_seqs
+            or self.x * max(ELASTIC_RESTORE_PREFILL_PROMPT_LEN, self.query_len)
+            > max_num_batched_tokens
+        ):
+            raise RuntimeError("restore decode exceeds the effective runtime")
+
+    def step_keys(
+        self,
+        *,
+        policy: GraphExecutionPolicy,
+        prefill_k: int,
+        max_num_batched_tokens: int,
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        def key(k: int, query_len: int, phase: str) -> tuple[int, ...]:
+            return canonical_graph_step_key(
+                SemanticGraphStep(
+                    num_spec_tokens=k,
+                    num_reqs=self.x,
+                    num_tokens=self.x * query_len,
+                    uniform_query_len=query_len if phase == "decode" else None,
+                    phase=phase,
+                    active_owners=(
+                        ("target", "mtp_prefill", "mtp_decode") if k else ("target",)
+                    ),
+                ),
+                policy,
+                max_num_batched_tokens=max_num_batched_tokens,
+            )
+
+        return (
+            key(prefill_k, ELASTIC_RESTORE_PREFILL_PROMPT_LEN, "mixed"),
+            key(self.k, self.query_len, "decode"),
+        )
+
+
+def resolve_restore_decode_geometry(
+    restore: tuple[tuple[int, ...], ...],
+    declared: Any = None,
+) -> RestoreDecodeGeometry:
+    if declared is not None:
+        return RestoreDecodeGeometry.from_payload(declared)
+    # Legacy schemas identified the decode role with exactly one FULL key.
+    # An all-PIECEWISE pair is ambiguous and must never use this inference.
+    full = tuple(key for key in restore if key[0] == 1)
+    if len(restore) != 2 or len(full) != 1 or sum(k[0] == 0 for k in restore) != 1:
+        raise RuntimeError(
+            "calibration surface requires one FULL/PIECEWISE restore pair "
+            "or explicit restore_decode geometry"
+        )
+    return RestoreDecodeGeometry(k=full[0][1], x=full[0][2], query_len=full[0][4])
 
 
 def expected_semantic_token_witnesses(

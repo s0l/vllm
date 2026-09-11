@@ -12,8 +12,10 @@ from pathlib import Path
 from typing import Any
 
 from vllm.v1.core.elastic_catalog import (
+    RestoreDecodeGeometry,
     finalize_migrated_catalog,
     rebind_finalized_catalog,
+    resolve_restore_decode_geometry,
 )
 
 
@@ -129,6 +131,7 @@ def publish_measured_catalog(
     migrated_source_keys: tuple[tuple[int, int, int, int, int], ...] = (),
     source_surface_sha256: str | None = None,
     owner_evidence_keys: tuple[tuple[int, int, int, int, int], ...] = (),
+    restore_decode: RestoreDecodeGeometry | None = None,
 ) -> Path:
     """Atomically publish complete measurements from the offline producer."""
     from vllm.v1.core.elastic_catalog import (
@@ -238,14 +241,6 @@ def publish_measured_catalog(
         compiled_piecewise_sizes=tuple(compiled),
         policy=policy,
     )
-    terminal_query_len = decode_k + 1
-    terminal_verification = (
-        int(policy.mode_for("target", terminal_query_len) == "FULL"),
-        decode_k,
-        decode_max_x,
-        decode_max_x * terminal_query_len,
-        terminal_query_len,
-    )
     shapes = []
     for key in sorted(required):
         catalog_row = dict(catalog[key])
@@ -268,12 +263,40 @@ def publish_measured_catalog(
             )
         )
         shapes.append(row)
-    if terminal_verification not in required:
-        raise RuntimeError(
-            "measured catalog omits the terminal verification carrier: "
-            f"key={terminal_verification!r}"
+    geometry = restore_decode or resolve_restore_decode_geometry(restore)
+    geometry.validate_runtime(
+        configured_k=decode_k,
+        max_num_seqs=decode_max_x,
+        max_num_batched_tokens=max_num_batched_tokens,
+    )
+    key_options = dict(
+        policy=policy,
+        prefill_k=prefill_k,
+        max_num_batched_tokens=max_num_batched_tokens,
+    )
+    if set(geometry.step_keys(**key_options)) != set(restore):
+        raise RuntimeError("measured catalog restore pair differs from runtime")
+    q1 = RestoreDecodeGeometry(k=decode_k, x=decode_max_x, query_len=1)
+    verification = RestoreDecodeGeometry(
+        k=decode_k,
+        x=decode_max_x,
+        query_len=decode_k + 1,
+    )
+    serving_carrier = tuple(
+        sorted(
+            set(
+                (
+                    *q1.step_keys(**key_options),
+                    *verification.step_keys(**key_options),
+                )
+            )
         )
-    serving_carrier = tuple(sorted(set((*restore, terminal_verification))))
+    )
+    if not set(serving_carrier).issubset(required):
+        raise RuntimeError(
+            "measured catalog omits the terminal prefill/q1/q(K+1) carrier: "
+            f"missing={sorted(set(serving_carrier) - set(required))!r}"
+        )
     coverage = {
         "required_step_keys": [list(key) for key in sorted(required)],
         "required_shapes": len(required),
@@ -288,6 +311,7 @@ def publish_measured_catalog(
         ],
         "mixed_query_witness_contract": "shape-specific-query-distribution-v1",
         "restore_step_keys": [list(key) for key in sorted(restore)],
+        "restore_decode": geometry.to_payload(),
         "serving_carrier_step_keys": [list(key) for key in serving_carrier],
         "serving_carrier_contract": "retained-terminal-mtp-no-cold-serving-v1",
         "serving_carrier_owner": "mtp_decode",

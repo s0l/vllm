@@ -812,6 +812,31 @@ def load_elastic_graph_catalog_coverage(
         raise RuntimeError(
             f"sealed elastic Graph catalog has no valid product boundary: {path}"
         )
+    if "restore_decode" in coverage:
+        from vllm.v1.core.elastic_catalog import RestoreDecodeGeometry
+
+        geometry = RestoreDecodeGeometry.from_payload(coverage["restore_decode"])
+        budget = vllm_config.scheduler_config.max_num_batched_tokens
+        k = int(vllm_config.num_speculative_tokens)
+        geometry.validate_runtime(
+            configured_k=k,
+            max_num_seqs=coverage["decode_max_x"],
+            max_num_batched_tokens=budget,
+        )
+        speculative = vllm_config.speculative_config
+        prefill_k = (
+            0
+            if speculative is not None and speculative.disable_speculation_on_non_decode
+            else k
+        )
+        if set(
+            geometry.step_keys(
+                policy=policy,
+                prefill_k=prefill_k,
+                max_num_batched_tokens=budget,
+            )
+        ) != set(restore_inventory):
+            raise RuntimeError("sealed catalog restore pair differs from runtime")
     return dict(coverage) | {"_catalog_source_sha256": source_sha256}
 
 

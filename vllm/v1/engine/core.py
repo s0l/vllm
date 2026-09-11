@@ -384,27 +384,36 @@ class EngineCore:
             require_restore=True,
         )
         restore = set(restore_inventory)
-        q1_keys = sorted(key for key in restore if key[0] == 1 and key[4] == 1)
-        if len(q1_keys) != 1 or len(restore) != 3:
+        terminal_x = coverage.get("decode_max_x")
+        if (
+            type(terminal_x) is not int
+            or terminal_x < 1
+            or terminal_x > scheduler.max_num_running_reqs
+        ):
             raise RuntimeError(
-                "bounded elastic startup requires one three-shape terminal "
-                f"carrier family with one q1 bridge: restore={sorted(restore)!r}"
+                "bounded elastic startup has an invalid terminal decode cohort"
             )
-        q1_key = q1_keys[0]
+        k = scheduler.num_spec_tokens
         terminal_query_len = scheduler.num_spec_tokens + 1
 
         started = time.monotonic()
         previous_restore_mode = getattr(scheduler, "_elastic_restore_mode", False)
         scheduler._elastic_restore_mode = True
         try:
+            q1_key = self._elastic_restore_decode_key(k=k, x=terminal_x, query_len=1)
+            terminal_key = self._elastic_restore_decode_key(
+                k=k,
+                x=terminal_x,
+                query_len=terminal_query_len,
+            )
             q1_execution = self._elastic_restore_execution_step_keys(
-                k=q1_key[1],
-                x=q1_key[2],
+                k=k,
+                x=terminal_x,
                 query_len=1,
             )
             verification_execution = self._elastic_restore_execution_step_keys(
-                k=q1_key[1],
-                x=q1_key[2],
+                k=k,
+                x=terminal_x,
                 query_len=terminal_query_len,
             )
             expected_restore = set((*q1_execution, *verification_execution))
@@ -441,9 +450,6 @@ class EngineCore:
                 query_len=terminal_query_len,
                 serial=2,
                 preserve_hotset=True,
-            )
-            terminal_key = next(
-                key for key in verification_execution if key[4] == terminal_query_len
             )
             if measured_key != terminal_key or admitted_x != q1_key[2]:
                 raise RuntimeError(
@@ -787,7 +793,9 @@ class EngineCore:
     @staticmethod
     def _elastic_restore_prefill_prompt_len() -> int:
         """Single source of truth for the restore cohort's live prefill M."""
-        return 2
+        from vllm.v1.core.elastic_catalog import ELASTIC_RESTORE_PREFILL_PROMPT_LEN
+
+        return ELASTIC_RESTORE_PREFILL_PROMPT_LEN
 
     def _elastic_restore_execution_step_keys(
         self, *, k: int, x: int, query_len: int

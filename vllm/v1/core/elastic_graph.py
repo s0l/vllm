@@ -115,6 +115,48 @@ class SemanticGraphStep:
 GRAPH_EXECUTION_POLICY_SCHEMA = 1
 
 
+def elastic_piecewise_token_boundary(num_tokens: int, max_tokens: int) -> int:
+    """Canonicalize M to a power of two or the configured terminal B."""
+    if num_tokens <= 0 or max_tokens <= 0 or num_tokens > max_tokens:
+        raise ValueError(
+            "elastic PIECEWISE tokens must satisfy 0 < num_tokens <= max_tokens"
+        )
+    return min(1 << (num_tokens - 1).bit_length(), max_tokens)
+
+
+def canonical_graph_step_key(
+    semantic: SemanticGraphStep,
+    policy: GraphExecutionPolicy,
+    *,
+    physical_num_reqs: int | None = None,
+    max_num_batched_tokens: int | None = None,
+) -> tuple[int, int, int, int, int]:
+    """Resolve physical identity without interpreting it as a semantic phase.
+
+    The scheduler selects any bounded decode cohort before calling this pure
+    transform. Ordinary PIECEWISE retains semantic X and pads M; only FULL
+    and the explicit batched-q1 verifier use the supplied physical cohort.
+    """
+    k, x, qlen = (
+        semantic.num_spec_tokens,
+        semantic.num_reqs,
+        semantic.uniform_query_len,
+    )
+    physical_x = x if physical_num_reqs is None else physical_num_reqs
+    if physical_x < x:
+        raise ValueError("physical Graph cohort underfills semantic requests")
+    if semantic.phase == "decode":
+        assert qlen is not None
+        if policy.mode_for("target", qlen) == "FULL":
+            return (1, k, physical_x, physical_x * qlen, qlen)
+        if policy.verifier_contract == "batched-causal-q1-v1" and qlen == k + 1:
+            return (0, k, physical_x, physical_x * qlen, qlen)
+    tokens = semantic.num_tokens
+    if max_num_batched_tokens is not None:
+        tokens = elastic_piecewise_token_boundary(tokens, max_num_batched_tokens)
+    return (0, k, x, tokens, 0)
+
+
 @dataclass(frozen=True, order=True)
 class OwnerGraphExecutionPolicy:
     """Effective CUDA Graph representations for one runtime owner."""

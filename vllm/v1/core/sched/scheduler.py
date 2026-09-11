@@ -48,6 +48,7 @@ from vllm.v1.core.elastic_graph import (
     bind_runtime_generation_to_policy,
     build_execution_manifest,
     canonical_execution_request_order,
+    canonical_graph_step_key,
     configured_compiled_piecewise_sizes,
     derive_short_decode_graph_inventory,
     execution_manifest_phase_from_step_key,
@@ -95,7 +96,6 @@ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutp
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
-    elastic_piecewise_token_boundary,
     get_mamba_prefill_checkpoint_position,
     is_mamba_prefill_checkpoint_valid,
 )
@@ -5344,13 +5344,10 @@ class Scheduler(SchedulerInterface):
             return None
         if policy is None:
             raise RuntimeError("elastic step routing requires an execution policy")
-        batched_q1_verifier = policy.verifier_contract == "batched-causal-q1-v1"
         # Semantic X remains in scheduler_output for request metadata, sampling
         # and output cropping. CUDA Graph identity uses the smallest declared
         # physical cohort covering it, so X8 -> X7 reuses HOT X8/M32. DCP is
         # intentionally absent: it partitions attention context, not rows.
-        qlen = semantic.uniform_query_len
-        target_mode = policy.mode_for("target", qlen)
         physical_x = semantic.num_reqs
         restore_mode = getattr(self, "_elastic_restore_mode", False)
         if semantic.phase == "decode" and not restore_mode:
@@ -5359,47 +5356,16 @@ class Scheduler(SchedulerInterface):
         # execution always uses the smallest declared bucket covering semantic
         # X. _elastic_step_residency_intent() protects the retained carrier
         # without making it a dispatch candidate.
-        if semantic.phase == "decode" and target_mode == "FULL":
-            return (
-                1,
-                semantic.num_spec_tokens,
-                physical_x,
-                physical_x * (qlen or 0),
-                qlen or 0,
-            )
-        exact_batched_decode_m = bool(
-            semantic.phase == "decode"
-            and batched_q1_verifier
-            and qlen == 1 + semantic.num_spec_tokens
-        )
-        exact_uniform_query_len = qlen if exact_batched_decode_m else 0
-        if exact_batched_decode_m:
-            canonical_tokens = physical_x * (semantic.num_spec_tokens + 1)
-            return (
-                0,
-                semantic.num_spec_tokens,
-                physical_x,
-                canonical_tokens,
-                exact_uniform_query_len,
-            )
         scheduler_config = getattr(self, "scheduler_config", None)
-        if scheduler_config is None:
-            return (
-                0,
-                semantic.num_spec_tokens,
-                semantic.num_reqs,
-                semantic.num_tokens,
-                0,
-            )
-        canonical_tokens = elastic_piecewise_token_boundary(
-            semantic.num_tokens, self.scheduler_config.max_num_batched_tokens
-        )
-        return (
-            0,
-            semantic.num_spec_tokens,
-            semantic.num_reqs,
-            canonical_tokens,
-            0,
+        return canonical_graph_step_key(
+            semantic,
+            policy,
+            physical_num_reqs=physical_x,
+            max_num_batched_tokens=(
+                None
+                if scheduler_config is None
+                else scheduler_config.max_num_batched_tokens
+            ),
         )
 
     def _elastic_short_decode_physical_x(self, actual_x: int) -> int:
