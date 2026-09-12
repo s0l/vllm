@@ -68,6 +68,11 @@ def test_prefill_trace_snapshots_resident_metadata_once_and_survives_misses(
         provider_module.NativeExpertProvider
     )
     provider.bank = SimpleNamespace(source=source, host_hot={(1, 0): 0})
+    provider.admission = SimpleNamespace(
+        counts=np.array([[0] * 512, [64] * 10 + [0] * 502], dtype=np.uint32),
+        tokens=64,
+        next_layer=2,
+    )
     provider.trace_path = "must-remain-enabled"
     monkeypatch.setattr(
         provider_module,
@@ -87,10 +92,25 @@ def test_prefill_trace_snapshots_resident_metadata_once_and_survives_misses(
         reads.clear()
         row = provider._trace_routes(1, ids, weights)
         assert row["selected_histogram"] == [128] * 10 + [0] * 502
+        assert row["admission_histogram"] == [64] * 10 + [0] * 502
+        assert row["admission_useful_tokens"] == 64
         assert row["ram_experts"] == expected
         assert row["gpu_hint_experts"] == [0]
         assert reads == [1]
         assert provider.trace_path == "must-remain-enabled"
+
+    provider.admission.next_layer = 1
+    assert provider._trace_routes(1, ids, weights) == {}
+    assert provider.trace_path == ""
+    provider.admission.next_layer = 2
+    provider.admission.counts[1, 11] = 1
+    provider.trace_path = "must-remain-enabled"
+    assert provider._trace_routes(1, ids, weights) == {}
+    assert provider.trace_path == ""
+    provider.admission.counts[1, 11] = 0
+    provider.trace_path = "must-remain-enabled"
+    assert provider._trace_routes(1, ids, weights)["admission_useful_tokens"] == 64
+    assert provider.trace_path == "must-remain-enabled"
 
 
 def test_manager_closes_capture_inputs_on_success_failure_and_recovery(monkeypatch):
@@ -390,6 +410,60 @@ def test_normalized_prefill_does_not_outvote_decode_by_physical_m():
     np.testing.assert_array_equal(policy.frequency, before)
 
 
+def test_free_hot_bootstrap_does_not_spend_replacement_allowance():
+    policy = ExpertFrequencyAdmission(1, 8, history_steps=2)
+    policy.observe(np.array([[8, 7, 6, 5, 4, 3, 2, 1]], np.uint32))
+    first = policy.plan(
+        [], list(range(8)), capacity=4, max_promotions=1, fill_free=True
+    )
+    assert first.promotions == (0, 1, 2, 3)
+    assert first.evictions == ()
+    policy.observe(np.array([[0, 0, 0, 0, 20, 19, 18, 17]], np.uint32))
+    second = policy.plan(
+        first.desired, list(range(8)), capacity=4, max_promotions=1, fill_free=True
+    )
+    assert second.promotions == (4,) and second.evictions == (3,)
+    assert len(second.desired) == 4
+
+
+def test_prefill_retention_uses_each_request_tail_and_updates_before_loading():
+    changes = []
+    source = SimpleNamespace(
+        experts=8,
+        layers=2,
+        set_residency_scores=lambda values, *args, **kwargs: changes.append(
+            values.copy()
+        ),
+    )
+    owner = NativeExpertAdmission.__new__(NativeExpertAdmission)
+    owner.bank = SimpleNamespace(source=source, host_hot={})
+    owner.provider = SimpleNamespace(
+        execution_identity=dict(num_reqs=2, tokens=8, query_start_loc=[0, 6, 8]),
+        stream_path=SimpleNamespace(max_m=2),
+    )
+    owner.policy = ExpertFrequencyAdmission(2, 8, history_steps=2)
+    owner.counts = np.zeros((2, 8), np.uint32)
+    owner.next_layer, owner.tokens = 0, None
+    ids = np.array([[0], [0], [1], [2], [3], [4], [5], [6], [-1], [-1]], np.int32)
+    weights = (ids >= 0).astype(np.float32)
+    owner.observe_prefill_layer(0, ids, weights)
+    assert owner.tokens == 6
+    np.testing.assert_array_equal(owner.counts[0], [0, 1, 1, 1, 1, 1, 1, 0])
+    np.testing.assert_array_equal(changes[-1][1], np.zeros(8))
+    assert changes[-1][0, 6] > 0 and changes[-1][0, 0] == 0
+    assert owner.policy.observation == 0  # Partial work is not committed history.
+    owner.observe_prefill_layer(1, ids, weights)
+    np.testing.assert_array_equal(changes[-1][0], changes[-1][1])
+    owner.provider.execution_identity["query_start_loc"] = [0, 9, 8]
+    before = owner.counts.copy()
+    with pytest.raises(ValueError, match="request ranges"):
+        owner.observe_prefill_layer(0, ids, weights)
+    np.testing.assert_array_equal(owner.counts, before)
+    owner.provider.execution_identity["query_start_loc"] = [0, 6, 8]
+    owner.observe_prefill_layer(0, ids, weights)
+    assert owner.next_layer == 1 and owner.policy.observation == 0
+
+
 def test_complete_model_observation_discards_cancelled_tail():
     owner = NativeExpertAdmission.__new__(NativeExpertAdmission)
     owner.bank = bank_fixture()
@@ -461,6 +535,7 @@ def test_peer_assignment_divergence_rejects_before_first_copy(monkeypatch):
     proposal = policy.plan([0, 1, 8, 9], [3, 11], capacity=4, max_promotions=2)
     coordinator = NativeBankCoordinator.__new__(NativeBankCoordinator)
     coordinator.bank, coordinator.ranks = bank, 3
+    coordinator.host_control = False
     coordinator.group = SimpleNamespace(device_group="control")
     coordinator.send, coordinator.recv = (
         torch.empty(72, dtype=torch.int64),
@@ -511,6 +586,9 @@ def asynchronous_fixture(monkeypatch):
     bank = bank_fixture()
     bank.strides = {name: 4 for name in COMPONENTS}
     bank.copy_bytes = bank.copy_calls = 0
+    # This fixture executes publication transitions on CPU; GPU controls
+    # separately verify the actual upload-stream wait on this event.
+    bank.fence = lambda: object()
     bank.source.lock = RLock()
     bank.source.cache = {
         (layer, 3): {name: np.ones(1, np.float32) for name in COMPONENTS}
@@ -519,6 +597,7 @@ def asynchronous_fixture(monkeypatch):
     bank.source.borrow_resident = lambda keys: [bank.source.cache[key] for key in keys]
     coordinator = NativeBankCoordinator.__new__(NativeBankCoordinator)
     coordinator.bank, coordinator.ranks = bank, 3
+    coordinator.host_control = False
     coordinator.group = SimpleNamespace(device_group="control")
     coordinator.send, coordinator.recv = (
         torch.empty(72, dtype=torch.int64),
@@ -578,3 +657,120 @@ def test_async_failure_and_resize_cannot_expose_unfinished_rows(monkeypatch):
         upload.poll()
     assert bank.state == "POISONED" and not bank.pending_promotions
     assert (0, 3) not in bank.host_hot and bank.tables.hot_phys[3] == -1
+
+
+@pytest.mark.parametrize("peer", ["ready", "pending", "generation", "error"])
+def test_host_control_vote_preserves_consensus_without_gpu_transfer(monkeypatch, peer):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import torch
+
+    from vllm.models.qwen4_exp.nvidia.expert_offload_bank import NativeBankCoordinator
+    from vllm.models.qwen4_exp.nvidia.expert_offload_promotion import (
+        NativeExpertPromotion,
+    )
+
+    coordinator = object.__new__(NativeBankCoordinator)
+    coordinator.ranks, coordinator.host_control = 3, True
+    coordinator.send = SimpleNamespace(numel=lambda: 72)
+    coordinator.group = SimpleNamespace(cpu_group=object())
+
+    def gather(recv, send, *, group):
+        assert send.device.type == recv.device.type == "cpu"
+        assert group is coordinator.group.cpu_group
+        recv.view(3, -1).copy_(send.expand(3, -1))
+        if peer == "pending":
+            recv.view(3, -1)[1, 0] = 0
+        elif peer == "generation":
+            recv.view(3, -1)[1, 1] += 1
+        elif peer == "error":
+            recv.view(3, -1)[1, 0] = -1
+
+    monkeypatch.setattr(torch.distributed, "all_gather_single", gather)
+    upload = object.__new__(NativeExpertPromotion)
+    upload.coordinator = coordinator
+    upload.bank = SimpleNamespace(generation=7, state="READY")
+    upload.sequence, upload.pending = 1, ((0, 2, 3),)
+    upload.cancel = Mock()
+    if peer in ("generation", "error"):
+        with pytest.raises(RuntimeError, match="rank-inconsistent"):
+            upload._vote("ready")
+        assert upload.bank.state == "POISONED"
+        upload.cancel.assert_called_once()
+    else:
+        assert upload._vote("ready") is (peer == "ready")
+        assert upload.bank.state == "READY"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        np.array([0, 0], np.int64),
+        np.array([-1], np.int64),
+        np.array([16], np.int64),
+        np.array([0], np.int32),
+        np.array([[0]], np.int64),
+        [0],
+        np.array([True]),
+    ],
+)
+def test_typed_placement_rejects_malformed_keys_and_recovers(bad):
+    policy = ExpertFrequencyAdmission(2, 8, history_steps=2)
+    policy.observe(np.ones((2, 8), np.uint32))
+    available = np.arange(16, dtype=np.int64)
+    with pytest.raises(ValueError):
+        policy.plan_arrays(bad, available, capacity=4, max_promotions=2)
+    actual = policy.plan_arrays(
+        np.array([0, 1], np.int64), available, capacity=4, max_promotions=2
+    )
+    expected = policy.plan([0, 1], available.tolist(), capacity=4, max_promotions=2)
+    assert actual == expected
+
+
+@pytest.mark.parametrize("budget", [0, 1])
+@pytest.mark.parametrize("bitmap", [False, True])
+def test_model_admission_freeze_and_bootstrap_consume_source_snapshot(
+    monkeypatch, budget, bitmap
+):
+    bank = bank_fixture()
+    bank.host_hot.clear()
+    bank.host_rows.clear()
+    bank.copy_bytes = 0
+    bank.source.lock = RLock()
+    bank.source.read_bytes = 0
+    bank.source.cache = {
+        (layer, expert): None for layer in range(2) for expert in range(8)
+    }
+    bank.source.set_residency_scores = lambda *args, **kwargs: 0
+    if bitmap:
+        bank.source.resident_bitmap = lambda: np.ones(16, np.uint8)
+    plans: list = []
+    coordinator = SimpleNamespace(
+        ranks=1,
+        group=SimpleNamespace(device_group="control"),
+        apply_admission=plans.append,
+    )
+    provider = SimpleNamespace(bank=bank, coordinator=coordinator)
+    owner = NativeExpertAdmission(
+        provider,
+        history_steps=2,
+        max_promotions=budget,
+        exclusive_ram=False,
+        asynchronous=False,
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_single",
+        lambda output, value, **kwargs: output.copy_(value),
+    )
+    for layer in range(2):
+        owner.observe_layer(
+            layer,
+            np.arange(8, dtype=np.int32).reshape(1, 8),
+            np.ones((1, 8), np.float32),
+        )
+    owner.finish_step()
+    assert len(plans) == 1
+    assert len(plans[0].promotions) == (bank.tables.pool_rows if budget else 0)
+    assert owner.last_step["available_keys"] == 16

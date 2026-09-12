@@ -181,6 +181,7 @@ class KVCacheCoordinator(ABC):
         self._physical_pool_planner: PhysicalPoolCapacityPlanner | None = None
         self.elastic_external_memory_bytes = 0
         self.elastic_expert_memory_bytes = 0
+        self.elastic_expert_rank_memory_bytes: tuple[int, ...] = ()
         self.last_elastic_rejection: dict[str, object] | None = None
         if separate_gdn_pool:
             pool_sizes = {
@@ -267,7 +268,7 @@ class KVCacheCoordinator(ABC):
     ) -> int:
         if external_memory_bytes is None:
             external_memory_bytes = self.elastic_external_memory_bytes
-        external_memory_bytes += (
+        expert_bytes = (
             self.elastic_expert_memory_bytes
             if expert_memory_bytes is None
             else expert_memory_bytes
@@ -279,11 +280,18 @@ class KVCacheCoordinator(ABC):
             if not (len(primary_surfaces) == len(gdn_surfaces) == len(rank_budgets)):
                 raise RuntimeError("elastic rank capacity surfaces are incomplete")
             quantum = self.kv_cache_config.elastic_mapping_quantum
-            external_mapped = cdiv(external_memory_bytes, quantum) * quantum
+            rank_experts = (
+                self.elastic_expert_rank_memory_bytes
+                if expert_memory_bytes is None
+                else ()
+            ) or (expert_bytes,) * len(rank_budgets)
             capacities = []
-            for primary_bytes, gdn_bytes, budget in zip(
-                primary_surfaces, gdn_surfaces, rank_budgets, strict=True
+            for primary_bytes, gdn_bytes, budget, expert in zip(
+                primary_surfaces, gdn_surfaces, rank_budgets, rank_experts, strict=True
             ):
+                external_mapped = (
+                    cdiv(external_memory_bytes + expert, quantum) * quantum
+                )
                 if not 0 <= gdn_blocks < len(gdn_bytes):
                     return 0
                 available_primary = budget - gdn_bytes[gdn_blocks] - external_mapped
@@ -301,7 +309,7 @@ class KVCacheCoordinator(ABC):
         return self._physical_pool_planner.max_primary_blocks(
             gdn_blocks,
             upper_bound=self.block_pool.num_gpu_blocks,
-            external_bytes=external_memory_bytes,
+            external_bytes=external_memory_bytes + expert_bytes,
         )
 
     def max_elastic_full_context_requests(
@@ -396,7 +404,10 @@ class KVCacheCoordinator(ABC):
         )
 
         def rank_capacities(
-            gdn: int, graph_bytes: int, expert_bytes: int = 0
+            gdn: int,
+            graph_bytes: int,
+            expert_bytes: int = 0,
+            rank_experts: tuple[int, ...] = (),
         ) -> tuple[int, ...]:
             primary = config.elastic_rank_primary_mapped_bytes
             secondary = config.elastic_rank_gdn_mapped_bytes
@@ -405,11 +416,15 @@ class KVCacheCoordinator(ABC):
                 if not (len(primary) == len(secondary) == len(budgets)):
                     raise RuntimeError("elastic rank capacity surfaces are incomplete")
                 quantum = config.elastic_mapping_quantum
-                mapped_graph = cdiv(graph_bytes + expert_bytes, quantum) * quantum
                 capacities = []
-                for primary_bytes, gdn_bytes, budget in zip(
-                    primary, secondary, budgets, strict=True
+                for primary_bytes, gdn_bytes, budget, expert in zip(
+                    primary,
+                    secondary,
+                    budgets,
+                    rank_experts or (expert_bytes,) * len(budgets),
+                    strict=True,
                 ):
+                    mapped_graph = cdiv(graph_bytes + expert, quantum) * quantum
                     if not 0 <= gdn < len(gdn_bytes):
                         capacities.append(0)
                         continue
@@ -423,7 +438,10 @@ class KVCacheCoordinator(ABC):
         raw_gdn = config.elastic_gdn_initial_blocks if self.mamba_block_pool else 0
         raw_blocks = rank_capacities(raw_gdn, 0)
         effective_blocks = rank_capacities(
-            gdn_blocks, external, self.elastic_expert_memory_bytes
+            gdn_blocks,
+            external,
+            self.elastic_expert_memory_bytes,
+            self.elastic_expert_rank_memory_bytes,
         )
 
         def mapped_attention_bytes(blocks_by_rank: tuple[int, ...]) -> tuple[int, ...]:
@@ -465,23 +483,42 @@ class KVCacheCoordinator(ABC):
             "active_gdn_blocks": gdn_blocks,
             "graph_external_bytes": external,
             "expert_borrowed_bytes": self.elastic_expert_memory_bytes,
+            "expert_borrowed_bytes_per_rank": self.elastic_expert_rank_memory_bytes,
             "rank_budget_bytes": tuple(config.elastic_rank_budget_bytes),
         }
 
     def set_elastic_expert_memory(
-        self, requested_bytes: int, minimum_free_primary_blocks: int = 0
+        self,
+        requested_bytes: int,
+        minimum_free_primary_blocks: int = 0,
+        *,
+        rank_requested_bytes: tuple[int, ...] = (),
     ) -> bool:
         """Change a revocable expert grant without relabeling it as Graph memory."""
         requested = self.normalize_elastic_external_memory(requested_bytes)
+        if rank_requested_bytes and (
+            len(rank_requested_bytes)
+            != len(self.kv_cache_config.elastic_rank_budget_bytes)
+            or any(
+                type(v) is not int or v < 0 or v > requested
+                for v in rank_requested_bytes
+            )
+        ):
+            raise ValueError("invalid per-rank expert memory")
         if requested and not self.kv_cache_config.elastic_mapping_quantum:
             return False
         previous = self.elastic_expert_memory_bytes
+        previous_ranks = self.elastic_expert_rank_memory_bytes
         self.elastic_expert_memory_bytes = requested
+        self.elastic_expert_rank_memory_bytes = tuple(
+            self.normalize_elastic_external_memory(v) for v in rank_requested_bytes
+        )
         if self.set_elastic_external_memory(
             self.elastic_external_memory_bytes, minimum_free_primary_blocks
         ):
             return True
         self.elastic_expert_memory_bytes = previous
+        self.elastic_expert_rank_memory_bytes = previous_ranks
         return False
 
     def set_elastic_external_memory(
@@ -566,12 +603,24 @@ class KVCacheCoordinator(ABC):
         minimum_attention_blocks: int = 0,
         gdn_blocks: int | None = None,
     ) -> int:
+        return min(
+            self.max_elastic_external_memory_by_rank(
+                minimum_free_primary_blocks, minimum_attention_blocks, gdn_blocks
+            )
+        )
+
+    def max_elastic_external_memory_by_rank(
+        self,
+        minimum_free_primary_blocks: int = 0,
+        minimum_attention_blocks: int = 0,
+        gdn_blocks: int | None = None,
+    ) -> tuple[int, ...]:
         """Return the largest step-scoped loan the current KV tail can fund."""
         config = self.kv_cache_config
         pool = self.mamba_block_pool
         quantum = config.elastic_mapping_quantum
         if not quantum or pool is None:
-            return 0
+            return (0,) * max(len(config.elastic_rank_budget_bytes), 1)
         if minimum_free_primary_blocks < 0:
             raise ValueError("elastic primary headroom cannot be negative")
         if minimum_attention_blocks < 0:
@@ -596,13 +645,13 @@ class KVCacheCoordinator(ABC):
         # Pricing only the currently active prefix overstates the loan that can
         # coexist with that request and moves the rejection past KV allocation.
         if minimum_attention > self.block_pool.num_gpu_blocks:
-            return 0
+            return (0,) * max(len(config.elastic_rank_budget_bytes), 1)
 
         rank_budgets = config.elastic_rank_budget_bytes
         rank_primary = config.elastic_rank_primary_mapped_bytes
         rank_gdn = config.elastic_rank_gdn_mapped_bytes
         if rank_budgets and rank_primary and rank_gdn:
-            available = min(
+            available = tuple(
                 budget
                 - primary[min(minimum_attention, len(primary) - 1)]
                 - gdn[min(gdn_blocks, len(gdn) - 1)]
@@ -615,10 +664,14 @@ class KVCacheCoordinator(ABC):
             available = (
                 self._physical_pool_planner.budget_bytes
                 - self._physical_pool_planner.primary_mapped_bytes(minimum_attention)
-                - self._physical_pool_planner.secondary_mapped_bytes(gdn_blocks)
+                - self._physical_pool_planner.secondary_mapped_bytes(gdn_blocks),
             )
-        return max(
-            (available - self.elastic_expert_memory_bytes) // quantum * quantum, 0
+        experts = self.elastic_expert_rank_memory_bytes or (
+            self.elastic_expert_memory_bytes,
+        ) * len(available)
+        return tuple(
+            max((value - expert) // quantum * quantum, 0)
+            for value, expert in zip(available, experts, strict=True)
         )
 
     def elastic_gdn_blocks_after_allocation(

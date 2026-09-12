@@ -134,6 +134,12 @@ def load_library(path, expected_sha):
         "fn_task_stats": ([ct.c_void_p] * 2, ct.c_int),
         "fn_task_destroy": ([ct.c_void_p], ct.c_int),
     }
+    for name, signature in {
+        "fn_executor_source_scores": ([ct.c_void_p] * 2 + [ct.c_size_t], ct.c_int),
+        "fn_executor_source_replacement_stats": ([ct.c_void_p] * 2, ct.c_int),
+    }.items():
+        if hasattr(lib, name):
+            signatures[name] = signature
     for name, (args, result) in signatures.items():
         fn = getattr(lib, name)
         fn.argtypes, fn.restype = args, result
@@ -307,6 +313,33 @@ class StreamExecutor:
         )
         return result
 
+    def source_scores(self, scores):
+        values = np.ascontiguousarray(scores, dtype=np.float64)
+        if (
+            values.shape != (self.layers, self.experts)
+            or not np.isfinite(values).all()
+            or np.any(values < 0)
+        ):
+            raise ValueError("invalid native source priorities")
+        require(
+            self.lib.fn_executor_source_scores(self.ptr, pointer(values), values.size),
+            "source priorities",
+        )
+
+    def source_replacement_stats(self):
+        values = np.zeros(3, np.uint64)
+        require(
+            self.lib.fn_executor_source_replacement_stats(self.ptr, pointer(values)),
+            "source replacement stats",
+        )
+        return dict(
+            zip(
+                ("replacement_ns", "indexed_rows", "priority_metadata_bytes"),
+                map(int, values),
+                strict=True,
+            )
+        )
+
     def source_hot(self, keys, *, drop=False):
         values = np.zeros((self.layers, self.experts), np.uint8)
         for layer, expert in keys:
@@ -350,7 +383,7 @@ class StreamExecutor:
             "source export",
         )
 
-    def resident_keys(self):
+    def resident_bitmap(self):
         present = np.zeros(self.layers * self.experts, np.uint8)
         require(
             self.lib.fn_executor_source_resident(
@@ -358,7 +391,10 @@ class StreamExecutor:
             ),
             "source resident snapshot",
         )
-        return np.flatnonzero(present).tolist()
+        return present
+
+    def resident_keys(self):
+        return np.flatnonzero(self.resident_bitmap()).tolist()
 
     def load_rows(self, layer, experts):
         values = np.asarray(experts, np.int32)

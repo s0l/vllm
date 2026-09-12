@@ -235,6 +235,9 @@ class NativeExpertProvider:
         # Demand misses use bounded staging. Only the whole-model admission
         # owner can replace HOT, so layer traversal no longer controls eviction.
         gp.set_gate(self.bank.tables, False)
+        if registered_source:
+            capacity = self.bank.source.cpu.source_stats()["capacity"]
+            self.use_prefetch = capacity >= 2 * self.bank.staging
 
     def _profile(self, layer, hidden, output):
         # Explicit dummy mode is supplied by ModelState, never inferred from
@@ -405,6 +408,10 @@ class NativeExpertProvider:
                             else self.hot_path
                         )
                         resident.propose(layer, validated_waves)
+                    if self.admission is not None:
+                        self.admission.observe_prefill_layer(
+                            layer, cpu_ids, cpu_weights
+                        )
             except Exception as exc:
                 error = exc
             if self.dummy and error is None:
@@ -422,8 +429,6 @@ class NativeExpertProvider:
             assert cpu_weights is not None
             if self.trace_path and self.trace_steps < self.trace_limit:
                 route_trace = self._trace_routes(layer, cpu_ids, cpu_weights)
-            if self.admission is not None:
-                self.admission.observe_layer(layer, cpu_ids, cpu_weights)
             if hidden.shape[0] == 0:
                 output.zero_()
                 return
@@ -603,6 +608,23 @@ class NativeExpertProvider:
             )
             if len(ids) <= 64:
                 route.update(ids=ids.tolist(), weights=weights.tolist())
+            if self.admission is not None:
+                admission = self.admission
+                retained = admission.counts[layer]
+                if (
+                    admission.next_layer != layer + 1
+                    or admission.tokens is None
+                    or not 0 <= admission.tokens <= useful_tokens
+                    or retained.shape != counts.shape
+                    or np.any(retained > counts)
+                ):
+                    raise ValueError("stale or invalid expert retention observation")
+                # Full-block totals cannot reconstruct request-local tails.
+                # Snapshot the actual policy input without another GPU readback.
+                route.update(
+                    admission_histogram=retained.tolist(),
+                    admission_useful_tokens=admission.tokens,
+                )
             return route
         except Exception as error:
             self._disable_trace(error)

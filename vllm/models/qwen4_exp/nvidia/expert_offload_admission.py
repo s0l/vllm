@@ -50,6 +50,7 @@ def cache_snapshot(bank):
         ram_keys = set(ram)
         overlap = hot_keys & ram_keys
         pinned = source.pinned_pool
+        controller = getattr(bank, "elastic_controller", None)
         return dict(
             schema="native-expert-residency-v1",
             generation=bank.generation,
@@ -59,6 +60,10 @@ def cache_snapshot(bank):
             hot_map_role="published_host_hint; device ownership checked at consumption",
             ram_keys=ram,
             hot_resident_keys=len(hot),
+            hot_unfilled_rows=bank.tables.pool_rows - len(hot),
+            elastic_physical_memory=None
+            if controller is None
+            else controller.physical_memory_receipt(),
             ram_resident_keys=len(ram),
             gpu_ram_duplicate_keys=len(overlap),
             gpu_ram_duplicate_payload_bytes=len(overlap) * sum(bank.strides.values()),
@@ -212,48 +217,110 @@ class ExpertFrequencyAdmission:
             raise ValueError("invalid or duplicate expert key")
         return set(keys)
 
-    def plan(self, resident, available, *, capacity, max_promotions, protected=()):
+    def plan(
+        self,
+        resident,
+        available,
+        *,
+        capacity,
+        max_promotions,
+        protected=(),
+        fill_free=False,
+    ):
+        arrays = [
+            np.fromiter(self._keys(values), dtype=np.int64)
+            for values in (resident, available, protected)
+        ]
+        return self.plan_arrays(
+            *arrays[:2],
+            protected=arrays[2],
+            capacity=capacity,
+            max_promotions=max_promotions,
+            fill_free=fill_free,
+        )
+
+    def plan_arrays(
+        self,
+        resident,
+        available,
+        *,
+        capacity,
+        max_promotions,
+        protected=None,
+        fill_free=False,
+    ):
         if (
             type(capacity) is not int
             or not 0 <= capacity <= self.layers * self.experts
             or type(max_promotions) is not int
             or max_promotions < 0
+            or type(fill_free) is not bool
         ):
             raise ValueError("invalid expert admission budget")
-        current, available, protected = map(
-            self._keys, (resident, available, protected)
-        )
-        if not protected <= current or len(protected) > capacity:
-            raise ValueError("expert shrink would evict an active lease")
         scores = self.frequency.reshape(-1)
-        # Stable residents win equal scores: a tie cannot pay for a transfer.
-        preference = lambda k: (-float(scores[k]), k not in current, k)
-        retained = sorted(current - protected, key=preference)
-        desired = protected | set(retained[: capacity - len(protected)])
-        candidates = sorted(
-            (k for k in available - current if scores[k] > 0), key=preference
-        )
-        victims = deque(
-            sorted(desired - protected, key=lambda k: (float(scores[k]), -k))
-        )
+
+        def mask(values):
+            if (
+                not isinstance(values, np.ndarray)
+                or values.ndim != 1
+                or values.dtype != np.int64
+                or np.any(values < 0)
+                or np.any(values >= scores.size)
+            ):
+                raise ValueError("invalid typed expert keys")
+            result = np.zeros(scores.size, dtype=np.bool_)
+            result[values] = True
+            if int(result.sum()) != len(values):
+                raise ValueError("duplicate expert keys")
+            return result
+
+        current, available = mask(resident), mask(available)
+        protected = mask(np.empty(0, np.int64) if protected is None else protected)
+        protected_count = int(protected.sum())
+        if np.any(protected & ~current) or protected_count > capacity:
+            raise ValueError("expert shrink would evict an active lease")
+
+        def ranked(selected, *, weakest=False):
+            keys = np.flatnonzero(selected)
+            order = (
+                np.lexsort((-keys, scores[keys]))
+                if weakest
+                else np.lexsort((keys, -scores[keys]))
+            )
+            return keys[order]
+
+        desired = protected.copy()
+        retained = ranked(current & ~protected)
+        desired[retained[: capacity - protected_count]] = True
+        size = int(desired.sum())
+        limit = max_promotions + (capacity - size if fill_free else 0)
+        candidates = ranked(available & ~current & (scores > 0))
+        victims = ranked(desired & ~protected, weakest=True)
+        victim_index = 0
         promoted: list[int] = []
         for candidate in candidates:
-            if len(promoted) == max_promotions:
+            if len(promoted) == limit:
                 break
-            if len(desired) == capacity:
-                if not victims or scores[candidate] <= scores[victims[0]]:
+            if size == capacity:
+                if (
+                    victim_index == len(victims)
+                    or scores[candidate] <= scores[victims[victim_index]]
+                ):
                     break
-                desired.remove(victims.popleft())
-            desired.add(candidate)
-            promoted.append(candidate)
+                desired[victims[victim_index]] = False
+                victim_index += 1
+            else:
+                size += 1
+            desired[candidate] = True
+            promoted.append(int(candidate))
         return ExpertAdmissionPlan(
             self.observation,
             capacity,
-            tuple(sorted(current)),
-            tuple(sorted(desired)),
+            tuple(np.flatnonzero(current).tolist()),
+            tuple(np.flatnonzero(desired).tolist()),
             tuple(promoted),
-            tuple(sorted(current - desired)),
-            tuple(sorted(protected)),
+            tuple(np.flatnonzero(current & ~desired).tolist()),
+            tuple(np.flatnonzero(protected).tolist()),
         )
 
     def validate(self, proposal, resident):
@@ -284,6 +351,7 @@ class NativeExpertAdmission:
         exclusive_ram,
         asynchronous=True,
         registered_source=False,
+        host_control=False,
     ):
         import torch
 
@@ -294,6 +362,9 @@ class NativeExpertAdmission:
             raise ValueError("invalid RAM ownership policy")
         if registered_source and not asynchronous:
             raise ValueError("registered source requires asynchronous promotion")
+        if type(host_control) is not bool or (host_control and not asynchronous):
+            raise ValueError("host control requires asynchronous promotion")
+        provider.coordinator.host_control = host_control
         self.provider, self.bank = provider, bank
         self.policy = ExpertFrequencyAdmission(
             bank.source.layers, bank.source.experts, history_steps=history_steps
@@ -312,12 +383,14 @@ class NativeExpertAdmission:
             bank.promotion_staging_bytes = self.promotion.staging_bytes
         packed = (self.counts.size + 7) // 8
         self.availability = torch.empty(
-            packed + 33, dtype=torch.uint8, device=bank.device
+            packed + 33,
+            dtype=torch.uint8,
+            device="cpu" if host_control else bank.device,
         )
         self.peer_availability = torch.empty(
             (packed + 33) * provider.coordinator.ranks,
             dtype=torch.uint8,
-            device=bank.device,
+            device=self.availability.device,
         )
 
     def observe_layer(self, layer, ids, weights):
@@ -335,6 +408,51 @@ class NativeExpertAdmission:
         self.tokens = tokens
         self.next_layer += 1
 
+    def observe_prefill_layer(self, layer, ids, weights):
+        """Retain each request's recent routes while its source rows are present."""
+        identity = getattr(self.provider, "execution_identity", None)
+        stream = self.provider.stream_path
+        horizon = self.policy.history_steps * (stream.max_m if stream else 1)
+        selected = None
+        if identity is not None:
+            offsets = identity["query_start_loc"]
+            if (
+                len(offsets) != identity["num_reqs"] + 1
+                or not offsets
+                or offsets[0] != 0
+                or offsets[-1] != identity["tokens"]
+                or offsets[-1] > len(ids)
+                or any(type(v) is not int for v in offsets)
+                or any(a > b for a, b in zip(offsets, offsets[1:]))
+            ):
+                raise ValueError("invalid request ranges for expert retention")
+            selected = (
+                np.concatenate(
+                    [
+                        np.arange(max(start, end - horizon), end)
+                        for start, end in zip(offsets, offsets[1:])
+                    ]
+                )
+                if identity["num_reqs"]
+                else np.array([], dtype=np.int64)
+            )
+        # Standalone callers without request boundaries retain all supplied
+        # rows; guessing a concatenated batch's tail would starve earlier requests.
+        self.observe_layer(
+            layer,
+            ids if selected is None else ids[selected],
+            weights if selected is None else weights[selected],
+        )
+        if layer == 0:
+            self.retention_scores = self.policy.frequency.copy()
+        if self.tokens:
+            self.retention_scores[layer] += self.counts[layer] / self.tokens
+        self.bank.source.set_residency_scores(
+            self.retention_scores,
+            (),
+            gpu_hot_keys=self.bank.host_hot,
+        )
+
     def finish_step(self):
         import time
 
@@ -344,11 +462,21 @@ class NativeExpertAdmission:
         if self.next_layer != source.layers or bank.state != "READY" or bank.leases:
             raise RuntimeError("expert admission requires a completed unleased model")
         started = time.perf_counter()
+        phases = {}
+        phase_start = started
+
+        def mark(name):
+            nonlocal phase_start
+            now = time.perf_counter()
+            phases[name] = (now - phase_start) * 1000
+            phase_start = now
+
         self.next_layer = 0
         if not self.tokens:
             self.last_step = dict(promotions=0, reason="padding-only model step")
             return
         self.policy.observe(self.counts, useful_tokens=self.tokens)
+        mark("history_ms")
         was_pending = self.promotion is not None and self.promotion.pending is not None
         pending = self.promotion is not None and not self.promotion.poll()
         completed_copy = (
@@ -356,6 +484,7 @@ class NativeExpertAdmission:
             if self.promotion is not None and was_pending and not pending
             else None
         )
+        mark("publish_ms")
         # RAM scores describe residual demand after VRAM ownership. Retiring a
         # cache reference cannot recycle a still-leased pinned source row.
         error = None
@@ -367,10 +496,20 @@ class NativeExpertAdmission:
                 gpu_hot_keys=bank.host_hot,
             )
             with source.lock:
-                for layer, expert in source.cache:
-                    available[layer * source.experts + expert] = 1
+                if hasattr(source, "resident_bitmap"):
+                    available = source.resident_bitmap()
+                    if (
+                        available.dtype != np.uint8
+                        or available.shape != (self.counts.size,)
+                        or np.any(available > 1)
+                    ):
+                        raise ValueError("invalid source residency bitmap")
+                else:
+                    for layer, expert in source.cache:
+                        available[layer * source.experts + expert] = 1
         except Exception as exc:
             error = exc
+        mark("source_scores_and_keys_ms")
         identity = sha256(
             self.policy.frequency.tobytes()
             + repr((self.policy.observation, bank.generation, pending)).encode()
@@ -387,9 +526,12 @@ class NativeExpertAdmission:
         torch.distributed.all_gather_single(
             self.peer_availability,
             self.availability,
-            group=coordinator.group.device_group,
+            group=coordinator.group.cpu_group
+            if coordinator.host_control
+            else coordinator.group.device_group,
         )
         peers = self.peer_availability.cpu().numpy().reshape(coordinator.ranks, -1)
+        mark("availability_consensus_ms")
         if (
             not (peers[:, 0] == 1).all()
             or not (peers[:, 1:33] == peers[:1, 1:33]).all()
@@ -403,32 +545,42 @@ class NativeExpertAdmission:
                 promotions=0,
                 pending=True,
                 completed_copy=completed_copy,
+                phases_ms=phases,
                 wall_ms=(time.perf_counter() - started) * 1000,
             )
             return
         common = np.unpackbits(np.bitwise_and.reduce(peers[:, 33:], axis=0))[
             : self.counts.size
         ]
-        resident = [layer * source.experts + expert for layer, expert in bank.host_hot]
-        proposal = self.policy.plan(
+        resident = np.fromiter(
+            (layer * source.experts + expert for layer, expert in bank.host_hot),
+            dtype=np.int64,
+        )
+        proposal = self.policy.plan_arrays(
             resident,
-            np.flatnonzero(common).tolist(),
+            np.flatnonzero(common),
             capacity=bank.tables.pool_rows,
             max_promotions=self.max_promotions,
+            # Zero disables admission, including bootstrap, for frozen controls.
+            fill_free=self.max_promotions > 0,
         )
-        self.policy.validate(proposal, resident)
+        # The bank validates actual current ownership again before retirement.
+        mark("placement_plan_ms")
         before_copy, before_read = bank.copy_bytes, source.read_bytes
         if self.promotion is None:
             coordinator.apply_admission(proposal)
         else:
             self.promotion.start(proposal)
+        mark("upload_reserve_launch_ms")
         released = source.set_residency_scores(
             self.policy.frequency,
             bank.host_hot if self.exclusive_ram else (),
             gpu_hot_keys=bank.host_hot,
         )
+        mark("source_after_retire_ms")
         self.last_step = dict(
             observation=self.policy.observation,
+            phases_ms=phases,
             promotions=len(proposal.promotions),
             completed_copy=completed_copy,
             evictions=len(proposal.evictions),

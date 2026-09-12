@@ -210,6 +210,33 @@ class NativeExpertBudget:
             hot_rows, self.mapped_bytes(hot_rows) - self.base_bytes
         )
 
+    def rank_borrowed_bytes(self, hot_rows):
+        """Physical growth above each rank's already profiled staging bank."""
+        return tuple(
+            self.rank_mapped_bytes(rank, hot_rows) - self.rank_mapped_bytes(rank, 0)
+            for rank in range(self.geometry.tp)
+        )
+
+    def fit_by_rank(self, available_bytes, *, max_rows=None):
+        if len(available_bytes) != self.geometry.tp or any(
+            type(value) is not int or value < 0 for value in available_bytes
+        ):
+            raise ValueError("invalid rank expert free budgets")
+        lo, hi = 0, self.max_hot_rows if max_rows is None else max_rows
+        self.mapped_bytes(hi)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if all(
+                used <= available
+                for used, available in zip(
+                    self.rank_borrowed_bytes(mid), available_bytes, strict=True
+                )
+            ):
+                lo = mid
+            else:
+                hi = mid - 1
+        return self.grant(lo)
+
     def fit(self, available_bytes, *, max_rows=None):
         if type(available_bytes) is not int or available_bytes < 0:
             raise ValueError("invalid expert free budget")

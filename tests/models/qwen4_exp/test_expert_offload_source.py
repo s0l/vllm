@@ -557,6 +557,8 @@ def _prefetch_bank(source, sample=None):
     bank.prefetch_ids = ()
     bank.next_demand = None
     bank.prepared = {}
+    bank.prepared_native = {}
+    bank.prefetch_region = None
     bank.prefetch_experts = bank.prefetch_consumed = 0
     sample = source.get(0, 0) if sample is None else sample
     bank.shapes = {name: value.shape for name, value in sample.items()}
@@ -571,6 +573,49 @@ def _prefetch_bank(source, sample=None):
     bank.pinned, bank.pinned_numpy = buffers()
     bank.next_pinned = bank.next_pinned_numpy = None
     return bank
+
+
+def test_registered_prefetch_retains_native_views_and_rejects_stale_region():
+    from types import SimpleNamespace
+
+    sample = {"w": np.zeros((2, 2), np.uint8)}
+    supplied = []
+
+    def get_many(layer, experts):
+        rows = [{"w": np.full((2, 2), layer * 16 + e, np.uint8)} for e in experts]
+        for row in rows:
+            row["w"].flags.writeable = False
+        supplied.append(rows)
+        return rows
+
+    source = SimpleNamespace(pin_cache=False, get_many=get_many)
+    bank = _prefetch_bank(source, sample)
+    region = SimpleNamespace(registered=True)
+    bank.registered_source_region = region
+
+    def forbidden(*args):
+        raise AssertionError("registered prefetch allocated or copied pinned staging")
+
+    bank._allocate_pinned = bank._fill_pinned = forbidden
+    try:
+        bank.prefetch(1, [0, 1, 2])
+        bank._finish_prefetch(1)
+        assert set(bank.prepared_native) == {1, 2} and not bank.prepared
+        assert bank.prepared_native[1] is supplied[-1][0]
+        assert bank.next_pinned is None
+        bank.prefetch(1, [3])
+        bank.prefetch_future.result()
+        bank.registered_source_region = SimpleNamespace(registered=True)
+        with pytest.raises(RuntimeError, match="stale registered"):
+            bank._finish_prefetch(1)
+        assert not bank.prepared_native and bank.prefetch_future is None
+        bank.registered_source_region = region
+        bank.prefetch(1, [2])
+        bank._finish_prefetch(1)
+        assert set(bank.prepared_native) == {2}
+    finally:
+        bank.close_prefetch()
+    assert not bank.prepared_native
 
 
 def test_exact_prefetch_excludes_hot_and_retains_bypassed_rows(tmp_path):

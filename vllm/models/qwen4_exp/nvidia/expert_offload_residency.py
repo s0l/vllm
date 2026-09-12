@@ -37,6 +37,7 @@ class NativeExpertResidency:
             controller.backings[name] = backing
             controller.auxiliary_targets[name] = backing.info.committed
         controller.auxiliary_owner = self
+        self.bank.elastic_controller = controller
 
     @property
     def pending(self):

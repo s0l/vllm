@@ -3338,18 +3338,25 @@ class Scheduler(SchedulerInterface):
         if budget is None:
             return None
         coordinator = self.kv_cache_manager.coordinator
-        available = (
-            coordinator.max_elastic_external_memory(
+        available = tuple(
+            max(value - coordinator.elastic_external_memory_bytes, 0)
+            for value in coordinator.max_elastic_external_memory_by_rank(
                 minimum_free_primary_blocks=minimum_free_primary_blocks
             )
-            - coordinator.elastic_external_memory_bytes
         )
-        grant = budget.fit(
-            max(available, 0),
-            max_rows=None if has_user_tokens else self._elastic_native_hot_rows,
+        max_rows = None if has_user_tokens else self._elastic_native_hot_rows
+        ranked = len(available) == budget.geometry.tp
+        grant = (
+            budget.fit_by_rank(available, max_rows=max_rows)
+            if ranked
+            else budget.fit(min(available), max_rows=max_rows)
         )
         if not coordinator.set_elastic_expert_memory(
-            grant.borrowed_bytes, minimum_free_primary_blocks
+            grant.borrowed_bytes,
+            minimum_free_primary_blocks,
+            rank_requested_bytes=budget.rank_borrowed_bytes(grant.hot_rows)
+            if ranked
+            else (),
         ):
             raise RuntimeError("expert grant disagrees with admitted free KV tail")
         self._elastic_native_hot_rows = grant.hot_rows

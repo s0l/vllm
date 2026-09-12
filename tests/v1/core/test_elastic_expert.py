@@ -69,6 +69,66 @@ def test_native_quantum_curve_and_maximal_fit(staging):
             assert budget.fit(grant.borrowed_bytes - 1).hot_rows < hot
 
 
+@pytest.mark.parametrize("tp", [1, 2, 3, 4, 5])
+def test_compact_rank_fit_is_maximal_and_accounts_actual_arrays(tp):
+    budget = NativeExpertBudget.from_config(
+        make_config(
+            dict(
+                max_hot_rows=128,
+                ram_cache_total_bytes=1 << 30,
+                pin_ram_cache=True,
+                hot_read=True,
+                prepared_archive="/prepared",
+                stream_experts=dict(
+                    library="/executor.so",
+                    sha256="a" * 64,
+                    cores=list(range(tp * 2)),
+                    max_m=4,
+                    history_steps=16,
+                    max_promotions=192,
+                ),
+            ),
+            tp,
+        )
+    )
+    q = 2 << 20
+    for hot in (0, 17, 64, 127):
+        expected = []
+        for rank in range(tp):
+            width = min(budget.geometry.local, 640 - rank * budget.geometry.local)
+            # Four physical arrays; scalars are already resident at zero HOT.
+            strides = (
+                2 * width * 1280,
+                2560 * width // 2,
+                2 * width * 160,
+                2560 * width // 16,
+            )
+            expected.append(
+                sum(
+                    ((hot + 32) * s + q - 1) // q * q - (32 * s + q - 1) // q * q
+                    for s in strides
+                )
+            )
+        assert budget.rank_borrowed_bytes(hot) == tuple(expected)
+        grant = budget.fit_by_rank(expected)
+        assert grant.hot_rows >= hot
+        assert all(
+            a <= b
+            for a, b in zip(
+                budget.rank_borrowed_bytes(grant.hot_rows), expected, strict=True
+            )
+        )
+        if grant.hot_rows < 128:
+            assert any(
+                a > b
+                for a, b in zip(
+                    budget.rank_borrowed_bytes(grant.hot_rows + 1),
+                    expected,
+                    strict=True,
+                )
+            )
+
+
 @pytest.mark.parametrize(
     "options",
     [
@@ -247,6 +307,73 @@ def test_expert_grant_cannot_cross_a_pinned_kv_tail():
     assert coordinator.elastic_expert_memory_bytes == 0 and pinned.ref_cnt == 1
     assert coordinator.set_elastic_expert_memory(available)
     assert coordinator.block_pool.active_num_gpu_blocks == 121
+
+
+def test_rank_expert_charge_preserves_capacity_and_rejects_pinned_tail():
+    coordinator = make_coordinator()
+    q = 2 << 20
+    # Smaller rank2 budget and shard: a replicated charge needlessly caps KV.
+    coordinator.kv_cache_config.elastic_rank_budget_bytes = (132 * q, 132 * q, 116 * q)
+    assert coordinator.set_elastic_expert_memory(32 * q)
+    assert coordinator.block_pool.active_num_gpu_blocks == 80
+    assert coordinator.set_elastic_expert_memory(
+        32 * q, rank_requested_bytes=(32 * q, 32 * q, 16 * q)
+    )
+    assert coordinator.block_pool.active_num_gpu_blocks == 96
+    receipt = coordinator.elastic_kv_authority_receipt(8)
+    assert receipt["effective_attention_blocks_per_rank"] == (96, 96, 96)
+    assert receipt["expert_borrowed_bytes_per_rank"] == (32 * q, 32 * q, 16 * q)
+    pinned = coordinator.block_pool.blocks[95]
+    coordinator.block_pool.touch([pinned])
+    assert not coordinator.set_elastic_expert_memory(
+        33 * q, rank_requested_bytes=(33 * q, 33 * q, 17 * q)
+    )
+    assert coordinator.elastic_expert_rank_memory_bytes == (32 * q, 32 * q, 16 * q)
+    assert pinned.ref_cnt == 1
+    coordinator.block_pool.free_blocks([pinned])
+    assert coordinator.set_elastic_expert_memory(0)
+    assert coordinator.elastic_expert_rank_memory_bytes == ()
+    assert coordinator.block_pool.active_num_gpu_blocks == 112
+
+
+@pytest.mark.parametrize("bad", [(1, 2), (1, -1, 1), (1, True, 1), (1, 4 << 20, 1)])
+def test_invalid_rank_expert_charge_leaves_authority_unchanged(bad):
+    coordinator = make_coordinator()
+    with pytest.raises(ValueError):
+        coordinator.set_elastic_expert_memory(2, rank_requested_bytes=bad)
+    assert coordinator.elastic_expert_memory_bytes == 0
+    assert coordinator.elastic_expert_rank_memory_bytes == ()
+
+
+def test_physical_receipt_distinguishes_kv_tail_from_expert_allocation():
+    from vllm.v1.worker.gpu.elastic_gdn import ElasticKVController
+
+    q = 2 << 20
+    controller = ElasticKVController(torch.device("cpu"))
+    controller.backings = {
+        name: SimpleNamespace(info=SimpleNamespace(committed=committed, quantum=q))
+        for name, committed in (
+            ("elastic-attention-0", 8 * q),
+            ("elastic-gdn", 2 * q),
+            ("native-w13", 3 * q),
+        )
+    }
+    controller.geometry = {"elastic-attention-0": q, "elastic-gdn": q}
+    controller.auxiliary_targets = {"native-w13": 3 * q}
+    controller._physical_budget_bytes = 15 * q
+    controller._external_memory_bytes = 2 * q
+    controller._logical_transition = (3, 2)
+    receipt = controller.physical_memory_receipt()
+    owners = {row["owner"]: row for row in receipt["backings"]}
+    assert owners["elastic-attention-0"]["retained_tail_bytes"] == 5 * q
+    assert owners["native-w13"]["retained_tail_bytes"] == 0
+    assert sum(row["mapped_bytes"] for row in owners.values()) == 13 * q
+    controller._logical_transition = (7, 2)
+    assert (
+        controller.physical_memory_receipt()["backings"][0]["retained_tail_bytes"] == q
+    )
+    controller._logical_transition = None
+    assert controller.physical_memory_receipt()["backings"][0]["required_bytes"] is None
 
 
 def test_expert_grant_changes_both_plan_and_replay_epoch_identity():

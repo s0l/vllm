@@ -87,6 +87,8 @@ class NativeExpertBank:
         )
         self.pinned, self.pinned_numpy = self._allocate_pinned()
         self.next_pinned = self.next_pinned_numpy = None
+        self.prepared_native = {}
+        self.prefetch_region = None
         self.tables = gp.allocate_global_tables(
             device, source.experts, [0] * source.layers, staging
         )
@@ -309,17 +311,22 @@ class NativeExpertBank:
                 return
             if len(missing) > self.staging:
                 raise ValueError("native prefetch exceeds one staging wave")
-            if self.next_pinned is None:
+            region = getattr(self, "registered_source_region", None)
+            if region is None and self.next_pinned is None:
                 self.next_pinned, self.next_pinned_numpy = self._allocate_pinned()
             if self.prefetch_reader is None:
                 self.prefetch_reader = ThreadPoolExecutor(
                     max_workers=1, thread_name_prefix="expert-next-wave"
                 )
             self.prefetch_layer, self.prefetch_ids = layer, missing
+            self.prefetch_region = region
 
             def fill():
                 rows = self.source.get_many(layer, missing)
+                if region is not None:
+                    return rows
                 self._fill_pinned(rows, range(len(missing)), self.next_pinned_numpy)
+                return None
 
             self.prefetch_future = self.prefetch_reader.submit(fill)
             self.prefetch_experts += len(missing)
@@ -336,17 +343,27 @@ class NativeExpertBank:
 
     def _finish_prefetch(self, layer):
         self.prepared.clear()
+        self.prepared_native.clear()
         future, self.prefetch_future = self.prefetch_future, None
         error, self.prefetch_error = self.prefetch_error, None
         try:
-            if future is not None:
-                future.result()
+            rows = None if future is None else future.result()
             if error is not None:
                 raise error
             if future is None:
                 return
             if layer != self.prefetch_layer:
                 raise RuntimeError("stale native prefetch layer")
+            if self.prefetch_region is not None:
+                if (
+                    self.prefetch_region
+                    is not getattr(self, "registered_source_region", None)
+                    or rows is None
+                    or len(rows) != len(self.prefetch_ids)
+                ):
+                    raise RuntimeError("stale registered prefetch source")
+                self.prepared_native = dict(zip(self.prefetch_ids, rows, strict=True))
+                return
             # begin runs only after the preceding copy event and compute lease
             # completed. Neither buffer has an outstanding DMA reader now.
             self.pinned, self.next_pinned = self.next_pinned, self.pinned
@@ -357,6 +374,8 @@ class NativeExpertBank:
             self.prepared = {expert: i for i, expert in enumerate(self.prefetch_ids)}
         finally:
             self.prefetch_layer, self.prefetch_ids = None, ()
+            self.prefetch_region = None
+            future = rows = None
 
     def drain_prefetch(self):
         """Cancellation joins CPU readers before releasing their source epoch."""
@@ -365,6 +384,7 @@ class NativeExpertBank:
                 self._finish_prefetch(self.prefetch_layer)
             finally:
                 self.prepared.clear()
+                self.prepared_native.clear()
                 self.next_demand = None
 
     def close_prefetch(self):
@@ -386,6 +406,22 @@ class NativeExpertBank:
             row: Any = None
             try:
                 pairs = sorted(plan.copies, key=lambda pair: pair[1])
+                region = getattr(self, "registered_source_region", None)
+                if region is not None:
+                    missing = [e for e, _ in pairs if e not in self.prepared_native]
+                    self.prefetch_consumed += len(pairs) - len(missing)
+                    self.prepared_native.update(
+                        zip(
+                            missing,
+                            self.source.get_many(plan.layer, missing),
+                            strict=True,
+                        )
+                    )
+                    rows = [self.prepared_native[e] for e, _ in pairs]
+                    self._copy_native_rows(rows, [slot for _, slot in pairs], region)
+                    self.direct_rows += len(pairs)
+                    self.start_next()
+                    return
                 missing = [e for e, _ in pairs if e not in self.prepared]
                 self.prefetch_consumed += sum(e in self.prepared for e, _ in pairs)
                 positions = dict(self.prepared)
@@ -473,6 +509,62 @@ class NativeExpertBank:
                 # DMA has drained, it must not keep evicted source row leases.
                 rows = ordinary = row = None
                 self.prepared.clear()
+                self.prepared_native.clear()
+
+    def _copy_native_rows(self, rows, destinations, region):
+        """Copy leased immutable native RAM directly, without a second host copy."""
+        if not rows:
+            return
+        from vllm import _custom_ops as ops
+
+        if not region.registered or len(rows) != len(destinations):
+            raise ValueError("unavailable registered source generation")
+        sources, targets, sizes = [], [], []
+        for row, slot in zip(rows, destinations, strict=True):
+            if not 0 <= slot < self.rows:
+                raise ValueError("native DMA destination outside committed bank")
+            for name in COMPONENTS:
+                value = row[name]
+                address, nbytes = value.ctypes.data, value.nbytes
+                if (
+                    not value.flags.c_contiguous
+                    or value.flags.writeable
+                    or nbytes != self.strides[name]
+                    or address < region.address
+                    or address + nbytes > region.address + region.nbytes
+                ):
+                    raise ValueError("native DMA source outside leased layout")
+                sources.append(address)
+                targets.append(
+                    self.consumer_views[name].data_ptr() + slot * self.strides[name]
+                )
+                sizes.append(nbytes)
+        descriptors = [
+            torch.from_numpy(np.asarray(values, np.int64))
+            for values in (sources, targets, sizes)
+        ]
+        current = stream = torch.cuda.current_stream(self.device)
+        if stream.cuda_stream == 0:
+            if self.dma_stream is None:
+                self.dma_stream = torch.cuda.Stream(device=self.device)
+            stream = self.dma_stream
+            stream.wait_stream(current)
+        try:
+            with torch.cuda.stream(stream):
+                ops.swap_blocks_batch(
+                    descriptors[0],
+                    descriptors[1],
+                    descriptors[2],
+                    is_src_access_order_any=True,
+                )
+            self.copy_calls += 1
+            self.copy_bytes += sum(sizes)
+            self.completed.update(
+                (slot, name) for slot in destinations for name in COMPONENTS
+            )
+        finally:
+            if stream is not current:
+                current.wait_stream(stream)
 
     def _copy_registered(self, groups):
         if not groups:
@@ -809,6 +901,21 @@ class NativeBankCoordinator:
         )
         self.copy_vote = torch.empty(1, dtype=torch.int32, device=bank.device)
         self.plan_votes = self.copy_votes = self.hot_steps = 0
+        self.host_control = False
+
+    def exchange_control(self, payload):
+        """Exchange host-owned metadata; this is not a CUDA completion fence."""
+        if self.host_control:
+            send = torch.tensor(payload, dtype=torch.int64, device="cpu")
+            recv = torch.empty(self.ranks * send.numel(), dtype=send.dtype)
+            torch.distributed.all_gather_single(recv, send, group=self.group.cpu_group)
+        else:
+            self.send.copy_(torch.tensor(payload, dtype=torch.int64))
+            torch.distributed.all_gather_single(
+                self.recv, self.send, group=self.group.device_group
+            )
+            recv = self.recv
+        return recv.view(self.ranks, -1).cpu().numpy()
 
     def admit_routes(
         self, layer, ids, weights, *, error=None, dummy=False, resident=None
@@ -929,11 +1036,7 @@ class NativeBankCoordinator:
             error, digest = exc, bytes(32)
         payload = [int(error is None), bank.generation] + list(digest)
         payload += [-1] * (self.send.numel() - len(payload))
-        self.send.copy_(torch.tensor(payload, dtype=torch.int64))
-        torch.distributed.all_gather_single(
-            self.recv, self.send, group=self.group.device_group
-        )
-        peers = self.recv.view(self.ranks, -1).cpu().numpy()
+        peers = self.exchange_control(payload)
         if not (peers[:, 0] == 1).all() or not (peers == peers[:1]).all():
             bank.state = "POISONED"
             raise RuntimeError("rank-inconsistent expert assignment") from error

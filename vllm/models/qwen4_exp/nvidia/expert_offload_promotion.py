@@ -40,20 +40,18 @@ class NativeExpertPromotion:
         self.bank.promotion_registered_source_bytes = (
             0 if self.registration is None else self.registration.nbytes
         )
+        self.bank.registered_source_region = self.registration
         self.future, self.pending = None, None
         self.sequence = 0
         self.last_step = {}
+        self.invalidation_fence = None
 
     def _vote(self, phase, *, ready=1, error=None):
         bank, coordinator = self.bank, self.coordinator
         digest = sha256(repr((phase, self.sequence, self.pending)).encode()).digest()
         payload = [-1 if error is not None else ready, bank.generation] + list(digest)
         payload += [-1] * (coordinator.send.numel() - len(payload))
-        coordinator.send.copy_(torch.tensor(payload, dtype=torch.int64))
-        torch.distributed.all_gather_single(
-            coordinator.recv, coordinator.send, group=coordinator.group.device_group
-        )
-        peers = coordinator.recv.view(coordinator.ranks, -1).cpu().numpy()
+        peers = coordinator.exchange_control(payload)
         if (peers[:, 0] < 0).any() or not (peers[:, 1:] == peers[:1, 1:]).all():
             bank.state = "POISONED"
             self.cancel()
@@ -66,7 +64,9 @@ class NativeExpertPromotion:
         if self.pending is not None:
             raise RuntimeError("expert upload already pending")
         bank = self.bank
+        started = time.perf_counter()
         assignments = self.coordinator.admission_assignments(proposal)
+        assigned = time.perf_counter()
         if not assignments:
             self.last_step = dict(promotions=0, pending=False)
             return
@@ -75,7 +75,7 @@ class NativeExpertPromotion:
         rows, error = None, None
         try:
             with bank.lock, bank.source.lock:
-                if bank.leases or bank.state != "READY" or bool(bank.tables.gate[0]):
+                if bank.leases or bank.state != "READY":
                     raise RuntimeError(
                         "asynchronous admission requires exclusive placement authority"
                     )
@@ -84,6 +84,7 @@ class NativeExpertPromotion:
                 rows = bank.source.borrow_resident(
                     [(layer, expert) for layer, expert, _ in assignments]
                 )
+                borrowed = time.perf_counter()
                 if any(set(row) != set(COMPONENTS) for row in rows):
                     raise ValueError("incomplete upload source bundle")
                 slots = [r for _, _, r in assignments]
@@ -96,23 +97,29 @@ class NativeExpertPromotion:
                     -1 if key is None else key[0] * bank.source.experts + key[1]
                     for key in old
                 ]
-                if (
-                    bank.tables.row_key[slots].tolist() != old_keys
-                    or bank.tables.hot_phys[keys].tolist() != [-1] * len(keys)
-                    or int(bank.tables.error[0])
-                    or any(
-                        key is not None and bank.host_hot.get(key) != slot
-                        for key, slot in zip(old, slots)
+                victims = [key for key in old_keys if key >= 0]
+                victim_slots = [slot for slot, key in zip(slots, old_keys) if key >= 0]
+                observed = (
+                    torch.cat(
+                        (
+                            bank.tables.row_key[slots].long(),
+                            bank.tables.hot_phys[keys].long(),
+                            bank.tables.error.reshape(-1).long(),
+                            bank.tables.gate.reshape(-1).long(),
+                            bank.tables.hot_phys[victims].long(),
+                        )
                     )
+                    .cpu()
+                    .tolist()
+                )
+                expected = old_keys + [-1] * len(keys) + [0, 0] + victim_slots
+                if observed != expected or any(
+                    key is not None and bank.host_hot.get(key) != slot
+                    for key, slot in zip(old, slots)
                 ):
                     raise RuntimeError(
                         "upload reservation differs from published ownership"
                     )
-                victims = [key for key in old_keys if key >= 0]
-                if victims and bank.tables.hot_phys[victims].tolist() != [
-                    slot for slot, key in zip(slots, old_keys) if key >= 0
-                ]:
-                    raise RuntimeError("upload victim differs from reverse ownership")
                 bank.pending_promotions.update(slots)
                 bank.generation += 1
                 bank.plan = None
@@ -124,8 +131,9 @@ class NativeExpertPromotion:
                         device=bank.device,
                     )
                 bank.tables.row_key[slots] = -1
-                # The common vote runs on this same stream after invalidation.
-                # It fences every rank before the worker can overwrite a row.
+                # CPU consensus does not fence device writes. The upload stream
+                # explicitly waits for retirement before overwriting any row.
+                self.invalidation_fence = bank.fence()
                 for key, slot in zip(old, slots):
                     if key is not None:
                         del bank.host_hot[key]
@@ -133,12 +141,19 @@ class NativeExpertPromotion:
         except Exception as exc:
             error = exc
         self._vote("reserve", error=error)
+        reserved = time.perf_counter()
         try:
             self.future = self.worker.submit(self._copy, rows)
         except Exception as exc:
             error = exc
         self._vote("launch", error=error)
         self.last_step = dict(
+            reserve_phases_ms=dict(
+                assignment_ms=(assigned - started) * 1000,
+                borrow_ms=(borrowed - assigned) * 1000,
+                invalidate_and_vote_ms=(reserved - borrowed) * 1000,
+                launch_and_vote_ms=(time.perf_counter() - reserved) * 1000,
+            ),
             promotions=len(assignments),
             pending=True,
             source_lease_payload_bytes=len(assignments) * sum(bank.strides.values()),
@@ -162,6 +177,9 @@ class NativeExpertPromotion:
                 torch.accelerator.device_index(bank.device.index),
                 torch.cuda.stream(self.stream),
             ):
+                if self.invalidation_fence is None:
+                    raise RuntimeError("upload has no slot retirement fence")
+                self.stream.wait_event(self.invalidation_fence)
                 if self.registration is not None:
                     from vllm import _custom_ops as ops
 
@@ -261,12 +279,21 @@ class NativeExpertPromotion:
                     layer * bank.source.experts + expert
                     for layer, expert, _ in self.pending
                 ]
+                observed = (
+                    torch.cat(
+                        (
+                            bank.tables.row_key[slots],
+                            bank.tables.hot_phys[keys],
+                        )
+                    )
+                    .cpu()
+                    .tolist()
+                )
                 if (
                     bank.state != "READY"
                     or bank.leases
                     or bank.pending_promotions != set(slots)
-                    or bank.tables.row_key[slots].tolist() != [-1] * len(slots)
-                    or bank.tables.hot_phys[keys].tolist() != [-1] * len(keys)
+                    or observed != [-1] * (len(slots) + len(keys))
                 ):
                     raise RuntimeError(
                         "upload destination was reused before publication"
@@ -312,3 +339,4 @@ class NativeExpertPromotion:
             if self.registration is not None:
                 self.registration.close()
                 self.bank.promotion_registered_source_bytes = 0
+                self.bank.registered_source_region = None

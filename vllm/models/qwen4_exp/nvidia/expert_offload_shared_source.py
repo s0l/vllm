@@ -69,11 +69,15 @@ class SharedNativeSource:
     def register_uploads(self):
         return RegisteredSourceRegion(self.cpu)
 
+    def resident_bitmap(self):
+        return self.cpu.resident_bitmap()
+
     def get_many(self, layer, experts):
         if not experts:
             return []
-        self.cpu.load_rows(layer, experts)
-        return self.borrow_resident([(layer, expert) for expert in experts])
+        with self.lock:
+            self.cpu.load_rows(layer, experts)
+            return self.borrow_resident([(layer, expert) for expert in experts])
 
     def get(self, layer, expert):
         return self.get_many(layer, [expert])[0]
@@ -119,14 +123,12 @@ class SharedNativeSource:
             or np.any(scores < 0)
         ):
             raise ValueError("invalid native residual priorities")
-        # GPU scores choose HOT. This bounded source retains residual demand
-        # with LRU; published GPU duplicates become reusable cache slots.
-        # Mapped pages remain inside the same process-wide allocation budget.
-        # Keep useful duplicates while capacity permits. Prefer them as RAM
-        # victims; force removal only when explicitly requested by the caller.
+        # Consumed residual priorities survive scans; READY GPU duplicates
+        # remain the first reclaimable tier unless a row lease protects them.
         hot = tuple(gpu_hot_keys) or tuple(gpu_only_keys)
         if not set(gpu_only_keys) <= set(hot):
             raise ValueError("GPU-only source keys are not published HOT")
+        self.cpu.source_scores(scores)
         released = self.cpu.source_hot(gpu_only_keys, drop=True) if gpu_only_keys else 0
         self.cpu.source_hot(hot)
         return released

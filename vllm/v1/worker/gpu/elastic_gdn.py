@@ -4,16 +4,18 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm.device_allocator.elastic_cumem import ElasticCuMemBacking
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.worker.mamba_utils import GDNPrefixCheckpointStore
+
+if TYPE_CHECKING:
+    from vllm.device_allocator.elastic_cumem import ElasticCuMemBacking
 
 logger = init_logger(__name__)
 
@@ -39,6 +41,35 @@ class ElasticKVController:
     def external_memory_bytes(self) -> int:
         """Return the worker-applied, mapping-quantized external loan."""
         return self._external_memory_bytes
+
+    def physical_memory_receipt(self) -> dict[str, Any]:
+        """Report mapped owners and unrequested KV without querying the GPU."""
+        rows = []
+        for key, owner in sorted(self.backings.items()):
+            info = owner.info
+            required = None
+            if key in self.auxiliary_targets:
+                required = self.auxiliary_targets[key]
+            elif self._logical_transition is not None:
+                blocks = self._logical_transition[key == "elastic-gdn"]
+                size = blocks * self.geometry[key]
+                required = (size + info.quantum - 1) // info.quantum * info.quantum
+            rows.append(
+                dict(
+                    owner=key,
+                    mapped_bytes=info.committed,
+                    required_bytes=required,
+                    retained_tail_bytes=None
+                    if required is None
+                    else max(info.committed - required, 0),
+                )
+            )
+        return dict(
+            physical_budget_bytes=self._physical_budget_bytes,
+            external_memory_bytes=self._external_memory_bytes,
+            logical_transition=self._logical_transition,
+            backings=rows,
+        )
 
     def configure_physical_budget(
         self,
