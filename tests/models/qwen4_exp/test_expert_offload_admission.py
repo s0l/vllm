@@ -22,6 +22,94 @@ from vllm.models.qwen4_exp.nvidia.expert_offload_bank import (
 from vllm.models.qwen4_exp.nvidia.expert_offload_source import NativeExpertStore
 
 
+def test_manager_closes_capture_inputs_on_success_failure_and_recovery(monkeypatch):
+    from vllm.config import CUDAGraphMode
+    from vllm.v1.worker.gpu.cudagraph_utils import (
+        CudaGraphManager,
+        ModelCudaGraphManager,
+    )
+
+    manager = ModelCudaGraphManager.__new__(ModelCudaGraphManager)
+    manager.use_breakable_cg = manager.tp3_owner_prequant = False
+    manager.cudagraph_mode = CUDAGraphMode.NONE
+    events = []
+    fail = False
+
+    def capture(*args, **kwargs):
+        events.append("capture")
+        if fail:
+            raise ValueError("original capture failure")
+
+    monkeypatch.setattr(CudaGraphManager, "capture", capture)
+    state = SimpleNamespace(finish_native_capture=lambda: events.append("release"))
+    for fail in (False, True, False):
+        events.clear()
+        if fail:
+            with pytest.raises(ValueError, match="original capture failure"):
+                manager.capture(None, state, None, None, None, [], None)
+        else:
+            manager.capture(None, state, None, None, None, [], None)
+        assert events == ["capture", "release"]
+
+
+def test_failed_allocation_rpc_keeps_primary_error_and_restores_core_state(monkeypatch):
+    from vllm.v1.core.elastic_graph import ElasticPlanKind
+    from vllm.v1.engine import elastic_memory_profile as profile
+    from vllm.v1.engine.elastic_calibrator import ElasticCatalogCalibrator
+
+    key = (0, 3, 1, 1, 0)
+    previous: dict[tuple[int, ...], dict] = {}
+    events: list[str] = []
+    scheduler = SimpleNamespace(
+        has_unfinished_requests=lambda: False,
+        _elastic_graph_execution_policy=SimpleNamespace(fingerprint="policy"),
+        _elastic_restore_mode=False,
+        _elastic_graph_catalog=previous,
+        num_spec_tokens=3,
+        prepare_elastic_restore_idle_reclaim=lambda: events.append("reclaim"),
+        prepare_elastic_restore_capture=lambda key: True,
+        schedule=lambda **kwargs: SimpleNamespace(
+            total_num_scheduled_tokens=0,
+            elastic_step_plan=SimpleNamespace(kind=ElasticPlanKind.MAINTENANCE),
+        ),
+        update_from_output=lambda *args: None,
+        assert_elastic_restore_captures_hot=lambda keys: None,
+    )
+
+    def execute(output):
+        scheduler._elastic_graph_catalog[key] = {}
+        return SimpleNamespace(req_ids=[])
+
+    def failed_rpc(*args, **kwargs):
+        raise ValueError("primary worker failure")
+
+    owner = SimpleNamespace(
+        scheduler=scheduler,
+        vllm_config=SimpleNamespace(
+            additional_config={"flashnext_native_experts": True},
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
+        ),
+        model_executor=SimpleNamespace(
+            execute_model=execute, collective_rpc=failed_rpc
+        ),
+    )
+    monkeypatch.setattr(
+        profile, "allocation_profile_shapes", lambda *args: ((key,), ())
+    )
+    monkeypatch.setattr(
+        ElasticCatalogCalibrator,
+        "_validate_surface_before_mutation",
+        lambda *args: None,
+    )
+    for _ in range(2):
+        events.clear()
+        with pytest.raises(ValueError, match="primary worker failure"):
+            profile.profile_allocation_catalog(owner, SimpleNamespace(decode_max_x=1))
+        assert events == ["reclaim"]
+        assert scheduler._elastic_graph_catalog is previous
+        assert scheduler._elastic_restore_mode is False
+
+
 def test_fp4_scale_bound_covers_independent_partition_maximum():
     from vllm._custom_ops import _fp4_moe_blockscale_rows
 
