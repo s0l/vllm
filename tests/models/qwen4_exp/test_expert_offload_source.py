@@ -257,15 +257,30 @@ def test_native_model_state_switches_dummy_and_real_without_ple(
     owner = Qwen4ExpModelState.__new__(Qwen4ExpModelState)
     owner.uses_ngram_embedding = False
     owner._native_providers = (
-        SimpleNamespace(prepare_execution=lambda *, dummy: calls.append(dummy)),
+        SimpleNamespace(
+            prepare_execution=lambda *, dummy, **kwargs: calls.append((dummy, kwargs))
+        ),
     )
     monkeypatch.setattr(MambaHybridModelState, "prepare_inputs", lambda *args: {})
     monkeypatch.setattr(MambaHybridModelState, "prepare_dummy_inputs", lambda *args: {})
     owner.prepare_dummy_inputs(1, 1)
-    owner.prepare_inputs(None, None)
-    owner.prepare_runtime_dummy_inputs(None, None)
-    owner.prepare_inputs(None, None)
-    assert calls == [True, False, True, False]
+    batch = SimpleNamespace(
+        num_tokens_after_padding=4,
+        num_tokens=3,
+        num_reqs=1,
+        req_ids=["request-tail"],
+        has_prefill=False,
+        query_start_loc_np=np.array([0, 3]),
+        num_computed_tokens_np=np.array([19]),
+        num_scheduled_tokens=np.array([3]),
+    )
+    owner.prepare_inputs(batch, None)
+    owner.prepare_runtime_dummy_inputs(batch, None)
+    owner.prepare_inputs(batch, None)
+    assert [dummy for dummy, _ in calls] == [True, False, True, False]
+    assert calls[1][1]["num_tokens"] == 4
+    assert calls[1][1]["identity"]["req_ids"] == ["request-tail"]
+    assert calls[1][1]["identity"]["scheduled"] == [3]
 
 
 def test_native_model_does_not_silently_consume_dense_owner_prequant_rows():
@@ -515,6 +530,7 @@ def test_provider_retirement_starts_a_fresh_graph_pool_epoch(monkeypatch):
         graphs={graph}, stable_graphs={graph}, close_prefetch=Mock()
     )
     provider.kernels = {16: (object(), graph)}
+    provider.admission = provider.hybrid_path = provider.stream_path = None
     provider.quiesce = Mock()
     provider.graph_pool = object()
     fresh = object()
