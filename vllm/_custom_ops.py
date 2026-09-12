@@ -1615,6 +1615,17 @@ def scaled_fp4_quant(
     return output, output_scale
 
 
+def _fp4_moe_blockscale_rows(num_lanes: int, num_experts: int) -> int:
+    """Bound the sum of per-expert 128-row padded counts without route readback.
+
+    At most min(lanes, experts) groups are nonempty, each adding at most 127
+    padding rows. The actual sum is a multiple of 128, so round this bound down.
+    """
+    if num_lanes < 0 or num_experts <= 0:
+        raise ValueError("invalid FP4 MoE scale geometry")
+    return (num_lanes + 127 * min(num_lanes, num_experts)) // 128 * 128
+
+
 def scaled_fp4_experts_quant(
     input_tensor: torch.Tensor,
     input_global_scale: torch.Tensor,
@@ -1660,7 +1671,7 @@ def scaled_fp4_experts_quant(
         m_numtopk, k // 2, device=input_tensor.device, dtype=torch.uint8
     )
     output_scales = torch.empty(
-        MAX_TOKENS_PER_EXPERT * topk,
+        _fp4_moe_blockscale_rows(m_numtopk, expert_offsets.shape[0] - 1),
         padded_k,
         dtype=torch.int32,
         device=input_tensor.device,
@@ -1725,7 +1736,7 @@ def silu_and_mul_scaled_fp4_experts_quant(
         m_numtopk, k // 2, device=input_tensor.device, dtype=torch.uint8
     )
     output_scales = torch.empty(
-        MAX_TOKENS_PER_EXPERT * topk,
+        _fp4_moe_blockscale_rows(m_numtopk, expert_offsets.shape[0] - 1),
         padded_k,
         dtype=torch.int32,
         device=input_tensor.device,

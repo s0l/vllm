@@ -29,6 +29,7 @@ from vllm.v1.core.elastic_expert import NativeExpertBudget
 
 from .expert_offload_bank import NativeExpertBank
 from .expert_offload_provider import NativeExpertProvider
+from .expert_offload_shared_source import SharedNativeSource
 from .expert_offload_source import NativeExpertStore
 
 _providers: weakref.WeakValueDictionary[int, NativeExpertProvider] = (
@@ -71,16 +72,39 @@ def get_native_provider(vllm_config):
     key = id(vllm_config.compilation_config.static_forward_context)
     provider = _providers.get(key)
     if provider is None:
-        source = NativeExpertStore(
+        source: NativeExpertStore | SharedNativeSource = NativeExpertStore(
             vllm_config.model_config.model,
             get_tensor_model_parallel_rank(),
-            budget.ram_cache_bytes,
+            0 if budget.stream_experts else budget.ram_cache_bytes,
             layers=text.num_hidden_layers,
             experts=text.num_experts,
             geometry=budget.geometry,
-            pin_cache=budget.pin_ram_cache,
+            pin_cache=budget.pin_ram_cache and budget.stream_experts is None,
             archive_path=budget.prepared_archive,
         )
+        cpu = None
+        if budget.stream_experts is not None:
+            from .expert_offload_archive import row_schema
+
+            rank = source.rank
+            cpu = budget.stream_experts.create(
+                budget.geometry,
+                rank,
+                layers=source.layers,
+                experts=source.experts,
+                topk=text.num_experts_per_tok,
+            )
+            archive = source.archive
+            assert archive is not None
+            cpu.source(
+                [archive.paths[layer] for layer in range(source.layers)],
+                [archive.files[archive.paths[layer]] for layer in range(source.layers)],
+                budget.rank_ram_bytes(rank),
+                archive_width=budget.geometry.local,
+            )
+            cpu.publish()
+            fields, row_bytes, _ = row_schema(budget.rank_geometry(rank))
+            source = SharedNativeSource(source, cpu, fields, row_bytes)
         device = get_tp_group().device
         bank = NativeExpertBank(
             source,
@@ -90,7 +114,7 @@ def get_native_provider(vllm_config):
             staging=budget.staging,
         )
         if (
-            sum(bank.targets(0).values()) != budget.base_bytes
+            sum(bank.targets(0).values()) != budget.rank_mapped_bytes(source.rank, 0)
             or tuple(
                 bank.strides[name]
                 for name in (
@@ -100,13 +124,37 @@ def get_native_provider(vllm_config):
                     "w2_weight_scale",
                 )
             )
-            != budget.strides
+            != budget.rank_geometry(source.rank).strides
         ):
             raise RuntimeError("native bank differs from scheduler byte geometry")
         provider = NativeExpertProvider(
             bank, get_tp_group(), vllm_config, topk=text.num_experts_per_tok
         )
         provider.use_hot_path = budget.hot_read
+        if cpu is not None:
+            from vllm.logger import init_logger
+
+            from .expert_offload_stream import NativeStreamExperts
+
+            provider.stream_path = NativeStreamExperts(provider, cpu)
+            provider.enable_frequency_admission(
+                history_steps=budget.stream_experts.history_steps,
+                max_promotions=budget.stream_experts.max_promotions,
+                exclusive_ram=False,
+                registered_source=True,
+            )
+            init_logger(__name__).info(
+                "FlashNext stream experts attached: rank=%d width=%d RAM=%d "
+                "native=%s max_m=%d cores=%s history=%d promotions=%d",
+                source.rank,
+                cpu.i,
+                source.limit,
+                budget.stream_experts.cpu.sha256,
+                cpu.max_m,
+                budget.stream_experts.cpu.rank_cores(source.rank, source.tp),
+                budget.stream_experts.history_steps,
+                budget.stream_experts.max_promotions,
+            )
         if budget.cpu_experts is not None:
             from vllm.logger import init_logger
             from vllm.utils.nvfp4_cpu_experts import load_cpu_experts
@@ -177,11 +225,16 @@ class NativeOffloadedExperts(nn.Module):
         source.check_files(source.files)
         self.loaded = True
 
-    def forward(self, hidden, weights, ids):
+    def forward(self, hidden, weights, ids, *, include_shared=False):
         if not self.loaded:
             raise RuntimeError("native expert weights are not admitted")
         output = torch.empty_like(hidden)
-        torch.ops.vllm.flashnext_native_experts(
+        op = (
+            torch.ops.vllm.flashnext_stream_experts
+            if include_shared
+            else torch.ops.vllm.flashnext_native_experts
+        )
+        op(
             hidden,
             weights,
             ids,
@@ -229,6 +282,10 @@ class FlashNextNativeMoeBlock(Qwen3NextSparseMoeBlock):
         self.experts = NativeOffloadedExperts(
             provider, vllm_config, extract_layer_index(prefix), f"{prefix}.experts"
         )
+        self.stream_max_m = 0
+        if provider.stream_path is not None:
+            provider.stream_path.shared[self.experts.layer_id] = self.shared_expert
+            self.stream_max_m = provider.stream_path.max_m
 
     def forward(self, hidden_states, already_sequence_parallel=False):
         if already_sequence_parallel:
@@ -239,6 +296,10 @@ class FlashNextNativeMoeBlock(Qwen3NextSparseMoeBlock):
         weights, ids, _ = fused_topk(
             hidden_states, logits.float(), self.top_k, self.renormalize
         )
+        if hidden_states.shape[0] <= self.stream_max_m:
+            return tensor_model_parallel_all_reduce(
+                self.experts(hidden_states, weights, ids, include_shared=True)
+            )
         routed = self.experts(hidden_states, weights, ids)
         assert self.shared_expert is not None
         shared = self.shared_expert(hidden_states)

@@ -91,9 +91,31 @@ class Qwen4ExpModelState(MambaHybridModelState):
             {id(m.provider): m.provider for m in owners}.values()
         )
 
-    def _prepare_native_experts(self, *, dummy):
+    def _prepare_native_experts(self, *, dummy, num_tokens=None, input_batch=None):
+        identity = (
+            None
+            if input_batch is None
+            else dict(
+                req_ids=list(input_batch.req_ids),
+                num_reqs=input_batch.num_reqs,
+                tokens=input_batch.num_tokens,
+                physical_tokens=input_batch.num_tokens_after_padding,
+                phase="prefill_or_mixed" if input_batch.has_prefill else "decode",
+                query_start_loc=input_batch.query_start_loc_np[
+                    : input_batch.num_reqs + 1
+                ].tolist(),
+                computed=input_batch.num_computed_tokens_np.tolist(),
+                scheduled=input_batch.num_scheduled_tokens.tolist(),
+            )
+        )
         for provider in getattr(self, "_native_providers", ()):
-            provider.prepare_execution(dummy=dummy)
+            provider.prepare_execution(
+                dummy=dummy, num_tokens=num_tokens, identity=identity
+            )
+
+    def finish_native_experts(self, *, dummy):
+        for provider in self._native_providers:
+            provider.finish_execution(dummy=dummy)
 
     def resolve_cudagraph_mode(self, mode: CUDAGraphMode) -> CUDAGraphMode:
         if mode == CUDAGraphMode.NONE or not (
@@ -174,7 +196,11 @@ class Qwen4ExpModelState(MambaHybridModelState):
         req_states: RequestState,
     ) -> dict[str, Any]:
         model_inputs = super().prepare_inputs(input_batch, req_states)
-        self._prepare_native_experts(dummy=False)
+        self._prepare_native_experts(
+            dummy=False,
+            num_tokens=input_batch.num_tokens_after_padding,
+            input_batch=input_batch,
+        )
         if not self.uses_ngram_embedding:
             return model_inputs
 
@@ -203,7 +229,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
         num_tokens: int,
     ) -> dict[str, Any]:
         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
-        self._prepare_native_experts(dummy=True)
+        self._prepare_native_experts(dummy=True, num_tokens=num_tokens)
         if not self.uses_ngram_embedding:
             return model_inputs
 
@@ -242,7 +268,9 @@ class Qwen4ExpModelState(MambaHybridModelState):
 
     def prepare_runtime_dummy_inputs(self, input_batch, req_states):
         model_inputs = super().prepare_inputs(input_batch, req_states)
-        self._prepare_native_experts(dummy=True)
+        self._prepare_native_experts(
+            dummy=True, num_tokens=input_batch.num_tokens_after_padding
+        )
         if self.uses_ngram_embedding:
             model_inputs.update(
                 self._prepare_dummy_ple(

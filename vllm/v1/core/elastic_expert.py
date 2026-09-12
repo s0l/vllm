@@ -7,6 +7,7 @@ from pathlib import Path
 
 from vllm.utils.nvfp4_cpu_experts import CpuExpertConfig
 from vllm.utils.nvfp4_expert_geometry import NVFP4ExpertGeometry
+from vllm.utils.nvfp4_expert_stream import StreamExpertConfig
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class NativeExpertBudget:
     hot_read: bool = False
     prepared_archive: str | None = None
     cpu_experts: CpuExpertConfig | None = None
+    stream_experts: StreamExpertConfig | None = None
 
     def __post_init__(self):
         self.geometry.validate_cutlass()
@@ -50,6 +52,16 @@ class NativeExpertBudget:
             or self.ram_cache_bytes < 0
             or type(self.pin_ram_cache) is not bool
             or type(self.hot_read) is not bool
+            or (
+                self.stream_experts is not None
+                and (
+                    not isinstance(self.stream_experts, StreamExpertConfig)
+                    or self.cpu_experts is not None
+                    or not self.hot_read
+                    or not self.pin_ram_cache
+                    or self.prepared_archive is None
+                )
+            )
             or (
                 self.cpu_experts is not None
                 and (
@@ -68,6 +80,11 @@ class NativeExpertBudget:
             )
         ):
             raise ValueError("unsupported native expert budget geometry")
+        if self.stream_experts is not None:
+            for rank in range(self.geometry.tp):
+                self.rank_geometry(rank).validate_cutlass()
+                if self.rank_ram_bytes(rank) <= 0:
+                    raise ValueError("stream source requires a nonempty RAM budget")
 
     @classmethod
     def from_config(cls, config):
@@ -88,12 +105,19 @@ class NativeExpertBudget:
                 "hot_read",
                 "prepared_archive",
                 "cpu_experts",
+                "stream_experts",
             }
             or any(
                 type(v) is not int or v < 0
                 for key, v in options.items()
                 if key
-                not in {"pin_ram_cache", "hot_read", "prepared_archive", "cpu_experts"}
+                not in {
+                    "pin_ram_cache",
+                    "hot_read",
+                    "prepared_archive",
+                    "cpu_experts",
+                    "stream_experts",
+                }
             )
             or type(options.get("pin_ram_cache", False)) is not bool
             or type(options.get("hot_read", False)) is not bool
@@ -126,6 +150,40 @@ class NativeExpertBudget:
             cpu_experts=CpuExpertConfig.from_options(
                 options.get("cpu_experts"), config.parallel_config.tensor_parallel_size
             ),
+            stream_experts=StreamExpertConfig.from_options(
+                options.get("stream_experts"),
+                config.parallel_config.tensor_parallel_size,
+            ),
+        )
+
+    def rank_geometry(self, rank):
+        if not 0 <= rank < self.geometry.tp:
+            raise ValueError("expert rank outside configured TP")
+        if self.stream_experts is None:
+            return self.geometry
+        width = min(
+            self.geometry.local,
+            max(0, self.geometry.width - rank * self.geometry.local),
+        )
+        if width < 64 or width % 64:
+            raise ValueError("unsupported compact expert owner")
+        return NVFP4ExpertGeometry(self.geometry.hidden, width, 1)
+
+    def rank_ram_bytes(self, rank):
+        if self.stream_experts is None:
+            return self.ram_cache_bytes
+        strides = [
+            ((sum(self.rank_geometry(r).strides) + 24 + 4095) // 4096) * 4096
+            for r in range(self.geometry.tp)
+        ]
+        rows = self.ram_cache_bytes * self.geometry.tp // sum(strides)
+        return rows * strides[rank]
+
+    def rank_mapped_bytes(self, rank, hot_rows):
+        self.mapped_bytes(hot_rows)
+        return self.round((self.max_hot_rows + self.staging) * 6 * 4) + sum(
+            self.round((hot_rows + self.staging) * stride)
+            for stride in self.rank_geometry(rank).strides
         )
 
     @property

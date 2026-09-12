@@ -97,6 +97,7 @@ class NativeExpertBank:
         self.plan: NativeBankPlan | None = None
         self.completed: set[tuple[int, str]] = set()
         self.leases: set[object] = set()
+        self.pending_promotions: set[int] = set()
         self.graphs: set[torch.cuda.CUDAGraph] = set()
         self.stable_graphs: set[torch.cuda.CUDAGraph] = set()
         self.lock = RLock()
@@ -186,13 +187,15 @@ class NativeExpertBank:
         if plan is None or plan is not self.plan:
             raise RuntimeError("stale or foreign native plan")
 
-    def begin(self, layer, ids):
+    def begin(self, layer, ids, *, destinations=None):
         with self.lock:
             if self.state != "READY" or self.leases:
                 raise RuntimeError("native bank unavailable")
             self.state = "LOADING"
             try:
                 self._finish_prefetch(layer)
+                if destinations is not None:
+                    return self._begin_placement(layer, ids, destinations)
                 gp.step(self.tables, layer, ids, self.buffers)
                 if int(self.tables.error[0]):
                     raise ValueError("invalid native expert route")
@@ -215,6 +218,68 @@ class NativeExpertBank:
                 self.prepared.clear()
                 self.state = "POISONED"
                 raise
+
+    def _begin_placement(self, layer, ids, destinations):
+        """Reserve explicit admission rows under the ordinary LOADING epoch."""
+        experts = ids.tolist()
+        rows = tuple(destinations)
+        if (
+            self.pending_promotions
+            or not 0 <= layer < self.source.layers
+            or ids.dtype != torch.int32
+            or ids.ndim != 1
+            or not 0 < len(experts) <= self.staging
+            or len(rows) != len(experts)
+            or len(set(experts)) != len(experts)
+            or len(set(rows)) != len(rows)
+            or any(not 0 <= e < self.source.experts for e in experts)
+            or any(
+                type(row) is not int or not 0 <= row < self.tables.pool_rows
+                for row in rows
+            )
+            or any((layer, e) in self.host_hot for e in experts)
+        ):
+            raise ValueError("invalid explicit expert placement")
+        keys = [layer * self.source.experts + e for e in experts]
+        old = [self.host_rows.get(row) for row in rows]
+        expected = [
+            -1 if key is None else key[0] * self.source.experts + key[1] for key in old
+        ]
+        if (
+            self.tables.row_key[list(rows)].tolist() != expected
+            or self.tables.hot_phys[keys].tolist() != [-1] * len(keys)
+            or int(self.tables.error[0])
+        ):
+            raise RuntimeError("explicit placement disagrees with device ownership")
+        victims = [key for key in expected if key >= 0]
+        if victims:
+            if self.tables.hot_phys[victims].tolist() != [
+                row for row, key in zip(rows, expected) if key >= 0
+            ]:
+                raise RuntimeError("explicit victim disagrees with reverse ownership")
+            self.tables.hot_phys[victims] = -1
+            self.tables.cold_phys[victims] = torch.tensor(
+                [key % self.source.experts for key in victims],
+                dtype=torch.int32,
+                device=self.device,
+            )
+        # Consumers cannot see these provisional owners until all components
+        # and ranks publish; a partial failure poisons the ordinary bank epoch.
+        self.tables.hot_phys[keys] = torch.tensor(
+            rows, dtype=torch.int32, device=self.device
+        )
+        self.tables.cold_phys[keys] = -1
+        self.tables.row_key[list(rows)] = torch.tensor(
+            keys, dtype=torch.int32, device=self.device
+        )
+        self.tables.row_use[list(rows)] = self.tables.clock[0]
+        self.tables.miss_count[keys] = 0
+        self.generation += 1
+        self.plan = NativeBankPlan(
+            self.generation, layer, (), tuple(zip(experts, rows))
+        )
+        self.completed.clear()
+        return self.plan
 
     def prefetch(self, layer, experts):
         """Fill the other pinned generation while current DMA/compute runs.
@@ -510,7 +575,11 @@ class NativeExpertBank:
         """Close consumers before an externally admitted VMM transaction."""
         with self.lock:
             targets = self.targets(hot_rows)
-            if self.leases or self.state not in ("READY", "POISONED"):
+            if (
+                self.leases
+                or self.pending_promotions
+                or self.state not in ("READY", "POISONED")
+            ):
                 raise RuntimeError("native bank maintenance unavailable")
             self.drain_prefetch()
             self.state, self.plan = "RESIZING", None
@@ -644,6 +713,24 @@ class NativeMappedBankConsumer:
             raise RuntimeError("invalid mapped native consumer geometry")
         self.bank = bank
         self.values, self.expert_rows = bank.consumer_views, expert_rows
+        w13, w2 = self.values["w13_weight"], self.values["w2_weight"]
+        if w13.ndim != 3 or w2.ndim != 3:
+            raise ValueError("invalid mapped native weight rank")
+        rows, twice_n, half_k = w13.shape
+        n, k = twice_n // 2, half_k * 2
+        expected = {
+            "w2_weight": (rows, k, n // 2),
+            "w13_weight_scale": (rows, 2 * n, k // 16),
+            "w2_weight_scale": (rows, k, n // 16),
+        }
+        if (
+            twice_n % 2
+            or n < 64
+            or n % 64
+            or k % 128
+            or any(self.values[name].shape != shape for name, shape in expected.items())
+        ):
+            raise ValueError("invalid mapped native column/scale geometry")
 
     def __call__(self, hidden, weights, ids):
         if not all(value.is_contiguous() for value in (hidden, weights, ids)):
@@ -654,8 +741,12 @@ class NativeMappedBankConsumer:
         )
 
         m, k = hidden.shape
+        if k != self.values["w13_weight"].shape[2] * 2:
+            raise ValueError("mapped native activation/weight hidden mismatch")
         lanes = m * ids.shape[1]
-        n = self.bank.source.physical // self.bank.source.tp
+        # The admitted row owns its local columns. TP partitions need not
+        # retain the uniform splitter's all-zero final column block.
+        n = self.values["w13_weight"].shape[1] // 2
         values = self.values
         output = torch.empty_like(hidden)
         workspace13 = torch.empty(
@@ -791,11 +882,96 @@ class NativeBankCoordinator:
             raise RuntimeError("native recovery requires a common empty bank")
         bank.generation = int(peers[:, 1].max()) + 1
 
-    def stage(self, layer, ids):
+    def admission_assignments(self, proposal):
+        """Agree the entire assignment before any bounded copy wave begins."""
+        from .expert_offload_admission import ExpertAdmissionPlan
+
+        bank, error = self.bank, None
+        try:
+            current = tuple(
+                sorted(
+                    layer * bank.source.experts + expert
+                    for layer, expert in bank.host_hot
+                )
+            )
+            if (
+                not isinstance(proposal, ExpertAdmissionPlan)
+                or proposal.resident != current
+                or proposal.capacity != bank.tables.pool_rows
+                or bank.state != "READY"
+                or bank.leases
+                or bank.pending_promotions
+                or len(current) > proposal.capacity
+                or any(
+                    type(key) is not int
+                    or not 0 <= key < bank.source.layers * bank.source.experts
+                    for key in proposal.desired
+                )
+            ):
+                raise ValueError("stale or unavailable expert assignment")
+            retained = set(proposal.desired) & set(current)
+            occupied = {
+                row
+                for (layer, expert), row in bank.host_hot.items()
+                if layer * bank.source.experts + expert in retained
+            }
+            free = [row for row in range(proposal.capacity) if row not in occupied]
+            if len(free) < len(proposal.promotions):
+                raise ValueError("expert assignment exceeds committed rows")
+            assignments = sorted(
+                (key // bank.source.experts, key % bank.source.experts, row)
+                for key, row in zip(proposal.promotions, free)
+            )
+            digest = sha256((proposal.digest + repr(assignments)).encode()).digest()
+        except Exception as exc:
+            error, digest = exc, bytes(32)
+        payload = [int(error is None), bank.generation] + list(digest)
+        payload += [-1] * (self.send.numel() - len(payload))
+        self.send.copy_(torch.tensor(payload, dtype=torch.int64))
+        torch.distributed.all_gather_single(
+            self.recv, self.send, group=self.group.device_group
+        )
+        peers = self.recv.view(self.ranks, -1).cpu().numpy()
+        if not (peers[:, 0] == 1).all() or not (peers == peers[:1]).all():
+            bank.state = "POISONED"
+            raise RuntimeError("rank-inconsistent expert assignment") from error
+        return assignments
+
+    def apply_admission(self, proposal):
+        """Synchronous reference transaction for the asynchronous control."""
+        bank = self.bank
+        assignments = self.admission_assignments(proposal)
+        offset = 0
+        while offset < len(assignments):
+            layer = assignments[offset][0]
+            end = offset
+            while (
+                end < len(assignments)
+                and assignments[end][0] == layer
+                and end - offset < bank.staging
+            ):
+                end += 1
+            batch = assignments[offset:end]
+            self.stage(
+                layer,
+                torch.tensor([e for _, e, _ in batch], dtype=torch.int32),
+                destinations=[r for _, _, r in batch],
+            )
+            offset = end
+        observed = tuple(
+            sorted(
+                layer * bank.source.experts + expert for layer, expert in bank.host_hot
+            )
+        )
+        if observed != proposal.desired:
+            bank.state = "POISONED"
+            raise RuntimeError("published expert assignment differs from admission")
+
+    def stage(self, layer, ids, *, destinations=None):
         bank = self.bank
         error, plan = None, None
         try:
-            plan = bank.begin(layer, ids)
+            plan = bank.begin(layer, ids, destinations=destinations)
             raw_ids = ids.flatten().tolist()
         except Exception as exc:
             error, raw_ids = exc, []
@@ -807,7 +983,7 @@ class NativeBankCoordinator:
             len(plan.copies) if plan else 0,
             bank.rows,
             bank.staging,
-            1,
+            1 if destinations is None else 2,
         ] + self.identity
         if plan is not None:
             for values in (

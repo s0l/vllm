@@ -14,7 +14,7 @@ from collections import OrderedDict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from threading import RLock
-from typing import Any, BinaryIO
+from typing import TYPE_CHECKING, Any, BinaryIO
 
 import numpy as np
 import regex as re
@@ -22,6 +22,9 @@ import regex as re
 from vllm.utils.nvfp4_expert_geometry import NVFP4ExpertGeometry
 
 from .ple_offload import _header, fingerprint
+
+if TYPE_CHECKING:
+    from .expert_offload_pinned import PinnedExpertPool
 
 PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 FIELDS = ("weight", "weight_scale", "weight_scale_2", "input_scale")
@@ -179,8 +182,10 @@ class NativeExpertStore:
         self.limit = cache_bytes
         self.cache: OrderedDict[tuple[int, int], dict[str, np.ndarray]] = OrderedDict()
         self.cache_policy, self.io_workers = cache_policy, io_workers
-        self.pin_cache, self.pinned_pool = pin_cache, None
+        self.pin_cache = pin_cache
+        self.pinned_pool: PinnedExpertPool | None = None
         self.frequency = np.zeros((layers, experts), dtype=np.uint16)
+        self.residency_scores = None
         self.accesses = 0
         self.cache_heap: list[tuple[int, tuple[int, int]]] = []
         self.cache_bypasses = self.read_calls = 0
@@ -261,8 +266,15 @@ class NativeExpertStore:
         if any(fingerprint(p) != self.files[p] for p in paths):
             raise OSError("expert source identity changed; restart required")
 
+    def borrow_resident(self, keys):
+        """Retain immutable RAM rows without starting reads or changing policy."""
+        with self.lock:
+            if self.closed:
+                raise RuntimeError("closed expert source")
+            return [self.cache[key] for key in keys]
+
     def _access(self, key):
-        if self.cache_policy == "lru":
+        if self.cache_policy == "lru" or self.residency_scores is not None:
             return
         self.accesses += 1
         if self.accesses % max(1, self.layers * self.experts * 2) == 0:
@@ -275,8 +287,53 @@ class NativeExpertStore:
             self._rebuild_heap()
 
     def _rebuild_heap(self):
-        self.cache_heap = [(int(self.frequency[k]), k) for k in self.cache]
+        self.cache_heap = [(self._score(k), k) for k in self.cache]
         heapq.heapify(self.cache_heap)
+
+    def _score(self, key):
+        if key in getattr(self, "residency_hot", ()):
+            return -1.0
+        values = (
+            self.frequency if self.residency_scores is None else self.residency_scores
+        )
+        return float(values[key])
+
+    def set_residency_scores(self, scores, gpu_only_keys, *, gpu_hot_keys=()):
+        """Admit residual priorities and drop cache references, never leases.
+
+        The caller must have published all GPU copies and drained CPU readers.
+        NumPy bases continue to own any returned pinned rows independently.
+        Registered slabs remain reusable within the existing physical budget.
+        """
+        if (
+            not isinstance(scores, np.ndarray)
+            or scores.shape != self.frequency.shape
+            or not np.isfinite(scores).all()
+            or np.any(scores < 0)
+        ):
+            raise ValueError("invalid residual expert priorities")
+        keys, hot_keys = tuple(gpu_only_keys), tuple(gpu_hot_keys)
+        if any(
+            len(key) != 2
+            or any(type(v) is not int for v in key)
+            or not 0 <= key[0] < self.layers
+            or not 0 <= key[1] < self.experts
+            for key in keys + hot_keys
+        ):
+            raise ValueError("invalid GPU-only expert key")
+        with self.lock:
+            if self.closed:
+                raise RuntimeError("closed expert source")
+            self.residency_scores = scores.astype(np.float64, copy=True)
+            self.residency_hot = set(hot_keys)
+            released = 0
+            for key in keys:
+                value = self.cache.pop(key, None)
+                if value is not None:
+                    released += sum(a.nbytes for a in value.values())
+            self.used -= released
+            self._rebuild_heap()
+            return released
 
     def _retain(self, key, prepared):
         size = sum(a.nbytes for a in prepared.values())
@@ -297,13 +354,12 @@ class NativeExpertStore:
             if self.cache_policy == "frequency":
                 while self.cache_heap and (
                     self.cache_heap[0][1] not in self.cache
-                    or self.cache_heap[0][0]
-                    != int(self.frequency[self.cache_heap[0][1]])
+                    or self.cache_heap[0][0] != self._score(self.cache_heap[0][1])
                 ):
                     heapq.heappop(self.cache_heap)
                 score, victim = self.cache_heap[0]
                 # Equal-frequency scans must not replace the entire working set.
-                if int(self.frequency[key]) <= score:
+                if self._score(key) <= score:
                     self.cache_bypasses += 1
                     return prepared
                 heapq.heappop(self.cache_heap)
@@ -322,7 +378,7 @@ class NativeExpertStore:
         self.used += size
         self.peak = max(self.peak, self.used)
         if self.cache_policy == "frequency":
-            heapq.heappush(self.cache_heap, (int(self.frequency[key]), key))
+            heapq.heappush(self.cache_heap, (self._score(key), key))
         return prepared
 
     def _read_raw(self, key):

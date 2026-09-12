@@ -24,7 +24,8 @@ class NativeExpertResidency:
             or (self.bank.source.layers, self.bank.source.experts)
             != (budget.layers, budget.experts)
             or self.bank.tables.pool_rows != 0
-            or sum(self.bank.targets(0).values()) != budget.base_bytes
+            or sum(self.bank.targets(0).values())
+            != budget.rank_mapped_bytes(self.bank.source.rank, 0)
             or self.bank.max_rows != budget.max_hot_rows + budget.staging
             or self.bank.quantum != budget.quantum
         ):

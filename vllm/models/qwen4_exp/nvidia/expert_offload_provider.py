@@ -20,6 +20,7 @@ from vllm.triton_utils import tl
 from vllm.triton_utils import triton as tr
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from .expert_offload_admission import cache_snapshot, route_histogram
 from .expert_offload_bank import NativeBankCoordinator, NativeMappedBankConsumer
 from .expert_offload_plan import plan
 
@@ -159,6 +160,8 @@ class NativeExpertProvider:
         self.use_hot_path = False
         self.hot_path = None
         self.hybrid_path = None
+        self.stream_path = None
+        self.admission = None
         self.dummy = False
         self.active = False
         self.forward_count = 0
@@ -166,6 +169,9 @@ class NativeExpertProvider:
         self.trace_path = os.environ.get("AG2_VLLM_EXPERT_TRACE", "")
         self.trace_layers = []
         self.trace_steps = 0
+        self.trace_before = None
+        self.trace_bytes = 0
+        self.trace_byte_limit = 64 << 20
         self.trace_limit = int(os.environ.get("AG2_VLLM_EXPERT_TRACE_STEPS", "64"))
         if not 0 <= self.trace_limit <= 4096:
             raise ValueError("expert trace step budget must be within 0..4096")
@@ -173,10 +179,21 @@ class NativeExpertProvider:
             with open(f"{self.trace_path}-rank{bank.source.rank}.jsonl", "a"):
                 pass
 
-    def prepare_execution(self, *, dummy):
+    def prepare_execution(self, *, dummy, num_tokens=None, identity=None):
+        if self.stream_path is not None:
+            self.stream_path.abort_step()
         if self.active or self.bank.leases or self.bank.state != "READY":
             raise RuntimeError("cannot prepare an unavailable expert provider")
         self.dummy = bool(dummy)
+        self.execution_identity = identity
+        if self.stream_path is not None:
+            self.stream_path.prepare(
+                dummy=dummy, num_tokens=num_tokens, identity=identity
+            )
+
+    def finish_execution(self, *, dummy):
+        if self.stream_path is not None:
+            self.stream_path.finish(dummy=dummy)
 
     def enable_cpu_experts(self, executor):
         """Attach an admitted bounded CPU executor before profiling/serving."""
@@ -190,6 +207,34 @@ class NativeExpertProvider:
             self.hot_path = NativeHotRead(self)
         self.hybrid_path = NativeHybridRead(self, executor)
         self.use_hot_path = True
+
+    def enable_frequency_admission(
+        self,
+        *,
+        history_steps,
+        max_promotions,
+        exclusive_ram,
+        asynchronous=True,
+        registered_source=False,
+    ):
+        """Opt in only after the matched copy/source/execution control passes."""
+        from . import expert_offload_tables as gp
+        from .expert_offload_admission import NativeExpertAdmission
+
+        self.quiesce()
+        if self.admission is not None:
+            raise RuntimeError("expert admission owner already attached")
+        self.admission = NativeExpertAdmission(
+            self,
+            history_steps=history_steps,
+            max_promotions=max_promotions,
+            exclusive_ram=exclusive_ram,
+            asynchronous=asynchronous,
+            registered_source=registered_source,
+        )
+        # Demand misses use bounded staging. Only the whole-model admission
+        # owner can replace HOT, so layer traversal no longer controls eviction.
+        gp.set_gate(self.bank.tables, False)
 
     def _profile(self, layer, hidden, output):
         # Explicit dummy mode is supplied by ModelState, never inferred from
@@ -218,13 +263,24 @@ class NativeExpertProvider:
             self.bank.release(lease, self.bank.fence())
 
     def quiesce(self):
+        if self.stream_path is not None:
+            self.stream_path.abort_step()
         if self.active or self.bank.leases:
             raise RuntimeError("cannot retire an active expert provider")
+        if self.admission is not None:
+            self.admission.quiesce()
         self.bank.fence().synchronize()
 
     def retire(self):
         self.quiesce()
         self.bank.close_prefetch()
+        if self.admission is not None:
+            self.admission.close()
+            self.admission = None
+        if self.stream_path is not None:
+            self.stream_path.retire()
+            self.stream_path.cpu.close()
+            self.stream_path = None
         for _, graph in self.kernels.values():
             graph.reset()
             self.bank.graphs.discard(graph)
@@ -365,21 +421,9 @@ class NativeExpertProvider:
             assert cpu_ids is not None
             assert cpu_weights is not None
             if self.trace_path and self.trace_steps < self.trace_limit:
-                active_ids = cpu_ids[cpu_weights > 0]
-                selected = np.unique(active_ids).tolist()
-                route_trace = dict(
-                    selected_experts=selected,
-                    gpu_hint_experts=[
-                        e for e in selected if (layer, e) in self.bank.host_hot
-                    ],
-                    ram_experts=[
-                        e for e in selected if (layer, e) in self.bank.source.cache
-                    ],
-                )
-                if len(cpu_ids) <= 64:
-                    route_trace.update(
-                        ids=cpu_ids.tolist(), weights=cpu_weights.tolist()
-                    )
+                route_trace = self._trace_routes(layer, cpu_ids, cpu_weights)
+            if self.admission is not None:
+                self.admission.observe_layer(layer, cpu_ids, cpu_weights)
             if hidden.shape[0] == 0:
                 output.zero_()
                 return
@@ -468,6 +512,8 @@ class NativeExpertProvider:
                         self.bank.release(lease, self.bank.fence())
                     steps += 1
                 output[start : start + count].copy_(self.lanes[:count].sum(dim=1))
+            if self.admission is not None and layer == self.bank.source.layers - 1:
+                self.admission.finish_step()
             self.forward_count += 1
         except Exception:
             self.bank.state = "POISONED"
@@ -503,6 +549,9 @@ class NativeExpertProvider:
                 if hybrid_used and self.hybrid_path is not None
                 else {},
                 route=route_trace,
+                admission=dict(self.admission.last_step)
+                if self.admission is not None and layer == self.bank.source.layers - 1
+                else {},
             )
             self._trace_last_step()
             if drain_error is not None:
@@ -510,28 +559,83 @@ class NativeExpertProvider:
                     "native prefetch failed while draining"
                 ) from drain_error
 
+    def _disable_trace(self, error):
+        from vllm.logger import init_logger
+
+        init_logger(__name__).warning("Expert trace failed: %s", error)
+        self.trace_path = ""
+
+    def _trace_routes(self, layer, ids, weights):
+        try:
+            if layer == 0:
+                self.trace_before = cache_snapshot(self.bank)
+            counts, useful_tokens = route_histogram(
+                ids, weights, self.bank.source.experts
+            )
+            selected = np.flatnonzero(counts).tolist()
+            context = get_forward_context()
+            descriptor = context.batch_descriptor
+            route = dict(
+                selected_experts=selected,
+                selected_histogram=counts.tolist(),
+                useful_tokens=useful_tokens,
+                gpu_hint_experts=[
+                    e for e in selected if (layer, e) in self.bank.host_hot
+                ],
+                ram_experts=[
+                    e for e in selected if (layer, e) in self.bank.source.cache
+                ],
+                runtime=dict(
+                    num_tokens_unpadded=context.num_tokens_unpadded,
+                    target_pure_decode=context.tp3_sd_phase_reduce,
+                    draft=context.tp3_mtp_device_ce,
+                    graph_mode=str(context.cudagraph_runtime_mode),
+                    descriptor=None
+                    if descriptor is None
+                    else dict(
+                        num_tokens=descriptor.num_tokens,
+                        num_reqs=descriptor.num_reqs,
+                        physical_num_reqs=descriptor.physical_num_reqs,
+                        owner=descriptor.cudagraph_owner,
+                        generation=descriptor.runtime_generation,
+                    ),
+                ),
+            )
+            if len(ids) <= 64:
+                route.update(ids=ids.tolist(), weights=weights.tolist())
+            return route
+        except Exception as error:
+            self._disable_trace(error)
+            return {}
+
     def _trace_last_step(self):
         if self.trace_path and not self.dummy and self.trace_steps < self.trace_limit:
             if self.last_step["layer"] == 0:
                 self.trace_layers.clear()
             self.trace_layers.append(dict(self.last_step))
             if self.last_step["layer"] == self.bank.source.layers - 1:
-                row = dict(
-                    schema="native-expert-step-v2",
-                    rank=self.bank.source.rank,
-                    step=self.trace_steps,
-                    unix=time.time(),
-                    layers=self.trace_layers,
-                )
                 try:
+                    row = dict(
+                        schema="native-expert-step-v3",
+                        rank=self.bank.source.rank,
+                        step=self.trace_steps,
+                        unix=time.time(),
+                        layers=self.trace_layers,
+                        residency_before=self.trace_before,
+                        residency_after=cache_snapshot(self.bank),
+                        identity=getattr(self, "execution_identity", None),
+                    )
+                    payload = json.dumps(row) + "\n"
+                    size = len(payload.encode())
+                    if self.trace_bytes + size > self.trace_byte_limit:
+                        raise ValueError("expert trace byte budget exhausted")
                     with open(
                         f"{self.trace_path}-rank{self.bank.source.rank}.jsonl", "a"
                     ) as handle:
-                        handle.write(json.dumps(row) + "\n")
-                except OSError as error:
-                    from vllm.logger import init_logger
-
-                    init_logger(__name__).warning("Expert trace failed: %s", error)
-                    self.trace_path = ""
+                        handle.write(payload)
+                    self.trace_bytes += size
+                except Exception as error:
+                    self._disable_trace(error)
                 self.trace_steps += 1
                 self.trace_layers.clear()
+                self.trace_before = None

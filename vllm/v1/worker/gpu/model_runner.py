@@ -4143,6 +4143,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     with forward_scope:
                         model_output = self.model(**model_inputs)
 
+        finish_native_experts = getattr(self.model_state, "finish_native_experts", None)
+        if finish_native_experts is not None:
+            finish_native_experts(dummy=dummy_run)
+
         if not dummy_run:
             save_layer0_trace = getattr(self.model, "maybe_save_ag2_layer0_trace", None)
             if save_layer0_trace is not None:
