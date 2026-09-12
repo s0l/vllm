@@ -28,7 +28,7 @@ class Wave:
         )
 
 
-def plan(ids, num_experts, capacity, *, is_padding=None):
+def plan(ids, num_experts, capacity, *, is_padding=None, resident_experts=None):
     """Preserve each token/top-k lane once; only expert loads are deduplicated."""
     if (
         not isinstance(ids, np.ndarray)
@@ -61,6 +61,22 @@ def plan(ids, num_experts, capacity, *, is_padding=None):
     demand, starts, counts = np.unique(
         flat[order], return_index=True, return_counts=True
     )
+    if resident_experts is not None:
+        resident = np.asarray(resident_experts)
+        if (
+            resident.ndim != 1
+            or resident.dtype.kind not in "iu"
+            or np.any(resident < 0)
+            or np.any(resident >= num_experts)
+        ):
+            raise ValueError("invalid resident expert identities")
+        permutation = np.argsort(~np.isin(demand, resident), kind="stable")
+        if len(permutation):
+            order = np.concatenate(
+                [order[starts[i] : starts[i] + counts[i]] for i in permutation]
+            )
+            demand, counts = demand[permutation], counts[permutation]
+            starts = np.concatenate(([0], np.cumsum(counts[:-1])))
     waves = []
     for first in range(0, len(demand), capacity):
         last = min(first + capacity, len(demand))

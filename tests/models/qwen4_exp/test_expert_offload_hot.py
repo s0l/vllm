@@ -325,3 +325,45 @@ def test_histogram_observer_failure_cannot_interrupt_expert_execution(monkeypatc
         == {}
     )
     assert provider.trace_path == "" and provider.bank.state == "READY"
+
+
+@pytest.mark.parametrize("m", [4, 65, 4096])
+def test_resident_first_waves_preserve_each_assignment_and_padding(m):
+    ids = ((np.arange(m)[:, None] * 13 + np.arange(10) * 37) % 512).astype(np.int32)
+    padding = np.zeros(m, np.bool_)
+    padding[-1] = True
+    ids[-1] = -1
+    resident = np.arange(256, 512, dtype=np.int32)
+    waves = plan(ids, 512, 32, is_padding=padding, resident_experts=resident)
+    received: list[tuple[int, int]] = []
+    experts: list[int] = []
+    for wave in waves:
+        experts.extend(wave.experts)
+        for tile in wave.tiles(256):
+            received.extend(
+                (int(lane), tile.experts[int(slot)])
+                for lane, slot in zip(tile.lanes, tile.slots, strict=True)
+            )
+    expected = [(lane, int(e)) for lane, e in enumerate(ids.flat) if e >= 0]
+    assert sorted(received) == expected
+    assert len(experts) == len(set(experts))
+    assert experts == sorted(experts, key=lambda e: (e not in resident, e))
+    with pytest.raises(ValueError, match="resident expert"):
+        plan(ids, 512, 32, is_padding=padding, resident_experts=np.array([512]))
+
+
+def test_stream_scan_policy_is_explicit_and_rejects_truthy_strings():
+    from vllm.utils.nvfp4_expert_stream import StreamExpertConfig
+
+    options = dict(
+        library="/test/cpu.so",
+        sha256="a" * 64,
+        cores=[0, 1, 2],
+        max_m=4,
+        history_steps=16,
+        max_promotions=192,
+    )
+    assert StreamExpertConfig.from_options(options, 3).scan_order is False
+    assert StreamExpertConfig.from_options(dict(options, scan_order=True), 3).scan_order
+    with pytest.raises(ValueError, match="requires a bool"):
+        StreamExpertConfig.from_options(dict(options, scan_order="false"), 3)

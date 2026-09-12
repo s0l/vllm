@@ -158,6 +158,7 @@ class NativeExpertProvider:
         # Standalone opt-in until the full source/copy DAG shows a benefit.
         self.use_prefetch = False
         self.use_hot_path = False
+        self.use_scan_order = False
         self.hot_path = None
         self.hybrid_path = None
         self.stream_path = None
@@ -352,7 +353,14 @@ class NativeExpertProvider:
         steps, tiles, useful, hot_calls = 0, 0, 0, 0
         route_trace = {}
         hybrid_used = False
+        scan_source = (
+            self.bank.source.cpu
+            if self.use_scan_order and not self.dummy and hidden.shape[0] > 64
+            else None
+        )
         try:
+            if scan_source is not None:
+                scan_source.source_scan_order(True)
             error = None
             cpu_ids = cpu_weights = cpu_padding = None
             validated_waves = resident = None
@@ -391,6 +399,15 @@ class NativeExpertProvider:
                         self.bank.source.experts,
                         self.bank.staging,
                         is_padding=cpu_padding,
+                        resident_experts=(
+                            np.flatnonzero(
+                                scan_source.resident_bitmap().reshape(
+                                    self.bank.source.layers, self.bank.source.experts
+                                )[layer]
+                            )
+                            if scan_source is not None
+                            else None
+                        ),
                     )
                     if (
                         self.use_hot_path
@@ -527,6 +544,8 @@ class NativeExpertProvider:
             drain_error = None
             try:
                 self.bank.drain_prefetch()
+                if scan_source is not None:
+                    scan_source.source_scan_order(False)
             except Exception as exc:
                 self.bank.state = "POISONED"
                 drain_error = exc

@@ -131,6 +131,9 @@ def get_native_provider(vllm_config):
             bank, get_tp_group(), vllm_config, topk=text.num_experts_per_tok
         )
         provider.use_hot_path = budget.hot_read
+        provider.use_scan_order = (
+            budget.stream_experts is not None and budget.stream_experts.scan_order
+        )
         if cpu is not None:
             from vllm.logger import init_logger
 

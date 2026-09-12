@@ -18,12 +18,13 @@ class StreamExpertConfig:
     cpu: CpuExpertConfig
     history_steps: int
     max_promotions: int
+    scan_order: bool = False
 
     @classmethod
     def from_options(cls, options, tp):
         if options is None:
             return None
-        if not isinstance(options, dict) or set(options) != {
+        if not isinstance(options, dict) or set(options) - {"scan_order"} != {
             "library",
             "sha256",
             "cores",
@@ -33,6 +34,9 @@ class StreamExpertConfig:
         }:
             raise ValueError("stream experts require explicit resources and placement")
         history, promotions = options["history_steps"], options["max_promotions"]
+        scan_order = options.get("scan_order", False)
+        if type(scan_order) is not bool:
+            raise ValueError("scan_order requires a bool")
         if (
             type(history) is not int
             or not 1 <= history <= 256
@@ -43,7 +47,7 @@ class StreamExpertConfig:
         cpu = CpuExpertConfig.from_options(
             {key: options[key] for key in ("library", "sha256", "cores", "max_m")}, tp
         )
-        return cls(cpu, history, promotions)
+        return cls(cpu, history, promotions, scan_order)
 
     def create(self, geometry, rank, *, layers, experts, topk):
         cores = self.cpu.rank_cores(rank, geometry.tp)
@@ -65,6 +69,10 @@ class StreamExpertConfig:
             threads=len(cores),
         )
         try:
+            if self.scan_order and not hasattr(
+                cpu.lib, "fn_executor_source_scan_order"
+            ):
+                raise ValueError("native expert library lacks scan-order support")
             cpu.pin(cores)
             cpu.begin(1)
         except BaseException:
@@ -135,6 +143,7 @@ def load_library(path, expected_sha):
         "fn_task_destroy": ([ct.c_void_p], ct.c_int),
     }
     for name, signature in {
+        "fn_executor_source_scan_order": ([ct.c_void_p, ct.c_int], ct.c_int),
         "fn_executor_source_scores": ([ct.c_void_p] * 2 + [ct.c_size_t], ct.c_int),
         "fn_executor_source_replacement_stats": ([ct.c_void_p] * 2, ct.c_int),
     }.items():
@@ -278,6 +287,14 @@ class StreamExecutor:
             "source admission",
         )
         self.owners.clear()
+
+    def source_scan_order(self, enabled):
+        if type(enabled) is not bool:
+            raise ValueError("scan order requires a bool")
+        require(
+            self.lib.fn_executor_source_scan_order(self.ptr, int(enabled)),
+            "source scan order",
+        )
 
     def source_stats(self):
         values = np.zeros(12, np.uint64)
