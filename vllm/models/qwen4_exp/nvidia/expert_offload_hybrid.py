@@ -198,9 +198,10 @@ class NativeHybridRead:
                     if error is None:
                         self.gpu_y[:count].copy_(self.host_y[:count], non_blocking=True)
                     self._ready(error)
-                    hot.output[:count].copy_(
-                        (hot.output[:count].float() + self.gpu_y[:count]).bfloat16()
+                    torch.add(
+                        hot.output[:count], self.gpu_y[:count], out=self.gpu_y[:count]
                     )
+                    hot.output[:count].copy_(self.gpu_y[:count])
                 self.calls += 1
                 self.last_step = dict(
                     hot_keys=len(self.selected),
