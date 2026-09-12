@@ -601,7 +601,22 @@ class NativeExpertAdmission:
             if self.bank.state == "POISONED":
                 self.promotion.cancel()
             else:
+                was_pending = self.promotion.pending is not None
                 self.promotion.poll(wait=True)
+                if was_pending and self.exclusive_ram:
+                    # Publication can complete after finish_step's RAM cleanup.
+                    # DMA leases have drained; reclaim only published HOT keys
+                    # before the next model step starts consuming source rows.
+                    try:
+                        released = self.bank.source.set_residency_scores(
+                            self.policy.frequency,
+                            self.bank.host_hot,
+                            gpu_hot_keys=self.bank.host_hot,
+                        )
+                    except Exception:
+                        self.bank.state = "POISONED"
+                        raise
+                    self.last_step["publication_ram_released_bytes"] = released
 
     def close(self):
         if self.promotion is not None:

@@ -774,3 +774,51 @@ def test_model_admission_freeze_and_bootstrap_consume_source_snapshot(
     assert len(plans) == 1
     assert len(plans[0].promotions) == (bank.tables.pool_rows if budget else 0)
     assert owner.last_step["available_keys"] == 16
+
+
+@pytest.mark.parametrize("exclusive", [False, True])
+def test_quiesce_reclaims_new_hot_only_after_async_publication(exclusive):
+    owner = object.__new__(NativeExpertAdmission)
+    events = []
+    owner.bank = SimpleNamespace(state="READY", host_hot={})
+    owner.exclusive_ram = exclusive
+    owner.policy = SimpleNamespace(frequency=np.ones((2, 8)))
+    owner.last_step = {}
+
+    def reclaim(scores, keys, *, gpu_hot_keys):
+        assert owner.promotion.pending is None
+        assert keys == gpu_hot_keys == {(1, 3): 0}
+        events.append("reclaim")
+        return 4096
+
+    def publish(*, wait):
+        assert wait
+        if owner.promotion.pending is not None:
+            events.append("publish")
+            owner.bank.host_hot[1, 3] = 0
+            owner.promotion.pending = None
+        return True
+
+    owner.bank.source = SimpleNamespace(set_residency_scores=reclaim)
+    owner.promotion = SimpleNamespace(pending=((1, 3, 0),), poll=publish)
+    owner.quiesce()
+    owner.quiesce()
+    assert events == (["publish", "reclaim"] if exclusive else ["publish"])
+    assert owner.last_step.get("publication_ram_released_bytes", 0) == (
+        4096 if exclusive else 0
+    )
+
+
+def test_failed_async_publication_never_discards_ram_fallback():
+    owner = object.__new__(NativeExpertAdmission)
+    owner.bank = SimpleNamespace(state="READY")
+    owner.exclusive_ram = True
+
+    def fail(*, wait):
+        owner.bank.state = "POISONED"
+        raise RuntimeError("upload failed")
+
+    owner.promotion = SimpleNamespace(pending=((0, 1, 0),), poll=fail)
+    with pytest.raises(RuntimeError, match="upload failed"):
+        owner.quiesce()
+    assert owner.bank.state == "POISONED"
