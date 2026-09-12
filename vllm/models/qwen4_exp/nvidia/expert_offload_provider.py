@@ -573,6 +573,8 @@ class NativeExpertProvider:
                 ids, weights, self.bank.source.experts
             )
             selected = np.flatnonzero(counts).tolist()
+            # One metadata snapshot, without probing or leasing expert rows.
+            ram_keys = set(self.bank.source.cache)
             context = get_forward_context()
             descriptor = context.batch_descriptor
             route = dict(
@@ -582,9 +584,7 @@ class NativeExpertProvider:
                 gpu_hint_experts=[
                     e for e in selected if (layer, e) in self.bank.host_hot
                 ],
-                ram_experts=[
-                    e for e in selected if (layer, e) in self.bank.source.cache
-                ],
+                ram_experts=[e for e in selected if (layer, e) in ram_keys],
                 runtime=dict(
                     num_tokens_unpadded=context.num_tokens_unpadded,
                     target_pure_decode=context.tp3_sd_phase_reduce,

@@ -20,6 +20,11 @@ class ResidentRows(Mapping):
     def __len__(self):
         return len(self.source.cpu.resident_keys())
 
+    def __contains__(self, key):
+        # Mapping's default probes __getitem__, which leases native weights
+        # and rejects a nonresident key. Membership is metadata-only.
+        return any(candidate == key for candidate in self)
+
     def __getitem__(self, key):
         return self.source.borrow_resident([key])[0]
 
