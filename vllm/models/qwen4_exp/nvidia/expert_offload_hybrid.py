@@ -29,8 +29,12 @@ class NativeHybridRead:
         self.max_tokens = executor.max_m
         self.output = self.hot.output
         shape = (self.max_tokens, provider.hidden)
-        self.host_x = torch.empty(shape, dtype=torch.bfloat16, pin_memory=True)
-        self.host_y = torch.empty(shape, dtype=torch.float32, pin_memory=True)
+        self.host_x = torch.empty(
+            shape, dtype=torch.bfloat16, device="cpu", pin_memory=True
+        )
+        self.host_y = torch.empty(
+            shape, dtype=torch.float32, device="cpu", pin_memory=True
+        )
         self.gpu_y = torch.empty(shape, dtype=torch.float32, device=bank.device)
         self.input_ready = torch.cuda.Event()
         self.cpu_epoch = 0
