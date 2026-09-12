@@ -560,7 +560,9 @@ class NativeExpertBank:
             self.leases.remove(lease)
 
     def fence(self):
-        event = torch.cuda.Event()
+        # CPU experts participate in the stream DAG. Busy host waits can
+        # starve their pinned workers while the GPU waits for those workers.
+        event = torch.cuda.Event(blocking=True)
         event.record(torch.cuda.current_stream(self.device))
         return event
 
