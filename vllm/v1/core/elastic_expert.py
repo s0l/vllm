@@ -5,6 +5,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+from vllm.utils.nvfp4_cpu_experts import CpuExpertConfig
 from vllm.utils.nvfp4_expert_geometry import NVFP4ExpertGeometry
 
 
@@ -32,6 +33,7 @@ class NativeExpertBudget:
     pin_ram_cache: bool = False
     hot_read: bool = False
     prepared_archive: str | None = None
+    cpu_experts: CpuExpertConfig | None = None
 
     def __post_init__(self):
         self.geometry.validate_cutlass()
@@ -48,6 +50,15 @@ class NativeExpertBudget:
             or self.ram_cache_bytes < 0
             or type(self.pin_ram_cache) is not bool
             or type(self.hot_read) is not bool
+            or (
+                self.cpu_experts is not None
+                and (
+                    not isinstance(self.cpu_experts, CpuExpertConfig)
+                    or not self.hot_read
+                    or not self.pin_ram_cache
+                    or self.prepared_archive is None
+                )
+            )
             or (
                 self.prepared_archive is not None
                 and (
@@ -76,11 +87,13 @@ class NativeExpertBudget:
                 "pin_ram_cache",
                 "hot_read",
                 "prepared_archive",
+                "cpu_experts",
             }
             or any(
                 type(v) is not int or v < 0
                 for key, v in options.items()
-                if key not in {"pin_ram_cache", "hot_read", "prepared_archive"}
+                if key
+                not in {"pin_ram_cache", "hot_read", "prepared_archive", "cpu_experts"}
             )
             or type(options.get("pin_ram_cache", False)) is not bool
             or type(options.get("hot_read", False)) is not bool
@@ -110,6 +123,9 @@ class NativeExpertBudget:
             pin_ram_cache=options.get("pin_ram_cache", False),
             hot_read=options.get("hot_read", False),
             prepared_archive=options.get("prepared_archive"),
+            cpu_experts=CpuExpertConfig.from_options(
+                options.get("cpu_experts"), config.parallel_config.tensor_parallel_size
+            ),
         )
 
     @property

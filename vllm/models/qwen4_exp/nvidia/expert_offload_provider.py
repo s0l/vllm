@@ -166,6 +166,12 @@ class NativeExpertProvider:
         self.trace_path = os.environ.get("AG2_VLLM_EXPERT_TRACE", "")
         self.trace_layers = []
         self.trace_steps = 0
+        self.trace_limit = int(os.environ.get("AG2_VLLM_EXPERT_TRACE_STEPS", "64"))
+        if not 0 <= self.trace_limit <= 4096:
+            raise ValueError("expert trace step budget must be within 0..4096")
+        if self.trace_path:
+            with open(f"{self.trace_path}-rank{bank.source.rank}.jsonl", "a"):
+                pass
 
     def prepare_execution(self, *, dummy):
         if self.active or self.bank.leases or self.bank.state != "READY":
@@ -285,6 +291,8 @@ class NativeExpertProvider:
         before_consumed = self.bank.prefetch_consumed
         started = time.perf_counter()
         steps, tiles, useful, hot_calls = 0, 0, 0, 0
+        route_trace = {}
+        hybrid_used = False
         try:
             error = None
             cpu_ids = cpu_weights = cpu_padding = None
@@ -355,6 +363,23 @@ class NativeExpertProvider:
                 resident=resident,
             )
             assert cpu_ids is not None
+            assert cpu_weights is not None
+            if self.trace_path and self.trace_steps < self.trace_limit:
+                active_ids = cpu_ids[cpu_weights > 0]
+                selected = np.unique(active_ids).tolist()
+                route_trace = dict(
+                    selected_experts=selected,
+                    gpu_hint_experts=[
+                        e for e in selected if (layer, e) in self.bank.host_hot
+                    ],
+                    ram_experts=[
+                        e for e in selected if (layer, e) in self.bank.source.cache
+                    ],
+                )
+                if len(cpu_ids) <= 64:
+                    route_trace.update(
+                        ids=cpu_ids.tolist(), weights=cpu_weights.tolist()
+                    )
             if hidden.shape[0] == 0:
                 output.zero_()
                 return
@@ -387,6 +412,7 @@ class NativeExpertProvider:
                     assert resident is not None
                     if self.hybrid_path is not None and resident is self.hybrid_path:
                         resident.run(layer, waves, cpu_ids, cpu_weights)
+                        hybrid_used = True
                     else:
                         resident.run(layer, waves, cpu_ids)
                     output[:count].copy_(resident.output[:count])
@@ -472,6 +498,11 @@ class NativeExpertProvider:
                 source_misses=self.bank.source.misses - before_misses,
                 ram_retained_bytes=self.bank.source.used,
                 tokens=hidden.shape[0],
+                execution="hybrid" if hybrid_used else "gpu",
+                hybrid=dict(self.hybrid_path.last_step)
+                if hybrid_used and self.hybrid_path is not None
+                else {},
+                route=route_trace,
             )
             self._trace_last_step()
             if drain_error is not None:
@@ -480,13 +511,13 @@ class NativeExpertProvider:
                 ) from drain_error
 
     def _trace_last_step(self):
-        if self.trace_path and not self.dummy and self.trace_steps < 64:
+        if self.trace_path and not self.dummy and self.trace_steps < self.trace_limit:
             if self.last_step["layer"] == 0:
                 self.trace_layers.clear()
             self.trace_layers.append(dict(self.last_step))
             if self.last_step["layer"] == self.bank.source.layers - 1:
                 row = dict(
-                    schema="native-expert-step-v1",
+                    schema="native-expert-step-v2",
                     rank=self.bank.source.rank,
                     step=self.trace_steps,
                     unix=time.time(),

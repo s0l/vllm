@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Opt-in mixed HOT GPU / selected CPU execution under the real bank lease."""
 
+import time
 from hashlib import sha256
 
 import numpy as np
@@ -88,6 +89,7 @@ class NativeHybridRead:
 
     def run(self, layer, waves, cpu_ids, cpu_weights):
         bank, provider, hot = self.bank, self.provider, self.hot
+        timings = dict(source_ms=0.0, bind_ms=0.0, cpu_ms=0.0, input_wait_ms=0.0)
         if self.all_hot:
             self.last_step = dict(
                 hot_keys=len(self.selected),
@@ -95,6 +97,7 @@ class NativeHybridRead:
                 hot_lanes=int((cpu_weights > 0).sum()),
                 cold_lanes=0,
                 cpu_generation=self.cpu_epoch,
+                **timings,
             )
             return hot.run(layer, waves, cpu_ids)
         count = len(cpu_ids)
@@ -159,13 +162,22 @@ class NativeHybridRead:
                 if len(self.cold):
                     self.cpu_epoch += 1
                     try:
+                        started = time.perf_counter()
                         rows = bank.source.get_many(layer, self.cold.tolist())
+                        timings["source_ms"] = (time.perf_counter() - started) * 1000
+                        started = time.perf_counter()
                         self.cpu.bind(rows, generation=self.cpu_epoch)
+                        timings["bind_ms"] = (time.perf_counter() - started) * 1000
+                        started = time.perf_counter()
                         self.input_ready.synchronize()
+                        timings["input_wait_ms"] = (
+                            time.perf_counter() - started
+                        ) * 1000
                         mapped = np.full(cpu_ids.shape, -1, np.int32)
                         mapped[cold_mask] = np.searchsorted(
                             self.cold, cpu_ids[cold_mask]
                         )
+                        started = time.perf_counter()
                         self.cpu.run(
                             self.host_x[:count].view(torch.uint16).numpy(),
                             mapped,
@@ -173,6 +185,7 @@ class NativeHybridRead:
                             self.host_y[:count].numpy(),
                             generation=self.cpu_epoch,
                         )
+                        timings["cpu_ms"] = (time.perf_counter() - started) * 1000
                     except Exception as exc:
                         error = RuntimeError(f"{type(exc).__name__}: {exc}")
                     finally:
@@ -195,6 +208,7 @@ class NativeHybridRead:
                     hot_lanes=int(hot_mask.sum()),
                     cold_lanes=int(cold_mask.sum()),
                     cpu_generation=self.cpu_epoch,
+                    **timings,
                 )
             finally:
                 bank.release(lease, bank.fence())

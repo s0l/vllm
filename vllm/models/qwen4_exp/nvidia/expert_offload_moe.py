@@ -107,6 +107,20 @@ def get_native_provider(vllm_config):
             bank, get_tp_group(), vllm_config, topk=text.num_experts_per_tok
         )
         provider.use_hot_path = budget.hot_read
+        if budget.cpu_experts is not None:
+            from vllm.logger import init_logger
+            from vllm.utils.nvfp4_cpu_experts import load_cpu_experts
+
+            executor = load_cpu_experts(
+                budget.cpu_experts,
+                budget.geometry,
+                get_tensor_model_parallel_rank(),
+                text.num_experts_per_tok,
+            )
+            provider.enable_cpu_experts(executor)
+            init_logger(__name__).info(
+                "FlashNext CPU experts attached: %s", executor.identity
+            )
         _providers[key] = provider
     return provider
 
