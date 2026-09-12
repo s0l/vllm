@@ -57,6 +57,8 @@ def _replay_allocation_profile(
         )
     sources = tuple({id(p.bank.source): p.bank.source for p in providers}.values())
     before_reads = sum(source.misses for source in sources)
+    for provider in providers:
+        provider.quiesce()
     transaction = "allocation-profile-replay"
     try:
         for key in keys:
@@ -97,10 +99,18 @@ def _replay_allocation_profile(
                 manager = managers[key.logical.owner]
                 desc = manager._descriptor_for_physical_key(key)
                 entry = manager._dynamic_capture_state_direct_entry(desc)
+                if key.logical.owner == "target":
+                    for provider in providers:
+                        provider.prepare_execution(
+                            dummy=True, num_tokens=desc.num_tokens
+                        )
                 if desc.cg_mode == CUDAGraphMode.FULL:
                     manager.run_fullgraph(desc)
                 else:
                     entry.capture_state(CUDAGraphMode.PIECEWISE)
+                if key.logical.owner == "target":
+                    for provider in providers:
+                        provider.finish_execution(dummy=True)
             # Sampling has a separate allocation lifetime after target. Its
             # maximum row count is X; values are intentionally synthetic.
             sample = torch.zeros(
@@ -173,6 +183,7 @@ def profile_allocation_catalog(owner: Any, surface: Any, *, progress=None):
         if scheduler.prepare_elastic_restore_idle_reclaim():
             execute(ElasticPlanKind.RECLAIM)
 
+    completed = False
     try:
         reclaim()
         for key in corners + holdouts:
@@ -208,10 +219,15 @@ def profile_allocation_catalog(owner: Any, surface: Any, *, progress=None):
         ElasticCatalogCalibrator(owner).validate_capacity(surface, rows)
         if progress is not None:
             progress(samples, None, time.monotonic() - started)
+        completed = True
         return rows
     finally:
         try:
-            reclaim()
+            # A failed RPC can leave a poisoned worker owner. Reclaiming through
+            # it masks the original failure and is not a recovery protocol.
+            # The contained caller must terminate that worker generation.
+            if completed:
+                reclaim()
         finally:
             scheduler._elastic_restore_mode = previous_mode
             scheduler._elastic_graph_catalog = previous_catalog

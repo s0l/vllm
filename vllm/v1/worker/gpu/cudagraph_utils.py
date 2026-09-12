@@ -4536,13 +4536,20 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             return forward_fn
 
-        super().capture(
-            create_forward_fn,
-            progress_bar_desc,
-            capture_descs,
-            capture_begin_hook=capture_begin_hook,
-            capture_complete_hook=capture_complete_hook,
-        )
+        try:
+            super().capture(
+                create_forward_fn,
+                progress_bar_desc,
+                capture_descs,
+                capture_begin_hook=capture_begin_hook,
+                capture_complete_hook=capture_complete_hook,
+            )
+        finally:
+            # These closures bypass execute_model's normal completion seam.
+            # Their transient read lease must not outlive capture/rollback.
+            finish_native_capture = getattr(model_state, "finish_native_capture", None)
+            if finish_native_capture is not None:
+                finish_native_capture()
         if self.tp3_owner_prequant:
             logger.warning(
                 "TP3 owner prequant CUDA Graph capture completed: descriptors=%s",

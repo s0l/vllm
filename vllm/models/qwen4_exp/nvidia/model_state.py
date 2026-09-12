@@ -117,6 +117,17 @@ class Qwen4ExpModelState(MambaHybridModelState):
         for provider in self._native_providers:
             provider.finish_execution(dummy=dummy)
 
+    def finish_native_capture(self):
+        """End capture-only read leases without committing dummy observations."""
+        for provider in self._native_providers:
+            if (
+                provider.stream_path is not None
+                and provider.stream_path.lease is not None
+            ):
+                if not provider.dummy:
+                    raise RuntimeError("native capture completion overlaps real input")
+                provider.stream_path.abort_step()
+
     def resolve_cudagraph_mode(self, mode: CUDAGraphMode) -> CUDAGraphMode:
         if mode == CUDAGraphMode.NONE or not (
             getattr(self, "_native_providers", ())
