@@ -22,6 +22,77 @@ from vllm.models.qwen4_exp.nvidia.expert_offload_bank import (
 from vllm.models.qwen4_exp.nvidia.expert_offload_source import NativeExpertStore
 
 
+def test_resident_membership_never_borrows_missing_or_present_weights():
+    from vllm.models.qwen4_exp.nvidia.expert_offload_shared_source import ResidentRows
+
+    keys = [513, 515]
+
+    def forbidden(*args):
+        raise AssertionError("membership borrowed weights")
+
+    source = SimpleNamespace(
+        experts=512,
+        cpu=SimpleNamespace(resident_keys=lambda: keys),
+        borrow_resident=forbidden,
+    )
+    rows = ResidentRows(source)
+    assert (1, 1) in rows and (1, 2) not in rows
+    keys.clear()
+    assert (1, 1) not in rows
+    keys.append(513)
+    assert (1, 1) in rows
+
+
+def test_prefill_trace_snapshots_resident_metadata_once_and_survives_misses(
+    monkeypatch,
+):
+    from vllm.models.qwen4_exp.nvidia import expert_offload_provider as provider_module
+    from vllm.models.qwen4_exp.nvidia.expert_offload_shared_source import ResidentRows
+
+    keys, reads = [513, 515], []
+
+    def resident_keys():
+        reads.append(1)
+        return keys
+
+    def forbidden(*args):
+        raise AssertionError("route observer borrowed weights")
+
+    source = SimpleNamespace(
+        experts=512,
+        cpu=SimpleNamespace(resident_keys=resident_keys),
+        borrow_resident=forbidden,
+    )
+    source.cache = ResidentRows(source)
+    provider = provider_module.NativeExpertProvider.__new__(
+        provider_module.NativeExpertProvider
+    )
+    provider.bank = SimpleNamespace(source=source, host_hot={(1, 0): 0})
+    provider.trace_path = "must-remain-enabled"
+    monkeypatch.setattr(
+        provider_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            batch_descriptor=None,
+            num_tokens_unpadded=128,
+            tp3_sd_phase_reduce=False,
+            tp3_mtp_device_ce=False,
+            cudagraph_runtime_mode="PIECEWISE",
+        ),
+    )
+    ids = np.tile(np.arange(10, dtype=np.int32), (128, 1))
+    weights = np.full(ids.shape, 0.1, np.float32)
+    for resident, expected in (([513, 515], [1, 3]), ([], []), ([516], [4])):
+        keys[:] = resident
+        reads.clear()
+        row = provider._trace_routes(1, ids, weights)
+        assert row["selected_histogram"] == [128] * 10 + [0] * 502
+        assert row["ram_experts"] == expected
+        assert row["gpu_hint_experts"] == [0]
+        assert reads == [1]
+        assert provider.trace_path == "must-remain-enabled"
+
+
 def test_manager_closes_capture_inputs_on_success_failure_and_recovery(monkeypatch):
     from vllm.config import CUDAGraphMode
     from vllm.v1.worker.gpu.cudagraph_utils import (
