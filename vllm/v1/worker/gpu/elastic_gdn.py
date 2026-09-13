@@ -577,8 +577,13 @@ class V2GDNCheckpointManager:
         kv_cache_config: KVCacheConfig,
         forward_context: dict[str, Any],
     ) -> tuple[bytes, ...]:
+        managed = getattr(scheduler_output, "gdn_checkpoint_plan", None) is not None
+        if managed:
+            self.store.begin_checkpoint_plan(scheduler_output)
         for req_id, key in (scheduler_output.gdn_checkpoint_save or {}).items():
             self.store.save_blocks(
                 key, self._block_ids[req_id], kv_cache_config, forward_context
             )
+        if managed:
+            self.store.finish_checkpoint_plan(scheduler_output)
         return self.store.snapshot_keys()

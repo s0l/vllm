@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from vllm.v1.core.gdn_checkpoint_policy import GDNCheckpointPolicy
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -37,6 +38,131 @@ class _TensorStore(GDNPrefixCheckpointStore):
 
 
 class TestGDNPrefixCheckpoint(unittest.TestCase):
+    def test_preview_lease_at_full_capacity_defers_new_save(self):
+        policy = GDNCheckpointPolicy(4, 4)
+        initial = policy.plan({b"leased": 10})
+        policy.acknowledge(initial, initial.resident)
+        blocked = policy.plan({b"new": 100}, protected={b"leased"})
+        self.assertEqual(blocked.saves, ())
+        policy.acknowledge(blocked, blocked.resident)
+        self.assertIn(b"leased", policy.visible())
+        # Cancellation releases the preview lease; admission can recover.
+        recovery = policy.plan({b"new": 100})
+        self.assertEqual(recovery.evictions, (b"leased",))
+        policy.acknowledge(recovery, recovery.resident)
+        self.assertEqual(policy.visible(), (b"new",))
+
+    def test_v2_managed_save_executes_authoritative_plan(self):
+        from vllm.v1.worker.gpu.elastic_gdn import V2GDNCheckpointManager
+
+        class Store(_TensorStore):
+            def _state_tensors_for_block_ids(self, *args, **kwargs):
+                yield from self.tensors["req"]
+
+        manager = V2GDNCheckpointManager()
+        manager.store = Store({"req": [torch.tensor([3.0])]})
+        manager._block_ids = {"req": ([1],)}
+        policy = GDNCheckpointPolicy(4, 4)
+        for key, value in ((b"a", 3.0), (b"b", 7.0)):
+            plan = policy.plan({key: 100})
+            manager.store.tensors["req"][0].fill_(value)
+            output = SimpleNamespace(
+                gdn_checkpoint_plan=(plan.sequence, plan.evictions, plan.resident),
+                gdn_checkpoint_budget=(4, 4),
+                gdn_checkpoint_save={"req": key},
+            )
+            keys = manager.save(output, None, None)
+            policy.acknowledge(plan, keys)
+            manager.store.tensors["req"][0].zero_()
+            manager.store.restore_blocks(key, ([1],), None, None)
+            self.assertEqual(manager.store.tensors["req"][0].item(), value)
+            with self.assertRaisesRegex(RuntimeError, "sequence"):
+                manager.save(output, None, None)
+            self.assertEqual(manager.store.checkpoint_bytes, 4)
+
+    def test_cost_aging_retains_long_prefix_through_short_request_churn(self):
+        for cost_aware in (False, True):
+            policy = GDNCheckpointPolicy(36 * 100, 100, cost_aware=cost_aware)
+            plan = policy.plan({b"long": 31000})
+            policy.acknowledge(plan, plan.resident)
+            for i in range(128):
+                plan = policy.plan({str(i).encode(): 2500})
+                policy.acknowledge(plan, plan.resident)
+                self.assertLessEqual(len(policy.entries) * 100, 3600)
+            self.assertEqual(b"long" in policy.visible(), cost_aware)
+            # Cost protection must age out under sustained unrelated demand.
+            for i in range(128, 2000):
+                plan = policy.plan({str(i).encode(): 2500})
+                policy.acknowledge(plan, plan.resident)
+            self.assertNotIn(b"long", policy.visible())
+
+    def test_retired_key_cannot_be_resurrected_by_delayed_publication(self):
+        policy = GDNCheckpointPolicy(8, 4)
+        first = policy.plan({b"a": 1, b"b": 1})
+        self.assertEqual(policy.visible(), ())
+        second = policy.plan({b"c": 2})
+        policy.acknowledge(first, first.resident)
+        self.assertNotIn(b"a", policy.visible())
+        self.assertNotIn(b"c", policy.visible())
+        with self.assertRaisesRegex(RuntimeError, "Out-of-order"):
+            policy.acknowledge(first, first.resident)
+        with self.assertRaisesRegex(RuntimeError, "membership"):
+            policy.acknowledge(second, (b"wrong",))
+        policy.acknowledge(second, second.resident)
+        self.assertIn(b"c", policy.visible())
+
+    def test_managed_restore_precedes_eviction_at_full_budget(self):
+        tensors = {"req": [torch.tensor([3.0])]}
+        store = _TensorStore(tensors)
+        policy = GDNCheckpointPolicy(4, 4)
+
+        def execute(plan, saves):
+            output = SimpleNamespace(
+                gdn_checkpoint_plan=(plan.sequence, plan.evictions, plan.resident),
+                gdn_checkpoint_budget=(4, 4),
+                gdn_checkpoint_save=saves,
+            )
+            store.save_from_output(output, None, None, None)
+
+        first = policy.plan({b"a": 100})
+        execute(first, {"req": b"a"})
+        policy.acknowledge(first, store.snapshot_keys())
+        # A restore already queued before retirement still finds exact bytes.
+        second = policy.plan({b"b": 10})
+        tensors["req"][0].zero_()
+        store.restore(b"a", "req", None, None, None)
+        self.assertEqual(tensors["req"][0].item(), 3.0)
+        tensors["req"][0].fill_(7)
+        execute(second, {"req": b"b"})
+        policy.acknowledge(second, store.snapshot_keys())
+        self.assertFalse(store.contains(b"a"))
+        self.assertEqual(store.checkpoint_bytes, 4)
+        tensors["req"][0].zero_()
+        store.restore(b"b", "req", None, None, None)
+        self.assertEqual(tensors["req"][0].item(), 7.0)
+
+    def test_managed_budget_rejects_oversize_before_copy_and_recovers(self):
+        store = _TensorStore({"req": [torch.ones(2)]})
+        store.managed_budget = (4, 4)
+        with self.assertRaisesRegex(RuntimeError, "before allocation"):
+            store.save(b"a", "req", None, None, None)
+        self.assertEqual(store.checkpoint_bytes, 0)
+        store.tensors["req"] = [torch.tensor([9.0])]
+        store.save(b"a", "req", None, None, None)
+        with self.assertRaises(RuntimeError):
+            store.save(b"a", "req", None, None, None)
+        self.assertEqual(store.checkpoint_bytes, 4)
+
+    def test_wave_larger_than_budget_is_admitted_without_overallocation(self):
+        policy = GDNCheckpointPolicy(8, 4)
+        plan = policy.plan({b"a": 10, b"b": 20, b"c": 30})
+        self.assertEqual(set(plan.saves), {b"b", b"c"})
+        policy.acknowledge(plan, plan.resident)
+        for candidates in ({b"c": 30, b"d": 40}, {}, {b"d": 40}):
+            plan = policy.plan(candidates)
+            policy.acknowledge(plan, plan.resident)
+        self.assertEqual(set(policy.visible()), {b"c", b"d"})
+
     def test_attention_cow_disjoint_and_overlapping_sources(self):
         from tests.experimental.elastic_attention_cow_region_control import main
 
@@ -44,14 +170,19 @@ class TestGDNPrefixCheckpoint(unittest.TestCase):
 
     def test_real_geometry_automatic_match_resume_and_bounded_splits(self):
         coordinator = object.__new__(HybridKVCacheCoordinator)
+        coordinator.mamba_block_pool = None
         coordinator.gdn_checkpoint_keys = OrderedDict()
         coordinator.enable_dcp_fine_prefix = True
         scheduler = object.__new__(Scheduler)
+        scheduler.mamba_has_prefill_checkpoint_blocks = False
+        scheduler.mamba_prefill_checkpoint_alignment = 1
+        scheduler.mamba_fine_grained_prefix_cache = False
         scheduler.kv_cache_manager = SimpleNamespace(coordinator=coordinator)
         scheduler.hash_block_size = 192
         scheduler.block_size = 7488
         scheduler.mamba_state_update_alignment = 64
         scheduler.use_eagle = True
+        scheduler.use_eagle_block_drop = True
         scheduler.mamba_partial_cache_hit = True
         scheduler.max_num_scheduled_tokens = 4096
         scheduler._long_prefill_chunk_cap = lambda request: 0
@@ -147,6 +278,7 @@ class TestGDNPrefixCheckpoint(unittest.TestCase):
         tensors = {"req": [torch.tensor([1.0])]}
         store = _TensorStore(tensors, limit=2)
         coordinator = object.__new__(HybridKVCacheCoordinator)
+        coordinator.mamba_block_pool = None
         coordinator.gdn_checkpoint_keys = OrderedDict()
         coordinator.gdn_checkpoint_limit = 2
 
@@ -168,6 +300,7 @@ class TestGDNPrefixCheckpoint(unittest.TestCase):
 
     def test_dcp_checkpoint_lookup_uses_newest_exact_effective_boundary(self):
         coordinator = object.__new__(HybridKVCacheCoordinator)
+        coordinator.mamba_block_pool = None
         coordinator.gdn_checkpoint_keys = OrderedDict()
         coordinator.gdn_checkpoint_limit = 8
         coordinator.hash_block_size = 2
@@ -194,6 +327,7 @@ class TestGDNPrefixCheckpoint(unittest.TestCase):
 
     def test_dcp_fine_checkpoint_lookup_uses_hash_boundary(self):
         coordinator = object.__new__(HybridKVCacheCoordinator)
+        coordinator.mamba_block_pool = None
         coordinator.gdn_checkpoint_keys = OrderedDict()
         coordinator.gdn_checkpoint_limit = 8
         coordinator.hash_block_size = 2
@@ -251,13 +385,18 @@ class TestGDNPrefixCheckpoint(unittest.TestCase):
 
     def test_fine_hint_is_an_exact_scheduler_stop(self):
         coordinator = object.__new__(HybridKVCacheCoordinator)
+        coordinator.mamba_block_pool = None
         coordinator.gdn_checkpoint_keys = OrderedDict()
         coordinator.enable_dcp_fine_prefix = True
         scheduler = object.__new__(Scheduler)
+        scheduler.mamba_has_prefill_checkpoint_blocks = False
+        scheduler.mamba_prefill_checkpoint_alignment = 1
+        scheduler.mamba_fine_grained_prefix_cache = False
         scheduler.kv_cache_manager = SimpleNamespace(coordinator=coordinator)
         scheduler.hash_block_size = 2
         scheduler.block_size = 12
         scheduler.use_eagle = False
+        scheduler.use_eagle_block_drop = False
         scheduler.mamba_partial_cache_hit = True
         request = SimpleNamespace(
             num_computed_tokens=0,
@@ -272,13 +411,18 @@ class TestGDNPrefixCheckpoint(unittest.TestCase):
 
     def test_eagle_fine_hint_materializes_resume_then_match_boundaries(self):
         coordinator = object.__new__(HybridKVCacheCoordinator)
+        coordinator.mamba_block_pool = None
         coordinator.gdn_checkpoint_keys = OrderedDict()
         coordinator.enable_dcp_fine_prefix = True
         scheduler = object.__new__(Scheduler)
+        scheduler.mamba_has_prefill_checkpoint_blocks = False
+        scheduler.mamba_prefill_checkpoint_alignment = 1
+        scheduler.mamba_fine_grained_prefix_cache = False
         scheduler.kv_cache_manager = SimpleNamespace(coordinator=coordinator)
         scheduler.hash_block_size = 2
         scheduler.block_size = 12
         scheduler.use_eagle = True
+        scheduler.use_eagle_block_drop = True
         scheduler.mamba_partial_cache_hit = True
         request = SimpleNamespace(
             num_computed_tokens=0,
@@ -326,6 +470,7 @@ class TestGDNPrefixCheckpoint(unittest.TestCase):
             separate_pool=True,
         )
         coordinator = object.__new__(HybridKVCacheCoordinator)
+        coordinator.mamba_block_pool = None
         coordinator.gdn_checkpoint_keys = OrderedDict()
         coordinator.enable_dcp_fine_prefix = True
         coordinator.hash_block_size = 2
@@ -335,9 +480,13 @@ class TestGDNPrefixCheckpoint(unittest.TestCase):
             kv_cache_groups=[KVCacheGroupSpec(["gdn"], spec)]
         )
         scheduler = object.__new__(Scheduler)
+        scheduler.mamba_has_prefill_checkpoint_blocks = False
+        scheduler.mamba_prefill_checkpoint_alignment = 1
+        scheduler.mamba_fine_grained_prefix_cache = False
         scheduler.kv_cache_manager = SimpleNamespace(coordinator=coordinator)
         scheduler.hash_block_size = 2
         scheduler.use_eagle = True
+        scheduler.use_eagle_block_drop = True
         request = SimpleNamespace(
             num_prompt_tokens=19,
             execution_prefill_len=19,
@@ -353,6 +502,7 @@ class TestGDNPrefixCheckpoint(unittest.TestCase):
 
     def test_lookup_does_not_touch_lru_until_restore_is_dispatched(self):
         coordinator = object.__new__(HybridKVCacheCoordinator)
+        coordinator.mamba_block_pool = None
         coordinator.gdn_checkpoint_keys = OrderedDict()
         coordinator.gdn_checkpoint_limit = 2
         coordinator.hash_block_size = 2
@@ -387,6 +537,7 @@ class TestGDNPrefixCheckpoint(unittest.TestCase):
         tensors = {"req": [torch.tensor([1.0])]}
         store = _TensorStore(tensors, limit=2)
         coordinator = object.__new__(HybridKVCacheCoordinator)
+        coordinator.mamba_block_pool = None
         coordinator.gdn_checkpoint_keys = OrderedDict()
         coordinator.gdn_checkpoint_limit = 2
 

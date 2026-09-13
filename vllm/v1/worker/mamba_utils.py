@@ -201,6 +201,9 @@ class GDNPrefixCheckpointStore:
         self.bytes_per_checkpoint: int | None = None
         self.checkpoint_bytes = 0
         self.peak_checkpoint_bytes = 0
+        self.managed_budget: tuple[int, int] | None = None
+        self.managed_sequence = 0
+        self._recycled_checkpoints: list[tuple[torch.Tensor, ...]] = []
 
     def __len__(self) -> int:
         return len(self._checkpoints)
@@ -278,12 +281,40 @@ class GDNPrefixCheckpointStore:
         )
 
     def _save_state_tensors(self, key: bytes, state_tensors) -> None:
+        state_tensors = tuple(state_tensors)
+        actual_bytes = sum(state.nbytes for state in state_tensors)
+        if self.managed_budget is not None:
+            budget, charge = self.managed_budget
+            if actual_bytes > charge or (len(self._checkpoints) + 1) * charge > budget:
+                raise RuntimeError(
+                    "GDN checkpoint byte budget exceeded before allocation"
+                )
+            if key in self._checkpoints:
+                raise RuntimeError(
+                    "Managed GDN checkpoint save would overwrite an entry"
+                )
+        recycled = (
+            self._recycled_checkpoints.pop() if self._recycled_checkpoints else ()
+        )
+        if recycled and (
+            len(recycled) != len(state_tensors)
+            or any(
+                a.shape != b.shape or a.dtype != b.dtype
+                for a, b in zip(recycled, state_tensors)
+            )
+        ):
+            self._recycled_checkpoints.append(recycled)
+            raise RuntimeError("GDN recycled checkpoint metadata changed")
         host_states: list[torch.Tensor] = []
-        for state in state_tensors:
-            host = torch.empty_like(
-                state,
-                device="cpu",
-                pin_memory=state.is_cuda,
+        for i, state in enumerate(state_tensors):
+            host = (
+                recycled[i]
+                if recycled
+                else torch.empty_like(
+                    state,
+                    device="cpu",
+                    pin_memory=state.is_cuda,
+                )
             )
             host.copy_(state, non_blocking=state.is_cuda)
             host_states.append(host)
@@ -403,8 +434,57 @@ class GDNPrefixCheckpointStore:
         requests: dict[str, CachedRequestState],
         forward_context: dict[str, Any],
     ) -> None:
+        self.begin_checkpoint_plan(scheduler_output)
         for req_id, key in (scheduler_output.gdn_checkpoint_save or {}).items():
             self.save(key, req_id, kv_cache_config, requests, forward_context)
+        self.finish_checkpoint_plan(scheduler_output)
+
+    def begin_checkpoint_plan(self, scheduler_output: SchedulerOutput) -> None:
+        command = getattr(scheduler_output, "gdn_checkpoint_plan", None)
+        if command is not None:
+            sequence, evictions, resident = command
+            budget = scheduler_output.gdn_checkpoint_budget
+            if (
+                budget is None
+                or budget[1] <= 0
+                or budget[0] < budget[1]
+                or sequence != self.managed_sequence + 1
+            ):
+                raise RuntimeError("Invalid GDN checkpoint command sequence/budget")
+            if self.managed_budget is not None and budget != self.managed_budget:
+                raise RuntimeError("GDN checkpoint budget changed within runtime")
+            saved = tuple((scheduler_output.gdn_checkpoint_save or {}).values())
+            old = set(self._checkpoints)
+            if (
+                len(set(evictions)) != len(evictions)
+                or not set(evictions) <= old
+                or len(set(saved)) != len(saved)
+                or (old - set(evictions)) & set(saved)
+                or len(set(resident)) != len(resident)
+                or (old - set(evictions)) | set(saved) != set(resident)
+                or len(resident) * budget[1] > budget[0]
+            ):
+                raise RuntimeError("Invalid GDN checkpoint membership command")
+            self.managed_budget = budget
+            self.limit = self.advertised_limit = budget[0] // budget[1]
+            # Called after this step's restores and forward. Earlier queued
+            # restores are already consumed; later requests cannot see these keys.
+            for key in evictions:
+                states = self._checkpoints.pop(key)
+                self.checkpoint_bytes -= sum(state.nbytes for state in states)
+                # Reuse the same bounded pinned buffers. D2H follows earlier
+                # H2D restores on the worker stream, so queued readers finish
+                # before overwrite without an additional host barrier/reserve.
+                self._recycled_checkpoints.append(states)
+                self.evictions += 1
+
+    def finish_checkpoint_plan(self, scheduler_output: SchedulerOutput) -> None:
+        command = getattr(scheduler_output, "gdn_checkpoint_plan", None)
+        if command is not None:
+            sequence, _, resident = command
+            self.managed_sequence = sequence
+            if set(self._checkpoints) != set(resident):
+                raise RuntimeError("GDN checkpoint execution differs from plan")
 
     def restore_from_output(
         self,

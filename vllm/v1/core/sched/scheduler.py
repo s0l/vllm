@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
 import os
 import time
 from collections import defaultdict, deque
@@ -63,6 +64,7 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
 )
+from vllm.v1.core.gdn_checkpoint_policy import CheckpointPlan, GDNCheckpointPolicy
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     KVCacheBlockPoolRequirements,
@@ -664,6 +666,42 @@ class Scheduler(SchedulerInterface):
                 self.cache_config.enable_mamba_fine_grained_prefix_cache
             ),
         )
+        self.gdn_checkpoint_policy = None
+        checkpoint_budget = (
+            additional_config.get("gdn_checkpoint_budget_bytes", 0)
+            if isinstance(additional_config, dict)
+            else 0
+        )
+        if checkpoint_budget:
+            if type(checkpoint_budget) is not int or checkpoint_budget <= 0:
+                raise ValueError("gdn_checkpoint_budget_bytes must be positive integer")
+            entry_bytes = sum(
+                sum(
+                    math.prod(shape) * dtype.itemsize
+                    for shape, dtype in zip(
+                        group.kv_cache_spec.shapes, group.kv_cache_spec.dtypes
+                    )
+                )
+                * len(group.layer_names)
+                for group in kv_cache_config.kv_cache_groups
+                if isinstance(group.kv_cache_spec, MambaSpec)
+                and group.kv_cache_spec.separate_pool
+            )
+            coordinator = self._gdn_checkpoint_coordinator
+            if coordinator is None:
+                raise ValueError("GDN checkpoint budget requires separate GDN pool")
+            self.gdn_checkpoint_policy = GDNCheckpointPolicy(
+                checkpoint_budget, entry_bytes
+            )
+            self.kv_cache_manager.log_gdn_checkpoint_lookups = True
+            coordinator.gdn_checkpoint_limit = self.gdn_checkpoint_policy.capacity
+            logger.info(
+                "GDN checkpoint authority: budget_bytes_per_rank=%d "
+                "entry_bytes=%d capacity=%d policy=greedydual_tokens",
+                checkpoint_budget,
+                entry_bytes,
+                self.gdn_checkpoint_policy.capacity,
+            )
         if self.elastic_on_demand_graphs and self._elastic_graph_catalog:
             self._publish_elastic_startup_capacity()
         # Bind GPU block pool to the KV connector. This must happen after
@@ -4549,6 +4587,8 @@ class Scheduler(SchedulerInterface):
                         )
                     ):
                         gdn_checkpoint_restore[request_id] = checkpoint_key
+                        if self.gdn_checkpoint_policy is not None:
+                            self.gdn_checkpoint_policy.touch(checkpoint_key)
                         logger.debug(
                             "Exact GDN prefix hit request=%s tokens=%d key=%s",
                             request_id,
@@ -4742,6 +4782,49 @@ class Scheduler(SchedulerInterface):
                     ):
                         gdn_checkpoint_save[req_id] = checkpoint_key
                         checkpoint_keys_to_save.add(checkpoint_key)
+
+        gdn_checkpoint_plan = None
+        gdn_checkpoint_budget = None
+        if self.gdn_checkpoint_policy is not None and num_scheduled_tokens:
+            checkpoint_policy = self.gdn_checkpoint_policy
+            candidates = {
+                key: self.requests[rid].num_computed_tokens + num_scheduled_tokens[rid]
+                for rid, key in gdn_checkpoint_save.items()
+            }
+            protected = set()
+            for request, hit, _lease in self._elastic_prefix_hits.values():
+                if hit[1] > 0:
+                    key = self._gdn_boundary_key(request, hit[1])
+                    if key is not None:
+                        protected.add(key)
+            plan = checkpoint_policy.plan(candidates, protected=protected)
+            gdn_checkpoint_save = {
+                rid: key
+                for rid, key in gdn_checkpoint_save.items()
+                if key in plan.saves
+            }
+            gdn_checkpoint_plan = (plan.sequence, plan.evictions, plan.resident)
+            gdn_checkpoint_budget = (
+                checkpoint_policy.budget_bytes,
+                checkpoint_policy.entry_bytes,
+            )
+            coordinator = self._gdn_checkpoint_coordinator
+            assert coordinator is not None
+            coordinator.sync_gdn_checkpoints(checkpoint_policy.visible())
+            if plan.saves or plan.evictions:
+                logger.info(
+                    "GDN checkpoint plan: sequence=%d saves=%d evictions=%d "
+                    "resident=%d ready=%d charged_bytes_per_rank=%d "
+                    "saved_keys=%s evicted_keys=%s",
+                    plan.sequence,
+                    len(plan.saves),
+                    len(plan.evictions),
+                    len(plan.resident),
+                    len(checkpoint_policy.ready),
+                    len(plan.resident) * checkpoint_policy.entry_bytes,
+                    [key.hex() for key in plan.saves],
+                    [key.hex() for key in plan.evictions],
+                )
 
         elastic_graph_step_key = self._canonical_elastic_graph_step_key(
             num_scheduled_tokens,
@@ -5222,6 +5305,8 @@ class Scheduler(SchedulerInterface):
             is_pure_decode_step=is_pure_decode_step,
             gdn_checkpoint_save=gdn_checkpoint_save or None,
             gdn_checkpoint_restore=gdn_checkpoint_restore or None,
+            gdn_checkpoint_plan=gdn_checkpoint_plan,
+            gdn_checkpoint_budget=gdn_checkpoint_budget,
             elastic_kv_transition=elastic_kv_transition,
             elastic_expert_grant=elastic_expert_grant,
             elastic_external_memory_bytes=(elastic_graph_step_grant),
@@ -8752,7 +8837,20 @@ class Scheduler(SchedulerInterface):
             # Reaching update_from_output proves the worker forward completed.
             # Mirror the actual worker membership instead of maintaining an
             # independently inferred LRU that can diverge on waiting/admission.
-            coordinator.sync_gdn_checkpoints(model_runner_output.gdn_checkpoint_keys)
+            if self.gdn_checkpoint_policy is not None:
+                command = scheduler_output.gdn_checkpoint_plan
+                if command is None:
+                    raise RuntimeError("Missing GDN checkpoint plan acknowledgement")
+                sequence, evictions, resident = command
+                self.gdn_checkpoint_policy.acknowledge(
+                    CheckpointPlan(sequence, (), evictions, resident),
+                    model_runner_output.gdn_checkpoint_keys,
+                )
+                coordinator.sync_gdn_checkpoints(self.gdn_checkpoint_policy.visible())
+            else:
+                coordinator.sync_gdn_checkpoints(
+                    model_runner_output.gdn_checkpoint_keys
+                )
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.

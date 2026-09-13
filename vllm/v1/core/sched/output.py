@@ -323,6 +323,8 @@ class SchedulerOutput:
     # after a successful forward and restore before preprocess_mamba.
     gdn_checkpoint_save: dict[str, bytes] | None = None
     gdn_checkpoint_restore: dict[str, bytes] | None = None
+    gdn_checkpoint_plan: tuple[int, tuple[bytes, ...], tuple[bytes, ...]] | None = None
+    gdn_checkpoint_budget: tuple[int, int] | None = None
 
     # Physical mapped-prefix sizes for (attention, GDN) stable-VA arenas.
     elastic_kv_transition: tuple[int, int] | None = None

@@ -152,6 +152,8 @@ class KVCacheBlocks:
 
 
 class KVCacheManager:
+    log_gdn_checkpoint_lookups: bool = False
+
     def __init__(
         self,
         kv_cache_config: KVCacheConfig,
@@ -394,6 +396,16 @@ class KVCacheManager:
             num_new_computed_tokens + num_uncached if num_uncached else 0
         )
 
+        if self.log_gdn_checkpoint_lookups:
+            logger.info(
+                "GDN prefix lookup: request=%s prompt=%d hit=%d "
+                "unreconciled_shared=%d visible_checkpoints=%d",
+                request.request_id,
+                request.num_tokens,
+                num_new_computed_tokens,
+                shared_prefix_boundary,
+                len(self.coordinator.gdn_checkpoint_keys or ()),
+            )
         blocks = self.create_kv_cache_blocks(computed_blocks)
         return blocks, num_new_computed_tokens, shared_prefix_boundary
 
