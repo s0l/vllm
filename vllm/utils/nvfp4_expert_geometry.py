@@ -28,6 +28,21 @@ class NVFP4ExpertGeometry:
     def physical(self):
         return self.tp * self.local
 
+    def owner_span(self, rank, *, balanced=False):
+        """Contiguous logical columns, with indivisible quantization blocks."""
+        if type(rank) is not int or not 0 <= rank < self.tp:
+            raise ValueError("expert owner outside TP")
+        if not balanced:
+            return rank * self.local, min((rank + 1) * self.local, self.width)
+        if self.width % self.local_alignment:
+            raise ValueError("balanced experts require complete alignment blocks")
+        blocks, remainder = divmod(self.width // self.local_alignment, self.tp)
+        if blocks == 0:
+            raise ValueError("balanced expert owner would be empty")
+        start = (rank * blocks + min(rank, remainder)) * self.local_alignment
+        size = (blocks + int(rank < remainder)) * self.local_alignment
+        return start, start + size
+
     @property
     def strides(self):
         """Bytes of W13, W2 and their separately swizzled block scales."""

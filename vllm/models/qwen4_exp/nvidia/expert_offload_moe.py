@@ -81,6 +81,7 @@ def get_native_provider(vllm_config):
             geometry=budget.geometry,
             pin_cache=budget.pin_ram_cache and budget.stream_experts is None,
             archive_path=budget.prepared_archive,
+            partition=budget.partition,
         )
         cpu = None
         if budget.stream_experts is not None:
@@ -93,6 +94,7 @@ def get_native_provider(vllm_config):
                 layers=source.layers,
                 experts=source.experts,
                 topk=text.num_experts_per_tok,
+                partition=budget.partition,
             )
             archive = source.archive
             assert archive is not None
@@ -100,7 +102,7 @@ def get_native_provider(vllm_config):
                 [archive.paths[layer] for layer in range(source.layers)],
                 [archive.files[archive.paths[layer]] for layer in range(source.layers)],
                 budget.rank_ram_bytes(rank),
-                archive_width=budget.geometry.local,
+                archive_width=archive.fields["w13_weight"]["shape"][0] // 2,
             )
             cpu.publish()
             fields, row_bytes, _ = row_schema(budget.rank_geometry(rank))

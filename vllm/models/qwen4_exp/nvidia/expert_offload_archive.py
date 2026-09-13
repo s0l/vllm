@@ -14,6 +14,8 @@ from pathlib import Path
 
 import numpy as np
 
+from vllm.utils.nvfp4_expert_geometry import NVFP4ExpertGeometry
+
 from .ple_offload import fingerprint
 
 FORMAT = "nvfp4-cutlass-expert-row-v1"
@@ -44,7 +46,7 @@ def row_schema(geometry):
 
 def source_identity(source):
     fields, size, stride = row_schema(source.geometry)
-    return dict(
+    identity = dict(
         format=FORMAT,
         geometry=asdict(source.geometry),
         layers=source.layers,
@@ -54,6 +56,25 @@ def source_identity(source):
         row_bytes=size,
         stride=stride,
     )
+    if getattr(source, "partition", "legacy") == "balanced":
+        identity.update(
+            format="nvfp4-cutlass-expert-row-v2-balanced",
+            spans=[list(span) for span in source.spans],
+            rank_schemas=[
+                dict(
+                    zip(
+                        ("schema", "row_bytes", "stride"),
+                        row_schema(NVFP4ExpertGeometry(source.hidden, end - start, 1)),
+                    )
+                )
+                for start, end in source.spans
+            ],
+        )
+    return identity
+
+
+def rank_schema(identity, rank):
+    return identity["rank_schemas"][rank] if "rank_schemas" in identity else identity
 
 
 def atomic_json(path, data):
@@ -94,7 +115,9 @@ class PreparedExpertArchive:
             or fingerprint(manifest) != before
         ):
             raise ValueError("prepared archive source/format/geometry mismatch")
-        self.fields, self.row_bytes, self.stride = row_schema(source.geometry)
+        schema = rank_schema(meta["identity"], source.rank)
+        self.fields = schema["schema"]
+        self.row_bytes, self.stride = schema["row_bytes"], schema["stride"]
         expected_keys = {
             f"{layer}:{rank}"
             for layer in range(source.layers)
@@ -185,15 +208,23 @@ def build_archive(source, root, *, min_free_bytes=20 << 30, progress=None):
                 entries = prior["files"]
                 if len(entries) != source.tp:
                     raise ValueError("incomplete prepared layer")
-                for entry in entries:
-                    checked_file(root, entry, source.experts * expected["stride"])
+                for rank, entry in enumerate(entries):
+                    checked_file(
+                        root,
+                        entry,
+                        source.experts * rank_schema(expected, rank)["stride"],
+                    )
                 reused += 1
             else:
-                remaining = (source.layers - layer) * source.tp * source.experts
-                if (
-                    shutil.disk_usage(root).free
-                    < remaining * expected["stride"] + min_free_bytes
-                ):
+                remaining = (
+                    (source.layers - layer)
+                    * source.experts
+                    * sum(
+                        rank_schema(expected, rank)["stride"]
+                        for rank in range(source.tp)
+                    )
+                )
+                if shutil.disk_usage(root).free < remaining + min_free_bytes:
                     raise OSError("prepared archive would violate free disk reserve")
                 paths = [
                     root / f"layer-{layer:03d}-rank-{r:03d}.bin"
@@ -217,15 +248,19 @@ def build_archive(source, root, *, min_free_bytes=20 << 30, progress=None):
                             width=source.width,
                             physical=source.physical,
                             tp=source.tp,
+                            spans=getattr(source, "spans", None),
                         )
-                        for handle, digest, bundle in zip(handles, hashes, split):
+                        for rank, (handle, digest, bundle) in enumerate(
+                            zip(handles, hashes, split)
+                        ):
+                            schema = rank_schema(expected, rank)
                             prepared = prepare(bundle)
                             row = b"".join(
-                                prepared[name].tobytes() for name in expected["schema"]
+                                prepared[name].tobytes() for name in schema["schema"]
                             )
-                            if len(row) != expected["row_bytes"]:
+                            if len(row) != schema["row_bytes"]:
                                 raise ValueError("prepared writer schema mismatch")
-                            row += bytes(expected["stride"] - len(row))
+                            row += bytes(schema["stride"] - len(row))
                             handle.write(row)
                             digest.update(row)
                     source.check_files(source.files)

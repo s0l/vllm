@@ -894,6 +894,16 @@ class NativeBankCoordinator:
             source.physical,
             source.tp,
         ]
+        self.identity += list(
+            sha256(
+                repr(
+                    (
+                        getattr(source, "partition", "legacy"),
+                        getattr(source, "spans", None),
+                    )
+                ).encode()
+            ).digest()
+        )
         width = max(72, 8 + len(self.identity) + bank.staging * 4)
         self.send = torch.empty(width, dtype=torch.int64, device=bank.device)
         self.recv = torch.empty(

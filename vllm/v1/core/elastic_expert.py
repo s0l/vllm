@@ -36,9 +36,14 @@ class NativeExpertBudget:
     prepared_archive: str | None = None
     cpu_experts: CpuExpertConfig | None = None
     stream_experts: StreamExpertConfig | None = None
+    partition: str = "legacy"
 
     def __post_init__(self):
         self.geometry.validate_cutlass()
+        if self.partition not in ("legacy", "balanced") or (
+            self.partition == "balanced" and self.stream_experts is None
+        ):
+            raise ValueError("balanced partition requires native stream experts")
         if (
             any(type(v) is not int or v <= 0 for v in (self.layers, self.experts))
             or type(self.max_hot_rows) is not int
@@ -106,6 +111,7 @@ class NativeExpertBudget:
                 "prepared_archive",
                 "cpu_experts",
                 "stream_experts",
+                "partition",
             }
             or any(
                 type(v) is not int or v < 0
@@ -117,6 +123,7 @@ class NativeExpertBudget:
                     "prepared_archive",
                     "cpu_experts",
                     "stream_experts",
+                    "partition",
                 }
             )
             or type(options.get("pin_ram_cache", False)) is not bool
@@ -154,6 +161,7 @@ class NativeExpertBudget:
                 options.get("stream_experts"),
                 config.parallel_config.tensor_parallel_size,
             ),
+            partition=options.get("partition", "legacy"),
         )
 
     def rank_geometry(self, rank):
@@ -161,10 +169,10 @@ class NativeExpertBudget:
             raise ValueError("expert rank outside configured TP")
         if self.stream_experts is None:
             return self.geometry
-        width = min(
-            self.geometry.local,
-            max(0, self.geometry.width - rank * self.geometry.local),
+        start, end = self.geometry.owner_span(
+            rank, balanced=self.partition == "balanced"
         )
+        width = max(0, end - start)
         if width < 64 or width % 64:
             raise ValueError("unsupported compact expert owner")
         return NVFP4ExpertGeometry(self.geometry.hidden, width, 1)

@@ -3,6 +3,7 @@
 """Source identity, admission and bounded residency before native execution."""
 
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -17,16 +18,56 @@ from vllm.models.qwen4_exp.nvidia.expert_offload_source import (
 from vllm.utils.nvfp4_expert_geometry import NVFP4ExpertGeometry
 
 
-def write_source(path, scale=1.0):
+def test_partition_consensus_identity_is_common_but_rejects_legacy(
+    tmp_path, monkeypatch
+):
+    from vllm.models.qwen4_exp.nvidia.expert_offload_bank import NativeBankCoordinator
+
+    write_source(tmp_path, hidden=128, width=640)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 3)
+    packets = []
+    for partition, rank in (
+        ("balanced", 0),
+        ("balanced", 1),
+        ("balanced", 2),
+        ("legacy", 2),
+    ):
+        source = NativeExpertStore(
+            tmp_path,
+            rank,
+            0,
+            layers=2,
+            experts=3,
+            geometry=NVFP4ExpertGeometry(128, 640, 3),
+            partition=partition,
+        )
+        coordinator = NativeBankCoordinator(
+            SimpleNamespace(source=source, staging=32, device="cpu"),
+            SimpleNamespace(device_group=None),
+        )
+        packets.append((coordinator.identity, coordinator.send.numel()))
+        source.close()
+    assert packets[0] == packets[1] == packets[2]
+    assert packets[3][0] != packets[0][0]
+    # Disagreement must be compared in one fixed-size collective, not hang
+    # because participants disagree on the collective tensor shape.
+    assert packets[3][1] == packets[0][1]
+
+
+def write_source(path, scale=1.0, *, hidden=32, width=16, varied=False):
     tensors = {}
     for layer in range(2):
         for expert in range(3):
             prefix = f"model.language_model.layers.{layer}.mlp.experts.{expert}"
             for projection in ("gate_proj", "up_proj", "down_proj"):
-                m, k = (32, 16) if projection == "down_proj" else (16, 32)
+                m, k = (hidden, width) if projection == "down_proj" else (width, hidden)
                 tensors[f"{prefix}.{projection}.weight"] = torch.full(
                     (m, k // 2), layer * 3 + expert + 1, dtype=torch.uint8
                 )
+                if varied:
+                    tensors[f"{prefix}.{projection}.weight"] = (
+                        torch.arange(m * k // 2).reshape(m, k // 2) % 251
+                    ).to(torch.uint8)
                 tensors[f"{prefix}.{projection}.weight_scale"] = torch.full(
                     (m, k // 16), 56, dtype=torch.uint8
                 ).view(torch.float8_e4m3fn)

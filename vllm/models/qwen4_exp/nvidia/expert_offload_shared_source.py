@@ -39,6 +39,8 @@ class SharedNativeSource:
     def __init__(self, source, cpu, fields, row_bytes):
         self.root = source.root
         self.geometry = source.geometry
+        self.partition = getattr(source, "partition", "legacy")
+        self.spans = getattr(source, "spans", None)
         self.rank = source.rank
         self.tp = source.tp
         self.hidden = source.hidden

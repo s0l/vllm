@@ -285,11 +285,13 @@ def test_residency_snapshot_counts_uniform_bytes_without_borrowing_weights():
     "tp,widths",
     [(1, [640]), (2, [320, 320]), (3, [256, 256, 128]), (4, [192, 192, 192, 64])],
 )
-def test_stream_ram_and_vmm_follow_actual_tp_shards(tp, widths):
+@pytest.mark.parametrize("partition", ["legacy", "balanced"])
+def test_stream_ram_and_vmm_follow_actual_tp_shards(tp, widths, partition):
     from vllm.models.qwen4_exp.nvidia.expert_offload_archive import row_schema
     from vllm.v1.core.elastic_expert import NativeExpertBudget
 
     options = dict(
+        partition=partition,
         ram_cache_total_bytes=28 << 30,
         prepared_archive="/prepared",
         pin_ram_cache=True,
@@ -316,6 +318,10 @@ def test_stream_ram_and_vmm_follow_actual_tp_shards(tp, widths):
         parallel_config=SimpleNamespace(tensor_parallel_size=tp),
     )
     budget = NativeExpertBudget.from_config(config)
+    if partition == "balanced":
+        widths = {1: [640], 2: [320, 320], 3: [256, 192, 192], 4: [192, 192, 128, 128]}[
+            tp
+        ]
     capacities, ram = [], []
     for rank, width in enumerate(widths):
         geometry = budget.rank_geometry(rank)

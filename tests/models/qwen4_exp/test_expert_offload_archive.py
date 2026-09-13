@@ -9,10 +9,57 @@ import numpy as np
 import pytest
 
 from vllm.models.qwen4_exp.nvidia.expert_offload_archive import build_archive
-from vllm.models.qwen4_exp.nvidia.expert_offload_source import NativeExpertStore
+from vllm.models.qwen4_exp.nvidia.expert_offload_source import (
+    NativeExpertStore,
+    split_bundle,
+)
 from vllm.utils.nvfp4_expert_geometry import NVFP4ExpertGeometry
 
 from .test_expert_offload_source import write_source
+
+
+@pytest.mark.parametrize("tp", [1, 2, 3, 4, 5, 8])
+def test_balanced_archive_preserves_columns_and_rejects_legacy_identity(tmp_path, tp):
+    write_source(tmp_path, hidden=128, width=640, varied=True)
+    geometry = NVFP4ExpertGeometry(128, 640, tp)
+    spans = tuple(geometry.owner_span(r, balanced=True) for r in range(tp))
+    widths = [end - start for start, end in spans]
+    assert sum(widths) == 640 and max(widths) - min(widths) <= 64
+    if tp == 3:
+        assert spans == ((0, 256), (256, 448), (448, 640))
+
+    def opened(rank=0, **kwargs):
+        return NativeExpertStore(
+            tmp_path, rank, 0, layers=2, experts=3, geometry=geometry, **kwargs
+        )
+
+    raw = opened(partition="balanced")
+    archive = tmp_path / "balanced"
+    build_archive(raw, archive, min_free_bytes=0)
+    raw.get(0, 0)  # Opens the immutable checkpoint descriptor.
+    bundle, _, _ = raw._read_raw((0, 0))
+    parts = split_bundle(
+        bundle, hidden=128, width=640, physical=geometry.physical, tp=tp, spans=spans
+    )
+    for name, original in bundle.items():
+        if original.ndim:
+            axis = int(name.startswith("down_proj"))
+            assert np.array_equal(
+                np.concatenate([p[name] for p in parts], axis=axis), original
+            )
+        else:
+            assert all(np.array_equal(p[name], original) for p in parts)
+    for rank in range(tp):
+        control = opened(rank, partition="balanced")
+        prepared = opened(rank, partition="balanced", archive_path=archive)
+        expected, actual = control.get(1, 2), prepared.get(1, 2)
+        assert actual["w13_weight"].shape[0] == 2 * widths[rank]
+        assert all(np.array_equal(expected[k], actual[k]) for k in expected)
+        control.close()
+        prepared.close()
+    with pytest.raises(ValueError, match="geometry mismatch"):
+        opened(archive_path=archive)
+    raw.close()
 
 
 def source(root, tp=3, rank=0, **kwargs):

@@ -53,12 +53,22 @@ def validate(bundle, hidden, width):
                 raise ValueError("nonfinite block scale")
 
 
-def split_bundle(bundle, *, hidden, width, physical, tp, selected_rank=None):
+def split_bundle(
+    bundle, *, hidden, width, physical, tp, selected_rank=None, spans=None
+):
     """Return independent rank bundles; immutable caller source, no requantization."""
     validate(bundle, hidden, width)
     if type(tp) is not int or tp <= 0 or physical < width or physical % tp:
         raise ValueError("invalid physical geometry")
     local = physical // tp
+    if spans is not None and (
+        len(spans) != tp
+        or spans[0][0] != 0
+        or spans[-1][1] != width
+        or any(a >= b or a % 64 or b % 64 for a, b in spans)
+        or any(a[1] != b[0] for a, b in zip(spans, spans[1:]))
+    ):
+        raise ValueError("invalid contiguous expert ownership")
     if local % 16:
         raise ValueError("TP boundaries must align to FP4 scale blocks")
     if selected_rank is not None and (
@@ -68,6 +78,9 @@ def split_bundle(bundle, *, hidden, width, physical, tp, selected_rank=None):
     ranks = []
     for rank in range(tp) if selected_rank is None else [selected_rank]:
         start, end = rank * local, min((rank + 1) * local, width)
+        if spans is not None:
+            start, end = spans[rank]
+            local = end - start
         valid = max(0, end - start)
         result = {}
         for p in PROJECTIONS:
@@ -154,6 +167,7 @@ class NativeExpertStore:
         io_workers=4,
         pin_cache=False,
         archive_path=None,
+        partition="legacy",
     ):
         hidden, width, physical, tp = (
             geometry.hidden,
@@ -176,6 +190,14 @@ class NativeExpertStore:
             raise ValueError("invalid expert cache policy or I/O concurrency")
         self.root = Path(checkpoint).resolve(strict=True)
         self.geometry = geometry
+        if partition not in ("legacy", "balanced"):
+            raise ValueError("unknown expert partition")
+        self.partition = partition
+        self.spans = (
+            tuple(geometry.owner_span(r, balanced=True) for r in range(tp))
+            if partition == "balanced"
+            else None
+        )
         self.rank, self.tp = rank, tp
         self.hidden, self.width, self.physical = hidden, width, physical
         self.layers, self.experts = layers, experts
@@ -419,6 +441,7 @@ class NativeExpertStore:
                 physical=self.physical,
                 tp=self.tp,
                 selected_rank=self.rank,
+                spans=self.spans,
             )[0]
         )
         for array in prepared.values():

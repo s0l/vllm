@@ -49,13 +49,16 @@ class StreamExpertConfig:
         )
         return cls(cpu, history, promotions, scan_order)
 
-    def create(self, geometry, rank, *, layers, experts, topk):
+    def create(self, geometry, rank, *, layers, experts, topk, partition="legacy"):
         cores = self.cpu.rank_cores(rank, geometry.tp)
         if not set(cores) <= os.sched_getaffinity(0):
             raise ValueError("stream expert cores are outside worker affinity")
         if not {"avx2", "fma"} <= set(Path("/proc/cpuinfo").read_text().split()):
             raise ValueError("stream experts require AVX2 and FMA")
-        width = min(geometry.local, max(0, geometry.width - rank * geometry.local))
+        if partition not in ("legacy", "balanced"):
+            raise ValueError("unknown expert partition")
+        start, end = geometry.owner_span(rank, balanced=partition == "balanced")
+        width = max(0, end - start)
         if width < 64 or width % 64:
             raise ValueError("compact stream rank has no supported local columns")
         cpu = StreamExecutor(
