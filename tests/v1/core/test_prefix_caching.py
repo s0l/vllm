@@ -1999,7 +1999,7 @@ def test_cache_frontier_exhaustive_free_cached_owned_states():
                 assert pool.get_num_free_blocks() == len(free_ids) - count
 
 
-@pytest.mark.parametrize("cached_count,expected", [(2, [3, 4]), (21, [1, 2])])
+@pytest.mark.parametrize("cached_count,expected", [(2, [3, 4]), (21, [21, 20])])
 def test_cache_frontier_preserves_reuse_without_historical_gdn_tail_pin(
     cached_count, expected
 ):
