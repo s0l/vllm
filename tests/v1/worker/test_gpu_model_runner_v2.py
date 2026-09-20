@@ -20,6 +20,27 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 
+def test_mtp_spec_hidden_states_preserves_fallback_without_target_override():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model = SimpleNamespace()
+    fallback = torch.arange(12).reshape(3, 4)
+
+    resolved = runner._mtp_spec_hidden_states(fallback, active_tokens=2)
+
+    assert resolved is fallback
+
+
+def test_mtp_spec_hidden_states_uses_bounded_target_override():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    target = torch.arange(20).reshape(5, 4)
+    runner.model = SimpleNamespace(get_mtp_target_hidden_states=lambda: target)
+    fallback = torch.zeros((2, 4))
+
+    resolved = runner._mtp_spec_hidden_states(fallback, active_tokens=2)
+
+    torch.testing.assert_close(resolved, target[:2])
+
+
 @pytest.mark.parametrize(
     "dbo,async_scheduling", [(False, False), (True, False), (False, True)]
 )

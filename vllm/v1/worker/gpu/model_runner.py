@@ -1523,10 +1523,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
             # target returns a persistent buffer sized at max_num_batched_tokens;
             # slice to the active token count that propose() expects.
-            spec_hidden_states = hidden_states
-            if hasattr(self.model, "get_mtp_target_hidden_states"):
-                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+            assert hidden_states is not None
+            spec_hidden_states = self._mtp_spec_hidden_states(
+                hidden_states, hidden_states.shape[0]
+            )
             if isinstance(self.sampler, GPUWatermarkSampler):
                 self.speculator.prepare_watermarking(
                     self.sampler._get_contexts(input_batch.idx_mapping),
@@ -4643,6 +4643,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 tuple(input_batch.idx_mapping.shape),
             )
 
+    def _mtp_spec_hidden_states(
+        self, fallback: torch.Tensor, active_tokens: int
+    ) -> torch.Tensor:
+        """Resolve the target representation consumed by the MTP drafter."""
+        if not hasattr(self.model, "get_mtp_target_hidden_states"):
+            return fallback
+        target_hidden_states = self.model.get_mtp_target_hidden_states()
+        return target_hidden_states[:active_tokens]
+
     @torch.inference_mode()
     @step_eplb_after()
     def sample_tokens(
@@ -4820,17 +4829,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
             # target returns a persistent buffer sized at max_num_batched_tokens;
             # slice to the active token count that propose() expects.
-            spec_hidden_states = draft_hidden_states
-            if hasattr(self.model, "get_mtp_target_hidden_states"):
-                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: draft_hidden_states.size(0)]
+            spec_hidden_states = self._mtp_spec_hidden_states(
+                draft_hidden_states, draft_hidden_states.size(0)
+            )
             if isinstance(self.sampler, GPUWatermarkSampler):
                 self.speculator.prepare_watermarking(
                     self.sampler._get_contexts(input_batch.idx_mapping),
                     self.sampler.watermarking.gpu[input_batch.idx_mapping],
                 )
-            with use_workspace_lane(self._draft_workspace_lane):
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
             with (
                 use_workspace_lane(self._draft_workspace_lane),
                 record_function_or_nullcontext("ag2.mtp_propose"),
