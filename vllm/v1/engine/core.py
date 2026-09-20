@@ -168,9 +168,9 @@ class EngineCore:
             include_finished_set=include_finished_set,
             log_stats=self.log_stats,
         )
-        self._initialize_effective_attention_block_size()
         self.structured_output_manager = prepared_runtime.structured_output_manager
         self.scheduler = prepared_runtime.scheduler
+        self._initialize_effective_attention_block_size()
         self.elastic_runtime_generation_receipt = prepared_runtime.generation_receipt
         hash_block_size = prepared_runtime.hash_block_size
         self.use_spec_decode = vllm_config.speculative_config is not None
