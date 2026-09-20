@@ -260,6 +260,7 @@ def compute_elastic_graph_price_identity(
                         "AG2_VLLM_TP3_UNIFIED_EXACT_BACKEND",
                         "AG2_VLLM_TP3_UNIFIED_EXACT_REDUCE",
                         "AG2_FLASHNEXT_QSA_COMMAND_CAPTURE",
+                        "AG2_FLASHNEXT_GRAPH_LIFETIME_SHA256",
                         "NCCL_ALGO",
                         "NCCL_PROTO",
                         "VLLM_TP3_CE_REDUCE",
