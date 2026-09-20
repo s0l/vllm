@@ -189,6 +189,13 @@ class XgrammarGrammar(StructuredOutputGrammar):
 
         accepted_tokens = []
         for token in tokens:
+            # A speculative window may contain tokens after an accepted stop
+            # token. They are invalid drafts, not inputs to a terminated
+            # matcher. Probing them makes xgrammar warn and can leave the
+            # structured-output state machine on an error path before the
+            # accepted prefix is rolled back.
+            if self.matcher.is_terminated():
+                break
             if self.matcher.accept_token(token):
                 accepted_tokens.append(token)
                 if self.matcher.is_terminated():

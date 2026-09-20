@@ -33,6 +33,7 @@ from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.cache import MultiModalCacheMissError
+from vllm.sampling_params import SamplingParams
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
@@ -45,16 +46,16 @@ from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+from vllm.v1.core.elastic_graph import ElasticPlanKind
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     generate_scheduler_kv_cache_config,
     get_kv_cache_configs,
     get_request_block_hasher,
     init_none_hash,
-    resolve_kv_cache_block_sizes,
     update_kv_cache_capacity,
 )
-from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import (
@@ -72,6 +73,12 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine.elastic_bootstrap import (
+    complete_elastic_startup,
+    prepare_elastic_runtime,
+    resolve_elastic_graph_execution_policy,
+    synchronize_elastic_runtime_generation,
+)
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -80,6 +87,7 @@ from vllm.v1.engine.utils import (
     get_physical_gpu_ids_for_local_dp_rank,
 )
 from vllm.v1.executor import Executor
+from vllm.v1.executor.worker_failure import WorkerFailureCode, WorkerRemoteError
 from vllm.v1.fault_tolerance.engine_core_sentinel import (
     FT_UTILITY_METHOD,
     EngineCoreSentinel,
@@ -94,11 +102,19 @@ from vllm.v1.metrics.stats import SchedulerIterationDetails, SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
-from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
+
+
+class _ElasticRestorePartialWave(RuntimeError):
+    def __init__(self, admitted_x: int, requested_x: int) -> None:
+        super().__init__(
+            "elastic restore refused a partial active cohort before model "
+            f"execution: requested_x={requested_x} admitted_x={admitted_x}"
+        )
+        self.admitted_x = admitted_x
 
 
 HANDSHAKE_TIMEOUT_MINS = 5
@@ -145,34 +161,18 @@ class EngineCore:
         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self._eep_scale_up_before_kv_init()
 
-        # Setup KV Caches and update CacheConfig after profiling.
-        kv_cache_config = self._initialize_kv_caches(vllm_config)
-        self.structured_output_manager = StructuredOutputManager(vllm_config)
-
-        # Setup scheduler.
-        Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
-
-        if len(kv_cache_config.kv_cache_groups) == 0:  # noqa: SIM102
-            # Encoder models without KV cache don't support
-            # chunked prefill. But do SSM models?
-            if vllm_config.scheduler_config.enable_chunked_prefill:
-                logger.warning("Disabling chunked prefill for model without KVCache")
-                vllm_config.scheduler_config.enable_chunked_prefill = False
-
-        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
-            kv_cache_config, vllm_config
-        )
-
-        self.scheduler: SchedulerInterface = Scheduler(
+        prepared_runtime = prepare_elastic_runtime(
             vllm_config=vllm_config,
-            kv_cache_config=kv_cache_config,
-            structured_output_manager=self.structured_output_manager,
+            initialize_kv_cache=lambda: self._initialize_kv_caches(vllm_config),
+            collective_rpc=self.collective_rpc,
             include_finished_set=include_finished_set,
             log_stats=self.log_stats,
-            block_size=scheduler_block_size,
-            hash_block_size=hash_block_size,
         )
         self._initialize_effective_attention_block_size()
+        self.structured_output_manager = prepared_runtime.structured_output_manager
+        self.scheduler = prepared_runtime.scheduler
+        self.elastic_runtime_generation_receipt = prepared_runtime.generation_receipt
+        hash_block_size = prepared_runtime.hash_block_size
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
@@ -242,9 +242,56 @@ class EngineCore:
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
+        # Bounded research observer for attributing the host-side gap between
+        # otherwise identical saturated decode iterations. It is inert unless
+        # an output path is explicitly configured, keeps records in memory,
+        # and performs one atomic write only after the requested steady window.
+        self._ag2_step_trace_path = os.environ.get("AG2_VLLM_ENGINE_STEP_TRACE", "")
+        self._ag2_step_trace_min_running = int(
+            os.environ.get("AG2_VLLM_ENGINE_STEP_TRACE_MIN_RUNNING", "0")
+        )
+        self._ag2_step_trace_limit = int(
+            os.environ.get("AG2_VLLM_ENGINE_STEP_TRACE_STEPS", "64")
+        )
+        self._ag2_step_trace_include_context = (
+            os.environ.get("AG2_VLLM_ENGINE_STEP_TRACE_INCLUDE_CONTEXT", "0") == "1"
+        )
+        self._ag2_step_trace_require_context = (
+            os.environ.get("AG2_VLLM_ENGINE_STEP_TRACE_REQUIRE_CONTEXT", "0") == "1"
+        )
+        self._ag2_step_trace_saw_context = False
+        self._ag2_step_trace_records: list[dict[str, int | float]] = []
+        self._ag2_step_trace_previous_start_ns: int | None = None
+        self._ag2_step_trace_complete = False
+        if self._ag2_step_trace_path:
+            if self._ag2_step_trace_min_running < 1:
+                raise ValueError("engine step trace requires MIN_RUNNING >= 1")
+            if self._ag2_step_trace_limit < 1:
+                raise ValueError("engine step trace requires STEPS >= 1")
+            if (
+                self._ag2_step_trace_require_context
+                and not self._ag2_step_trace_include_context
+            ):
+                raise ValueError(
+                    "engine step trace REQUIRE_CONTEXT requires INCLUDE_CONTEXT"
+                )
+            logger.info(
+                "AG2 engine-step trace initialized: path=%s min_running=%d "
+                "steps=%d include_context=%s require_context=%s",
+                self._ag2_step_trace_path,
+                self._ag2_step_trace_min_running,
+                self._ag2_step_trace_limit,
+                self._ag2_step_trace_include_context,
+                self._ag2_step_trace_require_context,
+            )
+
         self.aborts_queue = queue.Queue[list[str]]()
 
         self._idle_state_callbacks: list[Callable] = []
+
+        # This completes the same production-owned bootstrap used by the
+        # standalone full-DAG producer before either route can publish READY.
+        complete_elastic_startup(self)
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
@@ -254,6 +301,909 @@ class EngineCore:
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
+
+    def _resolve_elastic_graph_execution_policy(
+        self, vllm_config: VllmConfig, kv_cache_config: Any
+    ) -> None:
+        resolve_elastic_graph_execution_policy(
+            vllm_config, kv_cache_config, self.collective_rpc
+        )
+
+    def _synchronize_elastic_runtime_generation(self) -> None:
+        """Make the post-KV scheduler generation authoritative on workers."""
+        synchronize_elastic_runtime_generation(self.scheduler, self.collective_rpc)
+
+    def _restore_elastic_pinned_full_family(self) -> None:
+        """Recapture the sealed FULL family before serving becomes healthy.
+
+        CUDA graph executables are not disk-serializable.  The catalog and
+        recipe make a warm restart bounded, but every process epoch must still
+        recreate and pin the executable/address-stable state.
+        """
+        scheduler = cast(Any, self.scheduler)
+        coverage = scheduler._elastic_graph_catalog_coverage
+        max_x = int(coverage["mixed_max_x"])
+        configured_k = int(scheduler.num_spec_tokens)
+        query_lens = (1, 1 + configured_k) if configured_k else (1,)
+        required = {
+            tuple(int(value) for value in key)
+            for key in coverage["required_step_keys"]
+            if isinstance(key, list) and len(key) == 5 and key[0] == 1
+        }
+        expected = {
+            (1, configured_k, x, x * query_len, query_len)
+            for query_len in query_lens
+            for x in range(1, max_x + 1)
+        }
+        if not expected.issubset(required):
+            missing = sorted(expected - required)
+            raise RuntimeError(
+                "sealed catalog omitted required pinned FULL classes: "
+                f"missing={len(missing)} first={missing[:8]}"
+            )
+
+        started = time.monotonic()
+        previous_restore_mode = getattr(scheduler, "_elastic_restore_mode", False)
+        scheduler._elastic_restore_mode = True
+        scheduler.max_num_running_reqs = max_x
+        serial = 0
+        try:
+            # Restore the exact accepted layer order. Aggregate prices and KV
+            # coexistence are capture-context dependent; family-major replay
+            # would materialize an unmeasured q4 suffix before q1/X1.
+            for x in range(1, max_x + 1):
+                for query_len in reversed(query_lens):
+                    serial += 1
+                    measured_key, admitted_x = self._run_elastic_full_restore_wave(
+                        k=configured_k,
+                        x=x,
+                        query_len=query_len,
+                        serial=serial,
+                    )
+                    wanted = (1, configured_k, x, x * query_len, query_len)
+                    if measured_key != wanted or admitted_x != x:
+                        raise RuntimeError(
+                            "sealed pinned FULL boundary failed warm restore: "
+                            f"expected={wanted} actual={measured_key} "
+                            f"admitted_x={admitted_x}"
+                        )
+                    elapsed = time.monotonic() - started
+                    if elapsed > 120:
+                        raise RuntimeError(
+                            "sealed pinned FULL warm restore exceeded 120 s: "
+                            f"completed={serial}/{len(expected)} elapsed={elapsed:.3f}"
+                        )
+        finally:
+            scheduler._elastic_restore_mode = previous_restore_mode
+        logger.warning(
+            "Elastic sealed pinned FULL family restored before READY: "
+            "logical_shapes=%d max_x=%d wall_seconds=%.3f",
+            len(expected),
+            max_x,
+            time.monotonic() - started,
+        )
+
+    def _restore_elastic_bounded_hotset(self) -> None:
+        """Restore only the sealed minimal carrier set before READY."""
+        from vllm.v1.core.elastic_catalog import (
+            validate_elastic_catalog_key_inventory,
+        )
+
+        scheduler = cast(Any, self.scheduler)
+        coverage = scheduler._elastic_graph_catalog_coverage
+        if coverage.get("serving_carrier_contract") != (
+            "retained-terminal-mtp-no-cold-serving-v1"
+        ):
+            raise RuntimeError(
+                "bounded elastic serving carrier contract is unsupported"
+            )
+        if coverage.get("serving_carrier_owner") != "mtp_decode":
+            raise RuntimeError("bounded elastic serving carrier owner is unsupported")
+        _required, restore_inventory = validate_elastic_catalog_key_inventory(
+            coverage.get("required_step_keys"),
+            coverage.get("serving_carrier_step_keys", []),
+            label="bounded elastic serving carrier",
+            require_restore=True,
+        )
+        restore = set(restore_inventory)
+        terminal_x = coverage.get("decode_max_x")
+        if (
+            type(terminal_x) is not int
+            or terminal_x < 1
+            or terminal_x > scheduler.max_num_running_reqs
+        ):
+            raise RuntimeError(
+                "bounded elastic startup has an invalid terminal decode cohort"
+            )
+        k = scheduler.num_spec_tokens
+        terminal_query_len = scheduler.num_spec_tokens + 1
+
+        started = time.monotonic()
+        previous_restore_mode = getattr(scheduler, "_elastic_restore_mode", False)
+        scheduler._elastic_restore_mode = True
+        try:
+            q1_key = self._elastic_restore_decode_key(k=k, x=terminal_x, query_len=1)
+            terminal_key = self._elastic_restore_decode_key(
+                k=k,
+                x=terminal_x,
+                query_len=terminal_query_len,
+            )
+            q1_execution = self._elastic_restore_execution_step_keys(
+                k=k,
+                x=terminal_x,
+                query_len=1,
+            )
+            verification_execution = self._elastic_restore_execution_step_keys(
+                k=k,
+                x=terminal_x,
+                query_len=terminal_query_len,
+            )
+            expected_restore = set((*q1_execution, *verification_execution))
+            if restore != expected_restore:
+                raise RuntimeError(
+                    "bounded elastic serving carrier differs from the exact "
+                    "prefill/q1/q(K+1) identity: "
+                    f"declared={sorted(restore)!r} "
+                    f"expected={sorted(expected_restore)!r}"
+                )
+            q1_measured_key, q1_admitted_x = (
+                self._run_elastic_full_restore_wave_in_epoch(
+                    k=q1_key[1],
+                    x=q1_key[2],
+                    query_len=1,
+                    serial=1,
+                    preserve_hotset=True,
+                )
+            )
+            if q1_measured_key != q1_key or q1_admitted_x != q1_key[2]:
+                raise RuntimeError(
+                    "bounded elastic restore did not reproduce its q1 carrier: "
+                    f"expected={q1_key!r} actual={q1_measured_key!r} "
+                    f"admitted_x={q1_admitted_x}"
+                )
+            # The q1 wave deliberately leaves restore mode to prevent its
+            # terminal owners from being reclaimed while requests drain.  The
+            # second independent product-shaped wave re-enters calibration
+            # mode only for its pre-READY capture transaction.
+            scheduler._elastic_restore_mode = True
+            measured_key, admitted_x = self._run_elastic_full_restore_wave_in_epoch(
+                k=q1_key[1],
+                x=q1_key[2],
+                query_len=terminal_query_len,
+                serial=2,
+                preserve_hotset=True,
+            )
+            if measured_key != terminal_key or admitted_x != q1_key[2]:
+                raise RuntimeError(
+                    "bounded elastic restore did not reproduce its terminal carrier: "
+                    f"expected={terminal_key!r} actual={measured_key!r} "
+                    f"admitted_x={admitted_x}"
+                )
+            carrier_keys = scheduler.resolve_elastic_serving_carrier_physical_keys(
+                (q1_key, terminal_key)
+            )
+            scheduler._elastic_serving_carrier_keys = carrier_keys
+            scheduler._elastic_serving_carrier_resident_bytes = (
+                scheduler._elastic_serving_carrier_bytes()
+            )
+            hotset_xs = tuple(getattr(scheduler, "_elastic_serving_hotset_xs", ()))
+            hotset_steps: list[tuple[int, ...]] = []
+            for semantic_x in hotset_xs:
+                # Mixed/prefill target and MTP-prefill owners are compiled-only;
+                # this shape retains the exact-X MTP decode owner used while a
+                # long prompt is in flight.
+                hotset_steps.append((0, k, semantic_x, semantic_x, 0))
+                physical_x = scheduler._elastic_short_decode_physical_x(semantic_x)
+                hotset_steps.append(
+                    (
+                        0,
+                        k,
+                        physical_x,
+                        physical_x * terminal_query_len,
+                        terminal_query_len,
+                    )
+                )
+            hotset_steps = list(dict.fromkeys(hotset_steps))
+            declared_hotset_steps = [
+                tuple(key) for key in coverage.get("serving_hotset_step_keys", ())
+            ]
+            if hotset_xs and (
+                coverage.get("serving_hotset_contract")
+                != "pre-ready-hot-no-runtime-maintenance-v1"
+                or declared_hotset_steps != hotset_steps
+            ):
+                raise RuntimeError(
+                    "configured serving hotset differs from the sealed catalog: "
+                    f"declared={declared_hotset_steps!r} "
+                    f"configured={hotset_steps!r}"
+                )
+            required_steps = {
+                tuple(key) for key in coverage.get("required_step_keys", ())
+            }
+            missing_hotset_steps = tuple(
+                key for key in hotset_steps if key not in required_steps
+            )
+            if missing_hotset_steps:
+                raise RuntimeError(
+                    "configured serving hotset is absent from the sealed catalog: "
+                    f"missing={missing_hotset_steps!r}"
+                )
+            for step_key in hotset_steps:
+                scheduler._elastic_restore_mode = True
+                self._prepare_elastic_restore_capture(step_key)
+                scheduler.assert_elastic_restore_captures_hot((step_key,))
+                physical_keys = scheduler._resolve_elastic_step_physical_keys(step_key)
+                if not physical_keys:
+                    continue
+                retention = scheduler.retain_elastic_restore_captures((step_key,))
+                try:
+                    scheduler.promote_elastic_restore_retention_to_serving(
+                        retention, physical_keys
+                    )
+                finally:
+                    if scheduler._elastic_restore_retention_id == retention:
+                        scheduler.release_elastic_restore_retention(retention)
+            scheduler._elastic_serving_carrier_resident_bytes = (
+                scheduler._elastic_serving_carrier_bytes()
+            )
+            if not carrier_keys or any(
+                not (
+                    (entry := scheduler._elastic_admission_controller.entries.get(key))
+                    and entry.hot
+                )
+                for key in carrier_keys
+            ):
+                raise RuntimeError("terminal serving carrier was not retained HOT")
+            if time.monotonic() - started > 120:
+                raise RuntimeError("bounded elastic hotset restore exceeded 120 s")
+        finally:
+            scheduler._elastic_restore_mode = previous_restore_mode
+        scheduler.max_num_running_reqs = int(coverage["mixed_max_x"])
+        logger.warning(
+            "Elastic bounded terminal carrier restored before READY: "
+            "restore_shapes=%d hotset_shapes=%d max_x=%d resident_bytes=%d "
+            "wall_seconds=%.3f",
+            len(restore),
+            len(hotset_steps),
+            coverage["mixed_max_x"],
+            scheduler._elastic_serving_carrier_resident_bytes,
+            time.monotonic() - started,
+        )
+
+    def _synchronize_elastic_startup_residency(self) -> None:
+        """Publish restored HOT state and its replay workspace before READY."""
+        receipts: list[Any] = self.collective_rpc("get_elastic_graph_residency_receipt")
+        if not receipts:
+            raise RuntimeError("elastic startup returned no worker residency receipt")
+
+        scheduler = cast(Any, self.scheduler)
+        expected_generation = scheduler._elastic_admission_controller.generation.value
+        receipt_generations = [receipt.generation.value for receipt in receipts]
+        workspace_units = [receipt.cublas_workspace_bytes for receipt in receipts]
+        if any(generation != expected_generation for generation in receipt_generations):
+            raise RuntimeError(
+                "elastic startup workspace generation differs from scheduler: "
+                f"expected={expected_generation!r} "
+                f"receipts={receipts!r}"
+            )
+        if any(unit <= 0 for unit in workspace_units):
+            raise RuntimeError(
+                "elastic startup workspace unit must be positive on every rank: "
+                f"receipts={receipts!r}"
+            )
+        rank_safe_workspace_unit = max(workspace_units)
+
+        def rank_safe_projection(receipt: Any) -> tuple[object, ...]:
+            # local_pool_bytes is rank-local; all other fields are consensus.
+            entries = tuple(
+                (
+                    entry.key,
+                    entry.pinned,
+                    entry.resident_bytes,
+                    entry.reclaimable_bytes,
+                    entry.lease_ids,
+                )
+                for entry in receipt.entries
+            )
+            return (
+                receipt.generation,
+                receipt.transaction_id,
+                receipt.resident_bytes,
+                receipt.floor_bytes,
+                receipt.transition_floor_bytes,
+                receipt.peak_bytes,
+                receipt.complete,
+                receipt.schema,
+                receipt.schema_fingerprint,
+                entries,
+            )
+
+        reference = receipts[0]
+        projected = rank_safe_projection(reference)
+        if any(rank_safe_projection(receipt) != projected for receipt in receipts):
+            raise RuntimeError(
+                "elastic startup HOT residency differs across worker ranks"
+            )
+
+        # Mutate scheduler state only after both receipts validate. A stale or
+        # malformed workspace epoch must preserve the previously accepted HOT
+        # snapshot and unit rather than partially publishing startup state.
+        scheduler._sync_elastic_residency_receipt(reference)
+        scheduler._elastic_cublas_workspace_unit_bytes = rank_safe_workspace_unit
+        serving_carrier = tuple(getattr(scheduler, "_elastic_serving_carrier_keys", ()))
+        if serving_carrier:
+            missing = tuple(
+                key
+                for key in serving_carrier
+                if not (
+                    (entry := scheduler._elastic_admission_controller.entries.get(key))
+                    and entry.hot
+                )
+            )
+            if missing:
+                raise RuntimeError(
+                    "startup residency receipt dropped retained serving carrier: "
+                    f"missing={tuple(key.identity for key in missing)!r}"
+                )
+            scheduler._elastic_serving_carrier_resident_bytes = (
+                scheduler._elastic_serving_carrier_bytes()
+            )
+        # The scheduler constructor can only publish the catalog projection;
+        # this second receipt is the first authoritative post-restore physical
+        # KV/Graph state and therefore must precede READY.
+        scheduler._publish_elastic_startup_capacity()
+        logger.warning(
+            "Elastic startup HOT residency synchronized: entries=%d pinned=%d "
+            "resident_bytes=%d reclaimable_bytes=%d workspace_unit_bytes=%d "
+            "generation=%s",
+            len(reference.entries),
+            sum(entry.pinned for entry in reference.entries),
+            sum(entry.resident_bytes for entry in reference.entries),
+            sum(entry.reclaimable_bytes for entry in reference.entries),
+            rank_safe_workspace_unit,
+            scheduler._elastic_admission_controller.generation.value,
+        )
+
+    def _add_elastic_restore_request(
+        self,
+        *,
+        request_id: str,
+        prompt_len: int,
+        k: int,
+        max_tokens: int,
+    ) -> None:
+        if prompt_len <= 0:
+            raise ValueError("elastic restore prompt length must be positive")
+        configured_k = int(getattr(self.scheduler, "num_spec_tokens", 0))
+        if k not in {0, configured_k}:
+            raise ValueError(f"elastic restore K must be 0 or {configured_k}, got {k}")
+        sampling_params = SamplingParams(
+            max_tokens=max_tokens,
+            temperature=0.6,
+            ignore_eos=True,
+            extra_args=({"ag2_force_non_speculative": 1} if k == 0 else None),
+        )
+        # Cache salt, request id and token body are all unique. Calibration
+        # must exercise cold physical owners, not accidentally turn itself
+        # into a prefix-cache benchmark.
+        token = 100 + (abs(hash(request_id)) % 1000)
+        core_request = EngineCoreRequest(
+            request_id=request_id,
+            prompt_token_ids=[token] * prompt_len,
+            mm_features=None,
+            sampling_params=sampling_params,
+            pooling_params=None,
+            arrival_time=time.time(),
+            lora_request=None,
+            cache_salt=request_id,
+            data_parallel_rank=None,
+        )
+        request, request_wave = self.preprocess_add_request(core_request)
+        self.add_request(request, request_wave)
+
+    def _run_elastic_restore_step(self) -> SchedulerOutput:
+        outputs, model_executed = self.step()
+        self.post_step(model_executed)
+        scheduler_output = getattr(self, "_last_scheduler_output", None)
+        if scheduler_output is None:
+            raise RuntimeError("elastic restore step produced no scheduler output")
+        return scheduler_output
+
+    def _prepare_elastic_restore_admission(
+        self,
+        request_ids: list[str],
+        *,
+        retain_hot_graphs: bool = False,
+    ) -> int:
+        scheduler = cast(Any, self.scheduler)
+        return int(
+            scheduler.prepare_elastic_restore_admission(
+                request_ids,
+                retain_hot_graphs=retain_hot_graphs,
+            )
+        )
+
+    def _prepare_elastic_restore_capture(
+        self,
+        step_key: tuple[int, ...],
+    ) -> None:
+        scheduler = cast(Any, self.scheduler)
+        if not scheduler.prepare_elastic_restore_capture(step_key):
+            return
+        maintenance = self._run_elastic_restore_step()
+        expected_physical_keys = scheduler._elastic_step_residency_intent(step_key)[2]
+        actual_physical_keys = (
+            ()
+            if maintenance.elastic_step_plan is None
+            else maintenance.elastic_step_plan.physical_keys
+        )
+        if (
+            maintenance.total_num_scheduled_tokens
+            or maintenance.elastic_step_plan is None
+            or maintenance.elastic_step_plan.kind != ElasticPlanKind.MAINTENANCE
+            or actual_physical_keys != expected_physical_keys
+        ):
+            raise RuntimeError(
+                "elastic restore COLD capture crossed a request commit "
+                "boundary or changed physical owner identity: "
+                f"step_key={step_key!r} expected={expected_physical_keys!r} "
+                f"actual={actual_physical_keys!r}"
+            )
+
+    def _reclaim_elastic_restore_hotset_before_wave(self) -> None:
+        scheduler = cast(Any, self.scheduler)
+        if not scheduler.prepare_elastic_restore_idle_reclaim():
+            return
+        reclaim_output = self._run_elastic_restore_step()
+        if (
+            reclaim_output.total_num_scheduled_tokens
+            or reclaim_output.elastic_step_plan is None
+            or reclaim_output.elastic_step_plan.kind != ElasticPlanKind.RECLAIM
+        ):
+            raise RuntimeError("idle elastic reclaim crossed a request commit boundary")
+
+    def _begin_elastic_restore_physical_epoch(
+        self,
+        step_keys: tuple[tuple[int, ...], ...],
+    ) -> None:
+        declared_step_keys = tuple(dict.fromkeys(step_keys))
+        self._reclaim_elastic_restore_hotset_before_wave()
+        for step_key in declared_step_keys:
+            self._prepare_elastic_restore_capture(step_key)
+        scheduler = cast(Any, self.scheduler)
+        scheduler.assert_elastic_restore_captures_hot(declared_step_keys)
+
+    def _rollback_elastic_restore_physical_epoch(
+        self,
+        *,
+        request_ids: list[str],
+        step_keys: tuple[tuple[int, ...], ...],
+    ) -> None:
+        """Return a rejected calibration cohort and its graphs to X0.
+
+        Calibration retries are transactions over both request/KV state and
+        the physical graph owner set.  Retiring only the requests would leave
+        pinned graphs from a rejected larger cohort resident and make the next
+        prefix pay for stale state from the failed epoch.
+        """
+        scheduler = cast(Any, self.scheduler)
+        retention_id = getattr(scheduler, "_elastic_restore_retention_id", None)
+        if retention_id is not None:
+            scheduler.release_elastic_restore_retention(retention_id)
+        self.abort_requests(request_ids)
+        scheduler.reconcile_elastic_restore_rollback()
+        self._drain_elastic_restore()
+        self._reclaim_elastic_restore_hotset_before_wave()
+
+    def _drain_elastic_restore(self, *, max_steps: int = 32) -> None:
+        steps = 0
+        while self._has_scheduler_step_work():
+            scheduler = cast(Any, self.scheduler)
+            reclaim_ready = bool(
+                scheduler._needs_elastic_idle_reclaim()
+                and not scheduler.has_unfinished_requests()
+                and not scheduler.has_finished_requests()
+            )
+            if reclaim_ready:
+                self._reclaim_elastic_restore_hotset_before_wave()
+            else:
+                self._run_elastic_restore_step()
+            steps += 1
+            if steps > max_steps:
+                raise RuntimeError(
+                    "elastic startup calibration did not reach X0 within "
+                    f"{max_steps} steps"
+                )
+        scheduler = cast(Any, self.scheduler)
+        scheduler.finish_elastic_restore_epoch()
+
+    def _assert_elastic_restore_key(
+        self,
+        scheduler_output: SchedulerOutput,
+        expected: tuple[int, ...],
+    ) -> None:
+        scheduler = cast(Any, self.scheduler)
+        actual = scheduler._canonical_elastic_graph_step_key(
+            scheduler_output.num_scheduled_tokens,
+            scheduler_output.num_spec_tokens_to_schedule,
+            scheduler_output.is_pure_decode_step,
+        )
+        if actual != expected:
+            raise RuntimeError(
+                "elastic startup calibration shape drifted: "
+                f"expected={expected!r} actual={actual!r} "
+                f"tokens={scheduler_output.num_scheduled_tokens!r}"
+            )
+
+    def _elastic_restore_decode_key(
+        self, *, k: int, x: int, query_len: int
+    ) -> tuple[int, int, int, int, int]:
+        """Derive decode identity through the scheduler's active policy."""
+        scheduler = cast(Any, self.scheduler)
+        key = scheduler._canonical_elastic_graph_step_key(
+            {f"_elastic_restore_decode_shape_{index}": query_len for index in range(x)},
+            k,
+            True,
+        )
+        if key is None:
+            raise RuntimeError("elastic restore decode has no graph identity")
+        return key
+
+    def _elastic_restore_wave_step_keys(
+        self, *, k: int, x: int, query_len: int
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """Derive the exact prefill/decode pair before physical mutation."""
+        if x <= 0:
+            raise ValueError("elastic restore wave requires a positive X")
+        scheduler = cast(Any, self.scheduler)
+        prompt_len = self._elastic_restore_prefill_prompt_len()
+        prospective_prefill_tokens = {
+            f"_elastic_restore_shape_{index}": prompt_len for index in range(x)
+        }
+        prefill_key = scheduler._canonical_elastic_graph_step_key(
+            prospective_prefill_tokens,
+            self._elastic_restore_prefill_k(k),
+            False,
+        )
+        if prefill_key is None:
+            raise RuntimeError("elastic restore prefill has no graph identity")
+        decode_key = self._elastic_restore_decode_key(
+            k=k,
+            x=x,
+            query_len=query_len,
+        )
+        return prefill_key, decode_key
+
+    @staticmethod
+    def _elastic_restore_prefill_prompt_len() -> int:
+        """Single source of truth for the restore cohort's live prefill M."""
+        from vllm.v1.core.elastic_catalog import ELASTIC_RESTORE_PREFILL_PROMPT_LEN
+
+        return ELASTIC_RESTORE_PREFILL_PROMPT_LEN
+
+    def _elastic_restore_execution_step_keys(
+        self, *, k: int, x: int, query_len: int
+    ) -> tuple[tuple[int, ...], ...]:
+        """Return every physical step needed to reach the target decode.
+
+        When the effective MTP policy disables speculation on non-decode work,
+        prefill produces no drafts.  A q(1 + K) target then has a real q1
+        bridge that produces the drafts consumed by the target step.  The
+        bridge belongs to the same predeclared physical epoch because
+        calibration cannot capture a new graph while requests own KV state.
+        """
+        prefill_key, target_key = self._elastic_restore_wave_step_keys(
+            k=k,
+            x=x,
+            query_len=query_len,
+        )
+        if not self._elastic_restore_needs_decode_bridge(k=k, query_len=query_len):
+            return prefill_key, target_key
+        bridge_key = self._elastic_restore_decode_key(k=k, x=x, query_len=1)
+        return tuple(dict.fromkeys((prefill_key, bridge_key, target_key)))
+
+    def _elastic_restore_needs_decode_bridge(self, *, k: int, query_len: int) -> bool:
+        return k > 0 and query_len > 1 and self._elastic_restore_prefill_k(k) == 0
+
+    def _elastic_restore_prefill_k(self, k: int) -> int:
+        """Mirror the scheduler's non-decode speculation phase policy."""
+        scheduler = cast(Any, self.scheduler)
+        speculative_config = getattr(
+            getattr(scheduler, "vllm_config", None), "speculative_config", None
+        )
+        if (
+            speculative_config is not None
+            and speculative_config.disable_speculation_on_non_decode
+        ):
+            return 0
+        return k
+
+    def _run_elastic_full_restore_wave(
+        self,
+        *,
+        k: int,
+        x: int,
+        query_len: int,
+        serial: int,
+    ) -> tuple[tuple[int, ...] | None, int]:
+        # The prefill used to construct a decode cohort is an administrative
+        # witness, not part of the pinned FULL family. The restore helper
+        # explicitly reclaims incompatible evictable carriers before capture;
+        # pinned FULL publications survive that cleanup.
+        return self._run_elastic_full_restore_wave_in_epoch(
+            k=k,
+            x=x,
+            query_len=query_len,
+            serial=serial,
+        )
+
+    def _run_elastic_full_restore_wave_in_epoch(
+        self,
+        *,
+        k: int,
+        x: int,
+        query_len: int,
+        serial: int,
+        preserve_hotset: bool = False,
+    ) -> tuple[tuple[int, ...] | None, int]:
+        req_ids = [
+            f"_elastic_restore_full_{serial}_{k}_{query_len}_{x}_{index}"
+            for index in range(x)
+        ]
+        scheduler = cast(Any, self.scheduler)
+        declared_step_keys = self._elastic_restore_execution_step_keys(
+            k=k,
+            x=x,
+            query_len=query_len,
+        )
+        self._begin_elastic_restore_physical_epoch(declared_step_keys)
+        retention_id = scheduler.retain_elastic_restore_captures(declared_step_keys)
+        prompt_len = self._elastic_restore_prefill_prompt_len()
+        for req_id in req_ids:
+            self._add_elastic_restore_request(
+                request_id=req_id,
+                prompt_len=prompt_len,
+                k=k,
+                max_tokens=16,
+            )
+
+        # Both known physical owner sets are now settled.  Apply request/KV
+        # admission against their aggregate residency before executing either
+        # shape; a smaller prefix retries in a new untouched epoch.
+        retain_hot_graphs = bool(scheduler._elastic_admission_controller.resident_bytes)
+        prepared_x = self._prepare_elastic_restore_admission(
+            req_ids,
+            retain_hot_graphs=retain_hot_graphs,
+        )
+        if prepared_x == 0:
+            self._rollback_elastic_restore_physical_epoch(
+                request_ids=req_ids,
+                step_keys=declared_step_keys,
+            )
+            raise RuntimeError("elastic wave preflight admitted no requests")
+        if prepared_x != x:
+            if not 0 < prepared_x < x:
+                self._rollback_elastic_restore_physical_epoch(
+                    request_ids=req_ids,
+                    step_keys=declared_step_keys,
+                )
+                raise RuntimeError(
+                    "elastic restore admission returned an invalid prefix: "
+                    f"requested_x={x} prepared_x={prepared_x}"
+                )
+            self._rollback_elastic_restore_physical_epoch(
+                request_ids=req_ids,
+                step_keys=declared_step_keys,
+            )
+            logger.warning(
+                "Elastic pre-READY restore wave downshifted before model "
+                "execution: requested_x=%d prepared_x=%d K=%d query_len=%d",
+                x,
+                prepared_x,
+                k,
+                query_len,
+            )
+            return None, prepared_x
+
+        # Real prefill establishes request and sampler/MTP state only after
+        # every declared COLD owner set and the complete KV wave are committed.
+        prefill = self._run_elastic_restore_step()
+        admitted_x = len(prefill.num_scheduled_tokens)
+        if admitted_x > prepared_x:
+            self._rollback_elastic_restore_physical_epoch(
+                request_ids=req_ids,
+                step_keys=declared_step_keys,
+            )
+            raise RuntimeError(
+                "elastic MaxX scheduler exceeded its exact wave preflight: "
+                f"requested_x={x} prepared_x={prepared_x} "
+                f"admitted_x={admitted_x}"
+            )
+        if admitted_x != x:
+            if not 0 < admitted_x < x:
+                self._rollback_elastic_restore_physical_epoch(
+                    request_ids=req_ids,
+                    step_keys=declared_step_keys,
+                )
+                raise RuntimeError(
+                    "elastic MaxX probe made no monotone admission progress: "
+                    f"requested_x={x} admitted_x={admitted_x}"
+                )
+            self._rollback_elastic_restore_physical_epoch(
+                request_ids=req_ids,
+                step_keys=declared_step_keys,
+            )
+            logger.warning(
+                "Elastic pre-READY MaxX probe downshifted by admission: "
+                "requested_x=%d admitted_x=%d K=%d query_len=%d",
+                x,
+                admitted_x,
+                k,
+                query_len,
+            )
+            return None, admitted_x
+        needs_decode_bridge = self._elastic_restore_needs_decode_bridge(
+            k=k,
+            query_len=query_len,
+        )
+        if k > 0 and (query_len == 1 or needs_decode_bridge):
+            for req_id in req_ids:
+                scheduler.requests[req_id].spec_token_ids.clear()
+        if needs_decode_bridge:
+            bridge_expected = self._elastic_restore_decode_key(
+                k=k,
+                x=x,
+                query_len=1,
+            )
+            scheduler.prepare_elastic_restore_execution(bridge_expected)
+            self._elastic_restore_expected_decode_ids = frozenset(req_ids)
+            try:
+                bridge = self._run_elastic_restore_step()
+            except _ElasticRestorePartialWave as contraction:
+                self._elastic_restore_expected_decode_ids = frozenset()
+                self._rollback_elastic_restore_physical_epoch(
+                    request_ids=req_ids,
+                    step_keys=declared_step_keys,
+                )
+                logger.warning(
+                    "Elastic MTP bridge downshifted before target decode: "
+                    "requested_x=%d admitted_x=%d K=%d query_len=%d",
+                    x,
+                    contraction.admitted_x,
+                    k,
+                    query_len,
+                )
+                return None, contraction.admitted_x
+            finally:
+                self._elastic_restore_expected_decode_ids = frozenset()
+            bridge_admitted_x = len(bridge.num_scheduled_tokens)
+            if bridge_admitted_x != x:
+                self._rollback_elastic_restore_physical_epoch(
+                    request_ids=req_ids,
+                    step_keys=declared_step_keys,
+                )
+                raise RuntimeError(
+                    "elastic MTP bridge made no exact decode progress: "
+                    f"requested_x={x} admitted_x={bridge_admitted_x}"
+                )
+            self._assert_elastic_restore_key(bridge, bridge_expected)
+            draft_counts = {
+                req_id: len(scheduler.requests[req_id].spec_token_ids)
+                for req_id in req_ids
+            }
+            if any(count != k for count in draft_counts.values()):
+                self._rollback_elastic_restore_physical_epoch(
+                    request_ids=req_ids,
+                    step_keys=declared_step_keys,
+                )
+                raise RuntimeError(
+                    "elastic MTP bridge did not produce the target draft width: "
+                    f"expected_k={k} draft_counts={draft_counts!r}"
+                )
+        elif k > 0 and query_len > 1:
+            draft_counts = {
+                req_id: len(scheduler.requests[req_id].spec_token_ids)
+                for req_id in req_ids
+            }
+            if any(count != k for count in draft_counts.values()):
+                self._rollback_elastic_restore_physical_epoch(
+                    request_ids=req_ids,
+                    step_keys=declared_step_keys,
+                )
+                raise RuntimeError(
+                    "elastic MTP prefill did not produce the target draft width: "
+                    f"expected_k={k} draft_counts={draft_counts!r}"
+                )
+        expected = self._elastic_restore_decode_key(k=k, x=x, query_len=query_len)
+        scheduler.prepare_elastic_restore_execution(expected)
+        self._elastic_restore_expected_decode_ids = frozenset(req_ids)
+        try:
+            cold = self._run_elastic_restore_step()
+        except _ElasticRestorePartialWave as contraction:
+            self._elastic_restore_expected_decode_ids = frozenset()
+            self._rollback_elastic_restore_physical_epoch(
+                request_ids=req_ids,
+                step_keys=declared_step_keys,
+            )
+            logger.warning(
+                "Elastic pinned-family pre-execution gate downshifted FULL "
+                "decode: requested_x=%d admitted_x=%d K=%d query_len=%d",
+                x,
+                contraction.admitted_x,
+                k,
+                query_len,
+            )
+            return None, contraction.admitted_x
+        finally:
+            self._elastic_restore_expected_decode_ids = frozenset()
+        cold_admitted_x = len(cold.num_scheduled_tokens)
+        if cold_admitted_x != x:
+            if not 0 < cold_admitted_x < x:
+                self._rollback_elastic_restore_physical_epoch(
+                    request_ids=req_ids,
+                    step_keys=declared_step_keys,
+                )
+                raise RuntimeError(
+                    "elastic FULL probe made no monotone decode admission "
+                    f"progress: requested_x={x} admitted_x={cold_admitted_x}"
+                )
+            self._rollback_elastic_restore_physical_epoch(
+                request_ids=req_ids,
+                step_keys=declared_step_keys,
+            )
+            logger.warning(
+                "Elastic pinned-family fixed point downshifted FULL decode: "
+                "requested_x=%d admitted_x=%d K=%d query_len=%d",
+                x,
+                cold_admitted_x,
+                k,
+                query_len,
+            )
+            return None, cold_admitted_x
+        self._assert_elastic_restore_key(cold, expected)
+        if k > 0 and query_len == 1:
+            for req_id in req_ids:
+                request = scheduler.requests.get(req_id)
+                if request is not None:
+                    request.spec_token_ids.clear()
+        scheduler.prepare_elastic_restore_execution(expected)
+        self._elastic_restore_expected_decode_ids = frozenset(req_ids)
+        try:
+            hot = self._run_elastic_restore_step()
+        except _ElasticRestorePartialWave as contraction:
+            self._elastic_restore_expected_decode_ids = frozenset()
+            self._rollback_elastic_restore_physical_epoch(
+                request_ids=req_ids,
+                step_keys=declared_step_keys,
+            )
+            return None, contraction.admitted_x
+        finally:
+            self._elastic_restore_expected_decode_ids = frozenset()
+        self._assert_elastic_restore_key(hot, expected)
+        if preserve_hotset:
+            carrier_keys = scheduler.resolve_elastic_serving_carrier_physical_keys(
+                (expected,)
+            )
+            scheduler.promote_elastic_restore_retention_to_serving(
+                retention_id, carrier_keys
+            )
+        else:
+            scheduler.release_elastic_restore_retention(retention_id)
+        self.abort_requests(req_ids)
+        if preserve_hotset:
+            scheduler._elastic_restore_mode = False
+        self._drain_elastic_restore()
+        return expected, x
+
+    def _shutdown_failed_elastic_startup(self) -> None:
+        """Release workers when construction fails before assignment."""
+        try:
+            self.shutdown()
+        except Exception:
+            logger.exception(
+                "ELASTIC_STARTUP_SHUTDOWN_FAILED: explicit pre-READY worker "
+                "teardown raised; process exit remains mandatory"
+            )
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
@@ -334,7 +1284,13 @@ class EngineCore:
         if max_model_len_after != max_model_len_before:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
 
-        scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+        scheduler_kv_cache_config = generate_scheduler_kv_cache_config(
+            kv_cache_configs,
+            configured_max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
+            enable_auto_resident_cap=(
+                os.environ.get("AG2_VLLM_ELASTIC_AUTO_RESIDENT_CAP", "0") == "1"
+            ),
+        )
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
         if kv_cache_groups:
@@ -631,6 +1587,12 @@ class EngineCore:
         Overridden by the DP engine core; never throttles otherwise."""
         return False
 
+    def _has_scheduler_step_work(self) -> bool:
+        return bool(
+            self.scheduler.has_requests()
+            or cast(Any, self.scheduler).has_pending_elastic_maintenance()
+        )
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -639,26 +1601,136 @@ class EngineCore:
         """
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
-        if not self.scheduler.has_requests():
+        if not self._has_scheduler_step_work():
             return {}, False
-        scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        trace_enabled = bool(
+            self._ag2_step_trace_path and not self._ag2_step_trace_complete
+        )
+        step_start_ns = time.perf_counter_ns() if trace_enabled else 0
+        scheduler_output = self.scheduler.schedule(
+            self._should_throttle_prefills(), physical_quiescent=True
+        )
+        self._last_scheduler_output = scheduler_output
+        expected_calibration_ids: frozenset[str] = getattr(
+            self, "_elastic_restore_expected_decode_ids", frozenset()
+        )
+        if expected_calibration_ids and scheduler_output.is_pure_decode_step:
+            scheduled_ids = frozenset(scheduler_output.num_scheduled_tokens)
+            if scheduled_ids != expected_calibration_ids:
+                cast(Any, self.scheduler).cancel_unexecuted_elastic_restore_step(
+                    scheduler_output
+                )
+                raise _ElasticRestorePartialWave(
+                    len(scheduled_ids), len(expected_calibration_ids)
+                )
+        schedule_end_ns = time.perf_counter_ns() if trace_enabled else 0
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        submit_end_ns = time.perf_counter_ns() if trace_enabled else 0
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
-            model_output = future.result()
-            if model_output is None:
-                model_output = self.model_executor.sample_tokens(grammar_output)
+            try:
+                model_output = future.result()
+                if model_output is None:
+                    model_output = self.model_executor.sample_tokens(grammar_output)
+            except WorkerRemoteError as error:
+                if (
+                    error.failure.code
+                    != WorkerFailureCode.ELASTIC_EXECUTION_PLAN_MISMATCH
+                ):
+                    raise
+                # Match the ordinary result path: aborts accepted while the
+                # worker future was running take effect before its output.
+                self._process_aborts_queue()
+                failed = cast(
+                    Any, self.scheduler
+                ).recover_elastic_execution_plan_mismatch(scheduler_output)
+                recovered_outputs = {
+                    client_index: EngineCoreOutputs(finished_requests=set(request_ids))
+                    for client_index, request_ids in (
+                        cast(Any, self.scheduler).take_finished_request_ids().items()
+                    )
+                }
+                for request in failed:
+                    client_output = recovered_outputs.setdefault(
+                        request.client_index,
+                        EngineCoreOutputs(finished_requests=set()),
+                    )
+                    assert client_output.finished_requests is not None
+                    client_output.finished_requests.add(request.request_id)
+                    client_output.outputs.append(
+                        EngineCoreOutput(
+                            request_id=request.request_id,
+                            new_token_ids=[],
+                            finish_reason=FinishReason.ERROR,
+                            events=request.take_events(),
+                            trace_headers=request.trace_headers,
+                        )
+                    )
+                self._attach_iteration_details(recovered_outputs, iteration_details)
+                return recovered_outputs, False
+        future_end_ns = time.perf_counter_ns() if trace_enabled else 0
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        abort_end_ns = time.perf_counter_ns() if trace_enabled else 0
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        update_end_ns = time.perf_counter_ns() if trace_enabled else 0
         self._attach_iteration_details(engine_core_outputs, iteration_details)
+
+        if trace_enabled:
+            details = compute_iteration_details(scheduler_output)
+            if (
+                self._ag2_step_trace_include_context and details.num_ctx_tokens > 0
+            ) or details.num_generation_requests >= self._ag2_step_trace_min_running:
+                self._ag2_step_trace_saw_context |= details.num_ctx_tokens > 0
+                previous_start_ns = self._ag2_step_trace_previous_start_ns
+                self._ag2_step_trace_records.append(
+                    {
+                        "context_requests": details.num_ctx_requests,
+                        "context_tokens": details.num_ctx_tokens,
+                        "generation_requests": details.num_generation_requests,
+                        "generation_tokens": details.num_generation_tokens,
+                        "scheduled_tokens": scheduler_output.total_num_scheduled_tokens,
+                        "step_start_ns": step_start_ns,
+                        "start_spacing_ms": (
+                            (step_start_ns - previous_start_ns) / 1e6
+                            if previous_start_ns is not None
+                            else -1.0
+                        ),
+                        "schedule_ms": (schedule_end_ns - step_start_ns) / 1e6,
+                        "execute_submit_ms": (submit_end_ns - schedule_end_ns) / 1e6,
+                        "future_wait_ms": (future_end_ns - submit_end_ns) / 1e6,
+                        "abort_ms": (abort_end_ns - future_end_ns) / 1e6,
+                        "update_ms": (update_end_ns - abort_end_ns) / 1e6,
+                        "step_total_ms": (update_end_ns - step_start_ns) / 1e6,
+                    }
+                )
+                self._ag2_step_trace_previous_start_ns = step_start_ns
+                if len(self._ag2_step_trace_records) >= self._ag2_step_trace_limit and (
+                    not self._ag2_step_trace_require_context
+                    or self._ag2_step_trace_saw_context
+                ):
+                    payload = {
+                        "schema": "ag2-engine-step-trace-v2",
+                        "min_running": self._ag2_step_trace_min_running,
+                        "include_context": self._ag2_step_trace_include_context,
+                        "require_context": self._ag2_step_trace_require_context,
+                        "records": self._ag2_step_trace_records,
+                    }
+                    path = self._ag2_step_trace_path
+                    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                    temporary = f"{path}.tmp.{os.getpid()}"
+                    with open(temporary, "wb") as stream:
+                        stream.write(msgspec.json.encode(payload))
+                    os.replace(temporary, path)
+                    self._ag2_step_trace_complete = True
+                    logger.info("AG2 engine-step trace complete: %s", path)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -690,6 +1762,13 @@ class EngineCore:
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
+        trace_enabled = bool(
+            self._ag2_step_trace_path and not self._ag2_step_trace_complete
+        )
+        step_start_ns = time.perf_counter_ns() if trace_enabled else 0
+        schedule_end_ns = step_start_ns
+        submit_end_ns = step_start_ns
+
         # Try to schedule a new batch if the batch queue is not full, but
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
@@ -698,7 +1777,11 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
-            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            scheduler_output = self.scheduler.schedule(
+                self._should_throttle_prefills(),
+                physical_quiescent=not batch_queue,
+            )
+            schedule_end_ns = time.perf_counter_ns() if trace_enabled else 0
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -723,6 +1806,7 @@ class EngineCore:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
+            submit_end_ns = time.perf_counter_ns() if trace_enabled else 0
 
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
@@ -742,6 +1826,7 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
+        wait_start_ns = time.perf_counter_ns() if trace_enabled else 0
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
@@ -752,13 +1837,16 @@ class EngineCore:
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+        future_end_ns = time.perf_counter_ns() if trace_enabled else 0
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        abort_end_ns = time.perf_counter_ns() if trace_enabled else 0
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        update_end_ns = time.perf_counter_ns() if trace_enabled else 0
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
@@ -783,6 +1871,61 @@ class EngineCore:
             )
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
+
+        deferred_end_ns = time.perf_counter_ns() if trace_enabled else 0
+        if trace_enabled:
+            details = compute_iteration_details(scheduler_output)
+            if (
+                self._ag2_step_trace_include_context and details.num_ctx_tokens > 0
+            ) or details.num_generation_requests >= self._ag2_step_trace_min_running:
+                self._ag2_step_trace_saw_context |= details.num_ctx_tokens > 0
+                previous_start_ns = self._ag2_step_trace_previous_start_ns
+                self._ag2_step_trace_records.append(
+                    {
+                        "context_requests": details.num_ctx_requests,
+                        "context_tokens": details.num_ctx_tokens,
+                        "generation_requests": details.num_generation_requests,
+                        "generation_tokens": details.num_generation_tokens,
+                        "scheduled_tokens": scheduler_output.total_num_scheduled_tokens,
+                        "step_start_ns": step_start_ns,
+                        "start_spacing_ms": (
+                            (step_start_ns - previous_start_ns) / 1e6
+                            if previous_start_ns is not None
+                            else -1.0
+                        ),
+                        "schedule_ms": (schedule_end_ns - step_start_ns) / 1e6,
+                        "execute_and_sample_submit_ms": (
+                            submit_end_ns - schedule_end_ns
+                        )
+                        / 1e6,
+                        "queue_pre_wait_ms": (wait_start_ns - submit_end_ns) / 1e6,
+                        "future_wait_ms": (future_end_ns - wait_start_ns) / 1e6,
+                        "abort_ms": (abort_end_ns - future_end_ns) / 1e6,
+                        "update_ms": (update_end_ns - abort_end_ns) / 1e6,
+                        "deferred_sample_ms": (deferred_end_ns - update_end_ns) / 1e6,
+                        "step_total_ms": (deferred_end_ns - step_start_ns) / 1e6,
+                    }
+                )
+                self._ag2_step_trace_previous_start_ns = step_start_ns
+                if len(self._ag2_step_trace_records) >= self._ag2_step_trace_limit and (
+                    not self._ag2_step_trace_require_context
+                    or self._ag2_step_trace_saw_context
+                ):
+                    payload = {
+                        "schema": "ag2-engine-step-trace-v2",
+                        "min_running": self._ag2_step_trace_min_running,
+                        "include_context": self._ag2_step_trace_include_context,
+                        "require_context": self._ag2_step_trace_require_context,
+                        "records": self._ag2_step_trace_records,
+                    }
+                    path = self._ag2_step_trace_path
+                    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                    temporary = f"{path}.tmp.{os.getpid()}"
+                    with open(temporary, "wb") as stream:
+                        stream.write(msgspec.json.encode(payload))
+                    os.replace(temporary, path)
+                    self._ag2_step_trace_complete = True
+                    logger.info("AG2 engine-step trace complete: %s", path)
 
         return engine_core_outputs, model_executed
 

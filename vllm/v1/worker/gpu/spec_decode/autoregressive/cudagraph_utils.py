@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
+from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -27,6 +29,38 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
     earlier capture would execute kernels with stale buffer contents.
     """
 
+    def _store_capture_output(
+        self,
+        desc: BatchExecutionDescriptor,
+        output: Any,
+    ) -> None:
+        required = getattr(self, "_ag2_required_capture_output_fields", None)
+        if required is not None:
+            if not isinstance(output, dict):
+                raise RuntimeError(
+                    "Required speculator CUDA Graph output was not published "
+                    f"during capture for {desc}"
+                )
+            missing = required.difference(output)
+            if missing:
+                raise RuntimeError(
+                    "Speculator CUDA Graph output is incomplete during capture "
+                    f"for {desc}: missing={sorted(missing)}"
+                )
+        if not hasattr(self, "_ag2_capture_outputs"):
+            self._ag2_capture_outputs: dict[BatchExecutionDescriptor, Any] = {}
+        self._ag2_capture_outputs[desc] = output
+
+    def require_capture_output(self, fields: frozenset[str]) -> None:
+        if not fields:
+            raise ValueError("required CUDA Graph output fields cannot be empty")
+        self._ag2_required_capture_output_fields = fields
+
+    def _release_dynamic_capture_state(self, desc: BatchExecutionDescriptor) -> None:
+        outputs = getattr(self, "_ag2_capture_outputs", None)
+        if outputs is not None:
+            outputs.pop(desc, None)
+
     def capture(
         self,
         forward_fn: Callable,
@@ -36,13 +70,20 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         progress_bar_desc: str = "Capturing CUDA graphs",
+        capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]]
+        | None = None,
+        capture_begin_hook: Callable[[BatchExecutionDescriptor], None] | None = None,
+        capture_complete_hook: Callable[
+            [BatchExecutionDescriptor, Callable[[CUDAGraphMode], None]], None
+        ]
+        | None = None,
     ) -> None:
         def create_forward_fn(
             desc: BatchExecutionDescriptor,
             warmup: bool,
         ) -> Callable[[CUDAGraphMode], None]:
             num_tokens = desc.num_tokens
-            num_reqs = desc.num_reqs or min(num_tokens, self.max_num_reqs)
+            num_reqs = self._capture_num_reqs(desc)
             num_tokens_across_dp = (
                 torch.full((self.dp_size,), num_tokens, dtype=torch.int32, device="cpu")
                 if self.dp_size > 1
@@ -58,14 +99,38 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
                 kv_cache_config,
                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
             )
+            if envs.AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL:
+                layout = input_buffers.marlin_request_layout_cpu
+                layout[0] = num_reqs
+                layout[1] = num_reqs
+                layout[2 : num_reqs + 3].zero_()
 
-            return lambda cg_mode: forward_fn(
-                num_reqs,
-                num_tokens,
-                attn_metadata,
-                slot_mappings,
-                num_tokens_across_dp,
-                cg_mode,
-            )
+            def captured_forward(cg_mode: CUDAGraphMode) -> Any:
+                output = forward_fn(
+                    num_reqs,
+                    num_tokens,
+                    attn_metadata,
+                    slot_mappings,
+                    num_tokens_across_dp,
+                    cg_mode,
+                    physical_num_reqs=desc.physical_num_reqs,
+                    runtime_generation=desc.runtime_generation,
+                )
+                if not warmup:
+                    self._store_capture_output(desc, output)
+                return output
 
-        super().capture(create_forward_fn, progress_bar_desc)
+            return captured_forward
+
+        super().capture(
+            create_forward_fn,
+            progress_bar_desc,
+            capture_descs,
+            capture_begin_hook=capture_begin_hook,
+            capture_complete_hook=capture_complete_hook,
+        )
+
+    def run_fullgraph(self, desc: BatchExecutionDescriptor) -> Any:
+        super().run_fullgraph(desc)
+        outputs = getattr(self, "_ag2_capture_outputs", {})
+        return outputs.get(desc)

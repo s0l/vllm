@@ -25,6 +25,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import gc
+import itertools
 import threading
 import weakref
 from collections.abc import Callable
@@ -152,6 +153,10 @@ class BreakableCUDAGraphCapture:
     def __init__(self, pool: Any | None = None) -> None:
         self.pool = pool
         self.segments: list[Callable[[], Any]] = []
+        # Keep the graph objects themselves, not only their bound replay
+        # methods. Dynamic descriptor eviction must be able to call reset()
+        # deterministically before releasing a private graph pool.
+        self.graphs: list[torch.cuda.CUDAGraph] = []
         self._num_graphs: int = 0
         self._num_eager_breaks: int = 0
         self._current_graph: torch.cuda.CUDAGraph | None = None
@@ -190,6 +195,7 @@ class BreakableCUDAGraphCapture:
         assert self._current_graph is not None
         self._current_graph.capture_end()
         self.segments.append(self._current_graph.replay)
+        self.graphs.append(self._current_graph)
         self._num_graphs += 1
         self._current_graph = None
         self._capturing = False
@@ -214,6 +220,20 @@ class BreakableCUDAGraphCapture:
     def replay(self) -> None:
         for r in self.segments:
             r()
+
+    def reset(self) -> None:
+        """Destroy every CUDA graph segment owned by this capture."""
+        if self._capturing:
+            raise RuntimeError("Cannot reset an active breakable CUDA graph capture")
+        # Segments share one pool and were captured/replayed in forward order;
+        # release their dependency chain in reverse order.
+        for graph in reversed(self.graphs):
+            graph.reset()
+        self.segments.clear()
+        self.graphs.clear()
+        self.pool = None
+        self._num_graphs = 0
+        self._num_eager_breaks = 0
 
     # --- introspection ---------------------------------------------------
 
@@ -243,6 +263,9 @@ class _BreakableEntry:
     capture: BreakableCUDAGraphCapture | None = None
     output: Any = None
     input_addresses: list[int] | None = None
+    first_replay_addresses_validated: bool = False
+    graph_pool: Any | None = None
+    capture_order: int = -1
 
 
 class BreakableCUDAGraphWrapper:
@@ -265,11 +288,53 @@ class BreakableCUDAGraphWrapper:
     _all_instances: ClassVar[weakref.WeakSet[BreakableCUDAGraphWrapper]] = (
         weakref.WeakSet()
     )
+    _capture_sequence: ClassVar = itertools.count()
 
     @classmethod
     def clear_all_graphs(cls) -> None:
         for instance in list(cls._all_instances):
             instance.clear_graphs()
+
+    @classmethod
+    def count_batch_descriptor(
+        cls, batch_descriptor: BatchDescriptor, graph_pool: Any | None = None
+    ) -> int:
+        """Count physical graph segments resident for one descriptor."""
+        count = 0
+        for instance in list(cls._all_instances):
+            entry = instance.entries.get(batch_descriptor)
+            if entry is None or entry.capture is None:
+                continue
+            if graph_pool is not None and entry.graph_pool != graph_pool:
+                continue
+            count += entry.capture.num_graphs
+        return count
+
+    @classmethod
+    def evict_batch_descriptor(
+        cls, batch_descriptor: BatchDescriptor, graph_pool: Any | None = None
+    ) -> int:
+        """Atomically reset one ordered breakable descriptor artifact."""
+        evicted = 0
+        detached: list[tuple[int, BreakableCUDAGraphCapture]] = []
+        for instance in list(cls._all_instances):
+            entry = instance.entries.get(batch_descriptor)
+            if entry is None or (
+                graph_pool is not None and entry.graph_pool != graph_pool
+            ):
+                continue
+            del instance.entries[batch_descriptor]
+            if entry.capture is not None:
+                evicted += entry.capture.num_graphs
+                detached.append((entry.capture_order, entry.capture))
+            entry.capture = None
+            entry.output = None
+            entry.input_addresses = None
+            entry.first_replay_addresses_validated = False
+            entry.graph_pool = None
+        for _capture_order, capture in sorted(detached, reverse=True):
+            capture.reset()
+        return evicted
 
     def __init__(
         self,
@@ -310,6 +375,12 @@ class BreakableCUDAGraphWrapper:
         return self
 
     def clear_graphs(self) -> None:
+        for entry in self.entries.values():
+            if entry.capture is not None:
+                entry.capture.reset()
+            entry.capture = None
+            entry.output = None
+            entry.graph_pool = None
         self.entries.clear()
 
     # --- dispatch --------------------------------------------------------
@@ -385,21 +456,44 @@ class BreakableCUDAGraphWrapper:
         # pre-capture prefetches are complete and don't leak into the graph.
         get_offloader().sync_prev_onload()
 
-        capture = BreakableCUDAGraphCapture(pool=self.graph_pool)
-        with capture:
-            output = self.runnable(*args, **kwargs)
-            # Join the offloader's copy stream while we still hold the last
-            # segment open, so the join is captured into the graph (otherwise
-            # we get an "unjoined stream" error on subsequent forwards).
-            get_offloader().join_after_forward()
-            # Convert output to a weak ref *inside* the capture context so the
-            # strong ref is dropped before the last segment closes, letting
-            # the cudagraph pool reclaim/reuse that memory immediately for
-            # the next batch descriptor's capture.
-            output = weak_ref_tensors(output)
+        capture_type = BreakableCUDAGraphCapture
+        import os
+
+        if os.environ.get("AG2_FLASHNEXT_QSA_COMMAND_CAPTURE") == "1":
+            from vllm.models.qwen4_exp.nvidia.qsa_command_capture import (
+                QSACommandCapture,
+            )
+
+            capture_type = QSACommandCapture
+        capture = capture_type(pool=self.graph_pool)
+        try:
+            with capture:
+                output = self.runnable(*args, **kwargs)
+                # Join the offloader's copy stream while we still hold the last
+                # segment open, so the join is captured into the graph (otherwise
+                # we get an "unjoined stream" error on subsequent forwards).
+                get_offloader().join_after_forward()
+                # Convert output to a weak ref *inside* the capture context so the
+                # strong ref is dropped before the last segment closes, letting
+                # the cudagraph pool reclaim/reuse that memory immediately for
+                # the next batch descriptor's capture.
+                output = weak_ref_tensors(output)
+        except BaseException:
+            # No entry owns these segments yet. Release them before the caller
+            # measures reclamation; its exception traceback still owns `capture`.
+            capture.reset()
+            entry.input_addresses = None
+            entry.first_replay_addresses_validated = False
+            # Pool identity is published only on success. A caller's
+            # pool-filtered eviction cannot find this unpublished entry.
+            if self.entries.get(entry.batch_descriptor) is entry:
+                del self.entries[entry.batch_descriptor]
+            raise
 
         entry.capture = capture
         entry.output = weak_ref_tensors(output)
+        entry.graph_pool = self.graph_pool
+        entry.capture_order = next(self._capture_sequence)
 
         logger.debug(
             "Captured breakable cudagraph for %s: %r",
@@ -416,13 +510,17 @@ class BreakableCUDAGraphWrapper:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> Any:
-        if self.is_debugging_mode and entry.input_addresses is not None:
+        if entry.input_addresses is not None and (
+            self.is_debugging_mode or not entry.first_replay_addresses_validated
+        ):
             new_addresses = self._collect_tensor_addresses(args, kwargs)
-            assert new_addresses == entry.input_addresses, (
-                "Input tensor addresses changed between capture and replay "
-                f"for {entry.batch_descriptor}. Expected "
-                f"{entry.input_addresses}, got {new_addresses}."
-            )
+            if new_addresses != entry.input_addresses:
+                raise RuntimeError(
+                    "Breakable CUDA Graph input addresses changed between "
+                    f"capture and replay for {entry.batch_descriptor}. "
+                    f"Expected {entry.input_addresses}, got {new_addresses}."
+                )
+            entry.first_replay_addresses_validated = True
         # Sync the offloader's copy stream before replay so any external
         # dependencies from pre-capture prefetches are satisfied.
         get_offloader().sync_prev_onload()

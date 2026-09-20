@@ -70,6 +70,11 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
     )
     logger.info("Warmed up Qwen4Exp QSA decode kernels: %s.", profiles)
 
+    if owner.fp8_dcp:
+        # This owner consumes FlashInfer FP8 attention. Its static planning and
+        # runner warmup prepare that backend; the Triton path below is BF16-only.
+        return
+
     from vllm.models.qwen4_exp.nvidia.ops.qsa import (
         warmup_qsa_sparse_paged_attention,
     )

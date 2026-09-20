@@ -1,0 +1,11 @@
+#pragma once
+
+#if __has_include_next(<format>)
+#include_next <format>
+#else
+#define FMT_HEADER_ONLY
+#include <fmt/format.h>
+namespace std {
+using ::fmt::format;
+}
+#endif

@@ -382,6 +382,7 @@ class StructuredOutputManager:
                 grammar = structured_output_request.grammar
                 if TYPE_CHECKING:
                     assert isinstance(grammar, StructuredOutputGrammar)
+                reasoner = self._get_reasoner(request)
 
                 req_tokens = scheduled_spec_decode_tokens.get(req_id, list())
                 constraint_start = self._get_constraint_start(
@@ -390,17 +391,57 @@ class StructuredOutputManager:
                 state_advancements = 0
                 seen_padding = False
                 failed = False
+                post_reasoning_end_in_window = False
+                post_reasoning_draft_prefix_valid = True
+                req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
+                # Locate the reasoning-end marker in the draft window once.
+                # Rejected-draft padding (-1) is trailing, so the window is
+                # cut there and the reasoner never sees a placeholder.
+                window_start = len(request.all_token_ids)
+                reasoning_end_index: int | None = None
+                if reasoner is not None and req_tokens:
+                    window = req_tokens
+                    if -1 in window:
+                        window = window[: window.index(-1)]
+                    reasoning_end_index = self._find_reasoning_end_index(
+                        reasoner,
+                        request.all_token_ids,
+                        window_start,
+                        window,
+                        delta_appended=False,
+                    )
                 for i, token in enumerate(req_tokens):
                     apply_bitmask = (
-                        not failed and not seen_padding and i >= constraint_start
+                        not failed
+                        and not seen_padding
+                        and (i >= constraint_start or post_reasoning_end_in_window)
                     )
                     self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
+                    advance_grammar = apply_bitmask
                     if token == -1:
                         seen_padding = True
-                    elif apply_bitmask:
-                        if not grammar.is_terminated() and grammar.accept_tokens(
-                            req_id, [token]
-                        ):
+                        advance_grammar = False
+                    elif not apply_bitmask and window_start + i == reasoning_end_index:
+                        # Reasoning ended mid-window. Constrain the rest
+                        # of the window via bitmask. Skip grammar advance
+                        # through the marker (it is reasoning content);
+                        # Subsequent drafts predate the mask. Validate before
+                        # advancing and stop advancing after an invalid suffix.
+                        apply_bitmask = True
+                        advance_grammar = False
+                        post_reasoning_end_in_window = True
+                    if advance_grammar and not grammar.is_terminated():
+                        accepted = True
+                        if post_reasoning_end_in_window:
+                            accepted = (
+                                post_reasoning_draft_prefix_valid
+                                and grammar.validate_tokens([token]) == [token]
+                            )
+                            if not accepted:
+                                post_reasoning_draft_prefix_valid = False
+                        if accepted:
+                            accepted = grammar.accept_tokens(req_id, [token])
+                        if accepted:
                             state_advancements += 1
                         else:
                             failed = True

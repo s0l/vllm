@@ -863,30 +863,36 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
     ) -> None:
-        """Cache the prompt tail when it ends inside a cache block.
-
-        Only the final prompt hash boundary is registered as a partial
-        prefix-cache entry; intermediate hash boundaries inside the same cache
-        block are intentionally skipped.
-        """
+        """Cache requested partial boundaries inside an attention block."""
         hash_block_size = self.block_pool.hash_block_size
-        boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size
-        if boundary_tokens == 0 or boundary_tokens > num_tokens:
-            return
-        if boundary_tokens % self.block_size == 0:
-            return
-
-        blocks = self.req_to_blocks[request.request_id]
-        block_idx = boundary_tokens // self.block_size
-        if block_idx >= len(blocks):
-            return
-        self.block_pool.cache_partial_block(
-            request=request,
-            block=blocks[block_idx],
-            num_tokens=boundary_tokens,
-            kv_cache_group_id=self.kv_cache_group_id,
-            block_size=self.block_size,
+        prompt_tail = request.num_prompt_tokens // hash_block_size * hash_block_size
+        boundaries = {prompt_tail}
+        # get_computed_blocks retains a token for logits. When the prompt ends
+        # on a hash boundary, its full-tail alias is beyond the lookup limit.
+        replay_end = getattr(
+            request, "execution_prefill_len", request.num_prompt_tokens
         )
+        boundaries.add(max(0, replay_end - 1) // hash_block_size * hash_block_size)
+        if request.shared_prefix_boundary:
+            boundaries.add(request.shared_prefix_boundary)
+        blocks = self.req_to_blocks[request.request_id]
+        # Publish the longest extent first: extending an existing primary
+        # alias invalidates older metadata, then shorter aliases can be added.
+        for boundary_tokens in sorted(boundaries, reverse=True):
+            if boundary_tokens == 0 or boundary_tokens > num_tokens:
+                continue
+            if boundary_tokens % self.block_size == 0:
+                continue
+            block_idx = boundary_tokens // self.block_size
+            if block_idx >= len(blocks):
+                continue
+            self.block_pool.cache_partial_block(
+                request=request,
+                block=blocks[block_idx],
+                num_tokens=boundary_tokens,
+                kv_cache_group_id=self.kv_cache_group_id,
+                block_size=self.block_size,
+            )
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         blocks = self.req_to_blocks[running_request_id]
@@ -1468,6 +1474,7 @@ class MambaManager(SingleTypeKVCacheManager):
         # Mamba checkpoints follow Eagle's global replay boundary.
         self.drop_eagle_checkpoint_block = False
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+        self.one_slot_align = kv_cache_spec.separate_pool
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step
@@ -1500,12 +1507,11 @@ class MambaManager(SingleTypeKVCacheManager):
         assert isinstance(kv_cache_spec, MambaSpec), (
             "MambaManager can only be used for mamba groups"
         )
-        assert dcp_world_size == 1, "DCP not support mamba now."
-        assert pcp_world_size == 1, "PCP not support mamba now."
+        block_size = kv_cache_spec.block_size * dcp_world_size * pcp_world_size
         block_hashes = resolve_block_hashes(
             block_hashes,
             block_pool.hash_block_size,
-            kv_cache_spec.block_size,
+            block_size,
             supports_fine_grained_hash_lookup=cls.supports_fine_grained_hash_lookup,
             alignment_tokens=alignment_tokens,
         )
@@ -1514,7 +1520,6 @@ class MambaManager(SingleTypeKVCacheManager):
         )
         hit_length = 0
 
-        block_size = kv_cache_spec.block_size
         if alignment_tokens < block_size and block_size % alignment_tokens == 0:
             # list or lazy BlobBlockHashes view
             assert isinstance(block_hashes, Sequence)
@@ -1536,7 +1541,6 @@ class MambaManager(SingleTypeKVCacheManager):
                     hit_length = num_tokens
                     break
             return computed_blocks, hit_length
-
         max_num_blocks = max_length // block_size
         # Search from right to left and early stop when a match is found.
         for i in range(max_num_blocks - 1, -1, -1):
@@ -1652,6 +1656,15 @@ class MambaManager(SingleTypeKVCacheManager):
     ) -> None:
         assert isinstance(self.kv_cache_spec, MambaSpec)
 
+        if self.mamba_cache_mode == "align" and self.one_slot_align:
+            # The sole live state stays in constant table column 0 for the
+            # request's entire lifetime. Positional cleanup would interpret
+            # that column as an old sequence block, return it to the shared
+            # pool, and let another active request alias the same recurrent
+            # state. It is freed only by the normal request finish/preemption
+            # lifecycle.
+            return
+
         super().remove_skipped_blocks(
             request_id, processed_computed_tokens, num_prompt_tokens
         )
@@ -1673,6 +1686,32 @@ class MambaManager(SingleTypeKVCacheManager):
                 if blocks[last_state_block_idx] != self._null_block:
                     self.block_pool.free_blocks([blocks[last_state_block_idx]])
                     blocks[last_state_block_idx] = self._null_block
+
+    def add_local_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        if (
+            isinstance(self.kv_cache_spec, MambaSpec)
+            and self.kv_cache_spec.separate_pool
+        ):
+            # The scheduler's null entries encode only the exact hit length.
+            # Recurrent bytes are restored from the worker host checkpoint into
+            # a freshly allocated one-slot block, so no cached GPU block is touched.
+            assert all(block.is_null for block in new_computed_blocks)
+            self.num_cached_block[request_id] = cdiv(
+                num_local_computed_tokens, self.block_size
+            )
+            return
+        super().add_local_computed_blocks(
+            request_id,
+            new_computed_blocks,
+            num_local_computed_tokens,
+            num_external_computed_tokens,
+        )
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """Cascade attention is not supported by mamba"""
@@ -1752,6 +1791,9 @@ class MambaManager(SingleTypeKVCacheManager):
             # We can ignore lookahead tokens because current draft models don't have
             # mamba layers.
             num_tokens = num_tokens_main_model
+            if self.one_slot_align:
+                allocated = request_id in self._allocated_block_reqs
+                return 0 if allocated else 1 + self.num_speculative_blocks
 
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
@@ -1825,6 +1867,15 @@ class MambaManager(SingleTypeKVCacheManager):
             # mamba layers.
             num_tokens = num_tokens_main_model
             req_blocks: list[KVCacheBlock] = self.req_to_blocks[request_id]
+            if self.one_slot_align:
+                if request_id in self._allocated_block_reqs:
+                    return []
+                num_state_blocks = 1 + self.num_speculative_blocks
+                new_blocks = self.block_pool.get_new_blocks(num_state_blocks)
+                req_blocks.extend(new_blocks)
+                self.last_state_block_idx[request_id] = 0
+                self._allocated_block_reqs.add(request_id)
+                return new_blocks
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
             num_required_blocks = (
@@ -1992,6 +2043,11 @@ class MambaManager(SingleTypeKVCacheManager):
         *,
         replay_boundaries: Sequence[int],
     ) -> None:
+        if (
+            isinstance(self.kv_cache_spec, MambaSpec)
+            and self.kv_cache_spec.separate_pool
+        ):
+            return
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
         super().cache_blocks(
             request,

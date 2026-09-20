@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -8,6 +9,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Generic, Protocol, TypeVar
 
 import numpy as np
 import torch
+from typing_extensions import deprecated
 
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Dynamic64Sym,
@@ -64,6 +66,12 @@ class AttentionBackend(ABC):
         "float16",
         "bfloat16",
     ]
+    # Whether this backend implements the special DCP layout where every rank
+    # stores all global KV heads and selects the rank-local GQA mapping only
+    # for the new-token attention path. This is stricter than generic DCP
+    # support: a backend must opt in after implementing both context combine
+    # and local KV-head selection.
+    supports_dcp_full_kv_attention_heads: ClassVar[bool] = False
 
     # Does attention's forward() include kv cache update?
     forward_includes_kv_cache_update: bool = True
@@ -372,6 +380,16 @@ class AttentionBackend(ABC):
     def is_ssm(cls) -> bool:
         return False
 
+    @classmethod
+    def get_state_update_chunk_alignment(cls) -> int:
+        """Return the token alignment required for resumable state updates.
+
+        Stateless attention backends have no recurrence boundary constraint.
+        Stateful backends override this when splitting a prefill at an
+        arbitrary position changes the arithmetic of a later resumed update.
+        """
+        return 1
+
 
 class AttentionMetadata:
     pass
@@ -408,6 +426,13 @@ class CommonAttentionMetadata:
     block_table_tensor: torch.Tensor
     slot_mapping: torch.Tensor
 
+    full_cudagraph: bool = False
+    """Whether attention is owned by one outer FULL CUDA Graph.
+
+    PIECEWISE attention is a graph breakpoint and must use ordinary
+    replannable backend state rather than shape-owned FULL-graph buffers.
+    """
+
     causal: bool | torch.Tensor = True
 
     # Needed by FastPrefillAttentionBuilder
@@ -437,6 +462,26 @@ class CommonAttentionMetadata:
     """(batch_size,) bool tensor: True if request is still in prefill phase
     (num_computed_tokens < num_prompt_tokens). Used by some backends to
     distinguish actual decodes from short extends."""
+
+    request_ids: tuple[str | None, ...] | None = None
+    """Optional semantic request ids for bounded route provenance."""
+
+    num_scheduled_tokens_cpu: torch.Tensor | None = None
+    """Optional per-request scheduled-token counts for route provenance."""
+
+    num_computed_tokens_provenance_cpu: torch.Tensor | None = None
+    """Optional per-request computed-token counts for route provenance."""
+
+    num_prompt_tokens_cpu: torch.Tensor | None = None
+    """Optional per-request semantic prompt lengths. Unlike ``seq_lens``, this
+    does not include generated/speculative tokens and lets prompt-only routes
+    distinguish an aligned intermediate boundary from a natural final tail."""
+
+    num_decode_draft_tokens_cpu: torch.Tensor | None = None
+    """(batch_size,) number of valid speculative draft tokens for each decode
+    row, or -1 for rows that are not exact speculative-decode verification.
+    This is a semantic execution marker; a matching physical query length alone
+    does not imply that a row belongs to the speculative-decode path."""
 
     seq_lens_cpu_upper_bound: torch.Tensor | None = None
     """(batch_size,) CPU upper bound on seq_lens. Precise for prefill rows
@@ -479,6 +524,40 @@ class CommonAttentionMetadata:
 
     def replace(self, **kwargs) -> "CommonAttentionMetadata":
         return replace(self, **kwargs)
+
+    @property
+    @deprecated(
+        """
+    Prefer using device seq_lens directly to avoid implicit H<>D sync.
+    If a CPU copy is needed, use `seq_lens.cpu()` instead.
+    Will be removed in a future release, please migrate as soon as possible.
+    """
+    )
+    def seq_lens_cpu(self) -> torch.Tensor:
+        if self._seq_lens_cpu is None:
+            if os.getenv("AG2_VLLM_GRAPH_MODE_RECEIPT") == "1":
+                with torch.profiler.record_function("ag2.seq_lens_cpu_join"):
+                    self._seq_lens_cpu = self.seq_lens.to("cpu")
+            else:
+                self._seq_lens_cpu = self.seq_lens.to("cpu")
+        return self._seq_lens_cpu
+
+    @property
+    @deprecated(
+        """
+    Prefer using device seq_lens directly to avoid implicit H<>D sync which breaks full
+    async scheduling. If a CPU copy is needed, it can be derived from
+    query_start_loc_cpu and seq_lens.
+    Will be removed in a future release, please migrate as soon as possible.
+    """
+    )
+    def num_computed_tokens_cpu(self) -> torch.Tensor:
+        if self._num_computed_tokens_cpu is None:
+            query_seq_lens = (
+                self.query_start_loc_cpu[1:] - self.query_start_loc_cpu[:-1]
+            )
+            self._num_computed_tokens_cpu = self.seq_lens_cpu - query_seq_lens
+        return self._num_computed_tokens_cpu
 
     def compute_num_computed_tokens(self) -> torch.Tensor:
         """Compute num_computed_tokens on device (seq_lens - query_lens)."""
@@ -546,6 +625,14 @@ class CommonAttentionMetadata:
             seq_lens_cpu_upper_bound=maybe_slice_reqs(self.seq_lens_cpu_upper_bound),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
             req_idx=maybe_slice_reqs(self.req_idx),
+            request_ids=self.request_ids[:num_actual_reqs]
+            if self.request_ids is not None
+            else None,
+            num_scheduled_tokens_cpu=maybe_slice_reqs(self.num_scheduled_tokens_cpu),
+            num_computed_tokens_provenance_cpu=maybe_slice_reqs(
+                self.num_computed_tokens_provenance_cpu
+            ),
+            num_prompt_tokens_cpu=maybe_slice_reqs(self.num_prompt_tokens_cpu),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
             replayssm_decode_base_cpu=maybe_slice_reqs(self.replayssm_decode_base_cpu),
         )

@@ -1047,6 +1047,7 @@ def cutlass_fp4_moe_mm(
     problem_sizes: torch.Tensor,
     expert_offsets: torch.Tensor,
     sf_offsets: torch.Tensor,
+    expert_rows: torch.Tensor | None = None,
 ):
     """An FP4 Blockscaled Group Gemm that takes in  a_tensors, b_tensors and runs
     the gemms for each combination based on the specified problem sizes.
@@ -1063,6 +1064,20 @@ def cutlass_fp4_moe_mm(
     - problem_sizes: MxNxK sizes of each expert's multiplication in two grouped
                      MMs used in the fused MoE operation.
     """
+    if expert_rows is not None:
+        # Group metadata is compact; weights/scales remain in the global bank.
+        return torch.ops._C.cutlass_fp4_group_mm_mapped(
+            out_tensors,
+            a_tensors,
+            b_tensors,
+            a_scales,
+            b_scales,
+            alphas,
+            problem_sizes,
+            expert_offsets,
+            sf_offsets,
+            expert_rows,
+        )
     return torch.ops._C.cutlass_fp4_group_mm(
         out_tensors,
         a_tensors,
@@ -1608,6 +1623,17 @@ def scaled_fp4_quant(
     return output, output_scale
 
 
+def _fp4_moe_blockscale_rows(num_lanes: int, num_experts: int) -> int:
+    """Bound the sum of per-expert 128-row padded counts without route readback.
+
+    At most min(lanes, experts) groups are nonempty, each adding at most 127
+    padding rows. The actual sum is a multiple of 128, so round this bound down.
+    """
+    if num_lanes < 0 or num_experts <= 0:
+        raise ValueError("invalid FP4 MoE scale geometry")
+    return (num_lanes + 127 * min(num_lanes, num_experts)) // 128 * 128
+
+
 def scaled_fp4_experts_quant(
     input_tensor: torch.Tensor,
     input_global_scale: torch.Tensor,
@@ -1655,7 +1681,7 @@ def scaled_fp4_experts_quant(
         m_numtopk, k // 2, device=input_tensor.device, dtype=torch.uint8
     )
     output_scales = torch.empty(
-        MAX_TOKENS_PER_EXPERT * topk,
+        _fp4_moe_blockscale_rows(m_numtopk, expert_offsets.shape[0] - 1),
         padded_k,
         dtype=torch.int32,
         device=input_tensor.device,
@@ -1720,7 +1746,7 @@ def silu_and_mul_scaled_fp4_experts_quant(
         m_numtopk, k // 2, device=input_tensor.device, dtype=torch.uint8
     )
     output_scales = torch.empty(
-        MAX_TOKENS_PER_EXPERT * topk,
+        _fp4_moe_blockscale_rows(m_numtopk, expert_offsets.shape[0] - 1),
         padded_k,
         dtype=torch.int32,
         device=input_tensor.device,

@@ -569,7 +569,7 @@ def _ple_conv_writeback_kernel(
         )
 
 
-def ple_conv(
+def _ple_conv(
     inputs: torch.Tensor,
     residual: torch.Tensor,
     conv_state: torch.Tensor,
@@ -577,7 +577,7 @@ def ple_conv(
     state_indices: torch.Tensor,
     outer_residual: torch.Tensor,
     *,
-    mode: Literal["decode", "spec", "prefill"],
+    conv_mode: str,
     dilation: int,
     query_start_loc: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
@@ -586,6 +586,7 @@ def ple_conv(
     token_indices: torch.Tensor | None = None,
 ) -> None:
     """Add short convolution and the outer residual; update state."""
+    mode = conv_mode
     BLOCK_C = 512
     kernel_spec_query_len = spec_query_len if mode == "spec" else 1
     T, C = inputs.shape
@@ -686,3 +687,50 @@ def ple_conv(
             NULL_STATE_ID=NULL_BLOCK_ID,
             num_warps=num_warps,
         )
+
+
+def _ple_conv_fake(*args, **kwargs) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_conv",
+    op_func=_ple_conv,
+    mutates_args=["residual", "conv_state"],
+    fake_impl=_ple_conv_fake,
+)
+
+
+def ple_conv(
+    inputs: torch.Tensor,
+    residual: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weights: torch.Tensor,
+    state_indices: torch.Tensor,
+    outer_residual: torch.Tensor,
+    *,
+    mode: Literal["decode", "spec", "prefill"],
+    dilation: int,
+    query_start_loc: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    has_initial_states: torch.Tensor | None = None,
+    spec_query_len: int = 1,
+    token_indices: torch.Tensor | None = None,
+) -> None:
+    # PDL inline assembly prevents Triton's mutation analysis from recognizing
+    # readonly metadata. Keep its sliced views outside auto-functionalization.
+    torch.ops.vllm.qwen4_exp_ple_conv(
+        inputs,
+        residual,
+        conv_state,
+        conv_weights,
+        state_indices,
+        outer_residual,
+        conv_mode=mode,
+        dilation=dilation,
+        query_start_loc=query_start_loc,
+        num_accepted_tokens=num_accepted_tokens,
+        has_initial_states=has_initial_states,
+        spec_query_len=spec_query_len,
+        token_indices=token_indices,
+    )

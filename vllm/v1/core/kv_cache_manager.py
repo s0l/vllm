@@ -9,8 +9,10 @@ from typing import Literal, overload
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
+    KVCacheBlockPoolRequirements,
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
@@ -29,6 +31,39 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
+
+
+class PrefixCacheLease:
+    """Temporary physical ownership between a cache lookup and admission."""
+
+    def __init__(self, groups: Sequence[tuple[BlockPool, Sequence[KVCacheBlock]]]):
+        self._groups = tuple((pool, tuple(blocks)) for pool, blocks in groups)
+        self._released = False
+        # Validate all pools before any ownership mutation.
+        for pool, blocks in self._groups:
+            for block in blocks:
+                if not (
+                    0 <= block.block_id < pool.active_num_gpu_blocks
+                    and pool.blocks[block.block_id] is block
+                ):
+                    raise ValueError(
+                        "prefix lease contains a foreign or unmapped block"
+                    )
+        for pool, blocks in self._groups:
+            pool.touch(blocks)
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        for pool, blocks in reversed(self._groups):
+            pool.free_blocks(reversed(blocks))
+
+    def __enter__(self) -> "PrefixCacheLease":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.release()
 
 
 @dataclass
@@ -129,6 +164,8 @@ class KVCacheBlocks:
 
 
 class KVCacheManager:
+    log_gdn_checkpoint_lookups: bool = False
+
     def __init__(
         self,
         kv_cache_config: KVCacheConfig,
@@ -201,6 +238,7 @@ class KVCacheManager:
             if manager.retains_longer_hit
         )
         self.kv_cache_config = kv_cache_config
+        self.last_allocation_rejection: dict[str, object] | None = None
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -222,6 +260,40 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+
+        # Off-table cow blocks handed to a KV connector for partial-tail
+        # offload; pinned until the request's blocks are freed.
+        self._partial_tail_pins: dict[str, list[KVCacheBlock]] = {}
+
+    def _record_allocation_rejection(
+        self,
+        *,
+        stage: str,
+        request_id: str,
+        requirements: KVCacheBlockPoolRequirements,
+        reserved: KVCacheBlockPoolRequirements | None = None,
+        primary_watermark_blocks: int = 0,
+    ) -> None:
+        mamba_pool = self.coordinator.mamba_block_pool
+        rejection: dict[str, object] = {
+            "stage": stage,
+            "request_id": request_id,
+            "requirements": requirements,
+            "reserved": reserved or KVCacheBlockPoolRequirements(),
+            "primary_watermark": primary_watermark_blocks,
+            "primary_active": self.block_pool.active_num_gpu_blocks,
+            "primary_free": self.block_pool.get_num_free_blocks(),
+            "mamba_active": (
+                mamba_pool.active_num_gpu_blocks if mamba_pool is not None else None
+            ),
+            "mamba_free": (
+                mamba_pool.get_num_free_blocks() if mamba_pool is not None else None
+            ),
+            "elastic": self.coordinator.last_elastic_rejection,
+        }
+        if rejection != self.last_allocation_rejection:
+            logger.warning("KV slot allocation rejected: %s", rejection)
+        self.last_allocation_rejection = rejection
 
     @property
     def usage(self) -> float:
@@ -249,6 +321,23 @@ class KVCacheManager:
     def prefix_cache_lookup_enabled(self, request: Request) -> bool:
         """Whether a local prefix cache lookup may be run for this request."""
         return self.enable_caching and not request.skip_reading_prefix_cache
+
+    def lease_computed_blocks(self, blocks: KVCacheBlocks) -> PrefixCacheLease:
+        """Protect hits in every physical pool without attaching a request."""
+        managers = self.coordinator.single_type_managers
+        if len(blocks.blocks) != len(managers):
+            raise ValueError("prefix lease group count differs from KV configuration")
+        return PrefixCacheLease(
+            tuple(
+                # Separate-pool Mamba hits are positional nulls from the
+                # primary pool; their state lives in exact host checkpoints.
+                (
+                    manager.block_pool,
+                    tuple(block for block in group if not block.is_null),
+                )
+                for manager, group in zip(managers, blocks.blocks, strict=True)
+            )
+        )
 
     def record_prefix_cache_stats(self, request: Request, num_hits: int) -> None:
         # Don't count a request that skipped the cache lookup.
@@ -317,6 +406,16 @@ class KVCacheManager:
             num_new_computed_tokens + num_uncached if num_uncached else 0
         )
 
+        if self.log_gdn_checkpoint_lookups:
+            logger.info(
+                "GDN prefix lookup: request=%s prompt=%d hit=%d "
+                "unreconciled_shared=%d visible_checkpoints=%d",
+                request.request_id,
+                request.num_tokens,
+                num_new_computed_tokens,
+                shared_prefix_boundary,
+                len(self.coordinator.gdn_checkpoint_keys or ()),
+            )
         blocks = self.create_kv_cache_blocks(computed_blocks)
         return blocks, num_new_computed_tokens, shared_prefix_boundary
 
@@ -379,7 +478,7 @@ class KVCacheManager:
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
         full_sequence_must_fit: bool = False,
-        reserved_blocks: int = 0,
+        reserved_blocks: int | KVCacheBlockPoolRequirements = 0,
         has_scheduled_reqs: bool = True,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
@@ -406,11 +505,9 @@ class KVCacheManager:
                 free blocks to hold the full sequence, accounting for prefix cache hits
                 and sliding window. Used as an admission gate to prevent over-admitting
                 requests when chunked prefill would otherwise only check the first chunk
-            reserved_blocks: Number of free blocks that must be left available for
-                other in-flight sequences to complete. The actual allocation is only
-                made if it fits within (free blocks - reserved_blocks). Used to gate
-                async KV-connector loads so their initial allocation cannot consume
-                blocks an already in-flight (prefilling) sequence is relying on.
+            reserved_blocks: Per-pool free blocks that must be left available for
+                other in-flight sequences to complete. An integer reserves primary
+                pool blocks for backward compatibility.
             has_scheduled_reqs: Whether any requests are already scheduled to run
                 this step, controls whether watermark is applied.
 
@@ -512,11 +609,17 @@ class KVCacheManager:
         ):
             watermark_blocks = self.watermark_blocks
 
+        reserved = (
+            KVCacheBlockPoolRequirements(primary=reserved_blocks)
+            if isinstance(reserved_blocks, int)
+            else reserved_blocks
+        )
+
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
 
-            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+            requirements = self.coordinator.get_block_pool_requirements(
                 request_id=request.request_id,
                 num_tokens=full_num_tokens,
                 new_computed_blocks=new_computed_block_list,
@@ -526,8 +629,31 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
-            required_blocks = num_blocks_to_allocate + watermark_blocks
-            if required_blocks > self.block_pool.get_num_free_blocks():
+            admission_requirements = KVCacheBlockPoolRequirements(
+                primary=requirements.primary + reserved.primary,
+                mamba=requirements.mamba + reserved.mamba,
+            )
+            if not self.coordinator.ensure_elastic_capacity(admission_requirements):
+                self._record_allocation_rejection(
+                    stage="full_sequence_elastic",
+                    request_id=request.request_id,
+                    requirements=admission_requirements,
+                    reserved=reserved,
+                    primary_watermark_blocks=watermark_blocks,
+                )
+                return None
+            if not self.coordinator.can_allocate(
+                requirements,
+                reserved=reserved,
+                primary_watermark_blocks=watermark_blocks,
+            ):
+                self._record_allocation_rejection(
+                    stage="full_sequence_capacity",
+                    request_id=request.request_id,
+                    requirements=requirements,
+                    reserved=reserved,
+                    primary_watermark_blocks=watermark_blocks,
+                )
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -550,7 +676,7 @@ class KVCacheManager:
             num_prompt_tokens=request.num_prompt_tokens,
         )
 
-        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+        requirements = self.coordinator.get_block_pool_requirements(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
@@ -561,13 +687,35 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
-        # Keep `reserved_blocks` free for other in-flight sequences, and an
-        # additional watermark of headroom for waiting/preempted admissions.
-        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
-        required_blocks = num_blocks_to_allocate + watermark_blocks
-        if required_blocks > available_blocks:
-            # Cannot allocate new blocks
+        # Check every physical pool before any allocation mutates block state.
+        elastic_requirements = KVCacheBlockPoolRequirements(
+            primary=requirements.primary + reserved.primary,
+            mamba=requirements.mamba + reserved.mamba,
+        )
+        if not self.coordinator.ensure_elastic_capacity(elastic_requirements):
+            self._record_allocation_rejection(
+                stage="step_elastic",
+                request_id=request.request_id,
+                requirements=elastic_requirements,
+                reserved=reserved,
+                primary_watermark_blocks=watermark_blocks,
+            )
             return None
+        if not self.coordinator.can_allocate(
+            requirements,
+            reserved=reserved,
+            primary_watermark_blocks=watermark_blocks,
+        ):
+            # Cannot allocate new blocks
+            self._record_allocation_rejection(
+                stage="step_capacity",
+                request_id=request.request_id,
+                requirements=requirements,
+                reserved=reserved,
+                primary_watermark_blocks=watermark_blocks,
+            )
+            return None
+        self.last_allocation_rejection = None
 
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
@@ -606,6 +754,27 @@ class KVCacheManager:
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
+
+    def estimate_uncached_full_sequence_requirements(
+        self, request: Request
+    ) -> KVCacheBlockPoolRequirements:
+        """Conservatively size admission before prefix-cache lookup.
+
+        Elastic wave planning may evict free cached tail blocks, so a cache hit
+        observed before the layout transition is not a safe sizing input.
+        """
+        full_num_tokens = min(request.num_tokens, self.max_model_len)
+        total_computed_tokens = min(request.num_computed_tokens, full_num_tokens)
+        return self.coordinator.get_block_pool_requirements(
+            request_id=request.request_id,
+            num_tokens=full_num_tokens,
+            new_computed_blocks=self.empty_kv_cache_blocks.blocks,
+            num_encoder_tokens=0,
+            total_computed_tokens=total_computed_tokens,
+            num_local_computed_tokens=total_computed_tokens,
+            num_tokens_main_model=full_num_tokens,
+            apply_admission_cap=True,
+        )
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.

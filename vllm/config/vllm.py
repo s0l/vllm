@@ -788,7 +788,9 @@ class VllmConfig:
         )
 
         enabled = is_breakable_cudagraph_enabled()
-        if enabled:
+        if enabled and (
+            self.compilation_config.mode != CompilationMode.STOCK_TORCH_COMPILE
+        ):
             self.compilation_config.mode = CompilationMode.NONE
         return enabled
 
@@ -1270,6 +1272,44 @@ class VllmConfig:
         self.engram_config.verify_load_config(self.load_config)
         logger.info_once("Resolved Engram configuration: %s", str(self.engram_config))
 
+    def _uses_sequence_sharded_qsa(self) -> bool:
+        """Admit the opt-in QSA owner before generic KV-head DCP validation.
+
+        This owner retains every KV head on each rank and partitions positions.
+        Its backend still validates the actual process groups and cache views.
+        """
+        extra = self.additional_config
+        if not isinstance(extra, dict) or not extra.get("flashnext_qsa_dcp"):
+            return False
+        model = self.model_config
+        text = getattr(model, "hf_text_config", None)
+        parallel = self.parallel_config
+        tp = parallel.tensor_parallel_size
+        if (
+            extra["flashnext_qsa_dcp"] is not True
+            or getattr(text, "model_type", None)
+            not in {"qwen4_exp", "qwen4_exp_text", "qwen4_exp_mtp"}
+            or getattr(text, "hidden_size", None) != 2560
+            or getattr(text, "num_attention_heads", None) != 24
+            or getattr(text, "num_key_value_heads", None) != 2
+            or getattr(text, "head_dim", None) != 256
+            or getattr(text, "indexer_budget", None) != 2048
+            or getattr(text, "indexer_compress_ratio", None) != 4
+            or tp <= 0
+            or 24 % tp
+            or parallel.decode_context_parallel_size != tp
+            or parallel.prefill_context_parallel_size != 1
+            or parallel.pipeline_parallel_size != 1
+            or parallel.enable_dbo
+            or getattr(model, "dtype", None) != torch.bfloat16
+            or self.cache_config.cache_dtype not in ("fp8", "fp8_e4m3")
+            or self.attention_config.resolve_indexer_kv_dtype("bf16") != "bf16"
+        ):
+            raise ValueError(
+                "FlashNext FP8 QSA requires matching TP/DCP and model geometry"
+            )
+        return True
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
         # To give each torch profile run a unique instance name.
@@ -1289,7 +1329,10 @@ class VllmConfig:
         self.parallel_config.set_dcp_defaults()
 
         if self.model_config is not None:
-            self.model_config.verify_with_parallel_config(self.parallel_config)
+            self.model_config.verify_with_parallel_config(
+                self.parallel_config,
+                sequence_sharded_kv=self._uses_sequence_sharded_qsa(),
+            )
             self.model_config.verify_dual_chunk_attention_config(self.load_config)
 
             self.parallel_config.is_moe_model = self.model_config.is_moe
@@ -2263,6 +2306,33 @@ class VllmConfig:
             not be used.
 
         """
+        elastic_on_demand_graphs = bool(
+            isinstance(self.additional_config, dict)
+            and self.additional_config.get("elastic_gdn_backing", False)
+            and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        )
+        if elastic_on_demand_graphs:
+            configured_sizes = self.compilation_config.cudagraph_capture_sizes
+            if configured_sizes not in (None, []):
+                raise ValueError(
+                    "elastic CUDA Graph shapes are runtime-derived; remove "
+                    "cudagraph_capture_sizes from compilation config"
+                )
+            # Keep only the runtime reachability ceiling. There are no startup
+            # capture candidates: exact descriptors are derived after scheduler
+            # admission and captured under a step-scoped KV loan.
+            self.compilation_config.max_cudagraph_capture_size = (
+                self.scheduler_config.max_num_batched_tokens
+            )
+            self.compilation_config.cudagraph_capture_sizes = []
+            self.compilation_config.post_init_cudagraph_sizes()
+            logger.info(
+                "Elastic CUDA Graph shapes are runtime-derived up to %d tokens; "
+                "static capture-size list is empty",
+                self.scheduler_config.max_num_batched_tokens,
+            )
+            return
+
         if (
             self.model_config is not None
             and not self.model_config.enforce_eager
@@ -2882,7 +2952,14 @@ class VllmConfig:
         unsupported: list[str] = []
         speculative_config = self.speculative_config
 
-        if self.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE:
+        from vllm.compilation.breakable_cudagraph import (
+            is_breakable_cudagraph_enabled,
+        )
+
+        if (
+            self.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE
+            and not is_breakable_cudagraph_enabled()
+        ):
             unsupported.append("stock torch.compile")
 
         if (
@@ -3203,6 +3280,7 @@ class VllmConfig:
         finalised block_size.
         """
         block_size = self.cache_config.block_size
+        logger.info_once("Validated scheduler/cache block size: %d tokens.", block_size)
 
         # Skip DCP interleave-size compatibility for NIXL P/D: the interleave
         # size is pinned to block_size by each worker.

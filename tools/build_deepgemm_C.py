@@ -24,6 +24,7 @@ if len(sys.argv) != 4:
 src = Path(sys.argv[1]).resolve()
 out = Path(sys.argv[2]).resolve()
 target_py = sys.argv[3]
+compat_include = Path(__file__).parent / "cxx20_compat"
 out.mkdir(parents=True, exist_ok=True)
 
 info = json.loads(
@@ -43,6 +44,7 @@ if cuda_home is None:
     sys.exit("CUDA_HOME not found; cannot build DeepGEMM _C")
 # CCCL lives outside the standard CUDAToolkit search (mirrors DeepGEMM's setup.py).
 includes = [
+    str(compat_include),
     info["INCLUDEPY"],
     f"{cuda_home}/include",
     f"{cuda_home}/include/cccl",

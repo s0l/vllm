@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -14,6 +14,7 @@ from vllm.v1.attention.backends.recoverssm_metadata import (
     RecoverSSMPostprocessMetadata,
 )
 from vllm.v1.worker.gpu.model_states import mamba_hybrid
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
 
@@ -27,13 +28,16 @@ def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> Non
 
     positions = torch.tensor([1536], dtype=torch.int64)
     input_batch = SimpleNamespace(
+        req_ids=["r0"],
+        num_computed_tokens_np=torch.tensor([1536], dtype=torch.int32).numpy(),
+        prefill_len_np=torch.tensor([1024], dtype=torch.int32).numpy(),
         num_reqs=1,
         num_tokens=1,
         num_reqs_after_padding=1,
         num_tokens_after_padding=1,
         query_start_loc_np=torch.tensor([0, 1], dtype=torch.int32).numpy(),
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
-        num_scheduled_tokens=torch.tensor([1], dtype=torch.int32),
+        num_scheduled_tokens=torch.tensor([1], dtype=torch.int32).numpy(),
         seq_lens_cpu_upper_bound=torch.tensor([1537], dtype=torch.int32),
         seq_lens=torch.tensor([1537], dtype=torch.int32),
         is_prefilling_np=torch.tensor([False]).numpy(),
@@ -56,6 +60,36 @@ def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert metadata is expected_metadata
     assert build_attn_metadata.call_args.kwargs["positions"] is positions
+
+
+def test_constructor_defines_recoverssm_for_every_cache_mode() -> None:
+    source = MambaHybridModelState.__init__.__code__.co_names
+
+    assert "recoverssm" in source
+    assert "use_kda_recoverssm" in source
+    assert "RecoverSSMState" in source
+
+
+def test_add_request_resets_reused_separate_pool_slot() -> None:
+    state = object.__new__(MambaHybridModelState)
+    state.num_accepted_tokens_gpu = torch.full((4,), 4, dtype=torch.int32)
+    state._mamba_state_idx_gpu = torch.full((4,), 7, dtype=torch.int32)
+    state._align_mode = True
+    state._separate_mamba_pool = True
+
+    with patch.object(DefaultModelState, "add_request") as parent_add:
+        request = SimpleNamespace(num_computed_tokens=128)
+        state.add_request(2, request)
+
+    parent_add.assert_called_once_with(2, request)
+    torch.testing.assert_close(
+        state.num_accepted_tokens_gpu,
+        torch.tensor([4, 4, 1, 4], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        state._mamba_state_idx_gpu,
+        torch.tensor([7, 7, 0, 7], dtype=torch.int32),
+    )
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")

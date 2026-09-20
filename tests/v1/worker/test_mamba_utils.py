@@ -2601,10 +2601,11 @@ class TestPostprocessMambaFusedKernel:
         [torch.float16, torch.float32, torch.float64],
         ids=["fp16", "fp32", "fp64"],
     )
-    def test_sd_and_ds_conv_layouts_match_snapshot(
+    @pytest.mark.parametrize("conv_inner_dim", [64, 5120])
+    def test_ds_conv_layout_bias_gt_0_byte_equal_to_sd(
         self,
         device,
-        test_config,
+        conv_inner_dim,
         monkeypatch,
         accept_token_bias,
         same_physical_block,
@@ -2613,8 +2614,7 @@ class TestPostprocessMambaFusedKernel:
         """SD and DS copies should independently match memmove semantics."""
         from vllm.model_executor.layers.mamba import mamba_utils as model_mamba_utils
 
-        cfg = test_config
-        cfg.dtype = dtype
+        cfg = _TestConfig(conv_inner_dim=conv_inner_dim, dtype=dtype)
         torch.manual_seed(38898)
 
         req_ids = ["req_0"]

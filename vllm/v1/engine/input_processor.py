@@ -113,6 +113,11 @@ class InputProcessor:
     ) -> None:
         """Raise `ValueError` if SamplingParams or PoolingParams is not valid."""
         if isinstance(params, SamplingParams):
+            # Reject malformed research hints in the frontend, not inside the
+            # EngineCore request constructor or a partially scheduled step.
+            from vllm.v1.request import _parse_prefix_cache_hint_tokens
+
+            _parse_prefix_cache_hint_tokens(params.extra_args)
             supported_generation_tasks = [
                 task for task in supported_tasks if task in GENERATION_TASKS
             ]
@@ -390,6 +395,17 @@ class InputProcessor:
                     parameter="routed_experts_prompt_start",
                     value=sampling_params.routed_experts_prompt_start,
                 )
+            extra_args = sampling_params.extra_args or {}
+            if "ag2_prefix_cache_hint_tokens" in extra_args:
+                from vllm.v1.request import _parse_prefix_cache_hint_tokens
+
+                hint = _parse_prefix_cache_hint_tokens(extra_args)
+                if hint >= length_from_prompt_token_ids_or_embeds(
+                    prompt_token_ids, prompt_embeds
+                ):
+                    raise ValueError(
+                        "ag2_prefix_cache_hint_tokens must be smaller than the prompt"
+                    )
             # If unset max tokens, then generate up to the max_model_len.
             if sampling_params.max_tokens is None:
                 sampling_params.max_tokens = (

@@ -118,6 +118,48 @@ def test_eviction_when_cache_is_full():
     assert "x" in manager.get_freed_mm_hashes()
 
 
+def test_read_only_capacity_probe_does_not_evict_freeable_entry():
+    manager = EncoderCacheManager(cache_size=10)
+    old_request = MockRequest("old", ["old-image"], [10])
+    new_request = MockRequest("new", ["new-image"], [10])
+    manager.allocate(old_request, 0)
+    manager.free(old_request)
+
+    assert manager.contains(old_request, 0)
+    assert manager.unreferenced_input_size(old_request, 0) == 10
+    assert manager.can_allocate(
+        new_request,
+        0,
+        encoder_compute_budget=10,
+        num_embeds_to_schedule=0,
+        evict=False,
+    )
+
+    assert "old-image" in manager.cached
+    assert "old-image" in manager.freeable
+    assert manager.get_freed_mm_hashes() == []
+
+
+def test_read_only_capacity_probe_accounts_for_planned_cache_claim():
+    manager = EncoderCacheManager(cache_size=10)
+    cached_request = MockRequest("cached", ["cached-image"], [6])
+    new_request = MockRequest("new", ["new-image"], [5])
+    manager.allocate(cached_request, 0)
+    manager.free(cached_request)
+
+    claimed_slots = manager.unreferenced_input_size(cached_request, 0)
+    assert claimed_slots == 6
+    assert not manager.can_allocate(
+        new_request,
+        0,
+        encoder_compute_budget=5,
+        num_embeds_to_schedule=0,
+        evict=False,
+        unavailable_freeable_slots=claimed_slots,
+    )
+    assert manager.contains(cached_request, 0)
+
+
 def test_get_cached_input_ids():
     manager = EncoderCacheManager(cache_size=10)
     req = MockRequest("reqX", ["m", "n", "o"], [2, 4, 3])

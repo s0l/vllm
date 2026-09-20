@@ -8,10 +8,15 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.states import RequestState
+
+from .expert_offload_moe import NativeOffloadedExperts
+from .ple_layer import Qwen4ExpNGramEmbedding
+from .ple_offload import MmapPLEEmbedding
 
 
 class Qwen4ExpModelState(MambaHybridModelState):
@@ -25,8 +30,10 @@ class Qwen4ExpModelState(MambaHybridModelState):
         device: torch.device,
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
+        self._initialize_native_providers(vllm_config, model)
         config = self.model_config.hf_text_config
         self.uses_ngram_embedding = bool(config.ple_layer_ids)
+        self._mmap_ple_modules: tuple[Qwen4ExpNGramEmbedding, ...] = ()
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
@@ -63,6 +70,136 @@ class Qwen4ExpModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
+        self._initialize_mmap_staging(vllm_config, model)
+
+    def _initialize_native_providers(self, vllm_config, model):
+        owners = tuple(
+            m for m in model.modules() if isinstance(m, NativeOffloadedExperts)
+        )
+        declared = tuple(
+            m
+            for m in vllm_config.compilation_config.static_forward_context.values()
+            if isinstance(m, NativeOffloadedExperts)
+        )
+        if {id(m) for m in owners} != {id(m) for m in declared} or any(
+            not m.loaded for m in owners
+        ):
+            raise RuntimeError(
+                "native expert model/forward-context inventories disagree"
+            )
+        self._native_providers = tuple(
+            {id(m.provider): m.provider for m in owners}.values()
+        )
+
+    def _prepare_native_experts(self, *, dummy, num_tokens=None, input_batch=None):
+        identity = (
+            None
+            if input_batch is None
+            else dict(
+                req_ids=list(input_batch.req_ids),
+                num_reqs=input_batch.num_reqs,
+                tokens=input_batch.num_tokens,
+                physical_tokens=input_batch.num_tokens_after_padding,
+                phase="prefill_or_mixed" if input_batch.has_prefill else "decode",
+                query_start_loc=input_batch.query_start_loc_np[
+                    : input_batch.num_reqs + 1
+                ].tolist(),
+                computed=input_batch.num_computed_tokens_np.tolist(),
+                scheduled=input_batch.num_scheduled_tokens.tolist(),
+            )
+        )
+        for provider in getattr(self, "_native_providers", ()):
+            provider.prepare_execution(
+                dummy=dummy, num_tokens=num_tokens, identity=identity
+            )
+
+    def finish_native_experts(self, *, dummy):
+        for provider in self._native_providers:
+            provider.finish_execution(dummy=dummy)
+
+    def finish_native_capture_forward(self):
+        """Close state owned by one completed capture forward invocation."""
+        for provider in self._native_providers:
+            provider.finish_capture_forward()
+
+    def finish_native_capture(self):
+        """End capture-only read leases without committing dummy observations."""
+        for provider in self._native_providers:
+            provider.abort_capture()
+            if (
+                provider.stream_path is not None
+                and provider.stream_path.lease is not None
+            ):
+                if not provider.dummy:
+                    raise RuntimeError("native capture completion overlaps real input")
+                provider.stream_path.abort_step()
+
+    def resolve_cudagraph_mode(self, mode: CUDAGraphMode) -> CUDAGraphMode:
+        if mode == CUDAGraphMode.NONE or not (
+            getattr(self, "_native_providers", ())
+            or getattr(self, "_mmap_ple_modules", ())
+        ):
+            return super().resolve_cudagraph_mode(mode)
+        from vllm.compilation.breakable_cudagraph import (
+            is_breakable_cudagraph_enabled,
+        )
+
+        if not is_breakable_cudagraph_enabled():
+            raise RuntimeError(
+                "FlashNext host weight providers require breakable Graphs"
+            )
+        # PLE rows are copied into fixed-address device staging before model
+        # replay. Temporal E8 similarly owns a bounded device-only replay path.
+        # Keep FULL only when every native provider explicitly exposes that
+        # path; the runner applies its token bound to FULL descriptors and
+        # retains PIECEWISE for every larger shape.
+        if self.get_full_cudagraph_max_tokens() is not None:
+            return mode
+        return CUDAGraphMode.PIECEWISE
+
+    def get_full_cudagraph_max_tokens(self) -> int | None:
+        providers = getattr(self, "_native_providers", ())
+        ple_modules = getattr(self, "_mmap_ple_modules", ())
+        if ple_modules and any(
+            module.ngram_embedding.raw is None
+            or module.ngram_embedding.pinned is None
+            or module.ngram_embedding.event is None
+            for module in ple_modules
+        ):
+            return None
+        if not providers:
+            return getattr(self, "max_num_tokens", 2**31 - 1) if ple_modules else None
+        limits = tuple(provider.full_cudagraph_max_tokens() for provider in providers)
+        if not limits or any(limit <= 0 for limit in limits):
+            return None
+        return min(limits)
+
+    def _initialize_mmap_staging(self, vllm_config, model):
+        modules = tuple(
+            m
+            for m in model.modules()
+            if isinstance(m, Qwen4ExpNGramEmbedding)
+            and isinstance(m.ngram_embedding, MmapPLEEmbedding)
+        )
+        declared = tuple(
+            getattr(m, "ple_embedding", None)
+            for m in vllm_config.compilation_config.static_forward_context.values()
+        )
+        declared_ids = {
+            id(m)
+            for m in declared
+            if isinstance(m, Qwen4ExpNGramEmbedding)
+            and isinstance(m.ngram_embedding, MmapPLEEmbedding)
+        }
+        if {id(m) for m in modules} != declared_ids:
+            raise RuntimeError(
+                "PLE staging module/forward-context inventories disagree"
+            )
+        for module in modules:
+            module.ngram_embedding.initialize_staging(
+                self.max_num_tokens, module.ngram_heads, self.device
+            )
+        self._mmap_ple_modules = modules
 
     def _prepare_ngram_context(
         self,
@@ -98,6 +235,11 @@ class Qwen4ExpModelState(MambaHybridModelState):
         req_states: RequestState,
     ) -> dict[str, Any]:
         model_inputs = super().prepare_inputs(input_batch, req_states)
+        self._prepare_native_experts(
+            dummy=False,
+            num_tokens=input_batch.num_tokens_after_padding,
+            input_batch=input_batch,
+        )
         if not self.uses_ngram_embedding:
             return model_inputs
 
@@ -106,10 +248,18 @@ class Qwen4ExpModelState(MambaHybridModelState):
         query_start_loc[: num_reqs_padded + 1].copy_(input_batch.query_start_loc)
         # Represent unused capacity as trailing zero-length requests.
         query_start_loc[num_reqs_padded + 1 :].copy_(input_batch.query_start_loc[-1])
+        context = self._prepare_ngram_context(input_batch, req_states)
         model_inputs.update(
             query_start_loc=query_start_loc,
-            ngram_context=self._prepare_ngram_context(input_batch, req_states),
+            ngram_context=context,
         )
+        for module in self._mmap_ple_modules:
+            module.prepare_mmap_rows(
+                input_batch.input_ids[: input_batch.num_tokens],
+                query_start_loc[: input_batch.num_reqs + 1],
+                context[: input_batch.num_reqs],
+                input_batch.num_tokens_after_padding,
+            )
         return model_inputs
 
     def prepare_dummy_inputs(
@@ -118,12 +268,23 @@ class Qwen4ExpModelState(MambaHybridModelState):
         num_tokens: int,
     ) -> dict[str, Any]:
         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
+        self._prepare_native_experts(dummy=True, num_tokens=num_tokens)
         if not self.uses_ngram_embedding:
             return model_inputs
 
+        model_inputs.update(self._prepare_dummy_ple(num_reqs, num_tokens))
+        return model_inputs
+
+    def _prepare_dummy_ple(self, num_reqs, num_tokens):
+        if (
+            not 0 <= num_reqs <= self.max_num_reqs
+            or not 0 <= num_tokens <= self.max_num_tokens
+            or (num_reqs == 0 and num_tokens != 0)
+        ):
+            raise ValueError("invalid PLE dummy batch dimensions")
         query_start_loc = self.ple_query_start_loc
         query_start_loc[0] = 0
-        tokens_per_req, num_extra_tokens = divmod(num_tokens, num_reqs)
+        tokens_per_req, num_extra_tokens = divmod(num_tokens, max(1, num_reqs))
         query_lens = torch.full(
             (num_reqs,),
             tokens_per_req,
@@ -137,10 +298,25 @@ class Qwen4ExpModelState(MambaHybridModelState):
 
         ngram_context = self.ngram_context
         ngram_context.fill_(self.ngram_eos_token_id)
-        model_inputs.update(
+        for module in self._mmap_ple_modules:
+            module.ngram_embedding.prepare_dummy(num_tokens)
+        return dict(
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
         )
+
+    def prepare_runtime_dummy_inputs(self, input_batch, req_states):
+        model_inputs = super().prepare_inputs(input_batch, req_states)
+        self._prepare_native_experts(
+            dummy=True, num_tokens=input_batch.num_tokens_after_padding
+        )
+        if self.uses_ngram_embedding:
+            model_inputs.update(
+                self._prepare_dummy_ple(
+                    input_batch.num_reqs_after_padding,
+                    input_batch.num_tokens_after_padding,
+                )
+            )
         return model_inputs
 
 

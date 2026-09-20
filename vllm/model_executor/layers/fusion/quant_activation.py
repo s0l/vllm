@@ -46,6 +46,19 @@ class QuantizedActivation:
         )
 
 
+@dataclass
+class GDNQuantizedActivations:
+    """Consumer-specific prequant inputs for Qwen GDN's twin projections.
+
+    ``qkvz`` may carry an ARC-augmented K while ``ba`` retains canonical K.
+    Keeping the pair explicit prevents an augmented activation from being
+    accidentally routed into the unaugmented ba weight.
+    """
+
+    qkvz: QuantizedActivation
+    ba: QuantizedActivation
+
+
 def expose_input_quant_key(layer: torch.nn.Module, kernel) -> None:
     """Store the kernel's pre-quantized input key on the layer, if any.
 

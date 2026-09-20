@@ -12,6 +12,7 @@ shared by the generic cache-layout planner.
 """
 
 import math
+import weakref
 from dataclasses import dataclass
 from functools import cache
 from typing import ClassVar
@@ -43,6 +44,59 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
 )
+
+_cache_storages: weakref.WeakValueDictionary[tuple[int, int], torch.Tensor] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def qsa_cache_storage(cache: torch.Tensor) -> torch.Tensor:
+    """One byte carrier per complete storage, shared by every logical view.
+
+    AOT cannot merge mutated FP8/BF16 aliases. Repeated *tensor identity*
+    also avoids synthetic-base reconstruction of padded virtual arenas.
+    Owners retain carriers; this weak registry never retains an old KV pool.
+    Call only when binding cache views, outside compiled execution.
+    """
+    storage = cache.untyped_storage()
+    key = (storage._cdata, storage.nbytes())
+    carrier = _cache_storages.get(key)
+    if carrier is None:
+        carrier = cache.view(torch.uint8).as_strided((storage.nbytes(),), (1,), 0)
+        carrier = _cache_storages.setdefault(key, carrier)
+    return carrier
+
+
+def qsa_cache_view(storage: torch.Tensor, template: torch.Tensor) -> torch.Tensor:
+    """Interpret the operator's actual byte operand using bound cache geometry."""
+    if (
+        storage.dtype != torch.uint8
+        or storage.ndim != 1
+        or storage.stride() != (1,)
+        or storage.storage_offset() != 0
+        or storage.numel() != template.untyped_storage().nbytes()
+    ):
+        raise ValueError("QSA cache carrier differs from its bound storage extent")
+    return storage.view(template.dtype).as_strided(
+        template.shape, template.stride(), template.storage_offset()
+    )
+
+
+def qsa_cache_operands(
+    caches: list[torch.Tensor],
+) -> tuple[list[torch.Tensor], list[int]]:
+    """Pass each mutable storage once, including with functionalization V1."""
+    unique: list[torch.Tensor] = []
+    indices: list[int] = []
+    for carrier in caches:
+        for index, existing in enumerate(unique):
+            if carrier is existing:
+                indices.append(index)
+                break
+        else:
+            indices.append(len(unique))
+            unique.append(carrier)
+    return unique, indices
 
 
 def canonical_qsa_rope_positions(positions: torch.Tensor) -> torch.Tensor:
@@ -228,9 +282,13 @@ def _build_qsa_metadata_kernel(
     TOKEN_BLOCK_SIZE: tl.constexpr,
     REQUEST_SCAN_SIZE: tl.constexpr,
     WORK_BLOCK_SIZE: tl.constexpr,
+    REPLAY_QUERY_COUNT: tl.constexpr = False,
 ):
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
+
+    if REPLAY_QUERY_COUNT:
+        num_mapped_tokens = tl.load(query_start_loc_ptr + num_reqs)
 
     pid = tl.program_id(0)
     token_idx = pid * TOKEN_BLOCK_SIZE + tl.arange(0, TOKEN_BLOCK_SIZE)
@@ -395,10 +453,13 @@ def build_qsa_metadata_triton(
     circular_buffer_size: int = 0,
     k_work_metadata_buffer: torch.Tensor | None = None,
     request_capacity: int | None = None,
+    replay_query_count: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build QSA side-cache and optional pre-indexer work metadata."""
     num_tokens = common_attn_metadata.num_actual_tokens
-    num_mapped_tokens = int(common_attn_metadata.query_start_loc_cpu[-1])
+    num_mapped_tokens = (
+        0 if replay_query_count else int(common_attn_metadata.query_start_loc_cpu[-1])
+    )
     token_to_req = token_to_req_buffer[:num_tokens]
     logical_positions = logical_positions_buffer[:num_tokens]
     visible_blocks = visible_blocks_buffer[:num_tokens]
@@ -454,6 +515,7 @@ def build_qsa_metadata_triton(
         TOKEN_BLOCK_SIZE=128,
         REQUEST_SCAN_SIZE=request_scan_size,
         WORK_BLOCK_SIZE=256,
+        REPLAY_QUERY_COUNT=replay_query_count,
         num_warps=4,
     )
     if circular_buffer_size == 0 and compress_ratio == 1:
@@ -591,6 +653,7 @@ class QSAForwardMetadata(AttentionMetadata):
     max_seq_len: int
     storage_block_size: int
     compress_ratio: int
+    draft_common: CommonAttentionMetadata | None = None
 
 
 class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
@@ -606,7 +669,9 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         device: torch.device,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        self._init_reorder_batch_threshold(
+            1, supports_spec_as_decode=True, supports_dcp_with_varlen=True
+        )
         assert self.reorder_batch_threshold is not None
         self.is_circular_buffer = isinstance(kv_cache_spec, CircularBufferSpec)
         if isinstance(kv_cache_spec, MLAAttentionSpec):
@@ -633,6 +698,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         )
         max_requests = vllm_config.scheduler_config.max_num_seqs
         self.request_capacity = max_requests
+        self.supports_draft_decode_metadata_update = current_platform.is_cuda()
         if not self.is_circular_buffer and self.compress_ratio != 1:
             max_k_work = (
                 max_tokens + (self.compress_ratio - 1) * max_requests
@@ -718,6 +784,31 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             max_seq_len=common_attn_metadata.max_seq_len,
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
+            draft_common=common_attn_metadata,
+        )
+
+    def update_draft_decode_metadata(self, metadata: QSAForwardMetadata) -> None:
+        common = metadata.draft_common
+        if common is None or metadata.max_query_len != 1 or metadata.num_prefills:
+            raise ValueError("QSA draft metadata update requires uniform q1 decode")
+        # update_draft_inputs already advanced seq_lens; generic block tables
+        # already refreshed common.slot_mapping. Recompute only QSA-derived
+        # device tensors, retaining every address consumed by the draft graph.
+        build_k_work = not self.is_circular_buffer and self.compress_ratio != 1
+        build_qsa_metadata_triton(
+            common,
+            metadata.token_to_req,
+            metadata.logical_positions,
+            metadata.visible_blocks,
+            metadata.slot_mapping,
+            storage_block_size=self.storage_block_size,
+            compress_ratio=self.compress_ratio,
+            circular_buffer_size=(
+                self.kv_cache_spec.block_size if self.is_circular_buffer else 0
+            ),
+            k_work_metadata_buffer=metadata.k_work_metadata if build_k_work else None,
+            request_capacity=self.request_capacity if build_k_work else None,
+            replay_query_count=True,
         )
 
 
@@ -749,8 +840,18 @@ class QSAStateBackend(AttentionBackend):
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
-        # QSA pages are packed beside the main KV pages within each block.
         return (KVCacheLayout.BLNHC, KVCacheLayout.BLHNC)
+
+
+class QSALayerCompactStateBackend(QSAStateBackend):
+    @staticmethod
+    def get_name() -> str:
+        return "QWEN4_EXP_QSA_ELASTIC_STATE"
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        # One KV head and explicit page strides permit independent backings.
+        return (KVCacheLayout.LBNHC,)
 
 
 class _QSAStateCache(nn.Module, AttentionLayerBase):
@@ -781,6 +882,11 @@ class _QSAStateCache(nn.Module, AttentionLayerBase):
         self.prefix = prefix
         self.compress_ratio = compress_ratio
         self.kv_cache = torch.tensor([])
+        self.kv_cache_storage = qsa_cache_storage(self.kv_cache)
+        extra = vllm_config.additional_config
+        self.layer_compact_state = isinstance(extra, dict) and bool(
+            extra.get("flashnext_qsa_dcp")
+        )
 
         static_context = vllm_config.compilation_config.static_forward_context
         if prefix in static_context:
@@ -800,9 +906,12 @@ class _QSAStateCache(nn.Module, AttentionLayerBase):
                 f"{kv_cache.shape[3]} != {self.head_size})"
             )
         super().bind_kv_cache(kv_cache.transpose(1, 2))
+        self.kv_cache_storage = qsa_cache_storage(self.kv_cache)
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        return QSAStateBackend
+        return (
+            QSALayerCompactStateBackend if self.layer_compact_state else QSAStateBackend
+        )
 
 
 class QSAKeyStateCache(_QSAStateCache):
@@ -853,6 +962,7 @@ class QSAKeyStateCache(_QSAStateCache):
             head_size=self.head_size,
             head_size_v=0,
             dtype=self.dtype,
+            dcp_replicated=True,
         )
 
 
@@ -867,6 +977,7 @@ class QSACompressedKeyCache(_QSAStateCache):
             head_size=self.head_size,
             dtype=self.dtype,
             tokens_per_state=self.compress_ratio,
+            dcp_replicated=True,
         )
 
 

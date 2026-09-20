@@ -148,10 +148,20 @@ is_amd = device_platform == "amd"
 is_intel = device_platform == "intel"
 is_nvidia = device_platform == "nvidia"
 is_intel_alchemist = is_intel and "Intel(R) Arc(TM) A" in torch.xpu.get_device_name(0)
+is_nvidia_blackwell = is_nvidia and torch.cuda.get_device_capability()[0] >= 10
 is_nvidia_hopper = is_nvidia and (
     "NVIDIA H" in torch.cuda.get_device_name(0)
     or torch.cuda.get_device_capability()[0] >= 9
 )
+use_blackwell_safe_gdn = (
+    is_nvidia_blackwell
+    and os.environ.get("AG2_VLLM_FLA_BLACKWELL_SAFE_GDN", "0") == "1"
+)
+if use_blackwell_safe_gdn:
+    logger.warning(
+        "Enabled SM120-safe FLA GDN POC: safe chunk_delta_h configs and "
+        "Blackwell IEEE chunk output dot"
+    )
 use_cuda_graph = is_nvidia and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
 is_gather_supported = hasattr(triton.language, "gather")
 is_tma_supported = (

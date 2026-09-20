@@ -143,6 +143,10 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             decode_query_len=self.num_query_per_req,
+            owner=f"{self._speculator_name.lower()}_query",
+            elastic_graph_activation="speculative",
+            elastic_graph_token_source="fixed_query",
+            elastic_graph_fixed_query_len=self.num_query_per_req,
         )
 
     def capture(self) -> None:
@@ -161,6 +165,49 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.max_model_len,
             causal=self._group_causal,
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
+        )
+
+    def dynamic_cudagraph_managers(self) -> tuple[DFlashCudaGraphManager, ...]:
+        """Publish the backend's real Graph owner to elastic residency."""
+        return (
+            (self.query_cudagraph_manager,)
+            if self.query_cudagraph_manager is not None
+            else ()
+        )
+
+    def capture_next_dynamic(self, manager: DFlashCudaGraphManager) -> bool:
+        if manager is not self.query_cudagraph_manager:
+            raise ValueError("unknown DFlash CUDA Graph manager")
+
+        self.sample_indices.zero_()
+        self.sample_pos.zero_()
+        self.sample_idx_mapping.zero_()
+
+        def capture_override(capture_descs, capture_complete_hook) -> None:
+            manager.capture(
+                self._generate_draft,
+                self.input_buffers,
+                self.block_tables,
+                self.attn_groups,
+                self.kv_cache_config,
+                self.max_model_len,
+                causal=self._group_causal,
+                progress_bar_desc=(
+                    f"Promoting dynamic {self._speculator_name.lower()} CUDA graph"
+                ),
+                capture_descs=capture_descs,
+                capture_complete_hook=capture_complete_hook,
+            )
+
+        return manager.capture_next_dynamic(
+            self.model,
+            self.model_state,
+            self.input_buffers,
+            None,
+            self.block_tables,
+            self.attn_groups,
+            self.kv_cache_config,
+            capture_override=capture_override,
         )
 
     def load_draft_model(

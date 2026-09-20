@@ -17,7 +17,6 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
-from vllm.config.scheduler import SchedulerPolicy
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalKwargsItem,
@@ -52,7 +51,6 @@ def mock_kv(matched_tokens: int, is_async: bool, num_defers_before_matching: int
 def create_scheduler(
     model: str = "facebook/opt-125m",
     max_num_seqs: int = 16,
-    max_num_active_seqs: int | None = None,
     max_num_batched_tokens: int = 8192,
     enable_chunked_prefill: bool = True,
     enable_prefix_caching: bool = False,
@@ -76,7 +74,8 @@ def create_scheduler(
     use_v2_model_runner: bool | None = None,
     kv_cache_spec: KVCacheSpec | None = None,
     per_request_spec_decode_metrics: str = "none",
-    scheduling_policy: SchedulerPolicy = "fcfs",
+    additional_config: dict | None = None,
+    elastic_graph_execution_policy: dict | None = None,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -101,6 +100,10 @@ def create_scheduler(
         # The scheduler reads model_config.max_model_len, not the
         # SchedulerConfig one, so both must agree.
         max_model_len=max_model_len,
+        # Synthetic scheduler geometry; no weights or inference use this config.
+        hf_overrides={"max_position_embeddings": max_model_len}
+        if max_model_len is not None
+        else {},
     )
     if use_ec_connector and ec_role == "ec_producer":
         model_config.multimodal_config = MultiModalConfig()
@@ -108,7 +111,6 @@ def create_scheduler(
         max_model_len = max_num_batched_tokens
     scheduler_config = SchedulerConfig(
         max_num_seqs=max_num_seqs,
-        max_num_active_seqs=max_num_active_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
         max_model_len=max_model_len,
         long_prefill_token_threshold=long_prefill_token_threshold,
@@ -118,7 +120,6 @@ def create_scheduler(
         is_encoder_decoder=model_config.is_encoder_decoder,
         # Ensure admission/preemption mechanics are deterministic
         watermark=0.0,
-        policy=scheduling_policy,
     )
     # Cache config, optionally force APC
     cache_config = CacheConfig(
@@ -178,6 +179,9 @@ def create_scheduler(
         else None
     )
 
+    vllm_config_kwargs = {}
+    if additional_config is not None:
+        vllm_config_kwargs["additional_config"] = additional_config
     vllm_config = VllmConfig(
         scheduler_config=scheduler_config,
         model_config=model_config,
@@ -192,6 +196,7 @@ def create_scheduler(
         observability_config=ObservabilityConfig(
             per_request_spec_decode_metrics=per_request_spec_decode_metrics,
         ),
+        **vllm_config_kwargs,
     )
     if kv_cache_spec is None:
         kv_cache_spec = FullAttentionSpec(
@@ -204,6 +209,7 @@ def create_scheduler(
         num_blocks=num_blocks,  # A large number of blocks to hold all requests
         kv_cache_tensors=[],
         kv_cache_groups=[KVCacheGroupSpec(["layer"], kv_cache_spec)],
+        elastic_graph_execution_policy=elastic_graph_execution_policy,
     )
     cache_config.num_gpu_blocks = num_blocks
     register_all_kvcache_specs(vllm_config)

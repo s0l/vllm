@@ -61,15 +61,15 @@ class Sampler:
 
         lp_req_state = LogitsProcRequestState.from_request_state(req_states)
         self.penalties_state = PenaltiesState(vllm_config, lp_req_state)
-        logit_bias_state = LogitBiasState(vllm_config, lp_req_state)
-        bad_words_state = BadWordsState(vllm_config, lp_req_state)
+        self.logit_bias_state = LogitBiasState(vllm_config, lp_req_state)
+        self.bad_words_state = BadWordsState(vllm_config, lp_req_state)
 
         # List order is pipeline order: bias adds, penalties scale, so the
         # two do not commute.
         self.logits_processors: list[LogitsProcessor] = [
-            logit_bias_state,
+            self.logit_bias_state,
             self.penalties_state,
-            bad_words_state,
+            self.bad_words_state,
             *custom_logits_processors,
         ]
 
@@ -225,8 +225,16 @@ class Sampler:
         expanded_local_pos: torch.Tensor,
         seq_lens_upper_bound_np: np.ndarray,
         skip_top_k_top_p: bool = False,
+        capture_stages: dict[str, torch.Tensor] | None = None,
+        vocab_start: int = 0,
     ) -> torch.Tensor:
+        def capture(name: str, value: torch.Tensor) -> None:
+            if capture_stages is not None:
+                capture_stages[name] = value.detach().cpu().clone()
+
+        capture("input", logits)
         if not np.any(self.needs_logits_processing[idx_mapping_np]):
+            capture("no_processing", logits)
             return logits
 
         # Copy logits to a new FP32 tensor.
@@ -240,31 +248,44 @@ class Sampler:
             input_ids=input_ids,
             pos=pos,
             seq_lens_upper_bound_np=seq_lens_upper_bound_np,
+            vocab_start=vocab_start,
+            vocab_is_sharded=logits.shape[-1] != self.sampling_states.vocab_size,
         )
 
         # Apply logits processors (native + any custom).
         for processor in self.logits_processors:
             logits = processor.apply(logits, ctx)
+            if processor is self.logit_bias_state:
+                capture("after_logit_bias", logits)
+            elif processor is self.penalties_state:
+                capture("after_penalties", logits)
+            elif processor is self.bad_words_state:
+                capture("after_bad_words", logits)
 
         # Forcing runs last so no stage can overwrite the forced end marker
         # or weaken it by scaling.
         self.thinking_budget_state.apply(logits, ctx)
+        capture("after_thinking_budget", logits)
 
         # Apply temperature in place.
         self.sampling_states.apply_temperature(
             logits, expanded_idx_mapping, idx_mapping_np
         )
+        capture("after_temperature", logits)
 
         # Apply min_p in place.
         self.sampling_states.apply_min_p(logits, expanded_idx_mapping, idx_mapping_np)
+        capture("after_min_p", logits)
 
         if skip_top_k_top_p:
             return logits
 
         # Apply top_k and/or top_p. This might or might not return a new tensor.
-        return self.sampling_states.apply_top_k_top_p(
+        logits = self.sampling_states.apply_top_k_top_p(
             logits, expanded_idx_mapping, idx_mapping_np
         )
+        capture("after_top_k_top_p", logits)
+        return logits
 
     def sample(
         self,

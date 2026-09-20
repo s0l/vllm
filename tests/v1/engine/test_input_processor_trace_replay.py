@@ -97,6 +97,22 @@ def test_trace_request_rejected_when_feature_disabled():
         _validate(enable_trace_replay=False)
 
 
+def test_prefix_hint_is_rejected_before_engine_request(monkeypatch):
+    monkeypatch.setenv("AG2_VLLM_DCP_FINE_PREFIX", "0")
+    params = SamplingParams(extra_args={"ag2_prefix_cache_hint_tokens": 384})
+    # No model/tokenizer is needed to reject a disabled feature at the edge.
+    with pytest.raises(ValueError, match="requires"):
+        InputProcessor._validate_params(SimpleNamespace(), params, ("generate",))
+
+
+def test_fractional_prefix_hint_is_not_truncated_at_frontend(monkeypatch):
+    monkeypatch.setenv("AG2_VLLM_DCP_FINE_PREFIX", "1")
+    monkeypatch.setenv("AG2_VLLM_DCP_FINE_PREFIX_HINT_TOKENS", "384")
+    params = SamplingParams(extra_args={"ag2_prefix_cache_hint_tokens": 384.9})
+    with pytest.raises(ValueError, match="integer"):
+        InputProcessor._validate_params(SimpleNamespace(), params, ("generate",))
+
+
 def test_trace_request_accepted_when_feature_enabled():
     _validate(enable_trace_replay=True)
 

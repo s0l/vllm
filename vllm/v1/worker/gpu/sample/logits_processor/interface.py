@@ -87,6 +87,10 @@ class LogitsContext:
     # being sampled this step, on the host. Exact when spec decoding isn't in use.
     # Exact per-row lengths on device are `pos + 1`.
     seq_lens_upper_bound_np: np.ndarray
+    # Global token id represented by local logits column zero.
+    vocab_start: int = 0
+    # Whether logits contain only one tensor-parallel vocabulary shard.
+    vocab_is_sharded: bool = False
 
 
 class LogitsProcessor(ABC):

@@ -76,9 +76,16 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from ..config import ATTENTION_LAYER_TYPES, QSA_LAYER_TYPE, Qwen4ExpConfig
+from .expert_offload_moe import (
+    FlashNextNativeMoeBlock,
+    finish_native_expert_load,
+    native_experts_enabled,
+    reject_native_expert_reload,
+)
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
-from .ple_layer import Qwen4ExpPLELayer
+from .ple_layer import Qwen4ExpNGramEmbedding, Qwen4ExpPLELayer
+from .ple_offload import reject_mmap_reload
 from .qsa import Qwen4ExpQSAAttention
 
 
@@ -244,9 +251,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
             num_experts > 0 and absolute_layer_id % config.decoder_sparse_step == 0
         )
         if is_moe_layer:
-            self.mlp = Qwen4ExpSparseMoeBlock(
-                vllm_config=vllm_config, prefix=f"{prefix}.mlp"
+            moe_type = (
+                FlashNextNativeMoeBlock
+                if native_experts_enabled(vllm_config, prefix)
+                else Qwen4ExpSparseMoeBlock
             )
+            self.mlp = moe_type(vllm_config=vllm_config, prefix=f"{prefix}.mlp")
         else:
             self.mlp = Qwen3NextMLP(
                 hidden_size=config.hidden_size,
@@ -340,7 +350,7 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
         example_moe = None
         for layer in layers:
             if isinstance(layer, Qwen4ExpDecoderLayer) and isinstance(
-                layer.mlp, Qwen4ExpSparseMoeBlock
+                layer.mlp, (Qwen4ExpSparseMoeBlock, FlashNextNativeMoeBlock)
             ):
                 example_moe = layer.mlp
                 self.moe_mlp_layers.append(layer.mlp)
@@ -416,7 +426,7 @@ class Qwen4ExpModel(nn.Module):
         )
         self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
             self.layers,
-            Qwen4ExpSparseMoeBlock,
+            Qwen3NextSparseMoeBlock,
             "mlp",
         )
         intermediate_size = config.hidden_size * config.hc_count
@@ -590,6 +600,8 @@ class Qwen4ExpModel(nn.Module):
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        reject_mmap_reload(self)
+        reject_native_expert_reload(self)
         weights = (
             (
                 _remap_qsa_cache_scale_name(name, self._qsa_layer_ids),
@@ -760,22 +772,10 @@ class Qwen4ExpForCausalLM(
     def get_gdn_mamba_state_shape_from_config(
         cls, vllm_config: VllmConfig
     ) -> tuple[tuple[int, int], tuple[int, int]]:
-        parallel_config = vllm_config.parallel_config
-        hf_config = vllm_config.model_config.hf_text_config
-        tp_size = parallel_config.tensor_parallel_size
-        num_spec = (
-            vllm_config.speculative_config.num_speculative_tokens
-            if vllm_config.speculative_config
-            else 0
-        )
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
-            tp_size,
-            hf_config.linear_num_key_heads,
-            hf_config.linear_num_value_heads,
-            hf_config.linear_key_head_dim,
-            hf_config.linear_value_head_dim,
-            hf_config.linear_conv_kernel_dim,
-            num_spec,
+        # Match the same non-interleaved GDN instance used by Qwen3.5,
+        # including padded non-uniform head ownership (16 K heads on TP3).
+        return Qwen3_5ForConditionalGeneration.get_mamba_state_shape_from_config(
+            vllm_config
         )
 
     @classmethod
@@ -852,6 +852,8 @@ class Qwen4ExpForCausalLM(
         return positions.unsqueeze(0).expand(3, -1), 0
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        reject_mmap_reload(self)
+        reject_native_expert_reload(self)
         mapper = self.hf_to_vllm_mapper | WeightsMapper(
             orig_to_new_substr={"mtp.": None}
         )
@@ -860,6 +862,12 @@ class Qwen4ExpForCausalLM(
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         return loader.load_weights(weights, mapper=mapper)
+
+    def process_weights_after_loading(self) -> None:
+        for module in self.modules():
+            if isinstance(module, Qwen4ExpNGramEmbedding):
+                module.finish_mmap_load()
+        finish_native_expert_load(self)
 
 
 class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
@@ -1021,8 +1029,11 @@ class Qwen4ExpForConditionalGeneration(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        ready_rows: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
+        if ready_rows is not None:
+            raise ValueError("Qwen4Exp does not consume owner-prequant ready rows")
         if intermediate_tensors is not None:
             inputs_embeds = None
         if inputs_embeds is not None and get_pp_group().is_first_rank:
@@ -1046,6 +1057,8 @@ class Qwen4ExpForConditionalGeneration(
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        reject_mmap_reload(self)
+        reject_native_expert_reload(self)
         mapper = self.hf_to_vllm_mapper | WeightsMapper(
             orig_to_new_substr={"mtp.": None},
             orig_to_new_prefix={"visual.": None} if self.language_model_only else {},

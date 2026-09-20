@@ -7,7 +7,7 @@ import os
 import tempfile
 from contextlib import suppress
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import vllm.envs as envs
 
@@ -21,7 +21,33 @@ def flashinfer_autotune_cache_hash(runner: "GPUModelRunner") -> str:
     return hashlib.sha256(config_hash.encode()).hexdigest()
 
 
-def resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
+def resolve_flashinfer_autotune_file(
+    runner: "GPUModelRunner", *, create_parent: bool = True
+) -> Path:
+    accepted_file = os.environ.get("AG2_FLASHINFER_ACCEPTED_AUTOTUNE_FILE", "")
+    accepted_sha256 = os.environ.get("AG2_FLASHINFER_ACCEPTED_AUTOTUNE_SHA256", "")
+    if bool(accepted_file) != bool(accepted_sha256):
+        raise RuntimeError(
+            "accepted FlashInfer autotune checkpoint requires both file and SHA256"
+        )
+    if accepted_file:
+        accepted_path = Path(accepted_file).expanduser().resolve()
+        try:
+            contents = accepted_path.read_bytes()
+        except OSError as error:
+            raise RuntimeError(
+                "accepted FlashInfer autotune checkpoint is unreadable: "
+                f"{accepted_path}"
+            ) from error
+        actual_sha256 = hashlib.sha256(contents).hexdigest()
+        if actual_sha256 != accepted_sha256.lower():
+            raise RuntimeError(
+                "accepted FlashInfer autotune checkpoint SHA256 mismatch: "
+                f"expected={accepted_sha256.lower()} actual={actual_sha256} "
+                f"path={accepted_path}"
+            )
+        return accepted_path
+
     override_dir = envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR
     if override_dir:
         root = Path(override_dir).expanduser()
@@ -37,7 +63,8 @@ def resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
         )
 
     output_dir = root / flashinfer_autotune_cache_hash(runner)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if create_parent:
+        output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir / "autotune_configs.json"
 
 
@@ -81,6 +108,11 @@ def sync_flashinfer_autotune_cache(
 
 def write_flashinfer_autotune_cache(cache_path: Path, contents: bytes) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if cache_path.read_bytes() == contents:
+            return
+    except (FileNotFoundError, OSError):
+        pass
     fd, tmp_path = tempfile.mkstemp(
         dir=cache_path.parent, suffix=".tmp", prefix=f".{cache_path.name}."
     )
@@ -92,3 +124,30 @@ def write_flashinfer_autotune_cache(cache_path: Path, contents: bytes) -> None:
         with suppress(OSError):
             os.unlink(tmp_path)
         raise
+
+
+def synchronize_flashinfer_autotune_cache(
+    *,
+    cache_path: Path,
+    world: Any,
+    tuner: Any,
+    save_leader: bool,
+) -> bool:
+    """Replace rank-local tuning results with rank 0's serialized choices."""
+    is_leader = world.rank_in_group == 0
+    if is_leader and save_leader:
+        tuner.save_configs(str(cache_path))
+
+    tune_results = (
+        cache_path.read_bytes() if is_leader and cache_path.exists() else None
+    )
+    tune_results = world.broadcast_object(tune_results, src=0)
+    if tune_results is None:
+        return False
+
+    write_flashinfer_autotune_cache(cache_path, tune_results)
+    world.barrier()
+    tuner.clear_cache()
+    if not tuner.load_configs(str(cache_path)):
+        raise RuntimeError("Failed to load synchronized FlashInfer autotune configs")
+    return True

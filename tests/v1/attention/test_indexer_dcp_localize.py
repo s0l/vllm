@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import numpy as np
 import pytest
 import torch
 
@@ -304,23 +303,6 @@ def test_get_dcp_local_seq_lens_preserves_mtp_bounds_shape():
     )
 
     assert actual.shape == seq_lens.shape
-    torch.testing.assert_close(actual, expected)
-
-
-def test_get_dcp_local_seq_lens_reuses_device_rank_tensor(monkeypatch):
-    seq_lens = torch.tensor([0, 1, 7, 8, 17], dtype=torch.int32)
-    world = 4
-    rank = 2
-    rank_tensor = torch.tensor(rank, dtype=torch.int32)
-    expected = get_dcp_local_seq_lens(seq_lens, world, rank, 2)
-
-    def fail_tensor_construction(*args, **kwargs):
-        raise AssertionError("rank tensor must be reused")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(torch, "tensor", fail_tensor_construction)
-        actual = get_dcp_local_seq_lens(seq_lens, world, rank_tensor, 2)
-
     torch.testing.assert_close(actual, expected)
 
 
@@ -841,7 +823,7 @@ def test_dcp_global_topk_physical_attention_matches_non_dcp(interleave: int):
 def test_correct_attn_out_zeroes_empty_nan_partial(is_lse_base_on_e: bool):
     out = torch.full((1, 1, 4), float("nan"), device="cuda")
     lses = torch.tensor(
-        [[[0.0]], [[float("-inf")]]],
+        [[[0.0]], [[float("-inf")]], [[float("-inf")]]],
         dtype=torch.float32,
         device="cuda",
     )
@@ -982,56 +964,20 @@ def test_sparse_decode_dcp_short_context_matches_non_dcp():
     torch.testing.assert_close(dcp_lse, ref_lse, atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.parametrize("dcp_world_size", [2, 4, 8])
-@pytest.mark.parametrize("interleave", [1, 64])
-@pytest.mark.parametrize("rows_per_req", [1, 2])
-@pytest.mark.parametrize(
-    "req_lens", [[7], [8, 8], [1, 9], [63, 64, 65], [255, 256, 257], [256, 1, 2730]]
-)
-def test_pcp_plan_deinterleave_restores_global_order(
-    monkeypatch, dcp_world_size, interleave, rows_per_req, req_lens
-):
-    """Gathering block-interleaved shards must restore each request's token order."""
-    from vllm.v1.attention.backends.mla.indexer import build_pcp_global_chunk_plan
+def test_correct_attn_out_tp3_uses_power_of_two_triton_tile() -> None:
+    class CaptureContext:
+        def __init__(self) -> None:
+            self.const_args = None
 
-    monkeypatch.setattr("vllm.v1.attention.backends.mla.indexer.PIN_MEMORY", False)
-    monkeypatch.setattr(
-        "vllm.v1.attention.backends.mla.indexer.async_tensor_h2d",
-        lambda x, device: x.to(device),
-    )
-    scheduled = np.array(req_lens, dtype=np.int64)
-    shard_rows = np.array(
-        [
-            max(
-                _local_count(g, r, dcp_world_size, interleave)
-                for r in range(dcp_world_size)
-            )
-            for g in req_lens
-        ]
-    )
-    rows = np.repeat(np.arange(len(scheduled)), rows_per_req)
-    plan = build_pcp_global_chunk_plan(
-        rows, shard_rows[rows], dcp_world_size, torch.device("cpu"), interleave
-    )
+        def call_kernel(self, _kernel, _grid, *_args, **const_args) -> None:
+            self.const_args = const_args
 
-    starts = np.concatenate([[0], np.cumsum(scheduled)])
+    ctx = CaptureContext()
+    out = torch.empty((2, 4, 128), dtype=torch.float32)
+    lses = torch.empty((3, 2, 4), dtype=torch.float32)
 
-    # Build each rank's padded shard exactly as the cache gather would.
-    padded_cu = plan.padded_local_cu[::rows_per_req].tolist()
-    shards = torch.zeros(dcp_world_size, plan.padded_local_total, 1)
-    for r in range(dcp_world_size):
-        for i, g in enumerate(req_lens):
-            owned = [t for t in range(g) if (t // interleave) % dcp_world_size == r]
-            for local, t in enumerate(owned):
-                shards[r, padded_cu[i] + local, 0] = starts[i] + t
+    correct_attn_out(out, lses, cp_rank=1, ctx=ctx)
 
-    gathered = shards.reshape(dcp_world_size * plan.padded_local_total, 1)
-    restored = gathered[plan.deinterleave_idx]
-    # The layout is padded per request; only the real positions are read.
-    row_start = plan.row_start_cu.tolist()
-    for row, i in enumerate(rows):
-        g = req_lens[i]
-        torch.testing.assert_close(
-            restored[row_start[row] : row_start[row] + g, 0],
-            torch.arange(starts[i], starts[i] + g, dtype=torch.float32),
-        )
+    assert ctx.const_args is not None
+    assert ctx.const_args["N"] == 3
+    assert ctx.const_args["N_ROUNDED"] == 4

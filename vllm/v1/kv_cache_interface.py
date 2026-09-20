@@ -6,12 +6,12 @@ from __future__ import annotations
 import copy
 from collections import Counter
 from collections.abc import Collection, Sequence
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum, IntEnum
 from fractions import Fraction
 from functools import cached_property
 from math import prod
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import torch
 from typing_extensions import Self
@@ -20,6 +20,9 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.core.elastic_graph import (
+    elastic_piecewise_token_boundary as elastic_piecewise_token_boundary,
+)
 from vllm.v1.kv_cache_layout import _DIM_B, _DIM_L, KVCacheLayout
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
@@ -194,6 +197,18 @@ class KVCacheSpec:
     @property
     def num_states(self) -> int:
         return self.get_num_kernel_states(self.block_size)
+
+    @property
+    def storage_block_size(self) -> int | None:
+        """Physical state slots in one logical block for legacy consumers.
+
+        Current layout code expresses compression through ``tokens_per_state``
+        and ``get_num_kernel_states``. Exp22's V2 allocator still consumes the
+        older ``storage_block_size`` name for token-compressed attention.
+        """
+        if isinstance(self.tokens_per_state, int) and self.tokens_per_state > 1:
+            return self.block_size // self.tokens_per_state
+        return self.block_size
 
     def get_num_kernel_states(self, kernel_block_size: int) -> int:
         if self.tokens_per_state > 0:
@@ -490,6 +505,10 @@ class AttentionSpec(KVCacheSpec):
     """Tokens covered by one stored state. Ints > 1 compress multiple tokens
     into one state (DSv4 sparse MLA); fractions < 1 store multiple states per
     token (Whisper block pooling: ``Fraction(1, block_pool_size)``)."""
+    dcp_replicated: bool = False
+    """Every DCP rank stores the full sequence for this attention state owner.
+    Used by a replicated sparse indexer alongside sequence-sharded main KV.
+    """
 
     def __post_init__(self):
         if self.head_size_v is None:
@@ -529,6 +548,8 @@ class AttentionSpec(KVCacheSpec):
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         parallel_config = vllm_config.parallel_config
         kv_shard_count = parallel_config.decode_context_parallel_size
+        if self.dcp_replicated:
+            kv_shard_count = 1
         return cdiv(max_len, self.block_size * kv_shard_count)
 
 
@@ -560,7 +581,7 @@ class FullAttentionSpec(AttentionSpec):
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
         dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
-        if dcp_world_size > 1:
+        if dcp_world_size > 1 and not self.dcp_replicated:
             max_model_len = cdiv(max_model_len, dcp_world_size)
         return cdiv(max_model_len, self.block_size) * self.page_size_bytes
 
@@ -607,6 +628,7 @@ class FullAttentionSpec(AttentionSpec):
             num_head_slots=specs[0].num_head_slots,
             state_content_bytes=specs[0].state_content_bytes,
             tokens_per_state=specs[0].tokens_per_state,
+            dcp_replicated=specs[0].dcp_replicated,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
             # If any layer in the group is non-causal, treat the group as
@@ -700,6 +722,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             state_content_bytes=specs[0].state_content_bytes,
             cache_dtype_str=cache_dtype_str_set.pop(),
             tokens_per_state=tokens_per_state_set.pop(),
+            dcp_replicated=specs[0].dcp_replicated,
             model_version=model_version_set.pop(),
             cache_role=cache_role_set.pop(),
             is_index_group_leader=index_group_leader_set.pop(),
@@ -945,6 +968,9 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         sliding_window_set = set(spec.sliding_window for spec in specs)
         extra_retained_set = set(spec.extra_retained_tokens for spec in specs)
         bounded_replay_set = set(spec.bounded_replay for spec in specs)
+        assert len({spec.dcp_replicated for spec in specs}) == 1, (
+            "All attention layers in a group must have the same DCP ownership."
+        )
         assert (
             len(cache_dtype_str_set) == 1
             and len(tokens_per_state_set) == 1
@@ -967,6 +993,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             state_content_bytes=specs[0].state_content_bytes,
             sliding_window=sliding_window_set.pop(),
             extra_retained_tokens=extra_retained_set.pop(),
+            dcp_replicated=specs[0].dcp_replicated,
             cache_dtype_str=cache_dtype_str_set.pop(),
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
@@ -1023,8 +1050,11 @@ class MambaSpec(KVCacheSpec):
     num_heads: int = 1
     tokens_per_state: int = -1
     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
-    # rank holds the full state (e.g. the replicated PLE conv state).
+    # rank holds the full state (e.g. a replicated recurrent state).
     tp_replicated: bool = False
+    separate_pool: bool = False
+    separate_pool_num_blocks: int = 0
+    state_update_chunk_alignment: int = 1
 
     @property
     def state_content_size_bytes(self) -> int:
@@ -1039,10 +1069,7 @@ class MambaSpec(KVCacheSpec):
 
     @property
     def page_size_bytes(self) -> int:
-        page_size = sum(
-            prod(shape) * get_dtype_size(dtype)
-            for (shape, dtype) in zip(self.shapes, self.dtypes)
-        )
+        page_size = self.state_content_size_bytes
         if self.page_size_padded is not None:
             assert self.page_size_padded >= page_size
             return self.page_size_padded
@@ -1059,6 +1086,8 @@ class MambaSpec(KVCacheSpec):
                 cdiv(max_model_len, self.block_size) + self.num_speculative_blocks
             ) * self.page_size_bytes
         elif vllm_config.cache_config.mamba_cache_mode == "align":
+            if self.separate_pool:
+                return self.page_size_bytes
             return self.page_size_bytes * (
                 2 + self.num_speculative_blocks + self.num_prefill_checkpoint_blocks
             )
@@ -1069,6 +1098,8 @@ class MambaSpec(KVCacheSpec):
         # Mamba state is replicated across DCP/PCP ranks, never sharded, so
         # no CP scaling applies.
         if vllm_config.cache_config.mamba_cache_mode == "align":
+            if self.separate_pool:
+                return 1
             # Block table rows are position-indexed over the full sequence
             # even though only 2 + num_speculative_blocks state blocks are
             # resident at a time (earlier states are nulled out by
@@ -1087,6 +1118,7 @@ class MambaSpec(KVCacheSpec):
             and spec.prefill_checkpoint_alignment == self.prefill_checkpoint_alignment
             and spec.page_size_bytes == self.page_size_bytes
             and spec.tp_replicated == self.tp_replicated
+            and spec.state_update_chunk_alignment == self.state_update_chunk_alignment
             for spec in kv_cache_specs.values()
         )
 
@@ -1175,6 +1207,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             head_size=specs[0].head_size,
             head_size_v=specs[0].head_size_v,
             sink_len=specs[0].sink_len,
+            dcp_replicated=specs[0].dcp_replicated,
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
@@ -1259,6 +1292,11 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         that inherit from FullAttentionSpec are treated as full attention.
         """
         block_sizes = set(spec.block_size for spec in kv_cache_specs.values())
+        ownership = {
+            getattr(spec, "dcp_replicated", False) for spec in kv_cache_specs.values()
+        }
+        if len(ownership) > 1:
+            return False
         if len(block_sizes) > 1:
             # Different block sizes, not uniform.
             return False
@@ -1292,6 +1330,16 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     @property
     def uses_slot_mapping(self) -> bool:
         return self.first_spec.uses_slot_mapping
+
+    # Compatibility helpers consumed by the Exp22 mixed-MLA planner. Current
+    # specs retain the same page-size authority, only the representation moved.
+    def get_page_sizes(self) -> list[int]:
+        return list(set(spec.page_size_bytes for spec in self.kv_cache_specs.values()))
+
+    def get_num_layer_tuples(self) -> int:
+        return Counter(
+            spec.page_size_bytes for spec in self.kv_cache_specs.values()
+        ).most_common(1)[0][1]
 
 
 def iter_layer_specs(kv_cache_spec: KVCacheSpec) -> Collection[KVCacheSpec]:
@@ -1392,12 +1440,34 @@ class KVCacheTensor:
     because a block ID is owned by one group at a time.
     """
 
-    size: int  # total size of the backing allocation in bytes
-    layers: list[str]  # layer names in L order
-    layer_stride: int
-    block_stride: int
+    size: int  # size of the KV cache tensor in bytes
+    # ``layers``/``layer_stride`` are the current layout-aware placement API.
+    # ``shared_by`` and the backing fields carry the Exp22 elastic allocation
+    # contract. Both views name the same ordered layer set.
+    layers: list[str] = field(default_factory=list)
+    layer_stride: int = 0
+    shared_by: list[str] = field(default_factory=list)
     offset: int = 0  # byte offset of layers[0]'s block 0
+    block_stride: int = 0
     host_resident: bool = False
+    backing_id: str = ""
+    committed_size: int = 0
+    mapping_quantum: int = 0
+    num_blocks: int = 0
+    logical_block_size: int = 0
+
+    def __post_init__(self) -> None:
+        if self.layers and self.shared_by and self.layers != self.shared_by:
+            raise ValueError(
+                "KV cache tensor layers/shared_by disagree: "
+                f"layers={self.layers}, shared_by={self.shared_by}"
+            )
+        if not self.layers and not self.shared_by:
+            raise ValueError("KV cache tensor must name at least one layer")
+        if self.layers:
+            self.shared_by = self.layers
+        else:
+            self.layers = self.shared_by
 
 
 class KVCacheGroupRole(str, Enum):
@@ -1455,6 +1525,20 @@ class KVCacheConfig:
 
     hisparse_shared_host_pool: bool = False
     """Whether local TP ranks share one physical HiSparse host pool."""
+    elastic_attention_stride: int = 0
+    elastic_gdn_stride: int = 0
+    elastic_mapping_quantum: int = 0
+    elastic_gdn_initial_blocks: int = 0
+    elastic_gdn_blocks_per_request: int = 0
+    elastic_budget_bytes: int = 0
+    elastic_attention_capacity_by_gdn_blocks: tuple[int, ...] = ()
+    elastic_rank_primary_mapped_bytes: tuple[tuple[int, ...], ...] = ()
+    elastic_rank_gdn_mapped_bytes: tuple[tuple[int, ...], ...] = ()
+    elastic_rank_budget_bytes: tuple[int, ...] = ()
+    effective_max_resident_seqs: int = 0
+    """Post-profile hard residency cap for elastic KV; 0 leaves it disabled."""
+    elastic_graph_execution_policy: dict[str, Any] | None = None
+    """All-rank effective Graph representation policy for scheduler startup."""
 
     @cached_property
     def transfer_group_ids(self) -> tuple[int, ...]:

@@ -61,6 +61,7 @@ class StructuredOutputsWorker:
         input_batch: InputBatch,
         grammar_req_ids: list[str],
         grammar_bitmask: np.ndarray,
+        vocab_start: int = 0,
     ) -> None:
         if not grammar_req_ids:
             return
@@ -102,17 +103,31 @@ class StructuredOutputsWorker:
         vocab_size = logits.shape[-1]
         BLOCK_SIZE = 8192
         grid = (num_masks, triton.cdiv(vocab_size, BLOCK_SIZE))
-        _apply_grammar_bitmask_kernel[grid](
-            logits,
-            logits.stride(0),
-            logits_indices,
-            input_batch.cu_num_logits,
-            bitmask,
-            bitmask.stride(0),
-            vocab_size,
-            MASK_STRIDE=self.mask_stride,
-            BLOCK_SIZE=BLOCK_SIZE,
-        )
+        if vocab_start == 0:
+            _apply_grammar_bitmask_kernel[grid](
+                logits,
+                logits.stride(0),
+                logits_indices,
+                input_batch.cu_num_logits,
+                bitmask,
+                bitmask.stride(0),
+                vocab_size,
+                MASK_STRIDE=self.mask_stride,
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
+        else:
+            _apply_local_grammar_bitmask_kernel[grid](
+                logits,
+                logits.stride(0),
+                logits_indices,
+                input_batch.cu_num_logits,
+                bitmask,
+                bitmask.stride(0),
+                vocab_size,
+                vocab_start,
+                MASK_STRIDE=self.mask_stride,
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
 
         # Ensure the copy stream waits for the device tensors to finish being used
         # before it re-uses or deallocates them
@@ -159,4 +174,41 @@ def _apply_grammar_bitmask_kernel(
         logits_ptr + logits_idx * logits_stride + block_offset,
         -float("inf"),
         mask=position_is_active & bitmask & (block_offset < vocab_size),
+    )
+
+
+@triton.jit
+def _apply_local_grammar_bitmask_kernel(
+    logits_ptr,
+    logits_stride,
+    logits_indices_ptr,
+    cu_num_logits_ptr,
+    bitmask_ptr,
+    bitmask_stride,
+    local_vocab_size,
+    vocab_start,
+    MASK_STRIDE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    bitmask_idx = tl.program_id(0)
+    mapping_idx = tl.load(logits_indices_ptr + bitmask_idx)
+    req_idx = mapping_idx // MASK_STRIDE
+    position_idx = mapping_idx % MASK_STRIDE
+    logits_idx = tl.load(cu_num_logits_ptr + req_idx)
+    num_req_logits = tl.load(cu_num_logits_ptr + req_idx + 1) - logits_idx
+    logits_idx += position_idx
+    position_is_active = position_idx < num_req_logits
+    local_offset = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    global_offset = vocab_start + local_offset
+    word_offset = global_offset // 32
+    packed = tl.load(
+        bitmask_ptr + bitmask_idx * bitmask_stride + word_offset,
+        mask=(local_offset < local_vocab_size) & (word_offset < bitmask_stride),
+        other=0,
+    )
+    forbidden = ((packed >> (global_offset % 32)) & 1) == 0
+    tl.store(
+        logits_ptr + logits_idx * logits_stride + local_offset,
+        -float("inf"),
+        mask=position_is_active & forbidden & (local_offset < local_vocab_size),
     )

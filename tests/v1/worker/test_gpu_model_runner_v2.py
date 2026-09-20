@@ -8,7 +8,6 @@ import pytest
 import torch
 
 import vllm.v1.worker.gpu.model_runner as model_runner_module
-from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -21,18 +20,72 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 
-def test_prepare_padding_mask_marks_sequence_parallel_padding():
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner.input_buffers = SimpleNamespace(is_padding=torch.empty(8, dtype=torch.bool))
+@pytest.mark.parametrize(
+    "dbo,async_scheduling", [(False, False), (True, False), (False, True)]
+)
+def test_multi_module_mtp_shares_only_sequential_kernel_scratch(
+    monkeypatch, dbo, async_scheduling
+):
+    from vllm.v1.worker.gpu.spec_decode import speculator as module
+    from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
+        MultiModuleMTPSpeculator,
+    )
 
-    mask = runner._prepare_padding_mask(1, 8)
+    class Builder:
+        def __init__(self, size):
+            self.scratch = bytearray(size)
+            self.metadata = object()
 
-    assert mask.tolist() == [False, True, True, True, True, True, True, True]
-    assert mask.data_ptr() == runner.input_buffers.is_padding.data_ptr()
+        def get_workspace_buffer_size(self):
+            return len(self.scratch)
 
-    mask = runner._prepare_padding_mask(0, 8)
+        def share_persistent_kernel_scratch_from(self, source):
+            assert len(source.scratch) >= len(self.scratch)
+            self.scratch = source.scratch
 
-    assert mask.all()
+    def group(builder):
+        return SimpleNamespace(get_metadata_builder=lambda index: builder)
+
+    source, smaller_source, draft = Builder(64), Builder(8), Builder(32)
+    original_scratch, metadata = draft.scratch, draft.metadata
+    target_groups = [[group(smaller_source), group(source)]]
+    draft_groups = [[group(draft)]]
+    monkeypatch.setattr(
+        module, "init_attn_backend", lambda *a, **k: (draft_groups, None, [])
+    )
+    spec = object.__new__(MultiModuleMTPSpeculator)
+    spec.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(enable_dbo=dbo),
+        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+    )
+    spec.device = torch.device("cpu")
+    spec.draft_attn_layer_names = {"draft"}
+    module.DraftModelSpeculator.set_attn(spec, None, None, None, None, target_groups)
+    assert draft.scratch is (
+        original_scratch if dbo or async_scheduling else source.scratch
+    )
+    assert draft.metadata is metadata
+    assert spec.attn_groups is draft_groups
+    assert spec.target_attn_groups is target_groups
+    assert not module.DraftModelSpeculator.share_target_attention_scratch
+
+
+def test_v2_static_owner_contract_and_signature_are_explicit():
+    assert hasattr(GPUModelRunner, "prepare_static_attn_owners_for_kv_sizing")
+
+    spec_a = object()
+    spec_b = object()
+    config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(layer_names=["a", "b"], kv_cache_spec=spec_a),
+            SimpleNamespace(layer_names=["c"], kv_cache_spec=spec_b),
+        ]
+    )
+    signature = GPUModelRunner._attn_config_signature(config)
+
+    assert signature == ((("a", "b"), spec_a), (("c",), spec_b))
+    config.kv_cache_groups[0].layer_names.reverse()
+    assert GPUModelRunner._attn_config_signature(config) != signature
 
 
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
@@ -52,7 +105,6 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
         parallel_config=parallel_config,
         cache_config=SimpleNamespace(mamba_cache_mode="none"),
     )
-    runner.jit_warmup_registry = JitWarmupRegistry(runner.vllm_config)
     runner.model_state = SimpleNamespace(
         get_additional_cg_support=lambda: (),
         num_new_sampled_tokens_per_step=1,
@@ -100,7 +152,7 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
     monkeypatch.setattr(
         model_runner_module,
         "init_attn_backend",
-        lambda *args, **kwargs: ([], attn_cg_support, [8, 262144]),
+        lambda *args: ([], attn_cg_support, [8, 262144]),
     )
     monkeypatch.setattr(
         model_runner_module,
@@ -252,7 +304,6 @@ def _make_capture_runner(captured: bool) -> GPUModelRunner:
     runner.attn_groups = None
     runner.kv_cache_config = None
     runner.use_aux_hidden_state_outputs = False
-    runner.kv_connector = model_runner_module.NO_OP_KV_CONNECTOR
     return runner
 
 

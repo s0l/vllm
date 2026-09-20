@@ -1651,6 +1651,84 @@ def test_fused_conv_correctness(
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused conv needs CUDA")
+@pytest.mark.parametrize("state_layout", ["SD", "DS"])
+def test_mixed_ple_conv_compiled_graph_preserves_metadata_views(state_layout):
+    # Readonly sliced metadata must not be cloned as a mutated full storage.
+    device = torch.device("cuda")
+    case = _ConvBatchCase(
+        spec_query_lens=(4, 1),
+        num_accepted=(1, 1),
+        spec_query_len=4,
+        num_decodes=2,
+        prefill_query_lens=(3, 0),
+        channels=512,
+        state_index_stride=3,
+    )
+    metadata, num_tokens = _make_conv_metadata(case, device)
+    module = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(module)
+    module.conv_state_len = 9
+    module.short_conv_dilation = 3
+    rng, initial, state, weights = _make_conv_case(
+        device,
+        seed=91,
+        channels=512,
+        kernel_size=4,
+        dilation=3,
+        state_layout=state_layout,
+        spec_query_len=4,
+    )
+    x = torch.randn(num_tokens, 512, dtype=torch.bfloat16, device=device, generator=rng)
+    original = x.clone()
+    outer_residual = torch.zeros_like(x)
+
+    def body(x):
+        residual = torch.zeros_like(x)
+        module._short_conv_dilated_dispatch(
+            x, residual, outer_residual, metadata, state, weights
+        )
+        return residual
+
+    compiled = torch.compile(body, fullgraph=True)
+    for _ in range(3):
+        state.copy_(initial)
+        compiled(x)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = compiled(x)
+    first = None
+    for multiplier, accepted in [(1, 1), (2, 2), (1, 1)]:
+        x.copy_(original * multiplier)
+        metadata.num_accepted_tokens[0] = accepted
+        state.copy_(initial)
+        expected_state = initial.clone()
+        expected = torch.zeros_like(x)
+        _short_conv_dilated_dispatch_pytorch(
+            x,
+            expected,
+            metadata,
+            expected_state,
+            weights,
+            conv_state_len=9,
+            dilation=3,
+        )
+        graph.replay()
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(
+            actual.float(), expected.float(), atol=0.03, rtol=0.03
+        )
+        assert torch.equal(state, expected_state)
+        if first is None:
+            first = actual.clone()
+        elif multiplier == 2:
+            assert not torch.equal(actual, first)
+        else:
+            assert torch.equal(actual, first)
+    graph.reset()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused gate needs CUDA")
 @pytest.mark.parametrize(("num_tokens", "strided_kv"), [(1, False), (64, True)])
 def test_fused_gate_correctness(num_tokens: int, strided_kv: bool) -> None:

@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import gc
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
 
-from vllm.config import (
-    VllmConfig,
-    get_layers_from_vllm_config,
-)
+from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.multimodal.inputs import MultiModalFeatureSpec
@@ -28,8 +27,11 @@ from vllm.v1.hisparse.binding import (
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
+    KVCacheLayout,
     KVCacheSpec,
+    MambaSpec,
     UniformTypeKVCacheSpecs,
+    create_kv_cache_views,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.ubatch_utils import get_num_ubatches
@@ -47,6 +49,8 @@ if TYPE_CHECKING:
         BatchExecutionDescriptor,
         CudaGraphManager,
     )
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -184,6 +188,14 @@ def get_kv_sharing_fast_prefill_eligible_layers(
     return eligible_layers
 
 
+def add_kv_sharing_layers_to_config(
+    kv_cache_config: KVCacheConfig, vllm_config: VllmConfig
+) -> None:
+    add_kv_sharing_layers_to_kv_cache_groups(
+        get_shared_kv_cache_layers(vllm_config), kv_cache_config.kv_cache_groups
+    )
+
+
 def init_attn_backend(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
@@ -202,6 +214,7 @@ def init_attn_backend(
     fast_prefill_eligible_layers = get_kv_sharing_fast_prefill_eligible_layers(
         vllm_config, draft_layer_names
     )
+    add_kv_sharing_layers_to_config(kv_cache_config, vllm_config)
 
     # Phase 1: discover attention groups for each kv cache group.
     for kv_cache_group_id, kv_cache_group_spec in enumerate(
@@ -251,7 +264,7 @@ def init_attn_backend(
     kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, attn_groups)
 
     # Phase 3: create metadata builders and determine cudagraph support.
-    attn_backend_workspace: torch.Tensor | None = None
+    attn_backend_workspace = None
     for kv_cache_group_id, groups in enumerate(attn_groups):
         kernel_block_size = None
         if kv_cache_group_id < len(kernel_block_sizes):
@@ -270,11 +283,38 @@ def init_attn_backend(
             # attention on the one compute stream the threads hand off, so the
             # buffer is written serially, as it already is across steps.
             for builder in group.metadata_builders:
+                if hasattr(builder, "share_persistent_kernel_scratch_from"):
+                    continue
                 if attn_backend_workspace is None:
                     if hasattr(builder, "_get_workspace_buffer"):
                         attn_backend_workspace = builder._get_workspace_buffer()
                 elif hasattr(builder, "set_workspace_buffer"):
                     builder.set_workspace_buffer(attn_backend_workspace)
+
+    # Attention groups execute sequentially in V2. Select the largest
+    # compatible owner before binding scratch so group order cannot produce an
+    # undersized shared workspace. Metadata buffers remain group-private.
+    shareable_builders: list[Any] = [
+        builder
+        for groups in attn_groups
+        for group in groups
+        for builder in group.metadata_builders
+        if hasattr(
+            builder,
+            "share_persistent_kernel_scratch_from",
+        )
+    ]
+    if shareable_builders:
+        owner = max(
+            shareable_builders,
+            key=lambda builder: builder.get_workspace_buffer_size(),
+        )
+        owner._get_workspace_buffer()
+        for builder in shareable_builders:
+            if builder is not owner:
+                builder.share_persistent_kernel_scratch_from(owner)
+        gc.collect()
+        torch.accelerator.empty_cache()
     attn_cg_support_info = get_attn_cg_support(attn_groups, vllm_config)
     return attn_groups, attn_cg_support_info, kernel_block_sizes
 
@@ -328,16 +368,203 @@ def get_query_lens_mismatch_unsupported_backend(
     return None
 
 
+def _allocate_kv_cache(
+    kv_cache_config: KVCacheConfig,
+    shared_layers: dict[str, str],
+    device: torch.device,
+    layout: KVCacheLayout,
+    kernel_block_sizes: list[int],
+    elastic_backings: dict[str, Any] | None = None,
+    elastic_geometry: dict[str, int] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Allocate Exp22 backings and view them through the current layout API.
+
+    ``KVCacheLayout`` and ``create_kv_cache_views`` remain authoritative for
+    physical strides. Exp22 extends only backing ownership with elastic VMM
+    and a separate GDN pool; it must not revive removed backend shape APIs.
+    """
+    kv_caches: dict[str, torch.Tensor] = {}
+    packed_backings: dict[str, torch.Tensor] = {}
+    owners = elastic_backings if elastic_backings is not None else {}
+    has_separate_pool = any(
+        isinstance(group.kv_cache_spec, MambaSpec) and group.kv_cache_spec.separate_pool
+        for group in kv_cache_config.kv_cache_groups
+    )
+
+    def resolve_backing_id(tensor_index: int) -> str:
+        tensor = kv_cache_config.kv_cache_tensors[tensor_index]
+        if tensor.backing_id:
+            return tensor.backing_id
+        if has_separate_pool:
+            return f"separate-{tensor_index}"
+        return "upstream-shared"
+
+    # CUDA VMM owners use independent custom MemPools and cannot consume
+    # cached blocks held by PyTorch's default allocator. Allocate independent
+    # owners largest-physical-commit first so a large arena is never stranded
+    # behind smaller mappings. View/binding order below remains unchanged.
+    elastic_plan: dict[str, tuple[int, int, int]] = {}
+    for tensor_index, tensor in enumerate(kv_cache_config.kv_cache_tensors):
+        if not tensor.mapping_quantum:
+            continue
+        backing_id = resolve_backing_id(tensor_index)
+        geometry = (tensor.size, tensor.committed_size, tensor.mapping_quantum)
+        previous = elastic_plan.setdefault(backing_id, geometry)
+        if previous != geometry:
+            raise ValueError(
+                f"KV backing {backing_id!r} has inconsistent elastic geometry: "
+                f"{previous} and {geometry}"
+            )
+
+    if elastic_plan:
+        from vllm.device_allocator.elastic_cumem import allocate_elastic_backing
+
+        if device.type == "cuda":
+            torch.accelerator.synchronize()
+            gc.collect()
+            torch.accelerator.empty_cache()
+        for backing_id, (reserved, committed, quantum) in sorted(
+            elastic_plan.items(),
+            key=lambda item: (-item[1][1], -item[1][0], item[0]),
+        ):
+            if backing_id not in owners:
+                owners[backing_id] = allocate_elastic_backing(
+                    reserved_bytes=reserved,
+                    committed_bytes=committed,
+                    quantum_bytes=quantum,
+                    device=device,
+                )
+
+    for tensor_index, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
+        backing_id = resolve_backing_id(tensor_index)
+
+        if kv_cache_tensor.mapping_quantum:
+            owner = owners[backing_id]
+            raw = owner.tensor.view(torch.int8)
+            if raw.numel() != kv_cache_tensor.size:
+                raise ValueError(
+                    f"KV backing {backing_id!r} has inconsistent reserved size: "
+                    f"{raw.numel()} and {kv_cache_tensor.size}"
+                )
+            if elastic_geometry is not None:
+                block_geometry = elastic_geometry.setdefault(
+                    backing_id, kv_cache_tensor.logical_block_size
+                )
+                if block_geometry != kv_cache_tensor.logical_block_size:
+                    raise ValueError(
+                        f"KV backing {backing_id!r} has inconsistent geometry: "
+                        f"{block_geometry} and {kv_cache_tensor.logical_block_size}"
+                    )
+            previous = packed_backings.setdefault(backing_id, raw)
+            if previous.data_ptr() != raw.data_ptr():
+                raise ValueError(f"KV backing id {backing_id!r} is not unique")
+        else:
+            raw = packed_backings.get(backing_id)
+            if raw is None:
+                raw = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
+                packed_backings[backing_id] = raw
+            elif raw.numel() != kv_cache_tensor.size:
+                raise ValueError(
+                    f"KV backing {backing_id!r} has inconsistent sizes: "
+                    f"{raw.numel()} and {kv_cache_tensor.size}"
+                )
+
+        # A zero layer stride identifies the Exp22 descriptor. Its
+        # ``shared_by`` list names cache groups overlaid on one physical slot;
+        # current ``layers`` instead names distinct L-axis slices. Materialize
+        # each legacy alias as an independent one-layer view of the same bytes.
+        legacy_aliases = kv_cache_tensor.layer_stride == 0
+        view_layer_sets = (
+            ([layer_name] for layer_name in kv_cache_tensor.layers)
+            if legacy_aliases
+            else (kv_cache_tensor.layers,)
+        )
+        for view_layers in view_layer_sets:
+            layer_name = view_layers[0]
+            group_id, group = next(
+                (group_id, group)
+                for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+                if layer_name in group.layer_names
+            )
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = spec.kv_cache_specs[layer_name]
+
+            num_blocks = kv_cache_tensor.num_blocks or kv_cache_config.num_blocks
+            if isinstance(spec, MambaSpec) and spec.separate_pool:
+                # Profiling allocates a transient fixed pool while the spec
+                # retains the production ceiling. The descriptor's physical
+                # extent is authoritative for this view; elastic production
+                # descriptors publish an explicit logical block count.
+                physical_block_stride = (
+                    kv_cache_tensor.block_stride or spec.page_size_bytes
+                )
+                if kv_cache_tensor.num_blocks:
+                    num_blocks = kv_cache_tensor.num_blocks
+                else:
+                    num_blocks, remainder = divmod(
+                        kv_cache_tensor.size, physical_block_stride
+                    )
+                    if remainder:
+                        raise ValueError(
+                            "separate Mamba backing is not an integer number of "
+                            f"blocks: size={kv_cache_tensor.size} "
+                            f"stride={physical_block_stride}"
+                        )
+            kernel_block_size = (
+                kernel_block_sizes[group_id]
+                if group_id < len(kernel_block_sizes)
+                else None
+            )
+            view_layer_stride = cast(
+                Any, None if legacy_aliases else kv_cache_tensor.layer_stride
+            )
+            view_config = replace(
+                kv_cache_tensor,
+                layers=view_layers,
+                shared_by=view_layers,
+                layer_stride=view_layer_stride,
+                block_stride=(
+                    kv_cache_tensor.block_stride or spec.page_size_bytes
+                    if legacy_aliases
+                    else kv_cache_tensor.block_stride
+                ),
+            )
+            views = create_kv_cache_views(
+                raw,
+                spec,
+                num_blocks,
+                layout,
+                view_config,
+                kernel_block_size=kernel_block_size,
+            )
+            kv_caches.update(zip(view_layers, views, strict=True))
+
+    layer_names = set()
+    for group in kv_cache_config.kv_cache_groups:
+        for layer_name in group.layer_names:
+            layer_names.add(layer_name)
+    assert layer_names == (kv_caches.keys() | shared_layers.keys()), (
+        "Some layers are not correctly initialized"
+    )
+    return kv_caches
+
+
 def init_kv_cache(
     forward_context: dict[str, Any],
     kv_cache_config: KVCacheConfig,
+    attn_groups: list[list[AttentionGroup]],
     device: torch.device,
+    cache_dtype: str,
     kernel_block_sizes: list[int],
     vllm_config: VllmConfig,
+    elastic_backings: dict[str, Any] | None = None,
+    elastic_geometry: dict[str, int] | None = None,
     kv_cache_allocation_context: AbstractContextManager | None = None,
     *,
     block_tables: "BlockTables | None" = None,
 ) -> dict[str, Any]:
+    shared_kv_cache_layers = get_shared_kv_cache_layers(vllm_config)
     allocation_context = kv_cache_allocation_context or nullcontext()
     with allocation_context:
         if vllm_config.attention_config.hisparse_config is not None:
@@ -359,6 +586,17 @@ def init_kv_cache(
             )
     for layer_name, target in get_shared_kv_cache_layers(vllm_config).items():
         kv_caches[layer_name] = kv_caches[target]
+        kv_caches = _allocate_kv_cache(
+            kv_cache_config,
+            shared_kv_cache_layers,
+            device,
+            vllm_config.cache_config.get_resolved_kv_cache_layout(),
+            kernel_block_sizes,
+            elastic_backings,
+            elastic_geometry,
+        )
+    for layer_name, target_layer_name in shared_kv_cache_layers.items():
+        kv_caches[layer_name] = kv_caches[target_layer_name]
     # Dual-attention models (e.g. LongCat-Flash) put two Attention modules per
     # decoder layer, so a layer name carries two integers (layer + module index).
     num_attn_module = (
@@ -407,9 +645,14 @@ def build_attn_metadata(
     dcp_local_seq_lens_cpu_upper_bound: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
     is_prefilling: torch.Tensor | None = None,
+    request_ids: tuple[str | None, ...] | None = None,
+    num_scheduled_tokens_cpu: torch.Tensor | None = None,
+    num_computed_tokens_provenance_cpu: torch.Tensor | None = None,
+    num_prompt_tokens_cpu: torch.Tensor | None = None,
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None,
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
+    full_cudagraph: bool = False,
     causal: bool | torch.Tensor | Mapping[int, bool] = True,
     rswa_prefix_lens: torch.Tensor | None = None,
     ubatch_idx: int = 0,
@@ -428,6 +671,11 @@ def build_attn_metadata(
 
     attn_metadata: dict[str, Any] = {}
     token_to_req_indices: torch.Tensor | None = None
+    # V2 hybrid layouts can have one KV-cache group per layer.  Building the
+    # same backend/spec metadata for every group repeats CPU classification,
+    # pinned allocations and H2D copies.  Reuse the first build when a backend
+    # explicitly supplies the block-table rebinding contract.
+    cached_attn_metadata: dict[tuple[KVCacheSpec, type[Any]], Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
     for i in range(num_kv_cache_groups):
         if not attn_groups[i]:
@@ -466,11 +714,16 @@ def build_attn_metadata(
             max_query_len=max_query_len,
             block_table_tensor=block_table,
             slot_mapping=slot_mapping,
+            full_cudagraph=full_cudagraph,
             causal=group_causal,
             dcp_local_seq_lens=dcp_local_seq_lens,
             dcp_local_seq_lens_cpu_upper_bound=dcp_local_seq_lens_cpu_upper_bound,
             positions=positions,
             is_prefilling=group_is_prefilling,
+            request_ids=request_ids,
+            num_scheduled_tokens_cpu=num_scheduled_tokens_cpu,
+            num_computed_tokens_provenance_cpu=num_computed_tokens_provenance_cpu,
+            num_prompt_tokens_cpu=num_prompt_tokens_cpu,
             mm_req_doc_ranges=mm_req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
             req_idx=req_idx,
@@ -480,9 +733,27 @@ def build_attn_metadata(
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(ubatch_idx)
+            kv_cache_spec = kv_cache_config.kv_cache_groups[i].kv_cache_spec
+            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
+            cache_key = (kv_cache_spec, type(attn_metadata_builder))
             if for_cudagraph_capture:
                 metadata = attn_metadata_builder.build_for_cudagraph_capture(
                     common_attn_metadata
+                )
+            elif (
+                cache_key in cached_attn_metadata
+                and attn_metadata_builder.supports_update_block_table
+                and getattr(
+                    attn_metadata_builder,
+                    "can_update_block_table",
+                    lambda metadata: True,
+                )(cached_attn_metadata[cache_key])
+            ):
+                metadata = attn_metadata_builder.update_block_table(
+                    cached_attn_metadata[cache_key],
+                    common_attn_metadata.block_table_tensor,
+                    common_attn_metadata.slot_mapping,
                 )
             else:
                 attn_metadata_extra_kwargs = (
@@ -498,6 +769,8 @@ def build_attn_metadata(
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )
+                if attn_metadata_builder.supports_update_block_table:
+                    cached_attn_metadata[cache_key] = metadata
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
         token_to_req_indices = common_attn_metadata._token_to_req_indices_cache

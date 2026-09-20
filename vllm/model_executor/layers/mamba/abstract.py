@@ -24,6 +24,10 @@ class MambaBase(AttentionLayerBase):
     # in the shape specified by `self.get_state_shape`.
     kv_cache: tuple[torch.Tensor, ...]
     supports_dcp: bool = False
+    # Opt in only when speculative candidates live in one extended conv
+    # window, with no temporal state. Separate-pool postprocess shifts that
+    # window and resets acceptance before the next forward.
+    supports_conv_only_spec_commit: bool = False
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         """Unpack a raw ``[B, 1, 1, C]`` int8 page view into per-state views.
@@ -66,6 +70,35 @@ class MambaBase(AttentionLayerBase):
         mamba_block_size = vllm_config.cache_config.mamba_block_size
         assert mamba_block_size is not None
         page_size_padded = vllm_config.cache_config.mamba_page_size_padded
+        additional = (
+            vllm_config.additional_config
+            if isinstance(vllm_config.additional_config, dict)
+            else {}
+        )
+        replay_commit = bool(additional.get("gdn_mtp_replay_commit", False))
+        num_speculative_blocks = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        if replay_commit:
+            conv_only = (
+                self.mamba_type == MambaAttentionBackendEnum.SHORT_CONV
+                and self.supports_conv_only_spec_commit
+                and len(self.get_state_dtype()) == 1
+            )
+            if self.mamba_type != MambaAttentionBackendEnum.GDN_ATTN and not conv_only:
+                raise ValueError(
+                    "gdn_mtp_replay_commit requires GDN or an explicitly "
+                    "supported conv-only speculative state"
+                )
+            if not additional.get("gdn_separate_pool", False):
+                raise ValueError("gdn_mtp_replay_commit requires gdn_separate_pool")
+            # The verifier journals compact recurrence inputs and commits the
+            # accepted prefix into the one live state after sampling.
+            # Conv-only owners use the same postprocess window shift, without
+            # a recurrence journal or extra speculative blocks.
+            num_speculative_blocks = 0
         return MambaSpec(
             shapes=tuple(self.get_state_shape()),
             dtypes=self.get_state_dtype(),
@@ -74,12 +107,9 @@ class MambaBase(AttentionLayerBase):
             mamba_type=self.mamba_type,
             tp_replicated=self.is_kv_cache_tp_replicated,
             mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
-            # RecoverSSM verifies the whole window off one checkpoint, so it
-            # never writes the baseline's per-draft-token state slots.
-            num_speculative_blocks=(
-                0
-                if vllm_config.cache_config.use_kda_recoverssm
-                else vllm_config.num_speculative_tokens
+            num_speculative_blocks=num_speculative_blocks,
+            state_update_chunk_alignment=(
+                self.get_attn_backend().get_state_update_chunk_alignment()
             ),
         )
 

@@ -517,6 +517,7 @@ def run_cutlass_moe_fp4(
     apply_router_weight_on_input: bool = False,
     *,
     activation_config: ApplyMoEActivationConfig | None = None,
+    expert_rows: torch.Tensor | None = None,
 ) -> None:
     """MoE implementation for FP4 Inputs.
 
@@ -563,7 +564,7 @@ def run_cutlass_moe_fp4(
     e_w1, w1_n_actual, half_k_w1 = w1_fp4.shape
     e_w2, k_w2, half_n_w2 = w2_fp4.shape
 
-    assert e_w1 == e_w2 and e_w1 == e, (
+    assert e_w1 == e_w2 and (expert_rows is not None or e_w1 == e), (
         "Number of experts must match",
         f" between weights. {e_w1}, {e_w2}, {e}",
     )
@@ -580,6 +581,14 @@ def run_cutlass_moe_fp4(
     topk = topk_ids.size(1)
     out_dtype = a.dtype
     num_topk = topk_ids.size(1)
+
+    if expert_rows is not None:
+        assert expert_rows.shape == (e,) and expert_rows.dtype == torch.int32
+        assert expert_rows.device == a.device and expert_rows.is_contiguous()
+        # Only scalar activation globals are gathered. Weight arrays and their
+        # block scales stay in place and use native pointer indirection.
+        a1_gscale = a1_gscale.index_select(0, expert_rows)
+        a2_gscale = a2_gscale.index_select(0, expert_rows)
 
     expert_offsets = torch.empty((e + 1), dtype=torch.int32, device=device)
     blockscale_offsets = torch.empty((e + 1), dtype=torch.int32, device=device)
@@ -635,6 +644,7 @@ def run_cutlass_moe_fp4(
         problem_sizes1,
         expert_offsets[:-1],
         blockscale_offsets[:-1],
+        expert_rows,
     )
     del rep_a_fp4, rep_a_blockscale
     if activation == MoEActivation.SILU and (
@@ -667,6 +677,7 @@ def run_cutlass_moe_fp4(
         problem_sizes2,
         expert_offsets[:-1],
         blockscale_offsets[:-1],
+        expert_rows,
     )
     del int_fp4, int_blockscale
 

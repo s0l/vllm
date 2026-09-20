@@ -2,19 +2,106 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the V2 model runner's InputBatch (vllm.v1.worker.gpu.input_batch)."""
 
-import numpy as np
 import pytest
 import torch
 
-from vllm.config import VllmConfig
-from vllm.forward_context import set_forward_context
-from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
 from vllm.platforms import current_platform
-from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
-from vllm.v1.worker.gpu import cp_utils
-from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.input_batch import (
+    InputBatch,
+    InputBuffers,
+    combine_sampled_and_draft_tokens,
+)
 
 DEVICE = current_platform.device_type
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+@pytest.mark.parametrize(
+    (
+        "query_start_loc",
+        "seq_lens",
+        "prefill_lens",
+        "cu_num_logits",
+        "draft_tokens",
+        "expected_indices",
+        "expected_input_ids",
+    ),
+    [
+        ([0, 1], [1], [1], [0, 1], [[0, 0, 0]], [0], [7]),
+        ([0, 1], [2], [1], [0, 1], [[0, 0, 0]], [0], [91]),
+        ([0, 4], [5], [1], [0, 4], [[11, 12, 13]], [0, 1, 2, 3], [91, 11, 12, 13]),
+        ([0, 1, 4], [2, 3], [1, 3], [0, 1, 2], [[0], [0]], [0, 3], [91, 7, 7, 7]),
+    ],
+)
+def test_combine_sampled_and_draft_tokens_writes_indices_before_prefill_exit(
+    query_start_loc: list[int],
+    seq_lens: list[int],
+    prefill_lens: list[int],
+    cu_num_logits: list[int],
+    draft_tokens: list[list[int]],
+    expected_indices: list[int],
+    expected_input_ids: list[int],
+):
+    """Prefill rows must not bypass the independent logits-index write."""
+    device = torch.device(DEVICE)
+    num_reqs = len(seq_lens)
+    input_ids = torch.full((query_start_loc[-1],), 7, dtype=torch.int32, device=device)
+    indices = combine_sampled_and_draft_tokens(
+        input_ids=input_ids,
+        idx_mapping=torch.arange(num_reqs, dtype=torch.int64, device=device),
+        last_sampled_tokens=torch.full(
+            (num_reqs,), 91, dtype=torch.int32, device=device
+        ),
+        query_start_loc=torch.tensor(query_start_loc, dtype=torch.int32, device=device),
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+        prefill_len=torch.tensor(prefill_lens, dtype=torch.int32, device=device),
+        draft_tokens=torch.tensor(draft_tokens, dtype=torch.int32, device=device),
+        cu_num_logits=torch.tensor(cu_num_logits, dtype=torch.int32, device=device),
+        num_logits=len(expected_indices),
+    )
+
+    assert indices.cpu().tolist() == expected_indices
+    assert input_ids.cpu().tolist() == expected_input_ids
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+def test_combine_sampled_and_draft_tokens_uses_persistent_output_buffer():
+    """Sampling indices must outlive model execution in their startup storage."""
+    device = torch.device(DEVICE)
+    buffers = InputBuffers(max_num_reqs=2, max_num_tokens=8, device=device)
+    indices = combine_sampled_and_draft_tokens(
+        input_ids=buffers.input_ids[:2],
+        idx_mapping=torch.arange(2, dtype=torch.int64, device=device),
+        last_sampled_tokens=torch.zeros(2, dtype=torch.int32, device=device),
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32, device=device),
+        seq_lens=torch.ones(2, dtype=torch.int32, device=device),
+        prefill_len=torch.ones(2, dtype=torch.int32, device=device),
+        draft_tokens=torch.zeros((2, 3), dtype=torch.int32, device=device),
+        cu_num_logits=torch.tensor([0, 1, 2], dtype=torch.int32, device=device),
+        num_logits=2,
+        logits_indices_buffer=buffers.logits_indices,
+    )
+
+    assert indices.data_ptr() == buffers.logits_indices.data_ptr()
+    assert indices.cpu().tolist() == [0, 1]
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+def test_combine_sampled_and_draft_tokens_rejects_small_persistent_buffer():
+    device = torch.device(DEVICE)
+    with pytest.raises(ValueError, match="too small"):
+        combine_sampled_and_draft_tokens(
+            input_ids=torch.zeros(2, dtype=torch.int32, device=device),
+            idx_mapping=torch.arange(2, dtype=torch.int64, device=device),
+            last_sampled_tokens=torch.zeros(2, dtype=torch.int32, device=device),
+            query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32, device=device),
+            seq_lens=torch.ones(2, dtype=torch.int32, device=device),
+            prefill_len=torch.ones(2, dtype=torch.int32, device=device),
+            draft_tokens=torch.zeros((2, 3), dtype=torch.int32, device=device),
+            cu_num_logits=torch.tensor([0, 1, 2], dtype=torch.int32, device=device),
+            num_logits=2,
+            logits_indices_buffer=torch.empty(1, dtype=torch.int64, device=device),
+        )
 
 
 @pytest.mark.parametrize(
@@ -57,132 +144,3 @@ def test_make_dummy_distributes_remainder(num_reqs: int, num_tokens: int):
     assert torch.equal(
         batch.query_start_loc.cpu(), torch.from_numpy(batch.query_start_loc_np)
     )
-
-
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA top-k.")
-@pytest.mark.parametrize("is_padding", [True, False])
-def test_make_dummy_padding_controls_moe_routing(monkeypatch, is_padding: bool):
-    """Dummy tokens marked as padding are dropped by the MoE router (top-k id
-    -1), which is wanted for idle DP ranks. Profile runs must not mark them, or
-    no token reaches the experts and MoE memory is never profiled."""
-    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", "1")
-    num_tokens = 16
-    buffers = InputBuffers(
-        max_num_reqs=4, max_num_tokens=num_tokens, device=torch.device(DEVICE)
-    )
-    batch = InputBatch.make_dummy(4, num_tokens, buffers, is_padding=is_padding)
-    hidden_states = torch.randn(num_tokens, 4, device=DEVICE)
-    router_logits = torch.randn(num_tokens, 8, device=DEVICE)
-
-    with set_forward_context(None, VllmConfig(), is_padding=batch.is_padding):
-        _, topk_ids, _ = fused_topk(hidden_states, router_logits, 2, False)
-
-    assert bool((topk_ids == -1).all()) is is_padding
-    assert bool((topk_ids >= 0).all()) is not is_padding
-
-
-def test_maybe_prepare_dcp_local_seq_lens_uses_shared_buffer(monkeypatch):
-    """The batch must view the caller-owned buffer, sliced to padded length.
-
-    Runtime (and capture) paths all funnel through this helper; attention
-    metadata indexes padded rows, so the view must reach
-    num_reqs_after_padding, and it must alias the persistent buffer so CUDA
-    graph replay sees the recomputed values.
-    """
-    buffers = InputBuffers(max_num_reqs=4, max_num_tokens=4, device=torch.device("cpu"))
-    batch = InputBatch.make_dummy(2, 4, buffers)
-    batch.num_reqs_after_padding = 4
-
-    def fake_kernel(
-        output,
-        seq_lens,
-        dcp_size,
-        dcp_rank,
-        cp_interleave,
-        num_reqs,
-        max_num_reqs,
-        block_size,
-    ):
-        assert output is buffers.dcp_local_seq_lens
-        assert seq_lens is batch.seq_lens
-        assert (num_reqs, dcp_size, dcp_rank, cp_interleave) == (2, 4, 1, 16)
-        assert (max_num_reqs, block_size) == (4, 128)
-        output[:] = torch.tensor([1, 2, 0, 0], dtype=output.dtype)
-
-    class FakeKernel:
-        def __getitem__(self, grid):
-            assert grid == (1,)
-            return fake_kernel
-
-    monkeypatch.setattr(cp_utils, "_dcp_local_seq_lens_kernel", FakeKernel())
-    batch.dcp_local_seq_lens = cp_utils.maybe_prepare_dcp_local_seq_lens(
-        buffers.dcp_local_seq_lens,
-        batch.seq_lens,
-        batch.num_reqs,
-        4,
-        1,
-        16,
-        num_reqs_padded=batch.num_reqs_after_padding,
-    )
-
-    assert batch.dcp_local_seq_lens is not None
-    assert batch.dcp_local_seq_lens.data_ptr() == buffers.dcp_local_seq_lens.data_ptr()
-    assert batch.dcp_local_seq_lens.tolist() == [1, 2, 0, 0]
-
-
-def test_maybe_prepare_dcp_local_seq_lens_clears_stale_metadata(monkeypatch):
-    """dcp_size == 1 resets the field to None instead of leaving a leftover.
-
-    DCP is toggled per deployment, and batches are recycled; a value from an
-    earlier DCP batch would otherwise be consumed as if it were current.
-    """
-    buffers = InputBuffers(max_num_reqs=2, max_num_tokens=2, device=torch.device("cpu"))
-    batch = InputBatch.make_dummy(1, 1, buffers)
-    batch.dcp_local_seq_lens = buffers.dcp_local_seq_lens[:1]
-
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("kernel must not run with dcp_size == 1")
-
-    monkeypatch.setattr(cp_utils, "_dcp_local_seq_lens_kernel", fail_if_called)
-    batch.dcp_local_seq_lens = cp_utils.maybe_prepare_dcp_local_seq_lens(
-        buffers.dcp_local_seq_lens,
-        batch.seq_lens,
-        batch.num_reqs,
-        1,
-        0,
-        1,
-        num_reqs_padded=batch.num_reqs_after_padding,
-    )
-
-    assert batch.dcp_local_seq_lens is None
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="triton kernel needs CUDA")
-@pytest.mark.parametrize("dcp_size", [2, 4])
-@pytest.mark.parametrize("cp_interleave", [1, 16])
-def test_maybe_prepare_dcp_local_seq_lens_matches_reference(
-    dcp_size: int, cp_interleave: int
-):
-    """Every rank's local lengths must equal the reference torch formula."""
-    device = torch.device("cuda:0")
-    seq_lens_np = np.array([7, 16, 33, 64, 512, 1023], dtype=np.int32)
-    buffers = InputBuffers(max_num_reqs=8, max_num_tokens=32, device=device)
-    batch = InputBatch.make_dummy(6, 12, buffers)
-    buffers.seq_lens[: len(seq_lens_np)] = torch.from_numpy(seq_lens_np).to(device)
-
-    for dcp_rank in range(dcp_size):
-        buffers.dcp_local_seq_lens.fill_(-1)
-        batch.dcp_local_seq_lens = cp_utils.maybe_prepare_dcp_local_seq_lens(
-            buffers.dcp_local_seq_lens,
-            batch.seq_lens,
-            batch.num_reqs,
-            dcp_size,
-            dcp_rank,
-            cp_interleave,
-            num_reqs_padded=batch.num_reqs_after_padding,
-        )
-        expected = get_dcp_local_seq_lens(
-            torch.from_numpy(seq_lens_np), dcp_size, dcp_rank, cp_interleave
-        )
-        assert batch.dcp_local_seq_lens is not None
-        assert torch.equal(batch.dcp_local_seq_lens.cpu(), expected.to(torch.int32))

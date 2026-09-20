@@ -113,3 +113,114 @@ def test_v2_min_tokens_mixed_batch_gates_restore_per_request():
 
     assert out[0, STOP_TOKEN] == 1.0
     assert torch.isneginf(out[1]).all()
+
+
+@pytest.mark.parametrize("rows", [4, 128, 152])
+def test_sharded_min_tokens_exact_graph_mutation_recovery(rows):
+    """Every shard matches full logits across stop owners and min_len boundary."""
+    req_states = RequestState(
+        max_num_reqs=3,
+        max_model_len=64,
+        max_num_batched_tokens=rows,
+        num_speculative_steps=1,
+        vocab_size=129,
+        device=DEVICE,
+    )
+    req_states.prompt_len.np[:] = 2
+    state = LogitBiasState(None, LogitsProcRequestState.from_request_state(req_states))
+    for i in range(3):
+        state.add_request(
+            i, SamplingParams(min_tokens=10, stop_token_ids=[0, 42, 43, 85, 86, 128])
+        )
+    state.apply_staged_writes()
+    vocab, shard = 129, 43
+    original = torch.randn(rows, vocab, device=DEVICE)
+    idx = torch.arange(rows, device=DEVICE, dtype=torch.int32) % 3
+    positions = (torch.arange(rows, device=DEVICE, dtype=torch.int32) % 3) + 10
+    active = np.arange(3, dtype=np.intp)
+
+    def apply(value, offset=0, sharded=False):
+        state.apply(
+            value,
+            LogitsContext(
+                expanded_idx_mapping=idx,
+                idx_mapping=torch.arange(3, dtype=torch.int32, device=DEVICE),
+                idx_mapping_np=active,
+                expanded_local_pos=torch.zeros(rows, dtype=torch.int32, device=DEVICE),
+                input_ids=torch.zeros(rows, dtype=torch.int32, device=DEVICE),
+                pos=positions,
+                seq_lens_upper_bound_np=np.full(3, 64, dtype=np.int64),
+                vocab_start=offset,
+                vocab_is_sharded=sharded,
+            ),
+        )
+
+    reference = original.clone()
+    apply(reference)
+    oracle = original.clone()
+    for row, position in enumerate(positions.cpu().tolist()):
+        if position + 1 < 12:
+            oracle[row, [0, 42, 43, 85, 86, 128]] = -float("inf")
+    assert torch.equal(reference, oracle)
+    for owner in range(3):
+        start = owner * shard
+        source = original[:, start : start + shard].contiguous()
+        output = source.clone()
+        apply(output, start, True)
+        assert torch.equal(output, reference[:, start : start + shard])
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output.copy_(source)
+            apply(output, start, True)
+        graph.replay()
+        torch.cuda.synchronize()
+        before = output.clone()
+        assert torch.equal(before, reference[:, start : start + shard])
+        source[:, 1] += 1
+        graph.replay()
+        torch.cuda.synchronize()
+        assert not torch.equal(output, before)
+        source.copy_(original[:, start : start + shard])
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(output, before)
+        positions.add_(100)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(output, source)
+        positions.sub_(100)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(output, before)
+
+
+def test_sharded_structured_restore_rejected_before_mutation():
+    req_states = RequestState(
+        max_num_reqs=1,
+        max_model_len=64,
+        max_num_batched_tokens=1,
+        num_speculative_steps=1,
+        vocab_size=VOCAB_SIZE,
+        device=DEVICE,
+    )
+    req_states.prompt_len.np[0] = PROMPT_LEN
+    state = LogitBiasState(None, LogitsProcRequestState.from_request_state(req_states))
+    state.add_request(0, _params(True))
+    state.apply_staged_writes()
+    value = _only_stop_token_left(1)
+    before = value.clone()
+    with pytest.raises(ValueError, match="only plain min_tokens"):
+        state.apply(
+            value,
+            LogitsContext(
+                expanded_idx_mapping=torch.zeros(1, dtype=torch.int32, device=DEVICE),
+                idx_mapping=torch.zeros(1, dtype=torch.int32, device=DEVICE),
+                idx_mapping_np=np.array([0]),
+                expanded_local_pos=torch.zeros(1, dtype=torch.int32, device=DEVICE),
+                input_ids=torch.zeros(1, dtype=torch.int32, device=DEVICE),
+                pos=torch.tensor([POS], dtype=torch.int32, device=DEVICE),
+                seq_lens_upper_bound_np=np.array([POS + 1]),
+                vocab_is_sharded=True,
+            ),
+        )
+    assert torch.equal(value, before)

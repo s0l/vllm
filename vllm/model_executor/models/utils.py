@@ -46,6 +46,13 @@ ShardIds: TypeAlias = ShardId | list[ShardId]
 """One shard, or a list of shards the same weight is loaded into in turn."""
 
 
+def ceil_to_multiple(value: int, multiple: int) -> int:
+    """Return the smallest multiple greater than or equal to ``value``."""
+    if multiple <= 0:
+        raise ValueError("multiple must be positive")
+    return ((value + multiple - 1) // multiple) * multiple
+
+
 @dataclass
 class WeightsMapper:
     """Maps the name of each weight if they match the following patterns.

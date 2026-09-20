@@ -97,6 +97,7 @@ class PenaltiesState(LogitsProcessor):
             self.presence_penalty.gpu,
             self.prompt_bin_mask,
             self.output_bin_counts,
+            vocab_start=ctx.vocab_start,
         )
         return logits
 
@@ -116,6 +117,7 @@ def _penalties_kernel(
     output_bin_counts_ptr,
     output_bin_counts_stride,
     vocab_size,
+    vocab_start,
     BLOCK_SIZE: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
@@ -134,12 +136,13 @@ def _penalties_kernel(
 
     block_idx = tl.program_id(1)
     block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    global_block = vocab_start + block
     mask = block < vocab_size
     logits = tl.load(logits_ptr + token_idx * logits_stride + block, mask=mask)
     logits = logits.to(tl.float32)
 
     base_output_counts = tl.load(
-        output_bin_counts_ptr + req_state_idx * output_bin_counts_stride + block,
+        output_bin_counts_ptr + req_state_idx * output_bin_counts_stride + global_block,
         mask=mask,
         other=0,
     )
@@ -152,16 +155,18 @@ def _penalties_kernel(
     output_bin_counts = base_output_counts
     for prev_pos in tl.range(pos):
         prev_token = tl.load(token_ids_ptr + start_idx + prev_pos + 1)
-        token_match = block == prev_token
+        token_match = global_block == prev_token
         output_bin_counts = output_bin_counts + token_match.to(tl.int32)
     output_bin_mask = output_bin_counts > 0
 
     # Apply repetition penalties.
     if use_rep_penalty:
-        packed_block = block_idx * BLOCK_SIZE // 32 + tl.arange(0, BLOCK_SIZE // 32)
+        packed_block = (vocab_start + block_idx * BLOCK_SIZE) // 32 + tl.arange(
+            0, BLOCK_SIZE // 32
+        )
         packed_mask = tl.load(
             prompt_bin_mask_ptr + req_state_idx * prompt_bin_mask_stride + packed_block,
-            mask=packed_block < tl.cdiv(vocab_size, 32),
+            mask=packed_block < prompt_bin_mask_stride,
             other=0,
         )
         prompt_bin_mask = (packed_mask[:, None] >> (tl.arange(0, 32)[None, :])) & 1
@@ -191,6 +196,7 @@ def apply_penalties(
     presence_penalty: torch.Tensor,
     prompt_bin_mask: torch.Tensor,
     output_bin_counts: torch.Tensor,
+    vocab_start: int = 0,
 ) -> None:
     num_tokens, vocab_size = logits.shape
     BLOCK_SIZE = 8192
@@ -209,6 +215,7 @@ def apply_penalties(
         output_bin_counts,
         output_bin_counts.stride(0),
         vocab_size,
+        vocab_start,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 

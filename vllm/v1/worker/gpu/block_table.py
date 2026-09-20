@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
 
+import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -27,6 +28,7 @@ class BlockTables:
         cp_rank: int = 0,
         cp_interleave: int = 1,
         slot_mapping_enabled: list[bool] | None = None,
+        cp_replicated: list[bool] | None = None,
     ):
         self.block_sizes = block_sizes
         self.kernel_block_sizes = kernel_block_sizes
@@ -44,6 +46,11 @@ class BlockTables:
             slot_mapping_enabled = [True] * self.num_kv_cache_groups
         assert len(slot_mapping_enabled) == self.num_kv_cache_groups
         self._slot_mapping_enabled = slot_mapping_enabled
+        if cp_replicated is None:
+            cp_replicated = [False] * self.num_kv_cache_groups
+        if len(cp_replicated) != self.num_kv_cache_groups:
+            raise ValueError("cache ownership must cover every block-table group")
+        self._cp_replicated = cp_replicated
 
         self.blocks_per_kv_block = [
             bs // kbs for bs, kbs in zip(block_sizes, kernel_block_sizes)
@@ -51,12 +58,19 @@ class BlockTables:
 
         # num_kv_cache_groups x [max_num_reqs, max_num_blocks]
         self.block_tables: list[StagedWriteTensor] = []
+        self.host_block_tables: list[np.ndarray] = []
         for i in range(self.num_kv_cache_groups):
             max_num_blocks = max_num_blocks_per_group[i] * self.blocks_per_kv_block[i]
             block_table = StagedWriteTensor(
                 (self.max_num_reqs, max_num_blocks), dtype=torch.int32, device=device
             )
             self.block_tables.append(block_table)
+            # A small authoritative host mirror used by fail-closed diagnostics.
+            # Reading the GPU table back immediately before graph replay would
+            # insert a device synchronization and perturb distributed execution.
+            self.host_block_tables.append(
+                np.zeros((self.max_num_reqs, max_num_blocks), dtype=np.int32)
+            )
 
         self.num_blocks = UvaBackedTensor(
             (self.num_kv_cache_groups, self.max_num_reqs),
@@ -108,6 +122,9 @@ class BlockTables:
         self.slot_mapping_enabled = torch.tensor(
             self._slot_mapping_enabled, dtype=torch.bool, device=self.device
         )
+        self.cp_replicated = torch.tensor(
+            self._cp_replicated, dtype=torch.bool, device=self.device
+        )
         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
 
     def append_block_ids(
@@ -130,6 +147,8 @@ class BlockTables:
                     f"row capacity ({end} > {row_capacity})"
                 )
             self.block_tables[i].stage_write(req_index, start, block_ids)
+            end = start + len(block_ids)
+            self.host_block_tables[i][req_index, start:end] = block_ids
             self.num_blocks.np[i, req_index] = end
 
     def apply_staged_writes(self) -> None:
@@ -195,6 +214,7 @@ class BlockTables:
         positions: torch.Tensor,
         num_tokens_padded: int,
         out: torch.Tensor | None = None,
+        is_padding: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.num_kv_cache_groups == 0:
             return (self.slot_mappings if out is None else out)[:, :num_tokens_padded]
@@ -211,12 +231,15 @@ class BlockTables:
             self.block_sizes_tensor,
             self.kernel_block_sizes_tensor,
             self.slot_mapping_enabled,
+            self.cp_replicated,
+            is_padding,
             slot_mappings,
             slot_mappings.stride(0),
             self.cp_rank,
             CP_SIZE=self.cp_size,
             CP_INTERLEAVE=self.cp_interleave,
             PAD_ID=PAD_SLOT_ID,
+            HAS_PADDING_MASK=is_padding is not None,
             TRITON_BLOCK_SIZE=1024,  # type: ignore
         )
         return slot_mappings[:, :num_tokens_padded]
@@ -284,12 +307,15 @@ def _compute_slot_mappings_kernel(
     block_sizes,  # [num_kv_cache_groups]
     kernel_block_sizes,  # [num_kv_cache_groups]
     slot_mapping_enabled,  # [num_kv_cache_groups]
+    cp_replicated,  # [num_kv_cache_groups]
+    is_padding,  # optional [max_num_tokens]
     slot_mappings_ptr,  # [num_kv_cache_groups, max_num_tokens]
     slot_mappings_stride,
     cp_rank,
     CP_SIZE: tl.constexpr,
     CP_INTERLEAVE: tl.constexpr,
     PAD_ID: tl.constexpr,
+    HAS_PADDING_MASK: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
     # kv cache group id
@@ -319,7 +345,10 @@ def _compute_slot_mappings_kernel(
     end_idx = tl.load(query_start_loc + batch_idx + 1)
     for i in range(start_idx, end_idx, TRITON_BLOCK_SIZE):
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
-        positions = tl.load(pos + offset, mask=offset < end_idx, other=0)
+        valid = offset < end_idx
+        if HAS_PADDING_MASK:
+            valid &= ~tl.load(is_padding + offset, mask=valid, other=True)
+        positions = tl.load(pos + offset, mask=valid, other=0)
 
         if CP_SIZE == 1:
             # Common case: Context parallelism is not used.
@@ -335,6 +364,9 @@ def _compute_slot_mappings_kernel(
             remainder = virtual_block_offsets % CP_INTERLEAVE
             local_offsets = rounds * CP_INTERLEAVE + remainder
             local_positions = virtual_block_indices * kv_block_size + local_offsets
+            replicated = tl.load(cp_replicated + group_id)
+            local_positions = tl.where(replicated, positions, local_positions)
+            is_local = replicated | is_local
 
         block_indices = tl.where(
             mapping_enabled, local_positions // kernel_block_size, 0
@@ -342,12 +374,12 @@ def _compute_slot_mappings_kernel(
         block_offsets = local_positions % kernel_block_size
         block_numbers = tl.load(
             block_table_ptr + req_state_idx * block_table_stride + block_indices,
-            mask=is_local,
+            mask=is_local & valid,
             other=0,
         )
         slot_ids = block_numbers * kernel_block_size + block_offsets
         if CP_SIZE != 1:
             slot_ids = tl.where(is_local, slot_ids, PAD_ID)
 
-        slot_ids = tl.where(mapping_enabled, slot_ids, PAD_ID)
+        slot_ids = tl.where(mapping_enabled & valid, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)

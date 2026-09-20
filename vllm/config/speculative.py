@@ -483,6 +483,15 @@ class SpeculativeConfig:
     inclusive batch-size range.
     """
 
+    disable_speculation_on_non_decode: bool = False
+    """Force dynamic speculative decoding to choose K=0 for any scheduler
+    step that is not uniform autoregressive decode.
+
+    This keeps drafter work out of prefill, resumed replay and mixed
+    prefill/decode steps. It only takes effect together with
+    ``num_speculative_tokens_per_batch_size``.
+    """
+
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the draft model initialized internal."""

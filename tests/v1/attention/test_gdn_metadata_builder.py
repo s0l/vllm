@@ -125,6 +125,7 @@ GDN_BUILD_TEST_CASES = {
 def _create_gdn_builder(
     num_speculative_tokens: int = 0,
     full_cuda_graph: bool = False,
+    replay_commit: bool = False,
 ) -> GDNAttentionMetadataBuilder:
     """Create a GDNAttentionMetadataBuilder with minimal config."""
     vllm_config = create_vllm_config(
@@ -138,10 +139,19 @@ def _create_gdn_builder(
             method="ngram",
             num_speculative_tokens=num_speculative_tokens,
         )
+    if replay_commit:
+        vllm_config.additional_config.update(
+            {
+                "gdn_mtp_replay_commit": True,
+                "gdn_separate_pool": True,
+            }
+        )
     mamba_spec = MambaSpec(
         block_size=BLOCK_SIZE,
         shapes=((16, 64),),
         dtypes=(torch.float16,),
+        separate_pool=replay_commit,
+        num_speculative_blocks=0,
     )
     return GDNAttentionMetadataBuilder(
         kv_cache_spec=mamba_spec,
@@ -221,3 +231,97 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.spec_query_start_loc.shape == (batch.batch_size + 1,)
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
+
+
+def test_replay_commit_metadata_aliases_one_state_and_tracks_batch_rows():
+    builder = _create_gdn_builder(
+        num_speculative_tokens=3,
+        full_cuda_graph=True,
+        replay_commit=True,
+    )
+    batch = BatchSpec(seq_lens=[80, 96], query_lens=[4, 4])
+    meta = _build(builder, batch, num_decode_draft_tokens=[3, 3])
+
+    assert meta.spec_state_indices_tensor is not None
+    assert meta.spec_state_indices_tensor.shape == (2, 4)
+    assert torch.equal(
+        meta.spec_state_indices_tensor,
+        meta.spec_state_indices_tensor[:, :1].expand(-1, 4),
+    )
+    assert meta.spec_batch_indices is not None
+    assert meta.spec_batch_indices.tolist() == [0, 1]
+
+
+@pytest.mark.parametrize("spec_decode", [False, True])
+def test_separate_pool_decode_block_table_reuse_matches_full_build(spec_decode: bool):
+    """Rebinding a GDN group must preserve the full-builder state indices."""
+    num_speculative_tokens = 3
+    source_builder = _create_gdn_builder(
+        num_speculative_tokens=num_speculative_tokens,
+        full_cuda_graph=True,
+        replay_commit=True,
+    )
+    reuse_builder = _create_gdn_builder(
+        num_speculative_tokens=num_speculative_tokens,
+        full_cuda_graph=True,
+        replay_commit=True,
+    )
+    expected_builder = _create_gdn_builder(
+        num_speculative_tokens=num_speculative_tokens,
+        full_cuda_graph=True,
+        replay_commit=True,
+    )
+    query_lens = [4, 4] if spec_decode else [1, 1]
+    draft_tokens = [3, 3] if spec_decode else None
+    batch = BatchSpec(seq_lens=[80, 96], query_lens=query_lens)
+    source_common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+    target_common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+    target_common.block_table_tensor.add_(7)
+
+    kwargs: dict = {}
+    if draft_tokens is not None:
+        kwargs = {
+            "num_decode_draft_tokens_cpu": torch.tensor(
+                draft_tokens, dtype=torch.int32
+            ),
+            "num_accepted_tokens": torch.ones(
+                batch.batch_size, dtype=torch.int32, device=DEVICE
+            ),
+        }
+    source = source_builder.build(0, source_common, **kwargs)
+    updated = reuse_builder.update_block_table(
+        source,
+        target_common.block_table_tensor,
+        target_common.slot_mapping,
+    )
+    expected = expected_builder.build(0, target_common, **kwargs)
+
+    assert updated is not source
+    if spec_decode:
+        assert torch.equal(
+            updated.spec_state_indices_tensor,
+            expected.spec_state_indices_tensor,
+        )
+        assert updated.spec_sequence_masks is source.spec_sequence_masks
+    else:
+        assert torch.equal(
+            updated.non_spec_state_indices_tensor,
+            expected.non_spec_state_indices_tensor,
+        )
+        assert updated.non_spec_query_start_loc is source.non_spec_query_start_loc
+
+
+def test_gdn_block_table_reuse_rejects_prefill_and_non_separate_pool():
+    prefill_builder = _create_gdn_builder(num_speculative_tokens=0)
+    prefill = _build(
+        prefill_builder,
+        BatchSpec(seq_lens=[32], query_lens=[16]),
+    )
+    assert not prefill_builder.can_update_block_table(prefill)
+
+    regular_builder = _create_gdn_builder(num_speculative_tokens=0)
+    regular = _build(
+        regular_builder,
+        BatchSpec(seq_lens=[32], query_lens=[1]),
+    )
+    assert not regular_builder.can_update_block_table(regular)

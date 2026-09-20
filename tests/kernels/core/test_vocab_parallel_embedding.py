@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers import vocab_parallel_embedding as embedding_module
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_masked_input_and_mask,
@@ -25,6 +26,45 @@ requires_cuda = pytest.mark.skipif(
     not current_platform.is_cuda(),
     reason="the fused vocab-parallel embedding kernel is CUDA-only",
 )
+
+
+def test_fused_forward_uses_embedding_collective(monkeypatch):
+    """The fused lookup is still only a rank-local TP partial."""
+    layer = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
+    torch.nn.Module.__init__(layer)
+    layer.tp_size = 3
+    layer.use_fused_embedding = True
+    layer.embedding_dim = 4
+    layer.weight = torch.nn.Parameter(torch.zeros(2, 4))
+    layer.shard_indices = VocabParallelEmbedding._get_indices(
+        vocab_size_padded=6,
+        org_vocab_size_padded=6,
+        vocab_size=6,
+        org_vocab_size=6,
+        tp_rank=0,
+        tp_size=3,
+    )
+
+    partial = torch.full((2, 4), 3.0)
+    reduced = torch.full((2, 4), 9.0)
+    calls = []
+
+    monkeypatch.setattr(ops, "vocab_parallel_embedding", lambda *args: partial)
+
+    def reduce_rank_partials(value):
+        calls.append(value)
+        return reduced
+
+    monkeypatch.setattr(
+        embedding_module,
+        "tensor_model_parallel_embedding_all_reduce",
+        reduce_rank_partials,
+    )
+
+    output = layer(torch.tensor([0, 1], dtype=torch.int32))
+
+    assert calls == [partial]
+    assert output is reduced
 
 
 def _shard_indices(vocab_size, org_vocab_size, tp_rank, tp_size, pad=64):

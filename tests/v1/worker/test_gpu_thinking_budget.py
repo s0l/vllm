@@ -71,6 +71,7 @@ def _apply(
     logits: torch.Tensor,
     input_ids: list[int],
     local_pos: list[int],
+    vocab_start: int = 0,
 ) -> torch.Tensor:
     idx_mapping = torch.tensor([3], dtype=torch.int32, device=DEVICE)
     expanded_idx_mapping = torch.tensor(
@@ -83,12 +84,14 @@ def _apply(
             expanded_idx_mapping=expanded_idx_mapping,
             idx_mapping=idx_mapping,
             idx_mapping_np=idx_mapping_np,
+            input_ids=torch.tensor(input_ids, dtype=torch.int32, device=DEVICE),
             expanded_local_pos=torch.tensor(
                 local_pos, dtype=torch.int32, device=DEVICE
             ),
-            input_ids=torch.tensor(input_ids, dtype=torch.int32, device=DEVICE),
-            pos=torch.zeros(len(input_ids), dtype=torch.int32, device=DEVICE),
-            seq_lens_upper_bound_np=np.full(1, len(input_ids), dtype=np.int64),
+            pos=torch.tensor(local_pos, dtype=torch.int32, device=DEVICE),
+            seq_lens_upper_bound_np=np.array([64]),
+            vocab_start=vocab_start,
+            vocab_is_sharded=logits.shape[-1] != VOCAB_SIZE,
         ),
     )
     return logits.cpu()
@@ -119,6 +122,30 @@ def test_v2_thinking_budget_restores_masked_end_token():
     out = _apply(state, logits, input_ids=[12], local_pos=[0])
 
     assert out[0, END] == pytest.approx(1.0e9)
+
+
+@pytest.mark.parametrize("vocab_start", [0, 48, 96])
+def test_v2_thinking_budget_forces_only_owning_local_vocab_shard(vocab_start):
+    req_states = _make_req_states([1, START, 10, 11, 12], prompt_len=1)
+    state = ThinkingBudgetState(req_states, MockReasoningConfig())
+    state.add_request(3, SamplingParams(thinking_token_budget=3))
+    state.apply_staged_writes()
+
+    local_vocab = 48
+    logits = torch.zeros((1, local_vocab), device=DEVICE)
+    out = _apply(
+        state,
+        logits,
+        input_ids=[12],
+        local_pos=[0],
+        vocab_start=vocab_start,
+    )
+
+    if vocab_start <= END < vocab_start + local_vocab:
+        assert out[0, END - vocab_start] == pytest.approx(1.0e9)
+        assert torch.count_nonzero(out).item() == 1
+    else:
+        assert torch.count_nonzero(out).item() == 0
 
 
 def test_v2_thinking_budget_allows_tokens_before_budget():
@@ -228,7 +255,7 @@ def test_v2_greedy_sampling_applies_thinking_budget():
         torch.tensor([4], dtype=torch.int32, device=DEVICE),
         input_ids,
         torch.tensor([0], dtype=torch.int32, device=DEVICE),
-        np.full(1, 4, dtype=np.int64),
+        np.array([5], dtype=np.int64),
     )
 
     assert out[0, END].item() == pytest.approx(1.0e9)
