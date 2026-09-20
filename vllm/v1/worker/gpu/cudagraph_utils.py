@@ -1971,6 +1971,12 @@ class CudaGraphManager:
 
         self._graphs_captured = False
 
+        # Profiling hooks, set only by profile_cudagraph_memory() below: cap
+        # FULL-mode capture at the N largest descriptors and record each
+        # captured FULL graph's memory delta for extrapolation.
+        self._max_full_descs_to_capture: int | None = None
+        self._capture_mem_samples: list[int] | None = None
+
         self._candidates: dict[tuple[int, int], list[BatchExecutionDescriptor]] = {}
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
         self.max_capture_tokens = 0
@@ -3764,6 +3770,11 @@ class CudaGraphManager:
                     continue
 
                 descs = selected_descs[mode]
+                if (
+                    mode == CUDAGraphMode.FULL
+                    and self._max_full_descs_to_capture is not None
+                ):
+                    descs = descs[: self._max_full_descs_to_capture]
                 if is_global_first_rank():
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
                 for desc in descs:
