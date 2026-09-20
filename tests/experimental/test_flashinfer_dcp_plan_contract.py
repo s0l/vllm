@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
 import unittest
 
 from vllm.v1.attention.backends.flashinfer import (
     BatchDCPPrefillWrapper,
     BatchDCPPseudoPrefillWrapper,
+    FlashInferImpl,
 )
 
 
@@ -47,6 +49,19 @@ class TestFlashInferDCPPlanContract(unittest.TestCase):
                         logits_soft_cap=0.0,
                         sm_scale=0.25,
                     )
+
+    def test_pseudo_dispatch_precedes_regular_dcp_contract(self) -> None:
+        source = inspect.getsource(FlashInferImpl.forward)
+        pseudo_dispatch = source.index("BatchDCPPseudoPrefillWrapper")
+        regular_contract = source.index(
+            "assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)"
+        )
+
+        assert pseudo_dispatch < regular_contract
+        assert (
+            source.count("assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)")
+            == 1
+        )
 
 
 if __name__ == "__main__":

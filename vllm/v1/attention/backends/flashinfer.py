@@ -6298,32 +6298,6 @@ class FlashInferImpl(AttentionImpl):
                 prefill_wrapper = attn_metadata.prefill.wrapper
                 assert prefill_wrapper is not None
                 if use_dcp:
-                    if key is None or value is None:
-                        raise NotImplementedError(
-                            "FlashInfer DCP prefill does not support KV-sharing layers"
-                        )
-                    assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
-                    assert prefill_wrapper._context._window_left == self.window_left
-                    assert prefill_wrapper._context._logits_soft_cap == (
-                        self.logits_soft_cap or 0.0
-                    )
-                    assert prefill_wrapper._context._sm_scale == self.scale
-                    assert not prefill_wrapper._context._causal
-                    assert prefill_wrapper._new_tokens._window_left == self.window_left
-                    assert prefill_wrapper._new_tokens._logits_soft_cap == (
-                        self.logits_soft_cap or 0.0
-                    )
-                    assert prefill_wrapper._new_tokens._sm_scale == self.scale
-                    assert prefill_wrapper._new_tokens._causal
-
-                    prefill_wrapper.run(
-                        layer,
-                        prefill_query,
-                        kv_cache_tuple,
-                        key[num_decode_tokens:num_actual_tokens],
-                        value[num_decode_tokens:num_actual_tokens],
-                        out=output[num_decode_tokens:],
-                    )
                     if isinstance(
                         prefill_wrapper,
                         BatchDCPBatchedDecodeWrapper | BatchDCPSequentialDecodeWrapper,
@@ -6348,6 +6322,11 @@ class FlashInferImpl(AttentionImpl):
                         )
                     else:
                         assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
+                        if key is None or value is None:
+                            raise NotImplementedError(
+                                "FlashInfer DCP prefill does not support "
+                                "KV-sharing layers"
+                            )
                         prefill_wrapper.assert_plan_contract(
                             window_left=self.window_left,
                             logits_soft_cap=self.logits_soft_cap or 0.0,
