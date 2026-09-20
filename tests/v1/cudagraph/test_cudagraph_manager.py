@@ -2958,6 +2958,35 @@ def test_model_dynamic_capture_state_is_charged_and_released():
     assert manager.aux_hidden_states_token_major == []
 
 
+def test_model_dynamic_capture_outputs_are_descriptor_owned_across_shapes():
+    manager = object.__new__(gpu_cudagraph_utils.ModelCudaGraphManager)
+    manager.is_last_pp_rank = True
+    manager.use_aux_hidden_state_outputs = False
+    manager.defer_startup_graphs = True
+    manager.hidden_states = None
+
+    one_token = gpu_cudagraph_utils.DynamicModelCaptureBundle()
+    two_tokens = gpu_cudagraph_utils.DynamicModelCaptureBundle()
+    manager._store_model_capture_output(
+        one_token, 1, torch.full((1, 5), 1, dtype=torch.bfloat16)
+    )
+    manager._store_model_capture_output(
+        two_tokens, 2, torch.full((2, 5), 2, dtype=torch.bfloat16)
+    )
+
+    assert manager.hidden_states is None
+    assert one_token.hidden_states is not None
+    assert one_token.hidden_states.shape == (1, 5)
+    assert torch.equal(
+        one_token.hidden_states, torch.ones_like(one_token.hidden_states)
+    )
+    assert two_tokens.hidden_states is not None
+    assert two_tokens.hidden_states.shape == (2, 5)
+    assert torch.equal(
+        two_tokens.hidden_states, torch.full_like(two_tokens.hidden_states, 2)
+    )
+
+
 @pytest.mark.parametrize("mode", [CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE])
 def test_model_dynamic_capture_state_direct_control_uses_retained_closure(mode):
     manager = object.__new__(gpu_cudagraph_utils.ModelCudaGraphManager)

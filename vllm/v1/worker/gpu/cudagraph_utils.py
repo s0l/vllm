@@ -4492,6 +4492,74 @@ class ModelCudaGraphManager(CudaGraphManager):
     def _tensor_bytes(tensor: torch.Tensor) -> int:
         return tensor.numel() * tensor.element_size()
 
+    def _store_model_capture_output(
+        self,
+        capture_outputs: "DynamicModelCaptureBundle | ModelCudaGraphManager",
+        num_tokens: int,
+        model_output: Any,
+    ) -> None:
+        """Store a capture result in the descriptor-owned output bundle."""
+        if self.is_last_pp_rank:
+            if self.use_aux_hidden_state_outputs:
+                hidden_states, aux_hidden_states = model_output
+            else:
+                hidden_states = model_output
+                aux_hidden_states = []
+            if capture_outputs.hidden_states is None:
+                capture_tokens = (
+                    num_tokens if self.defer_startup_graphs else self.max_capture_tokens
+                )
+                capture_outputs.hidden_states = torch.empty(
+                    (capture_tokens, *hidden_states.shape[1:]),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+            capture_outputs.hidden_states[:num_tokens] = hidden_states
+            if (
+                self.use_aux_hidden_state_outputs
+                and not capture_outputs.aux_hidden_states
+            ):
+                capture_tokens = (
+                    num_tokens if self.defer_startup_graphs else self.max_capture_tokens
+                )
+                capture_outputs.aux_hidden_states = [
+                    (
+                        torch.empty(
+                            (capture_tokens, *x.shape[1:]),
+                            dtype=x.dtype,
+                            device=x.device,
+                        )
+                        if x.ndim > 0 and x.shape[0] == num_tokens
+                        else torch.empty_like(x)
+                    )
+                    for x in aux_hidden_states
+                ]
+                capture_outputs.aux_hidden_states_token_major = [
+                    aux.ndim > 0 and aux.shape[0] == num_tokens
+                    for aux in aux_hidden_states
+                ]
+            for destination, aux, token_major in zip(
+                capture_outputs.aux_hidden_states,
+                aux_hidden_states,
+                capture_outputs.aux_hidden_states_token_major,
+                strict=True,
+            ):
+                copy_aux_hidden_state(
+                    destination,
+                    aux,
+                    num_tokens=num_tokens,
+                    token_major=token_major,
+                )
+            return
+
+        assert isinstance(model_output, IntermediateTensors)
+        if capture_outputs.intermediate_tensors is None:
+            capture_outputs.intermediate_tensors = IntermediateTensors.empty_like(
+                model_output
+            )
+        for key, value in model_output.tensors.items():
+            capture_outputs.intermediate_tensors[key][:num_tokens] = value
+
     def _dynamic_capture_state_bytes(self, desc: BatchExecutionDescriptor) -> int:
         entry = getattr(self, "_dynamic_graph_entries", {}).get(desc)
         bundle = entry.lifetime_bundle if entry is not None else None
@@ -4753,73 +4821,9 @@ class ModelCudaGraphManager(CudaGraphManager):
                     # model outputs. No need to keep track of the hidden states.
                     return None
 
-                store_capture_output(num_tokens, model_output)
-                if self.is_last_pp_rank:
-                    # Last PP rank (common case).
-                    if self.use_aux_hidden_state_outputs:
-                        hidden_states, aux_hidden_states = model_output
-                    else:
-                        hidden_states = model_output
-                        aux_hidden_states = []
-                    if capture_outputs.hidden_states is None:
-                        capture_tokens = (
-                            num_tokens
-                            if self.defer_startup_graphs
-                            else self.max_capture_tokens
-                        )
-                        capture_outputs.hidden_states = torch.empty(
-                            (capture_tokens, *hidden_states.shape[1:]),
-                            dtype=hidden_states.dtype,
-                            device=hidden_states.device,
-                        )
-                    capture_outputs.hidden_states[:num_tokens] = hidden_states
-                    if (
-                        self.use_aux_hidden_state_outputs
-                        and not capture_outputs.aux_hidden_states
-                    ):
-                        capture_tokens = (
-                            num_tokens
-                            if self.defer_startup_graphs
-                            else self.max_capture_tokens
-                        )
-                        capture_outputs.aux_hidden_states = [
-                            (
-                                torch.empty(
-                                    (capture_tokens, *x.shape[1:]),
-                                    dtype=x.dtype,
-                                    device=x.device,
-                                )
-                                if x.ndim > 0 and x.shape[0] == num_tokens
-                                else torch.empty_like(x)
-                            )
-                            for x in aux_hidden_states
-                        ]
-                        capture_outputs.aux_hidden_states_token_major = [
-                            aux.ndim > 0 and aux.shape[0] == num_tokens
-                            for aux in aux_hidden_states
-                        ]
-                    for destination, aux, token_major in zip(
-                        capture_outputs.aux_hidden_states,
-                        aux_hidden_states,
-                        capture_outputs.aux_hidden_states_token_major,
-                        strict=True,
-                    ):
-                        copy_aux_hidden_state(
-                            destination,
-                            aux,
-                            num_tokens=num_tokens,
-                            token_major=token_major,
-                        )
-                else:
-                    # Non-last PP rank.
-                    assert isinstance(model_output, IntermediateTensors)
-                    intermediate_tensors = model_output
-                    if capture_outputs.intermediate_tensors is None:
-                        capture_outputs.intermediate_tensors = (
-                            IntermediateTensors.empty_like(intermediate_tensors)
-                        )
-                    for k, v in intermediate_tensors.tensors.items():
-                        capture_outputs.intermediate_tensors[k][:num_tokens] = v
+                self._store_model_capture_output(
+                    capture_outputs, num_tokens, model_output
+                )
 
             def allocation_profile_replay_context():
                 # Allocation profiling replays a retained FULL descriptor
