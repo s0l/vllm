@@ -14,6 +14,18 @@ from vllm.v1.core.elastic_memory_profile import (
 )
 
 
+def _validate_native_expert_profile_contract(
+    config: Any, providers: tuple[Any, ...]
+) -> bool:
+    additional = config.additional_config or {}
+    native_experts = bool(additional.get("flashnext_native_experts"))
+    if native_experts != bool(providers):
+        raise RuntimeError(
+            "allocation profile model path disagrees with native expert providers"
+        )
+    return native_experts
+
+
 def replay_allocation_profile(
     worker: Any, step_key: tuple[int, int, int, int, int]
 ) -> dict:
@@ -50,8 +62,14 @@ def _replay_allocation_profile(
         max_num_batched_tokens=runner.max_num_tokens,
         policy=GraphExecutionPolicy.from_payload(policy),
     )
-    providers = tuple({id(p): p for p in runner.model_state._native_providers}.values())
-    if not providers or any(p.active for p in providers):
+    providers = tuple(
+        {
+            id(provider): provider
+            for provider in getattr(runner.model_state, "_native_providers", ())
+        }.values()
+    )
+    _validate_native_expert_profile_contract(runner.vllm_config, providers)
+    if any(p.active for p in providers):
         raise RuntimeError("allocation profiling requires idle providers")
     sources = tuple({id(p.bank.source): p.bank.source for p in providers}.values())
     before_reads = sum(source.misses for source in sources)
@@ -125,7 +143,7 @@ def _replay_allocation_profile(
             # Sampling has a separate allocation lifetime after target. Its
             # maximum row count is X; values are intentionally synthetic.
             sample = torch.zeros(
-                (step_key[2], providers[0].hidden),
+                (step_key[2], runner.model_config.get_hidden_size()),
                 dtype=torch.bfloat16,
                 device=runner.device,
             )
@@ -160,8 +178,6 @@ def profile_allocation_catalog(owner: Any, surface: Any, *, progress=None):
     if scheduler.has_unfinished_requests():
         raise RuntimeError("allocation profile requires a request-free scheduler")
     config = owner.vllm_config
-    if not config.additional_config.get("flashnext_native_experts"):
-        raise RuntimeError("allocation envelope requires the native FlashNext path")
     policy = scheduler._elastic_graph_execution_policy
     corners, holdouts = allocation_profile_shapes(
         scheduler.num_spec_tokens,

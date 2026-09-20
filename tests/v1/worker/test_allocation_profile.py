@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,6 +27,42 @@ def samples():
         )
         for key in corners + holdouts
     ]
+
+
+@pytest.mark.parametrize(
+    ("native_experts", "provider_count", "expected"),
+    [(False, 0, False), (True, 1, True)],
+)
+def test_allocation_profile_accepts_dense_and_native_expert_paths(
+    native_experts, provider_count, expected
+):
+    from vllm.v1.engine.elastic_memory_profile import (
+        _validate_native_expert_profile_contract,
+    )
+
+    config = SimpleNamespace(
+        additional_config={"flashnext_native_experts": native_experts}
+    )
+    providers = tuple(object() for _ in range(provider_count))
+
+    assert _validate_native_expert_profile_contract(config, providers) is expected
+
+
+@pytest.mark.parametrize(("native_experts", "provider_count"), [(False, 1), (True, 0)])
+def test_allocation_profile_rejects_model_provider_mismatch(
+    native_experts, provider_count
+):
+    from vllm.v1.engine.elastic_memory_profile import (
+        _validate_native_expert_profile_contract,
+    )
+
+    config = SimpleNamespace(
+        additional_config={"flashnext_native_experts": native_experts}
+    )
+    providers = tuple(object() for _ in range(provider_count))
+
+    with pytest.raises(RuntimeError, match="disagrees with native expert providers"):
+        _validate_native_expert_profile_contract(config, providers)
 
 
 def test_worker_rpc_enters_inference_mode_and_restores_caller(monkeypatch):
