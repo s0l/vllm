@@ -1012,11 +1012,16 @@ def test_chat_completion_request_n_parameter_default():
     assert sampling_params.n == 1, f"Expected n=1 (default), got n={sampling_params.n}"
 
 
-def test_chat_completion_request_accepts_model_specific_reasoning_effort():
+@pytest.mark.parametrize(
+    "reasoning_effort", ["max", "ylow", "ymedium", "yhigh", "yultra"]
+)
+def test_chat_completion_request_accepts_model_specific_reasoning_effort(
+    reasoning_effort,
+):
     request = ChatCompletionRequest(
         model="test-model",
         messages=[{"role": "user", "content": "Hello"}],
-        reasoning_effort="max",
+        reasoning_effort=reasoning_effort,
     )
 
     chat_params = request.build_chat_params(
@@ -1024,8 +1029,8 @@ def test_chat_completion_request_accepts_model_specific_reasoning_effort():
         default_template_content_format="auto",
     )
 
-    assert request.reasoning_effort == "max"
-    assert chat_params.chat_template_kwargs["reasoning_effort"] == "max"
+    assert request.reasoning_effort == reasoning_effort
+    assert chat_params.chat_template_kwargs["reasoning_effort"] == reasoning_effort
 
 
 def test_chat_completion_request_rejects_unknown_reasoning_effort():
