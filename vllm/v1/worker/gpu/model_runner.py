@@ -3802,6 +3802,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         batch_desc,
                         num_active_loras,
                     )
+                # prepare_inputs() includes PCP partitioning.  DCP-local
+                # lengths must therefore be produced here, after the final
+                # request geometry is known and before any backend metadata is
+                # built inside the all-rank staging consensus.
+                input_batch.dcp_local_seq_lens = maybe_prepare_dcp_local_seq_lens(
+                    (
+                        self.pcp_manager.input_buffers
+                        if self.pcp_manager is not None
+                        else self.input_buffers
+                    ).dcp_local_seq_lens,
+                    input_batch.seq_lens,
+                    input_batch.num_reqs,
+                    self.dcp_size,
+                    self.dcp_rank,
+                    self.cp_interleave,
+                    num_reqs_padded=input_batch.num_reqs_after_padding,
+                )
                 if elastic_plan is not None:
                     assert elastic_plan.execution_manifest is not None
                     _validate_elastic_materialized_input_batch(
@@ -4008,45 +4025,51 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_block_tables=block_tables,
                 )
 
-        attn_metadata = None
-        slot_mappings_by_layer = None
-        if not (dummy_run and skip_attn_for_dummy_run):
-            input_batch.dcp_local_seq_lens = maybe_prepare_dcp_local_seq_lens(
-                (
-                    self.pcp_manager.input_buffers
-                    if self.pcp_manager is not None
-                    else self.input_buffers
-                ).dcp_local_seq_lens,
-                input_batch.seq_lens,
-                input_batch.num_reqs,
-                self.dcp_size,
-                self.dcp_rank,
-                self.cp_interleave,
-                num_reqs_padded=input_batch.num_reqs_after_padding,
-            )
         if dummy_run:
             attn_metadata = None
             slot_mappings_by_layer = None
-        if dummy_run and batch_desc.num_ubatches > 1:
-            assert self.ubatch_runner is not None
-            assert block_tables is not None and slot_mappings is not None
-            ubatch_state = self.ubatch_runner.prepare(
-                input_batch,
-                block_tables,
-                slot_mappings,
-                cg_mode=batch_desc.cg_mode,
-                for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
-            )
-        elif batch_desc.num_ubatches == 1 and not (
-            dummy_run and skip_attn_for_dummy_run
-        ):
-            assert slot_mappings is not None
-            if dummy_run:
+            if not skip_attn_for_dummy_run:
+                input_batch.dcp_local_seq_lens = maybe_prepare_dcp_local_seq_lens(
+                    (
+                        self.pcp_manager.input_buffers
+                        if self.pcp_manager is not None
+                        else self.input_buffers
+                    ).dcp_local_seq_lens,
+                    input_batch.seq_lens,
+                    input_batch.num_reqs,
+                    self.dcp_size,
+                    self.dcp_rank,
+                    self.cp_interleave,
+                    num_reqs_padded=input_batch.num_reqs_after_padding,
+                )
+            if batch_desc.num_ubatches > 1:
+                assert self.ubatch_runner is not None
+                assert block_tables is not None and slot_mappings is not None
+                ubatch_state = self.ubatch_runner.prepare(
+                    input_batch,
+                    block_tables,
+                    slot_mappings,
+                    cg_mode=batch_desc.cg_mode,
+                    for_capture=batch_desc.cg_mode == CUDAGraphMode.FULL,
+                )
+            elif not skip_attn_for_dummy_run:
+                assert slot_mappings is not None
                 slot_mappings_by_layer = build_slot_mappings_by_layer(
                     slot_mappings, self.kv_cache_config
                 )
-            if dummy_run:
                 assert block_tables is not None
+                attn_groups = self.attn_groups
+                if is_profile:
+                    # Mamba layers take a cheap profile path with no metadata;
+                    # retain upstream's attention-only tuning contract.
+                    attn_groups = [
+                        [
+                            group
+                            for group in groups
+                            if not isinstance(group.kv_cache_spec, MambaSpec)
+                        ]
+                        for groups in attn_groups
+                    ]
                 with record_function_or_nullcontext(
                     "ag2.target_prepare_attention_metadata"
                 ):
@@ -4055,7 +4078,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         batch_desc.cg_mode,
                         block_tables,
                         slot_mappings,
-                        self.attn_groups,
+                        attn_groups,
                         self.kv_cache_config,
                         # FULL replay re-stages capture-time metadata buffers.
                         for_capture=batch_desc.cg_mode == CUDAGraphMode.FULL,

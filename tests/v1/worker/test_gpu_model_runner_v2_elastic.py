@@ -43,6 +43,35 @@ def test_complete_phase_sequence_is_checked_before_model_forward():
     assert forwards and checked[0] < min(forwards)
 
 
+def test_dcp_lengths_are_ready_before_attention_metadata_on_every_path():
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(GPUModelRunner.execute_model)))
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    dcp_lines = sorted(
+        node.lineno
+        for node in calls
+        if isinstance(node.func, ast.Name)
+        and node.func.id == "maybe_prepare_dcp_local_seq_lens"
+    )
+    metadata_lines = sorted(
+        node.lineno
+        for node in calls
+        if isinstance(node.func, ast.Attribute)
+        and node.func.attr == "prepare_attn"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "model_state"
+    )
+
+    # Real batches build metadata inside consensus staging; dummy/capture
+    # batches build it below.  Both paths must initialize DCP lengths after
+    # their final batch partition and before the backend consumes metadata.
+    assert len(dcp_lines) == len(metadata_lines) == 2
+    assert all(dcp < metadata for dcp, metadata in zip(dcp_lines, metadata_lines))
+
+
 def test_planned_compiled_dispatch_cannot_upgrade_to_full_graph():
     """Immutable worker dispatch dominates incidental scheduler decode state."""
     import ast
