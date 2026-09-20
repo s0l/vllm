@@ -1143,7 +1143,7 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
         with (
             patch.object(torch.cuda, "Event", return_value=_Event()),
             patch.object(torch.cuda, "current_stream", return_value=object()),
-            patch.object(torch.cuda, "mem_get_info", return_value=(24, 24)),
+            patch.object(torch.accelerator, "get_memory_info", return_value=(24, 24)),
             patch.object(torch.distributed, "is_initialized", return_value=False),
         ):
             controller.apply((2, 4))
@@ -1222,7 +1222,7 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
         with (
             patch.object(torch.cuda, "Event", return_value=_Event()),
             patch.object(torch.cuda, "current_stream", return_value=object()),
-            patch.object(torch.cuda, "mem_get_info", return_value=(24, 24)),
+            patch.object(torch.accelerator, "get_memory_info", return_value=(24, 24)),
             patch.object(torch.distributed, "is_initialized", return_value=False),
         ):
             controller.apply((2, 2), external_memory_bytes=8)
@@ -1250,8 +1250,8 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
             patch.object(torch.cuda, "Event", return_value=_Event()),
             patch.object(torch.cuda, "current_stream", return_value=object()),
             patch.object(
-                torch.cuda,
-                "mem_get_info",
+                torch.accelerator,
+                "get_memory_info",
                 side_effect=((4, 24), (8, 24)),
             ),
             patch.object(torch.distributed, "is_initialized", return_value=False),
@@ -1302,7 +1302,7 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
         with (
             patch.object(torch.cuda, "Event", return_value=_Event()),
             patch.object(torch.cuda, "current_stream", return_value=object()),
-            patch.object(torch.cuda, "mem_get_info", return_value=(12, 24)),
+            patch.object(torch.accelerator, "get_memory_info", return_value=(12, 24)),
             patch.object(torch.distributed, "is_initialized", return_value=True),
             patch.object(torch.distributed, "all_reduce", side_effect=rank_min),
             patch(

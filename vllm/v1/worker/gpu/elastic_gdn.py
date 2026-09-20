@@ -416,7 +416,7 @@ class ElasticKVController:
         requested = (external_memory_bytes + quantum - 1) // quantum * quantum
         current = (self._external_memory_bytes + quantum - 1) // quantum * quantum
 
-        local_free, local_total = torch.accelerator.memory.mem_get_info(self.device)
+        local_free, local_total = torch.accelerator.get_memory_info(self.device)
         if not 0 <= local_free <= local_total:
             raise RuntimeError(
                 "CUDA free-memory oracle returned an invalid local value: "
