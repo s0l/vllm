@@ -1049,6 +1049,35 @@ def test_throttle_defers_inflight_prefill_chunk():
     assert "chk0" in output.num_scheduled_tokens
 
 
+def test_full_isl_reservation_keeps_hybrid_pool_type_and_branch_contract():
+    scheduler = object.__new__(Scheduler)
+    current = Mock(spec=Request)
+    other = Mock(spec=Request)
+    scheduler._inflight_prefills = [current, other]
+    scheduler._request_remaining_blocks = lambda request: (
+        KVCacheBlockPoolRequirements(primary=3, mamba=1)
+        if request is current
+        else KVCacheBlockPoolRequirements(primary=5, mamba=2)
+    )
+    scheduler._spec_decode_step_blocks = lambda: 1
+
+    ordinary = Scheduler._full_isl_reserved_blocks(
+        scheduler, request=current, load_kv_async=False
+    )
+    asynchronous = Scheduler._full_isl_reserved_blocks(
+        scheduler, request=current, load_kv_async=True
+    )
+
+    assert ordinary == KVCacheBlockPoolRequirements(primary=5, mamba=2)
+    assert asynchronous == KVCacheBlockPoolRequirements(primary=9, mamba=3)
+
+    scheduler._inflight_prefills = []
+    empty = Scheduler._full_isl_reserved_blocks(
+        scheduler, request=current, load_kv_async=False
+    )
+    assert empty == KVCacheBlockPoolRequirements()
+
+
 def test_throttle_capacity_bound_guard_admits():
     """Saturation guard: if a cadence-aligned release step cannot drain the
     waiting prefill queue (it ran out of token budget), the throttle backs off on

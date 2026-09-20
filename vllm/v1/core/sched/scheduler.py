@@ -4472,22 +4472,9 @@ class Scheduler(SchedulerInterface):
 
                 reserved_blocks: int | KVCacheBlockPoolRequirements = 0
                 if self.scheduler_reserve_full_isl or load_kv_async:
-                    # An async load holds its blocks for the whole transfer with
-                    # no forward progress and isn't preemptible here. Admit it
-                    # only if it fits in (free - other in-flight reservations)
-                    # plus its own spec decode step blocks, to avoid deadlock and
-                    # predictable preemptions.
-                    reserved_blocks = (
-                        self._inflight_prefill_reserved_blocks()
-                        + self._spec_decode_step_blocks()
-                    )
-                    # no forward progress and isn't preemptible here. Ordinary
-                    # chunked prefills also need their unallocated full-ISL tail
-                    # protected: otherwise two requests can both pass the same
-                    # point-in-time admission check, become RUNNING, and then
-                    # serialize invisibly when their combined tails do not fit.
-                    reserved_blocks = self._inflight_prefill_reserved_blocks(
-                        exclude=request
+                    reserved_blocks = self._full_isl_reserved_blocks(
+                        request=request,
+                        load_kv_async=load_kv_async,
                     )
 
                 if (
@@ -11095,6 +11082,26 @@ class Scheduler(SchedulerInterface):
             if request is exclude:
                 continue
             reserved += self._request_remaining_blocks(request)
+        return reserved
+
+    def _full_isl_reserved_blocks(
+        self, *, request: Request, load_kv_async: bool
+    ) -> KVCacheBlockPoolRequirements:
+        """Return typed reservations that must remain free for admission.
+
+        An asynchronous KV load makes no forward progress while holding its
+        allocation, so it preserves every existing in-flight prefill tail plus
+        the current request's speculative attention slots. Ordinary chunked
+        prefill excludes the current request because ``allocate_slots`` prices
+        its own full sequence separately.
+        """
+        reserved = self._inflight_prefill_reserved_blocks(
+            exclude=None if load_kv_async else request
+        )
+        if load_kv_async:
+            reserved += KVCacheBlockPoolRequirements(
+                primary=self._spec_decode_step_blocks()
+            )
         return reserved
 
     def _mark_prefix_replay(self, request: Request, num_hit_tokens: int) -> int:
