@@ -73,6 +73,7 @@ def test_flashinfer_gqa_dcp_spec_decode_clamps_reorder_threshold(monkeypatch):
     assert (
         builder.flashinfer_trtllm_api_decode_kernel == FlashInferDecodeKernel.TRTLLM_GEN
     )
+    assert not builder.use_xqa
     assert builder.reorder_batch_threshold == 1
 
 

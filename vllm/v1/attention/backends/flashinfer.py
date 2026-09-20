@@ -5142,7 +5142,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             generic_split = split_decodes_and_prefills(
                 common_attn_metadata,
                 decode_threshold=self.reorder_batch_threshold,
-                require_uniform=not self.use_dedicated_xqa,
+                require_uniform=not self.use_xqa,
             )
         else:
             generic_split = (0, num_reqs, 0, num_actual_tokens)
