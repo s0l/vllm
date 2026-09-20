@@ -1617,6 +1617,27 @@ class KVCacheConfig:
         )
 
     @property
+    def mamba_cache_request_capacity(self) -> int:
+        """Maximum decode requests addressable by the Mamba block pool."""
+        mamba_specs = [
+            group.kv_cache_spec
+            for group in self.kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        ]
+        separate_specs = [spec for spec in mamba_specs if spec.separate_pool]
+        if not separate_specs:
+            return self.num_blocks
+        if len(separate_specs) != len(mamba_specs):
+            raise ValueError("Mamba groups cannot mix shared and separate pools")
+        pool_sizes = {spec.separate_pool_num_blocks for spec in separate_specs}
+        if len(pool_sizes) != 1:
+            raise ValueError("Separate Mamba groups must share one pool capacity")
+        blocks_per_request = sum(
+            1 + spec.num_speculative_blocks for spec in separate_specs
+        )
+        return max((pool_sizes.pop() - 1) // blocks_per_request, 0)
+
+    @property
     def has_mixed_precision_kv_cache(self) -> bool:
         """Whether device attention caches use more than one precision."""
         kv_cache_precisions: set[tuple[torch.dtype, KVQuantMode]] = set()

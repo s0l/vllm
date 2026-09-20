@@ -18,11 +18,20 @@ from vllm.v1.worker.gpu.model_runner import (
     _elastic_new_request_prompt_len,
     _prepare_elastic_local_staging_with_consensus,
     _stage_elastic_mm_inputs_with_consensus,
+    _uses_elastic_graph_lifecycle,
     _validate_elastic_materialized_input_batch,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_static_cudagraph_manager_does_not_enter_elastic_lifecycle():
+    assert not _uses_elastic_graph_lifecycle(None)
+    assert not _uses_elastic_graph_lifecycle(
+        SimpleNamespace(defer_startup_graphs=False)
+    )
+    assert _uses_elastic_graph_lifecycle(SimpleNamespace(defer_startup_graphs=True))
 
 
 def test_complete_phase_sequence_is_checked_before_model_forward():

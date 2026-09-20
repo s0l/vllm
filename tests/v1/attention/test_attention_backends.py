@@ -117,6 +117,67 @@ def test_flashinfer_dcp_paged_metadata_uses_local_context_lengths():
     assert num_blocks_np.tolist() == [2_014]
 
 
+@pytest.mark.parametrize("dcp_rank", [0, 1, 2])
+def test_flashinfer_dcp_first_prefill_has_no_paged_context(dcp_rank: int):
+    from vllm.v1.attention.backends.flashinfer import (
+        _flashinfer_seq_lens_and_blocks_for_paged_kv,
+    )
+
+    # Exact saved Exp27 stimulus: the first 1513-token prefill has no cached
+    # context.  Its query is consumed by the ragged new-token phase, so the
+    # paged context must remain empty on every DCP rank.
+    seq_lens_cpu = torch.tensor([1513], dtype=torch.int32)
+    qo_indptr_cpu = torch.tensor([0, 1513], dtype=torch.int32)
+
+    local_seq_lens, seq_lens_np, num_blocks_np = (
+        _flashinfer_seq_lens_and_blocks_for_paged_kv(
+            seq_lens_cpu,
+            qo_indptr_cpu,
+            num_decodes=0,
+            num_prefills=1,
+            page_size=64,
+            use_dcp=True,
+            dcp_world_size=3,
+            dcp_rank=dcp_rank,
+            dcp_kv_cache_interleave_size=1,
+        )
+    )
+
+    assert local_seq_lens.tolist() == [0]
+    assert seq_lens_np.tolist() == [0]
+    assert num_blocks_np.tolist() == [0]
+
+
+@pytest.mark.parametrize(
+    ("dcp_rank", "expected_decode_context"), [(0, 34), (1, 33), (2, 33)]
+)
+def test_flashinfer_dcp_mixed_batch_localizes_global_lengths_once(
+    dcp_rank: int, expected_decode_context: int
+):
+    from vllm.v1.attention.backends.flashinfer import (
+        _flashinfer_seq_lens_and_blocks_for_paged_kv,
+    )
+
+    local_seq_lens, seq_lens_np, num_blocks_np = (
+        _flashinfer_seq_lens_and_blocks_for_paged_kv(
+            torch.tensor([100, 1513], dtype=torch.int32),
+            torch.tensor([0, 1, 1514], dtype=torch.int32),
+            num_decodes=1,
+            num_prefills=1,
+            page_size=64,
+            use_dcp=True,
+            dcp_world_size=3,
+            dcp_rank=dcp_rank,
+            dcp_kv_cache_interleave_size=1,
+        )
+    )
+
+    expected = [expected_decode_context, 0]
+    assert local_seq_lens.tolist() == expected
+    assert seq_lens_np.tolist() == expected
+    assert num_blocks_np.tolist() == [1, 0]
+
+
 # Define common batch configurations
 BATCH_SPECS = {
     "small_decode": BatchSpec(seq_lens=[32, 40], query_lens=[1, 1]),

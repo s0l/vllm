@@ -777,7 +777,11 @@ def test_late_piecewise_restrictions_without_compilation(monkeypatch, engine_kwa
 def test_resolve_cudagraph_mode_skips_mamba_block_check_while_profiling():
     """Cudagraph memory profiling uses a minimal KV cache, so the Mamba
     block-count guard must only fire for the real cache sizing."""
-    kv_cache_config = SimpleNamespace(has_mamba_layers=True, num_blocks=4)
+    kv_cache_config = SimpleNamespace(
+        has_mamba_layers=True,
+        num_blocks=4,
+        mamba_cache_request_capacity=4,
+    )
 
     compilation_config = CompilationConfig(
         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
@@ -807,6 +811,35 @@ def test_resolve_cudagraph_mode_skips_mamba_block_check_while_profiling():
         is_profiling=True,
     )
     assert cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+
+
+def test_resolve_cudagraph_mode_uses_separate_mamba_pool_capacity():
+    """A separate GDN pool is independent of the attention block count."""
+    kv_cache_config = SimpleNamespace(
+        has_mamba_layers=True,
+        num_blocks=29,
+        mamba_cache_request_capacity=32,
+    )
+    compilation_config = CompilationConfig(
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+    )
+    assert (
+        compilation_config.resolve_cudagraph_mode_and_sizes(
+            AttentionCGSupport.ALWAYS,
+            "FakeAttentionBackend",
+            kv_cache_config=kv_cache_config,
+            max_num_reqs=32,
+        )
+        == CUDAGraphMode.FULL_AND_PIECEWISE
+    )
+
+    with pytest.raises(ValueError, match="request slots \\(32\\)"):
+        compilation_config.resolve_cudagraph_mode_and_sizes(
+            AttentionCGSupport.ALWAYS,
+            "FakeAttentionBackend",
+            kv_cache_config=kv_cache_config,
+            max_num_reqs=33,
+        )
 
 
 @pytest.mark.parametrize(

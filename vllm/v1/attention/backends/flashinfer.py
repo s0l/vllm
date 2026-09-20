@@ -5387,43 +5387,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         else:
             seq_lens_cpu = None
 
-        # Adjust seq_lens_cpu for DCP
-        if self.use_dcp and not use_dcp_pseudo_decode:
-            assert seq_lens_cpu is not None
-            if num_prefills > 0:
-                # Other attention groups may reuse the same common metadata.
-                seq_lens_cpu = seq_lens_cpu.clone()
-                qo_indptr_prefill_cpu = (
-                    qo_indptr_cpu[num_decodes:] - qo_indptr_cpu[num_decodes]
-                )
-                query_lens_prefill_cpu = (
-                    qo_indptr_prefill_cpu[1:] - qo_indptr_prefill_cpu[:-1]
-                )
-                seq_lens_cpu[num_decodes:] = (
-                    seq_lens_cpu[num_decodes:] - query_lens_prefill_cpu
-                )
-
-            seq_lens_cpu = get_dcp_local_seq_lens(
-                seq_lens_cpu,
-                self.dcp_world_size,
-                self.dcp_rank,
-                self.dcp_kv_cache_interleave_size,
-            )
-
-        # Pseudo-decode has already expanded every verification token into a
-        # causal row and localized its inclusive KV length in
-        # _prepare_dcp_pseudo_decode().  Applying the request-shaped DCP
-        # prefill transform above would mix num_reqs rows with num_tokens rows.
-
-        # Native paged attention consumes rank-local lengths (context only
-        # for DCP prefills), so derive its page counts after the conversion.
-        if seq_lens_cpu is not None:
-            seq_lens_np = seq_lens_cpu.numpy()
-            num_blocks_np = (seq_lens_np + (page_size - 1)) // page_size
-        else:
-            seq_lens_np = None
-            num_blocks_np = None
-
+        # Pseudo-decode already owns its row expansion and DCP localization.
+        # Every ordinary path is transformed exactly once by
+        # _flashinfer_seq_lens_and_blocks_for_paged_kv below.  In particular,
+        # do not subtract the prefill query or localize here first: the helper
+        # consumes global sequence lengths and performs both operations.
         if use_dcp_pseudo_decode:
             assert pseudo_seq_lens_cpu is not None
             seq_lens_cpu = pseudo_seq_lens_cpu

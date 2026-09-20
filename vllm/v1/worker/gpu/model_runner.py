@@ -461,6 +461,15 @@ def _release_idle_graph_cache(scheduler_output: SchedulerOutput) -> bool:
     return not (plan is not None and plan.kind == ElasticPlanKind.MAINTENANCE)
 
 
+def _uses_elastic_graph_lifecycle(
+    cudagraph_manager: ModelCudaGraphManager | None,
+) -> bool:
+    """Return whether this manager is owned by elastic on-demand capture."""
+    return bool(
+        cudagraph_manager is not None and cudagraph_manager.defer_startup_graphs
+    )
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def _full_graph_replay_context(
         self,
@@ -3048,9 +3057,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             not dummy_run
             and not is_profile
             and not is_synthetic_warmup
-            and self.cudagraph_manager is not None
+            and _uses_elastic_graph_lifecycle(self.cudagraph_manager)
             and not scheduler_output.elastic_preserve_graph_residency
         ):
+            assert self.cudagraph_manager is not None
             working_set = self._dynamic_graph_working_set()
             early_num_reqs = 0
             early_num_toks = 0
