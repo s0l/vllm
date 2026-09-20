@@ -81,7 +81,6 @@ from vllm.v1.core.elastic_graph import (
 )
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
     KVCacheConfig,
     MambaSpec,
     UniformTypeKVCacheSpecs,
@@ -1099,7 +1098,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
             )
             slot_mapping_enabled.append(layer_spec.uses_slot_mapping)
-            slot_mapping_enabled.append(not isinstance(layer_spec, CircularBufferSpec))
             cp_replicated.append(getattr(layer_spec, "dcp_replicated", False))
             # Let each cache type account for CP. Attention KV is DCP-sharded,
             # while Mamba/GDN recurrent state is replicated across DCP ranks.
@@ -1334,24 +1332,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # to its own attention support.
             self.speculator.init_cudagraph_manager(cudagraph_mode)
 
-        # Capture warmup providers that depend on allocated KV-cache strides.
-        with self.jit_warmup_registry.activate():
-            kv_caches_dict = init_kv_cache(
-                self.compilation_config.static_forward_context,
-                self.kv_cache_config,
-                self.device,
-                self.kernel_block_sizes,
-                self.vllm_config,
-                kv_cache_allocation_context=kv_cache_allocation_context,
-                block_tables=self.block_tables,
-            )
-        self.kv_caches = [
-            cache for cache in kv_caches_dict.values() if cache.device == self.device
-        ]
-        if is_profiling:
-            self.kv_connector = NO_OP_KV_CONNECTOR
-        else:
-            self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
         # Profiling left equivalent block-table/input owners alive, and final
         # initialization may replace them. Drop superseded cached blocks before
         # the large KV backings are allocated so allocator history is not part
@@ -1364,19 +1344,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             torch.accelerator.get_memory_info()[0] / (1 << 20),
         )
 
-        self.kv_caches: list[torch.Tensor] = []
-        kv_caches_dict = init_kv_cache(
-            self.kv_caches,
-            self.compilation_config.static_forward_context,
-            self.kv_cache_config,
-            self.attn_groups,
-            self.device,
-            self.cache_config.cache_dtype,
-            self.kernel_block_sizes,
-            self.vllm_config,
-            self.elastic_kv_controller.backings,
-            self.elastic_kv_controller.geometry,
-        )
+        # Capture warmup providers that depend on allocated KV-cache strides.
+        with self.jit_warmup_registry.activate():
+            kv_caches_dict = init_kv_cache(
+                self.compilation_config.static_forward_context,
+                self.kv_cache_config,
+                self.device,
+                self.kernel_block_sizes,
+                self.vllm_config,
+                elastic_backings=self.elastic_kv_controller.backings,
+                elastic_geometry=self.elastic_kv_controller.geometry,
+                kv_cache_allocation_context=kv_cache_allocation_context,
+                block_tables=self.block_tables,
+            )
+        self.kv_caches = [
+            cache for cache in kv_caches_dict.values() if cache.device == self.device
+        ]
         self.kv_caches_for_block_copy = get_kv_caches_for_block_copy(
             self.kv_caches,
             kv_caches_dict,
@@ -1416,7 +1399,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             for group in self.kv_cache_config.kv_cache_groups
         ):
             self.gdn_checkpoint_manager = V2GDNCheckpointManager()
-        self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+        self.kv_connector = (
+            NO_OP_KV_CONNECTOR
+            if is_profiling
+            else get_kv_connector(self.vllm_config, kv_caches_dict)
+        )
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -1826,11 +1813,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
                 assert self.sampler is not None
                 self.sampler.add_request(req_index, new_req_data.sampling_params)
-                self.sampler.add_request(
-                    req_index,
-                    prompt_len,
-                    new_req_data.sampling_params,
-                )
                 assert self.prompt_logprobs_worker is not None
                 self.prompt_logprobs_worker.add_request(
                     req_id, req_index, new_req_data.sampling_params
@@ -3815,7 +3797,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     ) from state_application_error
                 with record_function_or_nullcontext("ag2.target_prepare_inputs"):
                     input_batch = self.prepare_inputs(
-                        scheduler_output, batch_req_state, batch_desc
+                        scheduler_output,
+                        batch_req_state,
+                        batch_desc,
+                        num_active_loras,
                     )
                 if elastic_plan is not None:
                     assert elastic_plan.execution_manifest is not None
@@ -4039,7 +4024,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.cp_interleave,
                 num_reqs_padded=input_batch.num_reqs_after_padding,
             )
-        ubatch_state: UBatchState | None = None
         if dummy_run:
             attn_metadata = None
             slot_mappings_by_layer = None

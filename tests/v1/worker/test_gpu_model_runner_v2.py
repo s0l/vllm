@@ -112,6 +112,10 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
     runner.speculator = None
     runner.req_states = []
     runner.input_buffers = SimpleNamespace(query_start_loc=None)
+    runner._prepared_attn_groups = None
+    runner._prepared_attn_config_signature = None
+    runner._prepared_kernel_block_sizes = None
+    runner.jit_warmup_registry = SimpleNamespace(activate=contextlib.nullcontext)
     runner.vocab_size = 1
     runner.max_num_reqs = 1
     runner.max_num_tokens = 2
@@ -152,7 +156,7 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
     monkeypatch.setattr(
         model_runner_module,
         "init_attn_backend",
-        lambda *args: ([], attn_cg_support, [8, 262144]),
+        lambda *args, **kwargs: ([], attn_cg_support, [8, 262144]),
     )
     monkeypatch.setattr(
         model_runner_module,
@@ -176,6 +180,7 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
 
     assert captured["max_num_blocks_per_group"] == [1, 1]
     assert captured["slot_mapping_enabled"] == [False, True]
+    assert captured["cp_replicated"] == [False, False]
 
 
 @pytest.mark.parametrize(

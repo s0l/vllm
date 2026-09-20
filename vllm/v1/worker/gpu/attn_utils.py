@@ -38,7 +38,6 @@ from vllm.v1.worker.ubatch_utils import get_num_ubatches
 from vllm.v1.worker.utils import (
     AttentionGroup,
     add_kv_sharing_layers_to_kv_cache_groups,
-    allocate_kv_cache,
     bind_kv_cache_to_layers,
     prepare_kernel_block_sizes,
 )
@@ -553,9 +552,7 @@ def _allocate_kv_cache(
 def init_kv_cache(
     forward_context: dict[str, Any],
     kv_cache_config: KVCacheConfig,
-    attn_groups: list[list[AttentionGroup]],
     device: torch.device,
-    cache_dtype: str,
     kernel_block_sizes: list[int],
     vllm_config: VllmConfig,
     elastic_backings: dict[str, Any] | None = None,
@@ -578,23 +575,15 @@ def init_kv_cache(
                 block_tables,
             )
         else:
-            kv_caches = allocate_kv_cache(
+            kv_caches = _allocate_kv_cache(
                 kv_cache_config,
+                shared_kv_cache_layers,
                 device,
                 vllm_config.cache_config.get_resolved_kv_cache_layout(),
                 kernel_block_sizes,
+                elastic_backings,
+                elastic_geometry,
             )
-    for layer_name, target in get_shared_kv_cache_layers(vllm_config).items():
-        kv_caches[layer_name] = kv_caches[target]
-        kv_caches = _allocate_kv_cache(
-            kv_cache_config,
-            shared_kv_cache_layers,
-            device,
-            vllm_config.cache_config.get_resolved_kv_cache_layout(),
-            kernel_block_sizes,
-            elastic_backings,
-            elastic_geometry,
-        )
     for layer_name, target_layer_name in shared_kv_cache_layers.items():
         kv_caches[layer_name] = kv_caches[target_layer_name]
     # Dual-attention models (e.g. LongCat-Flash) put two Attention modules per
