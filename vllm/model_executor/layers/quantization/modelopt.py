@@ -2740,9 +2740,25 @@ class KFp8StaticTensor(QuantKeyScheme):
             weight = layer.weight
             max_w_scale = layer.weight_scale.max()
             if not (layer.weight_scale == layer.weight_scale[0]).all():
-                max_w_scale, weight = requantize_with_max_scale(
-                    layer.weight, layer.weight_scale, layer.logical_widths
+                if len(layer.logical_widths) != layer.weight_scale.numel():
+                    raise ValueError(
+                        "Fused ModelOpt FP8 widths/scales disagree: "
+                        f"{len(layer.logical_widths)} != {layer.weight_scale.numel()}"
+                    )
+                layer._modelopt_fp8_fused_scale_preserved = True
+                layer.weight_scale = Parameter(
+                    torch.cat(
+                        [
+                            scale.expand(width)
+                            for scale, width in zip(
+                                layer.weight_scale, layer.logical_widths
+                            )
+                        ]
+                    ).contiguous(),
+                    requires_grad=False,
                 )
+            else:
+                layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
             # Transposed here rather than in the kernel: ModelOpt maps each
             # fp8 key to exactly one kernel, so the layout is key-determined.
             layer.weight = Parameter(weight.t(), requires_grad=False)
@@ -2750,7 +2766,6 @@ class KFp8StaticTensor(QuantKeyScheme):
             # restore them for the transposed layout, which Humming reads.
             layer.weight.input_dim = 0
             layer.weight.output_dim = 1
-            layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
         elif role is ACT:
             if torch.unique(layer.input_scale).numel() != 1:
                 logger.warning_once(
@@ -3226,6 +3241,14 @@ class ModelOptLinearMethod(LinearMethodBase):
             self.akey.process(layer, ACT)
         maybe_fuse_global_scales(layer)
         self.fmt.post_process(layer)
+        if getattr(layer, "_modelopt_fp8_fused_scale_preserved", False):
+            from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
+                FusedPerTensorScaleTorchFP8ScaledMMLinearKernel,
+            )
+
+            self.kernel = FusedPerTensorScaleTorchFP8ScaledMMLinearKernel(
+                self.kernel.config, self.kernel.layer_param_names
+            )
         layer.is_w4a16_nvfp4 = (
             self.spec.weight == kNvfp4Static and self.spec.activation is None
         )

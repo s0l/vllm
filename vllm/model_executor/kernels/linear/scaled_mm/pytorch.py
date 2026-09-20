@@ -125,6 +125,64 @@ class PerTensorTorchFP8ScaledMMLinearKernel(TorchFP8ScaledMMLinearKernel):
         return torch.narrow(output, 0, 0, num_tokens).view(*output_shape)
 
 
+class FusedPerTensorScaleTorchFP8ScaledMMLinearKernel(TorchFP8ScaledMMLinearKernel):
+    """One FP8 GEMM for fused projections with distinct per-shard scales.
+
+    ModelOpt exports a scalar weight scale for each unfused projection.  A
+    fused vLLM layer must preserve those values: requantizing every shard to
+    the largest scale discards checkpoint precision.  CUDA ``_scaled_mm`` can
+    consume the equivalent per-output-channel scale vector in the GEMM.
+    """
+
+    @classmethod
+    def can_implement(cls, c: FP8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
+        per_tensor_activation_scales = (
+            c.activation_quant_key.scale.group_shape.is_per_tensor()
+        )
+        per_tensor_weight_scales = c.weight_quant_key.scale.group_shape.is_per_tensor()
+        if not (per_tensor_activation_scales and per_tensor_weight_scales):
+            return False, "requires per-tensor source activation and weight scales."
+        return True, None
+
+    def get_output_padding(self) -> int | None:
+        return None
+
+    def input_quant_key(self) -> QuantKey | None:
+        if self.config.activation_quant_key == kFp8StaticTensorSym:
+            return kFp8StaticTensorSym
+        return None
+
+    def apply_scaled_mm(
+        self,
+        *,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        out_dtype: torch.dtype,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+        bias: torch.Tensor | None,
+        output_shape: list,
+    ) -> torch.Tensor:
+        if Bs.numel() != B.shape[1]:
+            raise ValueError(
+                "Fused ModelOpt FP8 scale count must equal output width: "
+                f"{Bs.numel()} != {B.shape[1]}"
+            )
+        # CUDA row-wise scaled-MM requires (M, 1) x (1, N), even though the
+        # activation scale is constant for every row in this checkpoint.
+        scale_a = torch.ones_like(A[:, :1], dtype=torch.float32) * As.reshape(1, 1)
+        output = torch._scaled_mm(
+            A,
+            B,
+            out_dtype=out_dtype,
+            scale_a=scale_a,
+            scale_b=Bs.view(1, -1),
+            bias=bias,
+        )
+        num_tokens = _get_num_tokens(output_shape)
+        return torch.narrow(output, 0, 0, num_tokens).view(*output_shape)
+
+
 class RowWiseTorchFP8ScaledMMLinearKernel(TorchFP8ScaledMMLinearKernel):
     @classmethod
     def is_supported(

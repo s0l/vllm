@@ -115,6 +115,59 @@ def _mixed_precision_config(quantized_layers: dict) -> ModelOptMixedPrecisionCon
     )
 
 
+def _fp8_fused_layer(widths, scales):
+    layer = torch.nn.Module()
+    layer.logical_widths = widths
+    values = torch.arange(sum(widths) * 4, dtype=torch.float32).reshape(sum(widths), 4)
+    layer.weight = torch.nn.Parameter(
+        values.to(torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale = torch.nn.Parameter(
+        torch.tensor(scales, dtype=torch.float32), requires_grad=False
+    )
+    return layer
+
+
+def test_modelopt_fp8_fused_scales_preserve_checkpoint_weights():
+    from vllm.model_executor.layers.quantization import modelopt
+
+    layer = _fp8_fused_layer([2, 3], [0.25, 0.5])
+    original = layer.weight.detach().clone()
+
+    modelopt.KFp8StaticTensor().process(layer, modelopt.WEIGHT)
+
+    assert layer._modelopt_fp8_fused_scale_preserved is True
+    torch.testing.assert_close(layer.weight, original.t(), rtol=0, atol=0)
+    torch.testing.assert_close(
+        layer.weight_scale,
+        torch.tensor([0.25, 0.25, 0.5, 0.5, 0.5]),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_modelopt_fp8_equal_fused_scales_keep_scalar_contract():
+    from vllm.model_executor.layers.quantization import modelopt
+
+    layer = _fp8_fused_layer([2, 3], [0.25, 0.25])
+
+    modelopt.KFp8StaticTensor().process(layer, modelopt.WEIGHT)
+
+    assert not hasattr(layer, "_modelopt_fp8_fused_scale_preserved")
+    assert layer.weight_scale.shape == torch.Size([])
+    assert layer.weight_scale.item() == 0.25
+
+
+def test_modelopt_fp8_fused_scale_width_mismatch_fails_closed():
+    from vllm.model_executor.layers.quantization import modelopt
+
+    layer = _fp8_fused_layer([2, 3], [0.25, 0.5])
+    layer.logical_widths = [5]
+
+    with pytest.raises(ValueError, match="widths/scales disagree"):
+        modelopt.KFp8StaticTensor().process(layer, modelopt.WEIGHT)
+
+
 def test_modelopt_nvfp4_quantizes_parallel_lm_head():
     config = ModelOptNvFp4Config(
         is_checkpoint_nvfp4_serialized=True,
