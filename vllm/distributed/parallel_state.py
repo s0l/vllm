@@ -2598,7 +2598,10 @@ def get_pcp_group() -> GroupCoordinator:
 
 
 @contextmanager
-def graph_capture(device: torch.device):
+def graph_capture(
+    device: torch.device,
+    graph_capture_context: GraphCaptureContext | None = None,
+):
     """`graph_capture` is a context manager which should surround the code that
     is capturing the CUDA graph. Its main purpose is to ensure that some
     operations will be run after the graph is captured, before the graph
@@ -2611,7 +2614,9 @@ def graph_capture(device: torch.device):
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    context = GraphCaptureContext(torch.cuda.Stream(device=device))
+    context = graph_capture_context or GraphCaptureContext(
+        torch.cuda.Stream(device=device)
+    )
     with (
         get_tp_group().graph_capture(context),
         get_pp_group().graph_capture(context),
