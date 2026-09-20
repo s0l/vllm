@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import cast
 
 import numpy as np
 import torch
@@ -61,7 +62,7 @@ def main() -> None:
         torch.tensor([0, 3, 6], dtype=torch.int32),
         source,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert blocks.shape == (6, 74)
     assert seq_lens_cpu.tolist() == [14, 15, 15, 1184, 1184, 1185]
     assert torch.equal(blocks[0], source[0])
@@ -76,7 +77,7 @@ def main() -> None:
         torch.tensor([0, 3], dtype=torch.int32),
         source[:1],
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert blocks_replay.shape == (3, 74)
     assert seq_lens_replay.tolist() == [1185, 1185, 1185]
     assert builder._dcp_pseudo_decode_block_tables.data_ptr() == block_ptr
@@ -137,7 +138,7 @@ def main() -> None:
     builder.q_data_type_decode = torch.bfloat16
     builder.has_sinks = False
     builder.use_trtllm_decode_attention = False
-    builder.use_dedicated_xqa = False
+    builder.use_xqa = False
     builder.global_hyperparameters = SimpleNamespace(
         has_same_window_lefts=True,
         has_same_all_params=True,
@@ -186,7 +187,7 @@ def main() -> None:
         _seq_lens_cpu=torch.tensor([44, 3553], dtype=torch.int32),
     )
     metadata = builder.build(0, common)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert metadata.num_decodes == 0
     assert metadata.num_decode_tokens == 0
     assert metadata.num_prefills == 6
@@ -203,13 +204,46 @@ def main() -> None:
         1,
     ]
     assert builder.paged_kv_indices.gpu[:7].tolist() == [0, 0, 0, 74, 74, 74, 75]
-    assert planned["qo_indptr_cpu"].tolist() == list(range(7))
+    assert cast(torch.Tensor, planned["qo_indptr_cpu"]).tolist() == list(range(7))
     assert planned["num_qo_heads"] == 24
     assert planned["dcp_world_size"] == 3
     assert planned["q_data_type"] == torch.bfloat16
     assert planned["kv_cache_dtype"] == torch.float8_e4m3fn
 
+    # The production K3 warmup carries four target-verification tokens per
+    # request.  Its 14 request rows must expand to 56 pseudo rows without
+    # entering the ordinary request-shaped DCP prefill length transform.
+    builder._dcp_pseudo_decode_query_len = 4
+    k3_source = torch.arange(
+        14 * 74,
+        dtype=torch.int32,
+        device=device,
+    ).reshape(14, 74)
+    k3_query_start = torch.arange(0, 57, 4, dtype=torch.int32)
+    k3_seq_lens_cpu = torch.arange(40, 54, dtype=torch.int32)
+    k3_common = CommonAttentionMetadata(
+        query_start_loc=k3_query_start.to(device),
+        query_start_loc_cpu=k3_query_start,
+        seq_lens=k3_seq_lens_cpu.to(device),
+        num_reqs=14,
+        num_actual_tokens=56,
+        max_query_len=4,
+        max_seq_len=53,
+        block_table_tensor=k3_source,
+        slot_mapping=torch.arange(56, dtype=torch.int64, device=device),
+        causal=True,
+        is_prefilling=np.zeros(14, dtype=np.bool_),
+        _seq_lens_cpu=k3_seq_lens_cpu,
+    )
+    k3_metadata = builder.build(0, k3_common)
+    torch.accelerator.synchronize()
+    assert k3_metadata.num_decodes == 0
+    assert k3_metadata.num_prefills == 56
+    assert k3_metadata.num_prefill_tokens == 56
+    assert cast(torch.Tensor, planned["qo_indptr_cpu"]).tolist() == list(range(57))
+
     # Configured max_num_seqs=64 with K=2 expands to exactly 192 rows.
+    builder._dcp_pseudo_decode_query_len = 3
     max_source = torch.arange(
         64 * 74,
         dtype=torch.int32,
@@ -220,7 +254,7 @@ def main() -> None:
         torch.arange(0, 193, 3, dtype=torch.int32),
         max_source,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert max_blocks.shape == (192, 74)
     assert max_seq_lens.shape == (192,)
     assert torch.equal(max_blocks[189], max_source[63])

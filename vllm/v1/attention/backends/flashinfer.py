@@ -5388,7 +5388,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             seq_lens_cpu = None
 
         # Adjust seq_lens_cpu for DCP
-        if self.use_dcp:
+        if self.use_dcp and not use_dcp_pseudo_decode:
             assert seq_lens_cpu is not None
             if num_prefills > 0:
                 # Other attention groups may reuse the same common metadata.
@@ -5409,6 +5409,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 self.dcp_rank,
                 self.dcp_kv_cache_interleave_size,
             )
+
+        # Pseudo-decode has already expanded every verification token into a
+        # causal row and localized its inclusive KV length in
+        # _prepare_dcp_pseudo_decode().  Applying the request-shaped DCP
+        # prefill transform above would mix num_reqs rows with num_tokens rows.
 
         # Native paged attention consumes rank-local lengths (context only
         # for DCP prefills), so derive its page counts after the conversion.
