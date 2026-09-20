@@ -2291,8 +2291,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # arrived for it.
         if (
             grammar_output is not None
-            and logits.shape[0] > 0
             and not use_sparse_target_topk
+            and logits.shape[0] > 0
         ):
             # Apply grammar bitmask to the logits in-place.
             assert self.structured_outputs_worker is not None

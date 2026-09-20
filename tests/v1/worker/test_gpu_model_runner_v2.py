@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 
 def test_mtp_spec_hidden_states_preserves_fallback_without_target_override():
@@ -39,6 +40,53 @@ def test_mtp_spec_hidden_states_uses_bounded_target_override():
     resolved = runner._mtp_spec_hidden_states(fallback, active_tokens=2)
 
     torch.testing.assert_close(resolved, target[:2])
+
+
+def test_sparse_target_with_grammar_does_not_require_full_logits():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.batch_sharder = None
+    runner.target_boundary_capture = None
+    runner.speculator = SimpleNamespace(draft_logits=None)
+    local_logits = torch.arange(16, dtype=torch.float32).reshape(2, 8)
+    runner.model = SimpleNamespace(
+        compute_local_logits=lambda hidden: (local_logits, 0),
+    )
+    sampler_output = SamplerOutput(
+        sampled_token_ids=torch.zeros((2, 1), dtype=torch.int64),
+        logprobs_tensors=None,
+        num_nans=None,
+        num_sampled=torch.ones(2, dtype=torch.int32),
+        num_rejected=torch.zeros(2, dtype=torch.int32),
+    )
+    runner.rejection_sampler = SimpleNamespace(
+        can_use_sparse_target_topk=lambda batch: True,
+        sample_sparse_target_topk=lambda *args: sampler_output,
+    )
+    grammar_calls = []
+    runner.structured_outputs_worker = SimpleNamespace(
+        apply_grammar_bitmask=lambda *args, **kwargs: grammar_calls.append(
+            (args, kwargs)
+        )
+    )
+    input_batch = SimpleNamespace(
+        logits_indices=torch.tensor([0, 1]),
+        num_draft_tokens=6,
+    )
+    grammar_output = SimpleNamespace(
+        structured_output_request_ids=["req-0", "req-1"],
+        grammar_bitmask=object(),
+    )
+
+    result, num_sampled, num_rejected = runner.sample(
+        torch.ones((2, 4)), input_batch, grammar_output
+    )
+
+    assert result is sampler_output
+    assert num_sampled is sampler_output.num_sampled
+    assert num_rejected is sampler_output.num_rejected
+    assert len(grammar_calls) == 1
+    assert grammar_calls[0][0][0] is local_logits
+    assert grammar_calls[0][1] == {"vocab_start": 0}
 
 
 @pytest.mark.parametrize(
