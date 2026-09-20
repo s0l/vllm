@@ -219,10 +219,10 @@ def _nvfp4_marlin_request_isolated_impl(
     output_offset = 0
     for section in sections:
         next_offset = output_offset + section.shape[0]
-        # marlin_gemm already supports a caller-owned ``c`` tensor.  Write
-        # every request directly into its rows of the one full destination;
-        # retaining a separate section output here consumes exactly the HBM
-        # headroom that large GDN prefills need immediately afterwards.
+        # Fresh upstream exposes marlin_gemm as a functional operator.  The
+        # compatibility helper copies each result into this caller-owned
+        # slice.  Production whole-slice prefill does not enter this optional
+        # request-isolation path.
         apply_fp4_marlin_linear(
             input=section,
             weight=weight,

@@ -209,9 +209,8 @@ def apply_fp4_marlin_linear(
 
         inputs, a_scales = marlin_quant_input(inputs, torch.float8_e4m3fn)
 
-    output = torch.ops.vllm.marlin_gemm(
+    result = torch.ops.vllm.marlin_gemm(
         a=inputs,
-        c=output,
         b_q_weight=weight,
         b_bias=bias,
         b_scales=weight_scale,
@@ -227,8 +226,12 @@ def apply_fp4_marlin_linear(
         use_fp32_reduce=use_fp32_reduce,
     )
 
-    output = marlin_unpad_output(output, size_n, padded_n)
-    return output.reshape(out_shape)
+    if output is not None:
+        output.copy_(result)
+        result = output
+
+    result = marlin_unpad_output(result, size_n, padded_n)
+    return result.reshape(out_shape)
 
 
 def prepare_fp4_layer_for_marlin(
