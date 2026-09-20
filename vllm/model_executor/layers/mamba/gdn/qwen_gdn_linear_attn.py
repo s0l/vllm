@@ -2637,11 +2637,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # instead of allocating another value-sized tensor in chunk_fwd_o.
             # This is especially important at the 8K-token prefill boundary,
             # where the redundant BF16 output is 32 MiB per rank.
-            prefill_output_start = num_decode_tokens if split_non_spec else 0
-            prefill_num_tokens = query_non_spec.shape[1]
-            prefill_output = core_attn_out[
-                prefill_output_start : prefill_output_start + prefill_num_tokens
-            ].unsqueeze(0)
+            prefill_output = None
+            if spec_sequence_masks is None:
+                prefill_output_start = num_decode_tokens if split_non_spec else 0
+                prefill_num_tokens = query_non_spec.shape[1]
+                prefill_output = core_attn_out[
+                    prefill_output_start : prefill_output_start + prefill_num_tokens
+                ].unsqueeze(0)
             self._capture_gdn_replay_inputs(
                 q=query_non_spec,
                 k=key_non_spec,
