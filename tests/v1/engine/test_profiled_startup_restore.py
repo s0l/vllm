@@ -16,7 +16,10 @@ from vllm.v1.core.elastic_graph import (
 )
 from vllm.v1.core.elastic_memory_profile import CONTRACT
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.engine.elastic_bootstrap import complete_elastic_startup
+from vllm.v1.engine.elastic_bootstrap import (
+    complete_elastic_startup,
+    replay_allocation_profile_prefix_trace,
+)
 
 
 def startup_control():
@@ -108,6 +111,49 @@ def startup_control():
         _shutdown_failed_elastic_startup=MagicMock(),
     )
     return owner, events
+
+
+def test_restore_prefix_trace_names_first_failing_physical_owner(monkeypatch):
+    from vllm.v1.core import elastic_graph
+    from vllm.v1.engine import elastic_memory_profile
+
+    keys = tuple(
+        SimpleNamespace(logical=SimpleNamespace(owner=owner))
+        for owner in ("target", "mtp_prefill", "mtp_decode")
+    )
+
+    def resolver(*args, **kwargs):
+        return keys
+
+    monkeypatch.setattr(elastic_graph, "resolve_step_physical_keys", resolver)
+    observed = []
+
+    def replay(_worker, _step_key):
+        prefix = elastic_graph.resolve_step_physical_keys()
+        observed.append(tuple(key.logical.owner for key in prefix))
+        if len(prefix) == 2:
+            raise RuntimeError("synthetic asynchronous failure")
+        return {"stable_replays": 1, "source_reads": 0}
+
+    monkeypatch.setattr(elastic_memory_profile, "replay_allocation_profile", replay)
+    manager = SimpleNamespace(
+        dynamic_graph_owner="target", runtime_generation="trace-generation"
+    )
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            max_num_tokens=4096,
+            _dynamic_graph_working_set=lambda: SimpleNamespace(managers=[manager]),
+        ),
+        get_elastic_graph_execution_policy=lambda: (
+            startup_control().scheduler._elastic_graph_execution_policy.to_payload()
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="prefix=\\('target', 'mtp_prefill'\\)"):
+        replay_allocation_profile_prefix_trace(worker, (0, 3, 32, 128, 4))
+
+    assert observed == [("target",), ("target", "mtp_prefill")]
+    assert elastic_graph.resolve_step_physical_keys is resolver
 
 
 def test_profiled_startup_reclaims_target_but_keeps_terminal_mtp_before_ready():

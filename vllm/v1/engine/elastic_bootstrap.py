@@ -522,9 +522,59 @@ def prepare_elastic_runtime(
     )
 
 
+def replay_allocation_profile_prefix_trace(
+    worker: Any, step_key: tuple[int, int, int, int, int]
+) -> dict:
+    """Replay cumulative physical-owner prefixes and name the first bad edge."""
+    from vllm.v1.core import elastic_graph
+    from vllm.v1.core.elastic_graph import GraphExecutionPolicy, RuntimeGeneration
+    from vllm.v1.engine.elastic_memory_profile import replay_allocation_profile
+
+    runner = worker.model_runner
+    managers = {
+        manager.dynamic_graph_owner: manager
+        for manager in runner._dynamic_graph_working_set().managers
+    }
+    policy = GraphExecutionPolicy.from_payload(
+        worker.get_elastic_graph_execution_policy()
+    )
+    keys = elastic_graph.resolve_step_physical_keys(
+        step_key,
+        generation=RuntimeGeneration(next(iter(managers.values())).runtime_generation),
+        max_num_batched_tokens=runner.max_num_tokens,
+        policy=policy,
+    )
+    original_resolver = elastic_graph.resolve_step_physical_keys
+    final_receipt: dict | None = None
+    try:
+        for prefix_length in range(1, len(keys) + 1):
+            prefix = keys[:prefix_length]
+            elastic_graph.resolve_step_physical_keys = (
+                lambda *args, _prefix=prefix, **kwargs: _prefix
+            )
+            try:
+                final_receipt = replay_allocation_profile(worker, step_key)
+            except Exception as error:
+                owners = tuple(key.logical.owner for key in prefix)
+                raise RuntimeError(
+                    "allocation restore replay failed after physical-owner "
+                    f"prefix={owners!r} step_key={step_key!r}"
+                ) from error
+    finally:
+        elastic_graph.resolve_step_physical_keys = original_resolver
+    assert final_receipt is not None
+    return final_receipt
+
+
 def restore_profiled_graph_carrier(owner: Any) -> None:
     """Restore measured native owners without manufacturing model requests."""
     from vllm.v1.engine.elastic_memory_profile import replay_allocation_profile
+
+    replay = (
+        replay_allocation_profile_prefix_trace
+        if os.environ.get("AG2_VLLM_ELASTIC_RESTORE_PREFIX_TRACE", "0") == "1"
+        else replay_allocation_profile
+    )
 
     scheduler = owner.scheduler
     coverage = scheduler._elastic_graph_catalog_coverage
@@ -548,7 +598,7 @@ def restore_profiled_graph_carrier(owner: Any) -> None:
             key = (0, scheduler.num_spec_tokens, x, x * query_len, query_len)
             owner._prepare_elastic_restore_capture(key)
             scheduler.assert_elastic_restore_captures_hot((key,))
-            receipts = owner.collective_rpc(replay_allocation_profile, args=(key,))
+            receipts = owner.collective_rpc(replay, args=(key,))
             if not receipts or any(
                 receipt["source_reads"] or receipt["stable_replays"] < 1
                 for receipt in receipts
@@ -575,7 +625,7 @@ def restore_profiled_graph_carrier(owner: Any) -> None:
         for key in hotset_steps:
             owner._prepare_elastic_restore_capture(key)
             scheduler.assert_elastic_restore_captures_hot((key,))
-            receipts = owner.collective_rpc(replay_allocation_profile, args=(key,))
+            receipts = owner.collective_rpc(replay, args=(key,))
             if not receipts or any(
                 receipt["source_reads"] or receipt["stable_replays"] < 1
                 for receipt in receipts
