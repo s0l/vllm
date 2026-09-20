@@ -17,16 +17,29 @@ from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 
 
 @pytest.mark.parametrize("mode", list(CUDAGraphMode))
-@pytest.mark.parametrize("provider", [None, "_native_providers", "_mmap_ple_modules"])
+@pytest.mark.parametrize("provider", [None, "native_unsafe", "ple_only", "native_safe"])
 def test_target_host_provider_capture_capability(monkeypatch, mode, provider):
     from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
 
     state = object.__new__(Qwen4ExpModelState)
-    if provider:
-        setattr(state, provider, (object(),))
+    state._native_providers = ()
+    state._mmap_ple_modules = ()
+    if provider == "native_unsafe":
+        state._native_providers = (
+            SimpleNamespace(full_cudagraph_max_tokens=lambda: 0),
+        )
+    elif provider == "native_safe":
+        state._native_providers = (
+            SimpleNamespace(full_cudagraph_max_tokens=lambda: 4),
+        )
+    elif provider == "ple_only":
+        embedding = SimpleNamespace(raw=object(), pinned=object(), event=object())
+        state._mmap_ple_modules = (SimpleNamespace(ngram_embedding=embedding),)
     monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
     expected = (
-        CUDAGraphMode.PIECEWISE if provider and mode != CUDAGraphMode.NONE else mode
+        CUDAGraphMode.PIECEWISE
+        if provider == "native_unsafe" and mode != CUDAGraphMode.NONE
+        else mode
     )
     assert state.resolve_cudagraph_mode(mode) == expected
     monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
@@ -37,9 +50,24 @@ def test_target_host_provider_capture_capability(monkeypatch, mode, provider):
         assert state.resolve_cudagraph_mode(mode) == mode
     monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
     assert state.resolve_cudagraph_mode(mode) == expected
-    if provider:
-        setattr(state, provider, ())
+    state._native_providers = ()
+    state._mmap_ple_modules = ()
     assert state.resolve_cudagraph_mode(mode) == mode
+
+
+def test_temporal_e8_capability_is_not_bound_to_an_active_step():
+    from vllm.models.qwen4_exp.nvidia.expert_offload_provider import (
+        NativeExpertProvider,
+    )
+
+    provider = object.__new__(NativeExpertProvider)
+    provider.e8_path = SimpleNamespace(
+        temporal_cache=True,
+        demand_loader=object(),
+        deterministic_scatter=True,
+        demand_mode=False,
+    )
+    assert provider.full_cudagraph_max_tokens() == 4
 
 
 def test_inherited_trace_is_optional_without_legacy_constructor(monkeypatch):

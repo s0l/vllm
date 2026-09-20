@@ -147,7 +147,7 @@ def test_idle_dynamic_graph_step_reports_zero_floor_after_graph_eviction(
             self.resident_bytes = 0
             self.active_graph_bytes = 0
 
-        def reconcile_retained_cleanup(self, _reclaimed):
+        def reconcile_retained_cleanup(self, _reclaimed, *, force_rank_consensus=False):
             return None
 
         def clear_idle_retention_after_physical_reconcile(self):
@@ -191,7 +191,9 @@ def test_idle_x0_settles_graphs_and_keeps_pinned_floor_before_kv_return():
     working_set.prepare_idle_reclaim_before_post_consensus.assert_called_once_with()
     working_set.evict_unpinned_for_idle.assert_called_once_with("x0-17")
     runner._trim_dynamic_attention_cudagraph_state.assert_called_once_with(working_set)
-    working_set.reconcile_retained_cleanup.assert_called_once_with(41)
+    working_set.reconcile_retained_cleanup.assert_called_once_with(
+        41, force_rank_consensus=True
+    )
     runner._clear_elastic_cublas_workspaces.assert_called_once_with(working_set)
 
 
@@ -208,8 +210,51 @@ def test_idle_x0_preserves_global_workspace_while_pinned_graph_is_hot():
 
     working_set.prepare_idle_reclaim_before_post_consensus.assert_called_once_with()
     working_set.evict_unpinned_for_idle.assert_called_once_with("x0-18")
-    working_set.reconcile_retained_cleanup.assert_called_once_with(41)
+    working_set.reconcile_retained_cleanup.assert_called_once_with(
+        41, force_rank_consensus=True
+    )
     runner._clear_elastic_cublas_workspaces.assert_not_called()
+
+
+def test_idle_x0_uses_worst_rank_physical_floor(monkeypatch):
+    cpu_group = object()
+
+    def rank_max(floor, *, op, group):
+        assert op == torch.distributed.ReduceOp.MAX
+        assert group is cpu_group
+        assert floor.device.type == "cpu"
+        floor.fill_(88)
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "all_reduce", rank_max)
+    monkeypatch.setattr(
+        mrv2,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=cpu_group),
+    )
+
+    assert mrv2.GPUModelRunner._rank_common_idle_external_floor(42) == 88
+
+
+def test_idle_x0_cannot_take_equal_kv_noop_shortcut():
+    """The post-vote physical floor requires the all-rank reclaim path."""
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(
+        textwrap.dedent(inspect.getsource(mrv2.GPUModelRunner.execute_model))
+    )
+    guarded_noops = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and "elastic_equal_kv_noop_validated" in ast.dump(node.test)
+    ]
+    assert len(guarded_noops) == 1
+    guard = ast.dump(guarded_noops[0].test)
+    assert "idle_external_floor" in guard
+    assert "Is" in guard
 
 
 @pytest.mark.parametrize("preserve,grant", [(False, 0), (True, 88), (True, 0)])
@@ -248,6 +293,7 @@ def test_elastic_finished_drain_consumes_preservation_before_kv_growth(
             )
         )
     )
+    runner._rank_common_idle_external_floor.side_effect = lambda value: value
 
     def apply_kv(_transition, external):
         # A full KV target plus retained Graph bytes exceeds this pool.
@@ -505,12 +551,17 @@ def test_dynamic_attention_graph_state_keeps_request_and_token_key_domains(
     draft_builder.has_stale_dynamic_cudagraph_wrappers.return_value = False
     target_builder.trim_dynamic_cudagraph_wrappers.return_value = 2
     draft_builder.trim_dynamic_cudagraph_wrappers.return_value = 1
-    target_builder.trim_dynamic_cudagraph_wrappers.side_effect = lambda **_kwargs: (
-        events.append("target_trim") or 2
-    )
-    draft_builder.trim_dynamic_cudagraph_wrappers.side_effect = lambda **_kwargs: (
-        events.append("draft_trim") or 1
-    )
+
+    def target_trim(**_kwargs):
+        events.append("target_trim")
+        return 2
+
+    def draft_trim(**_kwargs):
+        events.append("draft_trim")
+        return 1
+
+    target_builder.trim_dynamic_cudagraph_wrappers.side_effect = target_trim
+    draft_builder.trim_dynamic_cudagraph_wrappers.side_effect = draft_trim
     monkeypatch.setattr(
         mrv2.torch.accelerator,
         "synchronize",

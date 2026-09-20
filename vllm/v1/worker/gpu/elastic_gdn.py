@@ -108,13 +108,21 @@ class ElasticKVController:
         if quantum is None:
             quantum = next(iter(self.backings.values())).info.quantum
         external_mapped = (external_memory_bytes + quantum - 1) // quantum * quantum
+        if external_mapped > self._physical_budget_bytes:
+            raise RuntimeError(
+                "elastic external target exceeds the physical budget: "
+                f"external={external_memory_bytes} mapped={external_mapped} "
+                f"budget={self._physical_budget_bytes} quantum={quantum}"
+            )
         retained_budget = self._physical_budget_bytes - external_mapped
         normalized = dict(targets)
         slack = retained_budget - sum(normalized.values())
         if slack < 0:
             raise RuntimeError(
                 "elastic KV and external targets exceed the physical budget by "
-                f"{-slack} bytes"
+                f"{-slack} bytes: external={external_memory_bytes} "
+                f"mapped={external_mapped} budget={self._physical_budget_bytes} "
+                f"target_sum={sum(normalized.values())} targets={normalized!r}"
             )
         for key in sorted(normalized):
             if key in self.auxiliary_targets:
@@ -194,11 +202,28 @@ class ElasticKVController:
                 continue
             block_bytes = self.geometry[key]
             blocks = gdn_blocks if key == "elastic-gdn" else attention_blocks
+            info = owner.info
+            if (
+                (
+                    self._mapping_quantum is not None
+                    and info.quantum != self._mapping_quantum
+                )
+                or info.committed < 0
+                or info.committed > info.reserved
+                or info.reserved % info.quantum
+            ):
+                raise RuntimeError(
+                    f"invalid elastic backing geometry for {key}: {info!r}"
+                )
             targets[key] = (
-                (blocks * block_bytes + owner.info.quantum - 1)
-                // owner.info.quantum
-                * owner.info.quantum
+                (blocks * block_bytes + info.quantum - 1) // info.quantum * info.quantum
             )
+            if targets[key] > info.reserved:
+                raise RuntimeError(
+                    f"elastic target exceeds reserved backing for {key}: "
+                    f"blocks={blocks} block_bytes={block_bytes} target={targets[key]} "
+                    f"reserved={info.reserved}"
+                )
         return self._preserve_physical_budget(targets, external_memory_bytes)
 
     def validate_equal_scheduler_step(
@@ -391,25 +416,68 @@ class ElasticKVController:
         requested = (external_memory_bytes + quantum - 1) // quantum * quantum
         current = (self._external_memory_bytes + quantum - 1) // quantum * quantum
 
-        # Taking memory from KV remains fail-closed and needs no new physical
-        # allocation. Returning memory to KV may grow a VMM backing, so bound
-        # that one commit by the worst-rank free-memory oracle first.
-        if requested >= current:
-            self.apply(None, requested)
-            return requested
-
-        local_free = torch.cuda.mem_get_info(self.device)[0]
-        free = torch.tensor(local_free, dtype=torch.int64, device=self.device)
-        if torch.distributed.is_initialized():
-            torch.distributed.all_reduce(
-                free,
-                op=torch.distributed.ReduceOp.MIN,
-                group=get_tp_group().device_group,
+        local_free, local_total = torch.accelerator.memory.mem_get_info(self.device)
+        if not 0 <= local_free <= local_total:
+            raise RuntimeError(
+                "CUDA free-memory oracle returned an invalid local value: "
+                f"free={local_free} total={local_total}"
             )
-        returnable = min(current - requested, int(free.item()) // quantum * quantum)
-        effective = current - returnable
-        if effective < current or (
-            self.auxiliary_owner is not None and self.auxiliary_owner.pending
+        # This decision must be rank synchronous. Rank-specific allocator floors
+        # can put one rank on the grow/no-op side and another on the return side.
+        # A conditional device collective here previously collided with the next
+        # preflight collective at X32; making the oracle CPU-side merely exposed
+        # the same bug as a hang. Every rank now enters the same two control-plane
+        # collectives and then applies one common worst-rank floor.
+        control = torch.tensor((requested, -requested, local_free), dtype=torch.int64)
+        cpu_group = None
+        if torch.distributed.is_initialized():
+            cpu_group = get_tp_group().cpu_group
+            torch.distributed.all_reduce(
+                control,
+                op=torch.distributed.ReduceOp.MIN,
+                group=cpu_group,
+            )
+        requested_min = int(control[0].item())
+        requested_max = -int(control[1].item())
+        rank_safe_free = int(control[2].item())
+        if requested_min != requested_max or requested != requested_min:
+            raise RuntimeError(
+                "elastic external target differs across ranks: "
+                f"local={requested} min={requested_min} max={requested_max}"
+            )
+        if not 0 <= rank_safe_free <= local_total:
+            raise RuntimeError(
+                "rank-safe CUDA free-memory oracle returned an invalid value: "
+                f"free={rank_safe_free} local_total={local_total}"
+            )
+        returnable = min(
+            max(current - requested, 0), rank_safe_free // quantum * quantum
+        )
+        local_effective = max(requested, current - returnable)
+        effective_tensor = torch.tensor(local_effective, dtype=torch.int64)
+        if cpu_group is not None:
+            torch.distributed.all_reduce(
+                effective_tensor,
+                op=torch.distributed.ReduceOp.MAX,
+                group=cpu_group,
+            )
+        effective = int(effective_tensor.item())
+        physical_budget_bytes = self._physical_budget_bytes
+        if physical_budget_bytes is None:
+            raise RuntimeError("elastic physical memory budget is unavailable")
+        if not requested <= effective <= physical_budget_bytes:
+            raise RuntimeError(
+                "rank-safe elastic external floor is outside its budget: "
+                f"requested={requested} effective={effective} "
+                f"budget={physical_budget_bytes}"
+            )
+        # All distributed ranks must enter apply(), including ranks for which
+        # the common floor is locally unchanged, because apply has its own
+        # rank-synchronous preflight and publication votes.
+        if (
+            cpu_group is not None
+            or effective != current
+            or (self.auxiliary_owner is not None and self.auxiliary_owner.pending)
         ):
             self.apply(None, effective)
 
@@ -423,7 +491,7 @@ class ElasticKVController:
                 requested / 1024**3,
                 effective / 1024**3,
                 retained / 1024**3,
-                int(free.item()) / 1024**3,
+                rank_safe_free / 1024**3,
             )
             self._last_logged_external_floor_bytes = retained
         elif retained == 0:

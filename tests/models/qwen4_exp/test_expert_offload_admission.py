@@ -143,6 +143,23 @@ def test_manager_closes_capture_inputs_on_success_failure_and_recovery(monkeypat
         assert events == ["capture", "release"]
 
 
+def test_model_state_separates_capture_forward_completion_from_rollback():
+    from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
+
+    events = []
+    provider = SimpleNamespace(
+        finish_capture_forward=lambda: events.append("forward"),
+        abort_capture=lambda: events.append("abort"),
+        stream_path=None,
+    )
+    state = Qwen4ExpModelState.__new__(Qwen4ExpModelState)
+    state._native_providers = (provider,)
+
+    state.finish_native_capture_forward()
+    state.finish_native_capture()
+    assert events == ["forward", "abort"]
+
+
 def test_failed_allocation_rpc_keeps_primary_error_and_restores_core_state(monkeypatch):
     from vllm.v1.core.elastic_graph import ElasticPlanKind
     from vllm.v1.engine import elastic_memory_profile as profile
@@ -394,6 +411,7 @@ def bank_fixture():
     bank.leases, bank.completed, bank.prepared = set(), set(), {}
     bank.pending_promotions = set()
     bank.rows, bank.staging, bank.generation = 6, 2, 0
+    bank.strides = {"w": 16}
     bank._finish_prefetch = lambda layer: None
     return bank
 
@@ -430,6 +448,32 @@ def test_free_hot_bootstrap_does_not_spend_replacement_allowance():
     )
     assert second.promotions == (4,) and second.evictions == (3,)
     assert len(second.desired) == 4
+
+
+def test_free_bootstrap_obeys_inflight_limit_and_recovers_after_drain():
+    policy = ExpertFrequencyAdmission(1, 8, history_steps=2)
+    policy.observe(np.array([[8, 7, 6, 5, 4, 3, 2, 1]], np.uint32))
+    first = policy.plan(
+        [], range(8), capacity=8, max_promotions=1, fill_free=True, upload_limit=2
+    )
+    assert first.promotions == (0, 1)
+    second = policy.plan(
+        first.desired,
+        range(8),
+        capacity=8,
+        max_promotions=1,
+        fill_free=True,
+        upload_limit=2,
+    )
+    assert second.promotions == (2, 3)
+    assert not policy.plan(
+        second.desired,
+        range(8),
+        capacity=8,
+        max_promotions=1,
+        fill_free=True,
+        upload_limit=0,
+    ).promotions
 
 
 def test_prefill_retention_uses_each_request_tail_and_updates_before_loading():
@@ -619,6 +663,7 @@ def asynchronous_fixture(monkeypatch):
     monkeypatch.setattr(torch.distributed, "all_gather_single", gather)
     upload = NativeExpertPromotion.__new__(NativeExpertPromotion)
     upload.bank, upload.coordinator = bank, coordinator
+    upload.provider = SimpleNamespace(admission=SimpleNamespace(max_upload_bytes=160))
     upload.future, upload.pending, upload.sequence, upload.last_step = None, None, 0, {}
     upload.staging_bytes = 80
     upload.registration = None
@@ -778,8 +823,21 @@ def test_model_admission_freeze_and_bootstrap_consume_source_snapshot(
         )
     owner.finish_step()
     assert len(plans) == 1
-    assert len(plans[0].promotions) == (bank.tables.pool_rows if budget else 0)
+    assert len(plans[0].promotions) == min(bank.tables.pool_rows, budget)
     assert owner.last_step["available_keys"] == 16
+    # Policy freezing/unfreezing cannot enlarge the separately admitted byte
+    # budget. A zero-at-construction budget remains zero after raising counts.
+    byte_budget = owner.max_upload_bytes
+    owner.max_promotions = 1 - budget
+    for layer in range(2):
+        owner.observe_layer(
+            layer,
+            np.arange(8, dtype=np.int32).reshape(1, 8),
+            np.ones((1, 8), np.float32),
+        )
+    owner.finish_step()
+    assert not plans[-1].promotions
+    assert owner.max_upload_bytes == byte_budget
 
 
 @pytest.mark.parametrize("exclusive", [False, True])

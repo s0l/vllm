@@ -1555,11 +1555,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     "DCP fine-prefix match unit must be divisible by DCP world size"
                 )
             if not all(
-                isinstance(g.kv_cache_spec, (FullAttentionSpec, MambaSpec))
+                not g.kv_cache_spec.prefix_cacheable
+                or isinstance(g.kv_cache_spec, (FullAttentionSpec, MambaSpec))
                 for g in kv_cache_config.kv_cache_groups
             ):
                 raise ValueError(
-                    "DCP fine-prefix only supports full-attention + Mamba groups"
+                    "DCP fine-prefix only supports prefix-cacheable "
+                    "full-attention + Mamba groups"
                 )
         # Generic DCP partial hits use upstream per-group geometry. Only the
         # separate host-state adapter needs its own activation gate.

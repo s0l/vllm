@@ -2743,6 +2743,14 @@ def generate_scheduler_kv_cache_config(
             )
             for gdn_blocks in range(max_gdn_blocks_value + 1)
         )
+        # Workers execute one TP batch and therefore must build identical
+        # synthetic warmup shapes. Publish the engine-derived worst-rank
+        # surface back to every worker config before kernel warmup.
+        for worker_cfg in elastic_configs:
+            worker_cfg.elastic_attention_capacity_by_gdn_blocks = (
+                cfg.elastic_attention_capacity_by_gdn_blocks
+            )
+            worker_cfg.elastic_rank_budget_bytes = cfg.elastic_rank_budget_bytes
         if enable_auto_resident_cap:
             if configured_max_num_seqs is None:
                 raise ValueError(

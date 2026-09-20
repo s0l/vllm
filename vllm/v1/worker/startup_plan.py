@@ -58,7 +58,7 @@ class ElasticGraphCatalog(dict[tuple[int, ...], dict[str, Any]]):
         self.source_sha256 = source_sha256
 
 
-PLAN_SCHEMA_VERSION = 4
+PLAN_SCHEMA_VERSION = 5
 GRAPH_RECIPE_SCHEMA_VERSION = 2
 ELASTIC_CAPTURE_STATE_ABI = "dynamic-capture-state-v1"
 BOUNDED_PIECEWISE_REPLAY_CONTRACT = "cold_capture_bounds_same_key_hot-v1"
@@ -157,6 +157,17 @@ def compute_plan_fingerprint(
         "vllm": vllm_version,
         "vllm_config": vllm_config.compute_hash(),
         "profile_config": elastic_profile_config_factors(vllm_config),
+        # CacheConfig.compute_hash() intentionally excludes memory sizing
+        # knobs because they do not change the computation graph.  They do,
+        # however, change the profiled KV budget persisted by this plan.
+        "memory_budget_config": {
+            "gpu_memory_utilization": getattr(
+                vllm_config.cache_config, "gpu_memory_utilization", None
+            ),
+            "kv_cache_memory_bytes": getattr(
+                vllm_config.cache_config, "kv_cache_memory_bytes", None
+            ),
+        },
         "device_name": current_platform.get_device_name(),
         "device_total_memory": current_platform.get_device_total_memory(),
         "device_capability": str(capability) if capability else "",
@@ -248,6 +259,7 @@ def compute_elastic_graph_price_identity(
                         "AG2_VLLM_TP3_OWNER_PREQUANT",
                         "AG2_VLLM_TP3_UNIFIED_EXACT_BACKEND",
                         "AG2_VLLM_TP3_UNIFIED_EXACT_REDUCE",
+                        "AG2_FLASHNEXT_QSA_COMMAND_CAPTURE",
                         "NCCL_ALGO",
                         "NCCL_PROTO",
                         "VLLM_TP3_CE_REDUCE",
@@ -761,6 +773,17 @@ def load_elastic_graph_catalog_coverage(
         if isinstance(coverage, dict)
         else None
     )
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    configured_hotset_xs = additional.get("elastic_serving_hotset_xs", [])
+    configured_min_decode_x = additional.get("elastic_short_decode_min_x", 1)
+    configured_forbid_maintenance = additional.get(
+        "elastic_forbid_serving_maintenance", False
+    )
+    hotset_policy_enabled = bool(
+        configured_hotset_xs
+        or configured_min_decode_x != 1
+        or configured_forbid_maintenance
+    )
     if (
         payload.get("schema") != ELASTIC_GRAPH_CATALOG_SCHEMA_VERSION
         or payload.get("fingerprint") != fingerprint
@@ -791,6 +814,21 @@ def load_elastic_graph_catalog_coverage(
         or coverage["mixed_max_x"] > coverage["decode_max_x"]
         or coverage["full_context_max_x"] > coverage["decode_max_x"]
         or not isinstance(required_step_keys, list)
+        or (
+            hotset_policy_enabled
+            and (
+                coverage.get("serving_hotset_xs") != configured_hotset_xs
+                or coverage.get("short_decode_min_x") != configured_min_decode_x
+                or coverage.get("forbid_serving_maintenance")
+                is not configured_forbid_maintenance
+                or coverage.get("serving_hotset_contract")
+                != "pre-ready-hot-no-runtime-maintenance-v1"
+                or not isinstance(coverage.get("serving_hotset_step_keys"), list)
+                or not {
+                    tuple(key) for key in coverage.get("serving_hotset_step_keys", [])
+                }.issubset(set(_required_inventory))
+            )
+        )
         or (
             configured_compiled
             and (

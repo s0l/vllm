@@ -517,7 +517,7 @@ class NativeExpertBank:
             return
         from vllm import _custom_ops as ops
 
-        if not region.registered or len(rows) != len(destinations):
+        if len(rows) != len(destinations):
             raise ValueError("unavailable registered source generation")
         sources, targets, sizes = [], [], []
         for row, slot in zip(rows, destinations, strict=True):
@@ -539,6 +539,7 @@ class NativeExpertBank:
                     self.consumer_views[name].data_ptr() + slot * self.strides[name]
                 )
                 sizes.append(nbytes)
+        region.ensure(sources, sizes)
         descriptors = [
             torch.from_numpy(np.asarray(values, np.int64))
             for values in (sources, targets, sizes)

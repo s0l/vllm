@@ -10,6 +10,40 @@ from vllm.v1.core.kv_cache_utils import init_none_hash
 
 
 class TestElasticCacheRetention(unittest.TestCase):
+    def test_zero_allocation_does_not_walk_blocks(self):
+        pool = self.pool(n=1000, frontier=1)
+
+        class ForbiddenBlocks:
+            def __getitem__(self, key):
+                raise AssertionError("zero allocation accessed block storage")
+
+        pool.blocks = ForbiddenBlocks()
+        self.assertEqual(pool.get_new_blocks(0), [])
+        self.assertEqual(pool.get_num_free_blocks(), 999)
+
+    def test_single_allocation_does_not_walk_unused_capacity(self):
+        for frontier, active in ((1, 1000), (25, 1000), (None, 1000), (None, 500)):
+            pool = BlockPool(
+                1000,
+                True,
+                192,
+                prefer_low_id_allocations=True,
+                active_num_gpu_blocks=active,
+            )
+            pool.cache_preservation_num_blocks = frontier
+
+            class BoundedBlocks(list):
+                def __getitem__(self, key):
+                    if not isinstance(key, int) or key != 1:
+                        raise AssertionError(
+                            "walked beyond sufficient first free block"
+                        )
+                    return super().__getitem__(key)
+
+            pool.blocks = BoundedBlocks(pool.blocks)
+            self.assertEqual([b.block_id for b in pool.get_new_blocks(1)], [1])
+            self.assertEqual(pool.get_num_free_blocks(), active - 2)
+
     def setUp(self):
         init_none_hash(sha256)
 

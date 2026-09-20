@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import numpy as np
@@ -40,6 +41,47 @@ def test_complete_phase_sequence_is_checked_before_model_forward():
     forwards = lines("forward_start") + lines("run_fullgraph")
     assert len(checked) == 1
     assert forwards and checked[0] < min(forwards)
+
+
+def test_planned_compiled_dispatch_cannot_upgrade_to_full_graph():
+    """Immutable worker dispatch dominates incidental scheduler decode state."""
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(GPUModelRunner.execute_model)))
+    expressions = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "allow_full"
+            for target in node.targets
+        )
+        and "planned_invocation" in ast.dump(node.value)
+    ]
+    assert len(expressions) == 1
+    code = compile(
+        ast.fix_missing_locations(ast.Expression(expressions[0])),
+        "<GPUModelRunner.execute_model:allow_full>",
+        "eval",
+    )
+
+    def evaluate(planned, token_source, pure_decode):
+        return eval(
+            code,
+            {},
+            {
+                "planned_invocation": planned,
+                "manager": SimpleNamespace(elastic_graph_token_source=token_source),
+                "scheduler_output": SimpleNamespace(is_pure_decode_step=pure_decode),
+            },
+        )
+
+    assert evaluate(object(), "step", True) is False
+    assert evaluate(object(), "requests", True) is False
+    assert evaluate(None, "step", True) is True
+    assert evaluate(None, "requests", False) is True
 
 
 def test_local_staging_failure_still_enters_post_materialization_vote():
@@ -159,7 +201,7 @@ def test_mm_staging_fingerprint_binds_tensor_geometry_and_mask():
 
 
 def test_input_staging_fingerprint_expands_grouped_encoder_items():
-    staged = (
+    staged: tuple[Any, ...] = (
         None,
         None,
         None,

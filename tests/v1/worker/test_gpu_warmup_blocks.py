@@ -27,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 from vllm.v1.worker.gpu.warmup import (
+    _flashnext_e8_large_prefill_tokens,
     _reserved_block_count,
     run_mixed_prefill_decode_warmup,
     warmup_kernels,
@@ -142,6 +143,20 @@ class _StepRecorder:
 
     def sample_tokens(self, grammar_output=None) -> None:
         return None
+
+
+def test_flashnext_e8_large_prefill_shape_is_exact_scheduler_chunk():
+    runner = _make_runner([_attention_group()], NUM_SPEC_STEPS)
+    assert _flashnext_e8_large_prefill_tokens(runner) == 0
+
+    runner.vllm_config.additional_config = {
+        "flashnext_native_experts": {"e8_archive": {"max_tokens": 1024}}
+    }
+    assert _flashnext_e8_large_prefill_tokens(runner) == MAX_MODEL_LEN
+
+    runner.max_model_len = 4096
+    runner.scheduler_config.max_num_batched_tokens = 4096
+    assert _flashnext_e8_large_prefill_tokens(runner) == 4096
 
 
 def _assert_covers_lookahead(

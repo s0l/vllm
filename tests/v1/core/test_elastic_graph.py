@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import pickle
+import copy
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -271,15 +271,14 @@ def test_variable_decode_uses_piecewise_manifest_lane() -> None:
     )
 
 
-@pytest.mark.parametrize("foreign_x", [1, 39])
-def test_manifest_rejects_foreign_mtp_carrier_as_current_execution(foreign_x) -> None:
+def test_manifest_rejects_underfilled_mtp_carrier_as_current_execution() -> None:
     policy = execution_manifest_policy()
     step_key = (0, 3, 12, 16, 0)
     exact = resolve_step_physical_keys(step_key, GENERATION, 4096, policy=policy)
     terminal_mtp = next(
         key
         for key in resolve_step_physical_keys(
-            (1, 3, foreign_x, foreign_x, 1), GENERATION, 4096, policy=policy
+            (1, 3, 1, 1, 1), GENERATION, 4096, policy=policy
         )
         if key.logical.owner == "mtp_decode"
     )
@@ -302,6 +301,47 @@ def test_manifest_rejects_foreign_mtp_carrier_as_current_execution(foreign_x) ->
             max_num_batched_tokens=4096,
             physical_keys=physical,
         )
+
+
+def test_manifest_accepts_padded_request_owner_for_mixed_execution() -> None:
+    policy = execution_manifest_policy()
+    step_key = (0, 3, 12, 16, 0)
+    exact = resolve_step_physical_keys(step_key, GENERATION, 4096, policy=policy)
+    padded_mtp = next(
+        key
+        for key in resolve_step_physical_keys(
+            (1, 3, 16, 16, 1), GENERATION, 4096, policy=policy
+        )
+        if key.logical.owner == "mtp_decode"
+    )
+    physical = tuple(
+        padded_mtp if key.logical.owner == "mtp_decode" else key for key in exact
+    )
+
+    manifest, dispatch = build_execution_manifest(
+        step_key=step_key,
+        request_ids=tuple(f"request-{index}" for index in range(12)),
+        per_request_query_lens=(2,) * 4 + (1,) * 8,
+        per_request_is_prefilling=(True,) * 4 + (False,) * 8,
+        scheduled_draft_rows=(0,) * 12,
+        requested_output_k=3,
+        executed_drafter_k=3,
+        phase="mixed",
+        generation=GENERATION,
+        policy=policy,
+        max_num_batched_tokens=4096,
+        physical_keys=physical,
+    )
+
+    mtp = next(item for item in manifest.invocations if item.owner == "mtp_decode")
+    assert mtp.semantic_num_reqs == 12
+    assert mtp.physical_num_reqs == 16
+    assert (
+        next(
+            item for item in dispatch if item.invocation.owner == "mtp_decode"
+        ).physical_key
+        == padded_mtp
+    )
 
 
 def test_manifest_rejects_terminal_override_for_non_mtp_owner() -> None:
@@ -531,7 +571,7 @@ def test_execution_manifest_state_matrix(
     assert dispatch[0].invocation.owner == "target"
     assert dispatch[0].invocation.physical_num_tokens == expected_target_bucket
     assert len(dispatch) == (3 if requested_k else 1)
-    restored = pickle.loads(pickle.dumps((manifest, dispatch)))
+    restored = copy.deepcopy((manifest, dispatch))
     assert restored == (manifest, dispatch)
     assert restored[0].fingerprint == manifest.fingerprint
 

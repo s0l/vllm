@@ -32,6 +32,7 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.elastic_graph import (
+    DispatchRepresentation,
     ElasticAdmissionController,
     ElasticGraphError,
     ElasticMaintenanceExecution,
@@ -8158,6 +8159,67 @@ def test_mixed_carrier_closure_and_qlen1_tail_share_bounded_x_inventory():
     ) == (1, 3, 4, 4, 1)
 
 
+def test_mixed_request_owner_executes_through_bounded_hot_x_inventory():
+    generation = RuntimeGeneration("mixed-bounded-request-owner")
+    scheduler = _new_elastic_scheduler(generation)
+    compiled = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
+    scheduler.scheduler_config = Mock(max_num_batched_tokens=4096, max_num_seqs=39)
+    scheduler._elastic_graph_execution_policy = _current_q4_piecewise_policy(compiled)
+    scheduler._elastic_compiled_piecewise_sizes = frozenset(compiled)
+    scheduler._elastic_graph_catalog_coverage = {
+        "decode_max_x": 39,
+        "serving_carrier_owner": "mtp_decode",
+    }
+    scheduler._elastic_short_decode_inventory = dict.fromkeys(
+        (1, 2, 4, 8, 16, 32, 39), ()
+    )
+
+    for physical_x in scheduler._elastic_short_decode_inventory:
+        _publish_elastic_step_hot(scheduler, (0, 3, physical_x, physical_x * 4, 4))
+
+    for semantic_x in range(1, 40):
+        physical_x = next(
+            value
+            for value in scheduler._elastic_short_decode_inventory
+            if value >= semantic_x
+        )
+        current, _successor, _protected = scheduler._elastic_step_residency_intent(
+            (0, 3, semantic_x, 4096, 0)
+        )
+        mtp_decode = next(key for key in current if key.logical.owner == "mtp_decode")
+        assert mtp_decode.physical_num_reqs == physical_x
+
+        query_lens = (2,) + (1,) * (semantic_x - 1)
+        step_tokens = 1 << (sum(query_lens) - 1).bit_length()
+        step_key = (0, 3, semantic_x, step_tokens, 0)
+        manifest_keys = scheduler._elastic_step_residency_intent(step_key)[0]
+        manifest, dispatch = build_execution_manifest(
+            step_key=step_key,
+            request_ids=tuple(f"request-{index}" for index in range(semantic_x)),
+            per_request_query_lens=query_lens,
+            per_request_is_prefilling=(True,) + (False,) * (semantic_x - 1),
+            scheduled_draft_rows=(0,) * semantic_x,
+            requested_output_k=3,
+            executed_drafter_k=3,
+            phase="mixed",
+            generation=generation,
+            policy=scheduler._elastic_graph_execution_policy,
+            max_num_batched_tokens=4096,
+            physical_keys=manifest_keys,
+        )
+        invocation = next(
+            item for item in manifest.invocations if item.owner == "mtp_decode"
+        )
+        assert invocation.semantic_num_reqs == semantic_x
+        assert invocation.physical_num_reqs == physical_x
+        assert (
+            next(
+                item for item in dispatch if item.invocation.owner == "mtp_decode"
+            ).representation
+            == DispatchRepresentation.HOT_GRAPH
+        )
+
+
 def test_sealed_runtime_executes_smallest_bucket_and_retains_terminal_carrier() -> None:
     scheduler = _new_elastic_scheduler(RuntimeGeneration("terminal-carrier"))
     scheduler.scheduler_config = Mock(max_num_batched_tokens=4096, max_num_seqs=39)
@@ -9155,7 +9217,7 @@ def test_cold_reclaim_sharing_is_receipt_backed_and_survives_teardown(evidence_s
             entries=entries,
         )
     )
-    evidence = ((terminal.identity, 20),)
+    evidence: tuple[tuple[str, int], ...] | None = ((terminal.identity, 20),)
     if evidence_state == "missing":
         evidence = None
     elif evidence_state == "stale":
@@ -14656,9 +14718,12 @@ def test_elastic_x2_to_x1_tail_composes_live_transition_floor_upper_bound(sealed
     coordinator.normalize_elastic_external_memory.side_effect = lambda value: (
         ((value + (2 << 20) - 1) // (2 << 20)) * (2 << 20)
     )
-    coordinator.set_elastic_external_memory.side_effect = lambda requested, **_kwargs: (
-        setattr(coordinator, "elastic_external_memory_bytes", requested) or True
-    )
+
+    def set_external_memory(requested, **_kwargs):
+        coordinator.elastic_external_memory_bytes = requested
+        return True
+
+    coordinator.set_elastic_external_memory.side_effect = set_external_memory
     scheduler.kv_cache_manager = Mock(coordinator=coordinator)
 
     scheduler._elastic_graph_catalog_coverage = (
@@ -14771,9 +14836,12 @@ def test_elastic_cold_growth_funds_immediate_same_key_hot_replay(price_role):
     coordinator.normalize_elastic_external_memory.side_effect = lambda value: (
         ((value + (2 << 20) - 1) // (2 << 20)) * (2 << 20)
     )
-    coordinator.set_elastic_external_memory.side_effect = lambda requested, **_kwargs: (
-        setattr(coordinator, "elastic_external_memory_bytes", requested) or True
-    )
+
+    def set_external_memory(requested, **_kwargs):
+        coordinator.elastic_external_memory_bytes = requested
+        return True
+
+    coordinator.set_elastic_external_memory.side_effect = set_external_memory
     scheduler.kv_cache_manager = Mock(coordinator=coordinator)
 
     output = SchedulerOutput.make_empty()
@@ -15654,6 +15722,17 @@ def test_elastic_pressure_reclaim_preserves_and_prices_serving_carrier():
     assert set(reclaim.victim_keys) == set(legacy_keys)
 
 
+def test_elastic_short_decode_minimum_reuses_x2_for_semantic_x1():
+    scheduler = object.__new__(Scheduler)
+    scheduler._elastic_restore_mode = False
+    scheduler._elastic_terminal_decode_carrier_x = 2
+    scheduler._elastic_short_decode_inventory = {1: (), 2: ()}
+    scheduler._elastic_short_decode_min_x = 2
+
+    assert scheduler._elastic_short_decode_physical_x(1) == 2
+    assert scheduler._elastic_short_decode_physical_x(2) == 2
+
+
 def test_elastic_serving_carrier_is_only_shared_terminal_mtp_owner():
     scheduler = _new_elastic_scheduler()
     scheduler._elastic_restore_mode = True
@@ -16100,6 +16179,71 @@ def test_elastic_restore_retains_hot_graph_charge_across_prompt_cohorts():
     coordinator.apply_elastic_admission_wave.assert_called_once_with(
         (5, 4), external_memory_bytes=256
     )
+
+
+def test_elastic_restore_does_not_recharge_cold_peak_for_retained_hot_graphs():
+    scheduler = _new_elastic_scheduler()
+    scheduler._elastic_restore_mode = True
+    scheduler._elastic_admission_controller.resident_bytes = 256
+    _clear_elastic_maintenance(scheduler)
+    scheduler.num_spec_tokens = 3
+    scheduler.dynamic_sd_lookup = None
+    scheduler.vllm_config = Mock(
+        speculative_config=Mock(disable_speculation_on_non_decode=False)
+    )
+    scheduler.block_size = 2496
+    scheduler.running = []
+    scheduler.num_waiting_for_streaming_input = 0
+    request = Mock(
+        status=RequestStatus.WAITING,
+        num_tokens=2,
+        force_non_speculative=False,
+    )
+    scheduler.requests = {"retained": request}
+    coordinator = Mock()
+    coordinator.apply_elastic_admission_wave.return_value = 1
+    kv_cache_manager = Mock()
+    kv_cache_manager.estimate_uncached_full_sequence_requirements.return_value = Mock(
+        primary=4
+    )
+    kv_cache_manager.watermark_blocks = 1
+    kv_cache_manager.coordinator = coordinator
+    scheduler.kv_cache_manager = kv_cache_manager
+    scheduler._canonical_elastic_graph_step_key = Mock(return_value=(0, 3, 1, 4, 0))
+    scheduler._elastic_capture_envelope = Mock(return_value=(3_200, 0, 0))
+    scheduler._estimate_elastic_graph_step_bytes = Mock(return_value=(384, False))
+
+    assert (
+        scheduler.prepare_elastic_restore_admission(
+            ["retained"], retain_hot_graphs=True
+        )
+        == 1
+    )
+    coordinator.apply_elastic_admission_wave.assert_called_once_with(
+        (5,), external_memory_bytes=384
+    )
+
+
+def test_elastic_restore_first_hot_replay_replaces_cold_measurement():
+    scheduler = _new_elastic_scheduler()
+    scheduler._elastic_restore_mode = True
+    step_key = (0, 3, 2, 8, 0)
+    controller = scheduler._elastic_admission_controller
+    for key in scheduler._resolve_elastic_step_physical_keys(step_key):
+        controller.publish_hot(
+            key,
+            GraphPrice(100, 100, f"first-hot:{key.identity}"),
+            pinned=False,
+        )
+    controller.resident_bytes = 200
+    controller.cublas_workspace_bytes = 40
+    controller.last_maintenance_step_key = step_key
+    controller.measured_bytes[step_key] = 3_200
+
+    assert scheduler._estimate_elastic_graph_step_bytes(step_key) == (240, False)
+
+    controller.last_maintenance_step_key = None
+    assert scheduler._estimate_elastic_graph_step_bytes(step_key) == (3_200, False)
 
 
 def test_elastic_restore_charges_successor_at_real_block_boundary():
@@ -16794,4 +16938,6 @@ def test_elastic_finished_drain_keeps_loan_and_graph_intent_consistent(
             transaction_id=plan.transaction_id,
             reason="elastic_admission_plan",
             administrative=True,
+            defer_rank_consensus=True,
         )
+        manager._publish_deferred_eviction_consensus.assert_called_once_with(None)

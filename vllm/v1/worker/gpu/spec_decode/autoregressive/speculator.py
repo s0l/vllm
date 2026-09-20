@@ -1087,6 +1087,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             slot_mappings_by_layer,
             num_tokens_across_dp,
             batch_desc.cg_mode,
+            physical_num_reqs=batch_desc.physical_num_reqs,
+            runtime_generation=batch_desc.runtime_generation,
         )
 
     def _generate_fused_drafts(

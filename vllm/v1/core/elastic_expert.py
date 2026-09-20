@@ -5,7 +5,9 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+from vllm.utils.e8_expert_config import E8ArchiveConfig
 from vllm.utils.nvfp4_cpu_experts import CpuExpertConfig
+from vllm.utils.nvfp4_expert_dispatch import DispatchConfig
 from vllm.utils.nvfp4_expert_geometry import NVFP4ExpertGeometry
 from vllm.utils.nvfp4_expert_stream import StreamExpertConfig
 
@@ -37,11 +39,52 @@ class NativeExpertBudget:
     cpu_experts: CpuExpertConfig | None = None
     stream_experts: StreamExpertConfig | None = None
     partition: str = "legacy"
+    wave_slots: int = 1
+    dispatch_profile: DispatchConfig | None = None
+    target_cpu_only: bool = False
+    e8_archive: E8ArchiveConfig | None = None
 
     def __post_init__(self):
         self.geometry.validate_cutlass()
+        if self.e8_archive is not None and (
+            not isinstance(self.e8_archive, E8ArchiveConfig)
+            or self.max_hot_rows != 0
+            or self.cpu_experts is not None
+            or self.stream_experts is not None
+            or self.dispatch_profile is not None
+            or self.hot_read
+            or self.target_cpu_only
+            or self.geometry.tp != 3
+        ):
+            raise ValueError("E8 experts require an exclusive TP3 native backend")
+        if type(self.target_cpu_only) is not bool or (
+            self.target_cpu_only
+            and (
+                self.max_hot_rows != 0
+                or self.stream_experts is None
+                or self.dispatch_profile is None
+            )
+        ):
+            raise ValueError(
+                "target CPU-only requires zero HOT and stream/mixed executors"
+            )
+        if self.dispatch_profile is not None and (
+            not isinstance(self.dispatch_profile, DispatchConfig)
+            or self.geometry.tp != 3
+            or self.partition != "balanced"
+            or self.staging != 32
+            or self.wave_slots != 2
+            or self.stream_experts is None
+            or self.stream_experts.cpu.max_m != 64
+            or self.stream_experts.capture_max_m != 4
+            or not self.stream_experts.ready_pipeline
+            or not self.stream_experts.column_jobs
+        ):
+            raise ValueError("mixed dispatch requires the calibrated physical executor")
         if self.partition not in ("legacy", "balanced") or (
-            self.partition == "balanced" and self.stream_experts is None
+            self.partition == "balanced"
+            and self.stream_experts is None
+            and self.e8_archive is None
         ):
             raise ValueError("balanced partition requires native stream experts")
         if (
@@ -51,6 +94,9 @@ class NativeExpertBudget:
             or type(self.staging) is not int
             or not 1 <= self.staging <= min(self.experts, 1024)
             or self.staging & (self.staging - 1)
+            or type(self.wave_slots) is not int
+            or self.wave_slots not in (1, 2)
+            or self.staging * self.wave_slots > self.experts
             or type(self.quantum) is not int
             or self.quantum != 2 << 20
             or type(self.ram_cache_bytes) is not int
@@ -112,6 +158,10 @@ class NativeExpertBudget:
                 "cpu_experts",
                 "stream_experts",
                 "partition",
+                "wave_slots",
+                "dispatch_profile",
+                "target_cpu_only",
+                "e8_archive",
             }
             or any(
                 type(v) is not int or v < 0
@@ -124,6 +174,9 @@ class NativeExpertBudget:
                     "cpu_experts",
                     "stream_experts",
                     "partition",
+                    "dispatch_profile",
+                    "target_cpu_only",
+                    "e8_archive",
                 }
             )
             or type(options.get("pin_ram_cache", False)) is not bool
@@ -133,6 +186,7 @@ class NativeExpertBudget:
         ):
             raise ValueError("native elastic experts require zero initial HOT rows")
         text = config.model_config.hf_text_config
+        e8_archive = E8ArchiveConfig.from_options(options.get("e8_archive"))
         return cls(
             NVFP4ExpertGeometry(
                 text.hidden_size,
@@ -142,7 +196,10 @@ class NativeExpertBudget:
             text.num_hidden_layers,
             text.num_experts,
             options.get(
-                "max_hot_rows", min(8192, text.num_hidden_layers * text.num_experts)
+                "max_hot_rows",
+                0
+                if e8_archive is not None
+                else min(8192, text.num_hidden_layers * text.num_experts),
             ),
             options.get("staging", 32),
             ram_cache_bytes=(
@@ -162,12 +219,35 @@ class NativeExpertBudget:
                 config.parallel_config.tensor_parallel_size,
             ),
             partition=options.get("partition", "legacy"),
+            wave_slots=options.get("wave_slots", 1),
+            dispatch_profile=DispatchConfig.from_options(
+                options.get("dispatch_profile")
+            ),
+            target_cpu_only=options.get("target_cpu_only", False),
+            e8_archive=e8_archive,
         )
+
+    def dispatch_workspace(self):
+        """Fixed compact buffers; the general worker profile owns this base.
+
+        CPU native scratch, the captured stream and the transient policy matrix
+        are separate owners, not additional borrowed HOT rows.
+        """
+        if self.dispatch_profile is None:
+            return dict(host_pinned_bytes=0, gpu_bytes=0)
+        return dict(
+            host_pinned_bytes=64 * (6 * self.geometry.hidden + 8 * 10) + 12,
+            gpu_bytes=64 * 4 * self.geometry.hidden,
+        )
+
+    @property
+    def scratch_rows(self):
+        return self.staging * self.wave_slots
 
     def rank_geometry(self, rank):
         if not 0 <= rank < self.geometry.tp:
             raise ValueError("expert rank outside configured TP")
-        if self.stream_experts is None:
+        if self.stream_experts is None and self.e8_archive is None:
             return self.geometry
         start, end = self.geometry.owner_span(
             rank, balanced=self.partition == "balanced"
@@ -189,8 +269,8 @@ class NativeExpertBudget:
 
     def rank_mapped_bytes(self, rank, hot_rows):
         self.mapped_bytes(hot_rows)
-        return self.round((self.max_hot_rows + self.staging) * 6 * 4) + sum(
-            self.round((hot_rows + self.staging) * stride)
+        return self.round((self.max_hot_rows + self.scratch_rows) * 6 * 4) + sum(
+            self.round((hot_rows + self.scratch_rows) * stride)
             for stride in self.rank_geometry(rank).strides
         )
 
@@ -204,9 +284,10 @@ class NativeExpertBudget:
     def mapped_bytes(self, hot_rows):
         if type(hot_rows) is not int or not 0 <= hot_rows <= self.max_hot_rows:
             raise ValueError("expert grant exceeds reserved rows")
-        scalar_bytes = self.round((self.max_hot_rows + self.staging) * 6 * 4)
+        scalar_bytes = self.round((self.max_hot_rows + self.scratch_rows) * 6 * 4)
         return scalar_bytes + sum(
-            self.round((hot_rows + self.staging) * stride) for stride in self.strides
+            self.round((hot_rows + self.scratch_rows) * stride)
+            for stride in self.strides
         )
 
     @property

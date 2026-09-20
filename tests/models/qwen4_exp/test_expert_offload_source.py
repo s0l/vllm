@@ -511,6 +511,7 @@ def test_provider_pinned_staging_owns_cpu_under_loader_device(
 def test_native_callback_defers_unproduced_capture_routes_until_replay(monkeypatch):
     from types import SimpleNamespace
 
+    from vllm.config.compilation import CUDAGraphMode
     from vllm.models.qwen4_exp.nvidia import expert_offload_provider as module
 
     calls = []
@@ -526,13 +527,17 @@ def test_native_callback_defers_unproduced_capture_routes_until_replay(monkeypat
         output.copy_(hidden)
 
     owner = SimpleNamespace(provider=SimpleNamespace(run=run), layer_id=2)
+    mode = CUDAGraphMode.PIECEWISE
     monkeypatch.setattr(
         module,
         "get_forward_context",
-        lambda: SimpleNamespace(no_compile_layers={"owner": owner}),
+        lambda: SimpleNamespace(
+            no_compile_layers={"owner": owner}, cudagraph_runtime_mode=mode
+        ),
     )
     x, weights = torch.ones(1, 4), torch.ones(1, 2)
-    ids, output = torch.zeros(1, 2, dtype=torch.int32), torch.ones_like(x)
+    ids = torch.tensor([[0, 1]], dtype=torch.int32)
+    output = torch.ones_like(x)
     capture_type = module.BreakableCUDAGraphCapture
     # add_eager has closed its segment while retaining capture TLS.
     with monkeypatch.context() as capture:
@@ -544,6 +549,12 @@ def test_native_callback_defers_unproduced_capture_routes_until_replay(monkeypat
         )
         module._native_experts(x, weights, ids, output, "owner")
         assert not calls and not output.count_nonzero()
+        mode = CUDAGraphMode.FULL
+        module._native_experts(x, weights, ids, output, "owner")
+        assert calls == [2] and torch.equal(output, x)
+        calls.clear()
+        output.zero_()
+    ids.fill_(0)
     with pytest.raises(ValueError, match="duplicate expert"):
         module._native_experts(x, weights, ids, output, "owner")
     assert not calls and not output.count_nonzero()
@@ -571,7 +582,11 @@ def test_provider_retirement_starts_a_fresh_graph_pool_epoch(monkeypatch):
         graphs={graph}, stable_graphs={graph}, close_prefetch=Mock()
     )
     provider.kernels = {16: (object(), graph)}
-    provider.admission = provider.hybrid_path = provider.stream_path = None
+    provider.admission = provider.hybrid_path = provider.stream_path = (
+        provider.wave_pipeline
+    ) = None
+    provider.mixed_path = None
+    provider.caller_affinity = None
     provider.quiesce = Mock()
     provider.graph_pool = object()
     fresh = object()

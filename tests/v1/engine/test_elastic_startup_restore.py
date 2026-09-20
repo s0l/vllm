@@ -3,6 +3,7 @@
 
 import json
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, call
 
 import pytest
@@ -481,7 +482,7 @@ def test_preserved_restore_promotes_carrier_before_request_free_drain() -> None:
     core = object.__new__(EngineCore)
     request_id = "_elastic_restore_full_1_3_1_1_0"
     request = SimpleNamespace(spec_token_ids=[])
-    events = []
+    events: list[tuple[Any, ...]] = []
     scheduler = SimpleNamespace(
         _elastic_admission_controller=SimpleNamespace(resident_bytes=0),
         _elastic_restore_mode=True,
@@ -814,13 +815,17 @@ def test_prepare_elastic_runtime_preserves_production_barrier_order(
         synchronize_generation,
     )
 
+    def make_structured_output_manager():
+        events.append("manager")
+        return manager
+
     prepared = elastic_bootstrap.prepare_elastic_runtime(
         vllm_config=vllm_config,
         initialize_kv_cache=initialize_kv_cache,
         collective_rpc=MagicMock(),
         include_finished_set=False,
         log_stats=True,
-        structured_output_manager_factory=lambda: events.append("manager") or manager,
+        structured_output_manager_factory=make_structured_output_manager,
     )
 
     assert events == ["kv", "policy", "manager", "scheduler", "generation"]
@@ -908,6 +913,23 @@ def test_complete_elastic_startup_auto_calibrates_miss_before_restore(
 
     assert elastic_bootstrap.complete_elastic_startup(owner) == "restored"
     assert events == ["calibrate", "restore", "publish"]
+
+
+def test_auto_calibration_without_external_surface_derives_runtime_profile(
+    monkeypatch,
+) -> None:
+    owner = object()
+    calls = []
+    monkeypatch.delenv("AG2_VLLM_ELASTIC_CALIBRATION_SURFACE", raising=False)
+    monkeypatch.setattr(
+        elastic_bootstrap,
+        "_auto_profile_runtime_catalog",
+        lambda actual: calls.append(actual),
+    )
+
+    elastic_bootstrap._auto_calibrate_missing_catalog(owner)
+
+    assert calls == [owner]
 
 
 def test_complete_elastic_startup_catalog_miss_fails_once_and_shuts_down() -> None:
@@ -1016,7 +1038,7 @@ def test_auto_calibration_seals_activates_and_records_receipt(
     monkeypatch.setattr(envs, "VLLM_CACHE_ROOT", str(tmp_path))
     monkeypatch.setattr(
         elastic_catalog,
-        "load_sealed_catalog_with_digest",
+        "load_calibration_surface_with_digest",
         lambda *_args, **_kwargs: ({"ok": 1}, "c" * 64),
     )
     monkeypatch.setattr(
@@ -1074,7 +1096,7 @@ def test_auto_calibration_failure_receipt_does_not_activate(
     monkeypatch.setattr(envs, "VLLM_CACHE_ROOT", str(tmp_path))
     monkeypatch.setattr(
         elastic_catalog,
-        "load_sealed_catalog_with_digest",
+        "load_calibration_surface_with_digest",
         lambda *_args, **_kwargs: ({"ok": 1}, "c" * 64),
     )
     monkeypatch.setattr(
@@ -1123,7 +1145,7 @@ def test_auto_calibration_records_restartable_checkpoint(
     monkeypatch.setattr(envs, "VLLM_CACHE_ROOT", str(tmp_path))
     monkeypatch.setattr(
         elastic_catalog,
-        "load_sealed_catalog_with_digest",
+        "load_calibration_surface_with_digest",
         lambda *_args, **_kwargs: ({"ok": 1}, "c" * 64),
     )
     monkeypatch.setattr(
@@ -1207,7 +1229,7 @@ def test_auto_calibration_rejects_existing_canonical_before_measurement(
     monkeypatch.setattr(envs, "VLLM_CACHE_ROOT", str(tmp_path))
     monkeypatch.setattr(
         elastic_catalog,
-        "load_sealed_catalog_with_digest",
+        "load_calibration_surface_with_digest",
         lambda *_args, **_kwargs: ({"ok": 1}, "c" * 64),
     )
     monkeypatch.setattr(

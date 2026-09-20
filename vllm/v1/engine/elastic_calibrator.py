@@ -57,6 +57,7 @@ class CalibrationSurface:
     decode_max_x: int
     mixed_max_x: int
     full_context_max_x: int
+    serving_hotset: tuple[tuple[int, int, int, int, int], ...] = ()
     semantic_token_witnesses: tuple[
         tuple[tuple[int, int, int, int, int], int], ...
     ] = ()
@@ -128,13 +129,22 @@ class CalibrationSurface:
 
         required = keys("required_step_keys")
         restore = keys("restore_step_keys")
-        required, restore = validate_elastic_catalog_key_inventory(
+        serving_hotset = (
+            keys("serving_hotset_step_keys")
+            if "serving_hotset_step_keys" in coverage
+            else ()
+        )
+        validated_required, validated_restore = validate_elastic_catalog_key_inventory(
             required,
             restore,
             label="calibration surface",
             require_restore=True,
         )
-        source_required_shapes = len(required)
+        required = cast(tuple[tuple[int, int, int, int, int], ...], validated_required)
+        restore = cast(tuple[tuple[int, int, int, int, int], ...], validated_restore)
+        if set(serving_hotset).intersection(required):
+            raise RuntimeError("calibration hotset aliases must be separate")
+        source_required_shapes = len(required) + len(serving_hotset)
         declared_required_shapes = coverage.get("required_shapes")
         if declared_required_shapes is not None and (
             isinstance(declared_required_shapes, bool)
@@ -165,14 +175,24 @@ class CalibrationSurface:
             for key in required
         ):
             raise RuntimeError("calibration surface exceeds the effective runtime")
-        decode_max_x = coverage.get("decode_max_x")
-        mixed_max_x = coverage.get("mixed_max_x")
-        full_context_max_x = coverage.get("full_context_max_x")
+        decode_max_x_value = coverage.get("decode_max_x")
+        mixed_max_x_value = coverage.get("mixed_max_x")
+        full_context_max_x_value = coverage.get("full_context_max_x")
         if any(
             isinstance(value, bool) or not isinstance(value, int) or value < 1
-            for value in (decode_max_x, mixed_max_x, full_context_max_x)
+            for value in (
+                decode_max_x_value,
+                mixed_max_x_value,
+                full_context_max_x_value,
+            )
         ):
             raise RuntimeError("calibration surface has invalid product boundaries")
+        assert isinstance(decode_max_x_value, int)
+        assert isinstance(mixed_max_x_value, int)
+        assert isinstance(full_context_max_x_value, int)
+        decode_max_x = decode_max_x_value
+        mixed_max_x = mixed_max_x_value
+        full_context_max_x = full_context_max_x_value
         if (
             decode_max_x > max_num_seqs
             or mixed_max_x > decode_max_x
@@ -182,7 +202,13 @@ class CalibrationSurface:
         ):
             raise RuntimeError("calibration surface boundaries are inconsistent")
         migration_contract = None
-        full_aliases = ()
+        full_aliases: tuple[
+            tuple[
+                tuple[int, int, int, int, int],
+                tuple[int, int, int, int, int],
+            ],
+            ...,
+        ] = ()
         if source_schema == 5:
             # Schema 5 recorded exact qlen1 rows. In schema 6 those rows have
             # two typed roles: bounded aliases describe the target product
@@ -221,7 +247,7 @@ class CalibrationSurface:
             owner_evidence_keys = tuple(sorted(source_full_keys))
         else:
             owner_evidence_keys = ()
-        migrated_source_keys = required
+        migrated_source_keys = tuple(sorted(set(required).union(serving_hotset)))
         semantic_token_witnesses = dict(
             expected_semantic_token_witnesses(
                 configured_k=configured_k,
@@ -329,6 +355,7 @@ class CalibrationSurface:
         return cls(
             required=required,
             restore=restore,
+            serving_hotset=serving_hotset,
             decode_max_x=decode_max_x,
             mixed_max_x=mixed_max_x,
             full_context_max_x=full_context_max_x,
@@ -352,6 +379,99 @@ class CalibrationResult:
     surface: CalibrationSurface
     measured_shapes: int
     wall_seconds: float
+
+
+def derive_runtime_calibration_surface(
+    owner: Any,
+) -> tuple[dict[str, Any], CalibrationSurface]:
+    """Derive the complete bounded surface from the effective worker policy.
+
+    This runs only after TP workers have agreed on one GraphExecutionPolicy and
+    the scheduler has been created from the final KV geometry.  It therefore
+    cannot carry a stale policy fingerprint from an earlier process epoch.
+    """
+    scheduler = owner.scheduler
+    policy = scheduler._elastic_graph_execution_policy
+    if policy is None:
+        raise RuntimeError("elastic calibration has no effective Graph policy")
+    k = scheduler.num_spec_tokens
+    max_x = scheduler.max_num_running_reqs
+    budget = scheduler.scheduler_config.max_num_batched_tokens
+    prefill_k = owner._elastic_restore_prefill_k(k)
+    if k <= 0 or prefill_k != k:
+        raise RuntimeError("runtime-derived calibration requires one shared positive K")
+
+    boundaries: list[int] = []
+    tokens = 1
+    while tokens < budget:
+        boundaries.append(tokens)
+        tokens *= 2
+    boundaries.append(budget)
+    required: set[tuple[int, int, int, int, int]] = set()
+    for x in range(1, max_x + 1):
+        for m in boundaries:
+            if m < x:
+                continue
+            lengths = {str(index): m // x + int(index < m % x) for index in range(x)}
+            key = scheduler._canonical_elastic_graph_step_key(lengths, prefill_k, False)
+            if key is None:
+                raise RuntimeError("runtime-derived prefill shape has no identity")
+            required.add(key)
+    inventory_xs = short_decode_inventory_xs(max_x)
+    for x in range(1, max_x + 1):
+        for query_len in range(1, k + 2):
+            if policy.mode_for("target", query_len) != "FULL" or x in inventory_xs:
+                key = scheduler._canonical_elastic_graph_step_key(
+                    {str(index): query_len for index in range(x)}, k, True
+                )
+                if key is None:
+                    raise RuntimeError("runtime-derived decode shape has no identity")
+                required.add(key)
+
+    additional = owner.vllm_config.additional_config or {}
+    hotset_xs = tuple(additional.get("elastic_serving_hotset_xs", ()))
+    serving_hotset: list[tuple[int, int, int, int, int]] = []
+    for semantic_x in hotset_xs:
+        physical_x = select_short_decode_physical_x(semantic_x, inventory_xs)
+        serving_hotset.extend(
+            (
+                (0, k, semantic_x, semantic_x, 0),
+                (0, k, physical_x, physical_x * (k + 1), k + 1),
+            )
+        )
+    serving_hotset = list(dict.fromkeys(serving_hotset))
+    serving_hotset = [key for key in serving_hotset if key not in required]
+    restore = tuple(
+        dict.fromkeys(owner._elastic_restore_wave_step_keys(k=k, x=max_x, query_len=1))
+    )
+    if not set(restore).issubset(required):
+        raise RuntimeError("runtime-derived restore shapes exceed the surface")
+    payload = {
+        "schema": ELASTIC_GRAPH_CATALOG_SCHEMA_VERSION,
+        "status": "UNMEASURED_SURFACE_NOT_A_SERVING_CATALOG",
+        "coverage": {
+            "representation": "bounded_exact_hotset",
+            "graph_execution_policy_fingerprint": policy.fingerprint,
+            "required_step_keys": [list(key) for key in sorted(required)],
+            "serving_hotset_step_keys": [list(key) for key in serving_hotset],
+            "restore_step_keys": [list(key) for key in restore],
+            "restore_decode": {"k": k, "x": max_x, "query_len": 1},
+            "required_shapes": len(required) + len(serving_hotset),
+            "decode_max_x": max_x,
+            "mixed_max_x": max_x,
+            "full_context_max_x": 1,
+        },
+    }
+    surface = CalibrationSurface.from_payload(
+        payload,
+        policy_fingerprint=policy.fingerprint,
+        configured_k=k,
+        prefill_k=prefill_k,
+        max_num_seqs=max_x,
+        max_num_batched_tokens=budget,
+    )
+    ElasticCatalogCalibrator(owner)._validate_surface_before_mutation(surface)
+    return payload, surface
 
 
 @dataclass(frozen=True)
@@ -710,6 +830,18 @@ class ElasticCatalogCalibrator:
                     f"declared={key!r} derived={actual!r}"
                 )
 
+        from vllm.v1.core.elastic_memory_profile import allocation_profile_shapes
+
+        corners, holdouts = allocation_profile_shapes(
+            cast(RestoreDecodeGeometry, surface.restore_decode).k,
+            surface.decode_max_x,
+            self.scheduler.scheduler_config.max_num_batched_tokens,
+        )
+        if not set(surface.serving_hotset).issubset(set(corners + holdouts)):
+            raise RuntimeError(
+                "calibration hotset aliases lack direct physical controls"
+            )
+
         geometry = surface.restore_decode or resolve_restore_decode_geometry(
             surface.restore
         )
@@ -961,7 +1093,10 @@ class ElasticCatalogCalibrator:
                     for key in surface.required
                     if working_catalog.get(key, {}).get("cold_observations", 0) > 0
                 }
-                checkpoint_callback(observed, executed_mixed_witnesses)
+                checkpoint_callback(
+                    cast(dict[tuple[int, ...], dict[str, Any]], observed),
+                    executed_mixed_witnesses,
+                )
             new_rows = len(set(complete) - initial_complete)
             if (
                 allow_restart
@@ -1256,7 +1391,7 @@ def calibrate_and_publish_catalog(
             "Elastic calibration seed: reused=%d required=%d source_sha256=%s",
             len(reusable),
             len(surface.required),
-            seed_rows.source_sha256,
+            seed_coverage.get("_catalog_source_sha256"),
         )
     checkpoint = parse_calibration_checkpoint(
         checkpoint_payload,
@@ -1274,7 +1409,7 @@ def calibrate_and_publish_catalog(
         # Resolve the complete declared inventory, then retain only observations.
         inventory = {key: checkpoint.catalog.get(key, {}) for key in surface.required}
         rebound = remap_catalog_resident_keys(
-            inventory,
+            cast(dict[tuple[int, ...], dict[str, Any]], inventory),
             source_generation=checkpoint_generation,
             destination_generation=scheduler._elastic_admission_controller.generation.value,
             max_num_batched_tokens=owner.vllm_config.scheduler_config.max_num_batched_tokens,

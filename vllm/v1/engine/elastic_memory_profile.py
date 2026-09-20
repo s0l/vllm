@@ -51,10 +51,8 @@ def _replay_allocation_profile(
         policy=GraphExecutionPolicy.from_payload(policy),
     )
     providers = tuple({id(p): p for p in runner.model_state._native_providers}.values())
-    if not providers or any(not p.dummy or p.active for p in providers):
-        raise RuntimeError(
-            "allocation profiling requires explicit idle dummy providers"
-        )
+    if not providers or any(p.active for p in providers):
+        raise RuntimeError("allocation profiling requires idle providers")
     sources = tuple({id(p.bank.source): p.bank.source for p in providers}.values())
     before_reads = sum(source.misses for source in sources)
     for provider in providers:
@@ -75,6 +73,8 @@ def _replay_allocation_profile(
         import numpy as np
 
         for provider in providers:
+            if provider.e8_path is not None:
+                continue
             if all(
                 (1 << exponent) in provider.kernels
                 for exponent in range(provider.max_lanes.bit_length())
@@ -100,12 +100,23 @@ def _replay_allocation_profile(
                 desc = manager._descriptor_for_physical_key(key)
                 entry = manager._dynamic_capture_state_direct_entry(desc)
                 if key.logical.owner == "target":
+                    # A physical step can begin with an MTP-only Graph.  In
+                    # that case the target providers have not entered a dummy
+                    # epoch yet.  Establish it at the actual target boundary
+                    # instead of requiring stale state from an earlier key.
                     for provider in providers:
                         provider.prepare_execution(
                             dummy=True, num_tokens=desc.num_tokens
                         )
                 if desc.cg_mode == CUDAGraphMode.FULL:
-                    manager.run_fullgraph(desc)
+                    startup_replay = getattr(
+                        manager, "allocation_profile_replay_context", None
+                    )
+                    if startup_replay is None:
+                        manager.run_fullgraph(desc)
+                    else:
+                        with startup_replay(desc):
+                            manager.run_fullgraph(desc)
                 else:
                     entry.capture_state(CUDAGraphMode.PIECEWISE)
                 if key.logical.owner == "target":

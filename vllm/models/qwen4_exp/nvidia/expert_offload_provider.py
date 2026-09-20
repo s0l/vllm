@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -15,6 +16,7 @@ from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphCapture,
     eager_break_during_capture,
 )
+from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.triton_utils import tl
 from vllm.triton_utils import triton as tr
@@ -63,10 +65,12 @@ def _native_experts(
 ) -> None:
     owner = get_forward_context().no_compile_layers[layer_name]
     if BreakableCUDAGraphCapture.is_active():
-        # The captured router has not executed yet. Only replay may read its
-        # demand; capture registers this callback without touching residency.
-        output.zero_()
-        return
+        mode = get_forward_context().cudagraph_runtime_mode
+        if mode != CUDAGraphMode.FULL:
+            # The captured router has not executed yet. Only replay may read
+            # its demand; PIECEWISE registers an eager provider callback.
+            output.zero_()
+            return
     owner.provider.run(
         owner.layer_id, hidden, weights, ids, output, is_padding=is_padding
     )
@@ -158,10 +162,15 @@ class NativeExpertProvider:
         # Standalone opt-in until the full source/copy DAG shows a benefit.
         self.use_prefetch = False
         self.use_hot_path = False
+        self.target_cpu_only = False
         self.use_scan_order = False
         self.hot_path = None
         self.hybrid_path = None
         self.stream_path = None
+        self.mixed_path = None
+        self.e8_path = None
+        self.caller_affinity = None
+        self.wave_pipeline = None
         self.admission = None
         self.dummy = False
         self.active = False
@@ -187,14 +196,29 @@ class NativeExpertProvider:
             raise RuntimeError("cannot prepare an unavailable expert provider")
         self.dummy = bool(dummy)
         self.execution_identity = identity
+        if self.e8_path is not None:
+            self.e8_path.prepare_execution(
+                dummy=bool(dummy), identity=identity, num_tokens=num_tokens
+            )
         if self.stream_path is not None:
             self.stream_path.prepare(
                 dummy=dummy, num_tokens=num_tokens, identity=identity
             )
 
     def finish_execution(self, *, dummy):
+        if self.e8_path is not None:
+            self.e8_path.finish_execution()
         if self.stream_path is not None:
             self.stream_path.finish(dummy=dummy)
+
+    def finish_capture_forward(self) -> None:
+        """Close E8 host state after one capture warmup/capture forward."""
+        if self.e8_path is not None:
+            self.e8_path.finish_execution()
+
+    def abort_capture(self) -> None:
+        if self.e8_path is not None and self.e8_path.prepared:
+            self.e8_path.abort_execution()
 
     def enable_cpu_experts(self, executor):
         """Attach an admitted bounded CPU executor before profiling/serving."""
@@ -240,12 +264,51 @@ class NativeExpertProvider:
             capacity = self.bank.source.cpu.source_stats()["capacity"]
             self.use_prefetch = capacity >= 2 * self.bank.staging
 
+    def enable_wave_pipeline(self, slots):
+        """Admit fixed scratch/metadata before profile and Graph capture."""
+        if self.active or self.wave_pipeline is not None or self.kernels:
+            raise RuntimeError("wave pipeline must be configured before execution")
+        from .expert_offload_waves import NativeWaveExecutor
+
+        self.wave_pipeline = NativeWaveExecutor(self, slots)
+        self.use_prefetch = False
+
+    def enable_mixed_dispatch(self, executor, policy):
+        """Experimental whole-job placement; no default serving policy."""
+        self.quiesce()
+        if self.mixed_path is not None:
+            raise RuntimeError("mixed dispatch already attached")
+        from .expert_offload_dispatch import NativeMixedDispatch
+
+        self.mixed_path = NativeMixedDispatch(self, executor, policy)
+
+    def _complete_wave_layer(self, layer, ids, weights, error=None):
+        # Every admitted rank enters exactly once, even after local source
+        # failure or with no GPU jobs. Physical wave/copy counts may differ.
+        digest = hashlib.sha256(ids.tobytes() + weights.tobytes()).digest()
+        packet = [int(error is None), self.bank.generation, layer, len(ids), 71]
+        packet += list(digest)
+        packet += [-1] * (self.coordinator.send.numel() - len(packet))
+        peers = self.coordinator.exchange_control(packet)
+        if not (peers[:, 0] == 1).all() or not (peers[:, 1:] == peers[:1, 1:]).all():
+            self.bank.state = "POISONED"
+            raise RuntimeError("rank-inconsistent semantic wave completion") from error
+
     def _profile(self, layer, hidden, output):
         # Explicit dummy mode is supplied by ModelState, never inferred from
         # attention metadata. It profiles the maximum native tile without I/O.
         ids = np.full((hidden.shape[0], self.topk), -1, dtype=np.int32)
         weights = np.zeros(ids.shape, dtype=np.float32)
         self.coordinator.admit_routes(layer, ids, weights, dummy=True)
+        if self.target_cpu_only:
+            output.zero_()
+            return
+        if self.wave_pipeline is not None:
+            self.x.zero_()
+            self.weights.zero_()
+            self.wave_pipeline.prepare_kernels([self.max_lanes])
+            output.zero_()
+            return
         ticket = self.coordinator.stage(layer, self.expert_ids[:0])
         lease = self.bank.acquire(ticket)
         try:
@@ -273,16 +336,24 @@ class NativeExpertProvider:
             raise RuntimeError("cannot retire an active expert provider")
         if self.admission is not None:
             self.admission.quiesce()
+        if self.wave_pipeline is not None:
+            self.wave_pipeline.drain()
         self.bank.fence().synchronize()
 
     def retire(self):
         self.quiesce()
+        if self.wave_pipeline is not None:
+            self.wave_pipeline.close()
         self.bank.close_prefetch()
         if self.admission is not None:
             self.admission.close()
             self.admission = None
         if self.stream_path is not None:
             self.stream_path.retire()
+        if self.mixed_path is not None:
+            self.mixed_path.retire()
+            self.mixed_path = None
+        if self.stream_path is not None:
             self.stream_path.cpu.close()
             self.stream_path = None
         for _, graph in self.kernels.values():
@@ -294,10 +365,18 @@ class NativeExpertProvider:
             self.hybrid_path.close()
             self.hybrid_path = None
         self.hot_path = None
+        e8_path = getattr(self, "e8_path", None)
+        if e8_path is not None:
+            e8_path.close()
+            self.e8_path = None
         # The allocator releases a pool when its last Graph is reset. A later
         # recovery capture needs a fresh pool epoch, even at the same addresses.
         self.graph_pool = torch.cuda.graph_pool_handle()
         self.consumer = None
+        if self.caller_affinity is not None:
+            thread, affinity = self.caller_affinity
+            os.sched_setaffinity(thread, affinity)
+            self.caller_affinity = None
         self.consumer_rows = None
 
     def _kernel(self, bucket):
@@ -338,12 +417,47 @@ class NativeExpertProvider:
         self.kernels[bucket] = direct, graph
         return direct, graph
 
+    def full_cudagraph_max_tokens(self) -> int:
+        """Largest token shape whose demand path is entirely graph replayable."""
+        if (
+            self.e8_path is not None
+            and self.e8_path.temporal_cache
+            and self.e8_path.demand_loader is not None
+            and self.e8_path.deterministic_scatter
+        ):
+            return 4
+        return 0
+
     def run(self, layer, hidden, weights, ids, output, *, is_padding=None):
-        if torch.cuda.is_current_stream_capturing():
+        graph_safe_temporal = bool(
+            self.e8_path is not None
+            and self.e8_path.temporal_cache
+            and self.e8_path.demand_mode
+            and hidden.shape[0] <= 4
+        )
+        if torch.cuda.is_current_stream_capturing() and not graph_safe_temporal:
             raise RuntimeError("native expert demand requires breakable Graph capture")
         if self.active:
             raise RuntimeError("native provider does not support concurrent forwards")
         self.active = True
+        if self.e8_path is not None:
+            try:
+                if self.dummy:
+                    output.zero_()
+                else:
+                    self.e8_path.run(
+                        layer, hidden, weights, ids, output, is_padding=is_padding
+                    )
+                self.last_step = dict(self.e8_path.last_step)
+                self.last_step["execution"] = "e8"
+                self.forward_count += 1
+                return
+            except Exception:
+                self.bank.state = "POISONED"
+                raise
+
+            finally:
+                self.active = False
         before_bytes = self.bank.copy_bytes
         before_read = self.bank.source.read_bytes
         before_hits, before_misses = self.bank.source.hits, self.bank.source.misses
@@ -352,7 +466,16 @@ class NativeExpertProvider:
         started = time.perf_counter()
         steps, tiles, useful, hot_calls = 0, 0, 0, 0
         route_trace = {}
+        mixed_steps = []
+        if self.mixed_path is not None:
+            self.mixed_path.last_step = {}
         hybrid_used = False
+        wave_admitted = False
+        wave_rows = (
+            self.bank.staging
+            if self.wave_pipeline is None
+            else self.wave_pipeline.wave_rows
+        )
         scan_source = (
             self.bank.source.cpu
             if self.use_scan_order and not self.dummy and hidden.shape[0] > 64
@@ -397,7 +520,7 @@ class NativeExpertProvider:
                     validated_waves = plan(
                         cpu_ids,
                         self.bank.source.experts,
-                        self.bank.staging,
+                        wave_rows,
                         is_padding=cpu_padding,
                         resident_experts=(
                             np.flatnonzero(
@@ -411,6 +534,7 @@ class NativeExpertProvider:
                     )
                     if (
                         self.use_hot_path
+                        and self.wave_pipeline is None
                         and 0 < hidden.shape[0] <= 64
                         and validated_waves
                     ):
@@ -444,13 +568,22 @@ class NativeExpertProvider:
             )
             assert cpu_ids is not None
             assert cpu_weights is not None
+            wave_admitted = self.wave_pipeline is not None
             if self.trace_path and self.trace_steps < self.trace_limit:
                 route_trace = self._trace_routes(layer, cpu_ids, cpu_weights)
             if hidden.shape[0] == 0:
                 output.zero_()
+                if wave_admitted:
+                    wave_admitted = False
+                    self._complete_wave_layer(layer, cpu_ids, cpu_weights)
                 return
-            for start in range(0, hidden.shape[0], self.max_tokens):
-                count = min(self.max_tokens, hidden.shape[0] - start)
+            chunk_tokens = (
+                min(self.max_tokens, self.mixed_path.max_m)
+                if self.target_cpu_only and self.mixed_path is not None
+                else self.max_tokens
+            )
+            for start in range(0, hidden.shape[0], chunk_tokens):
+                count = min(chunk_tokens, hidden.shape[0] - start)
                 self.x[:count].copy_(hidden[start : start + count])
                 self.weights[:count].copy_(weights[start : start + count])
                 padding = (
@@ -465,15 +598,38 @@ class NativeExpertProvider:
                     self.lanes[:count].index_fill_(0, padding_rows, 0)
                 waves = (
                     validated_waves
-                    if hidden.shape[0] <= self.max_tokens
+                    if hidden.shape[0] <= chunk_tokens
                     else plan(
                         cpu_ids[start : start + count],
                         self.bank.source.experts,
-                        self.bank.staging,
+                        wave_rows,
                         is_padding=padding,
                     )
                 )
                 assert waves is not None
+                if self.wave_pipeline is not None:
+                    if self.mixed_path is not None:
+                        count_steps, count_tiles, count_useful = self.mixed_path.run(
+                            layer,
+                            waves,
+                            cpu_ids[start : start + count],
+                            cpu_weights[start : start + count],
+                            output[start : start + count],
+                        )
+                        mixed_steps.append(
+                            dict(start=start, tokens=count, **self.mixed_path.last_step)
+                        )
+                        steps += count_steps
+                        tiles += count_tiles
+                        useful += count_useful
+                        continue
+                    if waves:
+                        count_tiles, count_useful = self.wave_pipeline.run(layer, waves)
+                        tiles += count_tiles
+                        useful += count_useful
+                        steps += len(waves)
+                    output[start : start + count].copy_(self.lanes[:count].sum(dim=1))
+                    continue
                 if all_hot:
                     assert resident is not None
                     if self.hybrid_path is not None and resident is self.hybrid_path:
@@ -534,10 +690,16 @@ class NativeExpertProvider:
                         self.bank.release(lease, self.bank.fence())
                     steps += 1
                 output[start : start + count].copy_(self.lanes[:count].sum(dim=1))
+            if wave_admitted:
+                wave_admitted = False
+                self._complete_wave_layer(layer, cpu_ids, cpu_weights)
             if self.admission is not None and layer == self.bank.source.layers - 1:
                 self.admission.finish_step()
             self.forward_count += 1
-        except Exception:
+        except Exception as exc:
+            if wave_admitted:
+                wave_admitted = False
+                self._complete_wave_layer(layer, cpu_ids, cpu_weights, error=exc)
             self.bank.state = "POISONED"
             raise
         finally:
@@ -568,7 +730,15 @@ class NativeExpertProvider:
                 source_misses=self.bank.source.misses - before_misses,
                 ram_retained_bytes=self.bank.source.used,
                 tokens=hidden.shape[0],
-                execution="hybrid" if hybrid_used else "gpu",
+                execution="mixed"
+                if self.mixed_path is not None
+                else "hybrid"
+                if hybrid_used
+                else "gpu",
+                mixed=dict(self.mixed_path.last_step)
+                if self.mixed_path is not None
+                else {},
+                mixed_chunks=mixed_steps if len(mixed_steps) > 1 else [],
                 hybrid=dict(self.hybrid_path.last_step)
                 if hybrid_used and self.hybrid_path is not None
                 else {},

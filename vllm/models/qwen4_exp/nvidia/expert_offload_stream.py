@@ -57,9 +57,12 @@ class NativeStreamExperts:
     team; no Python callback, route readback or collective is added per layer.
     """
 
-    def __init__(self, provider, cpu):
+    def __init__(self, provider, cpu, *, max_m=None):
         self.provider, self.bank, self.cpu = provider, provider.bank, cpu
-        self.max_m, self.layers, self.experts = cpu.max_m, cpu.layers, cpu.experts
+        self.max_m = cpu.max_m if max_m is None else max_m
+        if type(self.max_m) is not int or not 1 <= self.max_m <= cpu.max_m:
+            raise ValueError("captured stream domain exceeds CPU workspace")
+        self.layers, self.experts = cpu.layers, cpu.experts
         self.shared = {}
         self.enabled = torch.zeros((), dtype=torch.bool, device=self.bank.device)
         self.mapping = self.bank.tables.hot_phys.view(self.layers, self.experts)
@@ -119,6 +122,8 @@ class NativeStreamExperts:
             return
         if self.bank.state != "READY":
             raise RuntimeError("stream experts require a published bank")
+        if self.provider.target_cpu_only and self.bank.tables.pool_rows != 0:
+            raise RuntimeError("target CPU-only has a nonzero GPU expert grant")
         self.statuses.fill_(-1)
         self.lease = object()
         self.bank.leases.add(self.lease)
@@ -133,6 +138,8 @@ class NativeStreamExperts:
         self.cpu.retain_graph(graph)
 
     def gpu(self, hidden, weights, ids, table):
+        if self.provider.target_cpu_only:
+            return torch.zeros_like(hidden)
         valid = (ids >= 0) & (ids < self.experts)
         hot = valid & (table[ids.clamp(0, self.experts - 1).long()] >= 0)
         keys = torch.where(hot, ids, -1).int()

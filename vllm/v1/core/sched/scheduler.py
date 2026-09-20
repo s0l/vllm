@@ -354,6 +354,49 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 "elastic_compiled_piecewise_sizes requires elastic on-demand graphs"
             )
+        raw_hotset_xs = (
+            additional_config.get("elastic_serving_hotset_xs", [])
+            if isinstance(additional_config, dict)
+            else []
+        )
+        if (
+            not isinstance(raw_hotset_xs, list)
+            or any(type(value) is not int or value <= 0 for value in raw_hotset_xs)
+            or raw_hotset_xs != sorted(set(raw_hotset_xs))
+        ):
+            raise ValueError(
+                "elastic_serving_hotset_xs must be sorted unique positive integers"
+            )
+        if any(value > self.scheduler_config.max_num_seqs for value in raw_hotset_xs):
+            raise ValueError("elastic_serving_hotset_xs exceeds max_num_seqs")
+        self._elastic_serving_hotset_xs = tuple(raw_hotset_xs)
+        raw_min_decode_x = (
+            additional_config.get("elastic_short_decode_min_x", 1)
+            if isinstance(additional_config, dict)
+            else 1
+        )
+        if (
+            type(raw_min_decode_x) is not int
+            or raw_min_decode_x <= 0
+            or raw_min_decode_x > self.scheduler_config.max_num_seqs
+        ):
+            raise ValueError("elastic_short_decode_min_x must be within max_num_seqs")
+        if (
+            raw_min_decode_x > 1
+            and raw_min_decode_x not in self._elastic_serving_hotset_xs
+        ):
+            raise ValueError(
+                "elastic_short_decode_min_x must belong to elastic_serving_hotset_xs"
+            )
+        self._elastic_short_decode_min_x = raw_min_decode_x
+        raw_forbid_maintenance = (
+            additional_config.get("elastic_forbid_serving_maintenance", False)
+            if isinstance(additional_config, dict)
+            else False
+        )
+        if type(raw_forbid_maintenance) is not bool:
+            raise ValueError("elastic_forbid_serving_maintenance must be boolean")
+        self._elastic_forbid_serving_maintenance = raw_forbid_maintenance
         if self.elastic_on_demand_graphs:
             if self.lora_config is not None:
                 raise RuntimeError(
@@ -4947,6 +4990,13 @@ class Scheduler(SchedulerInterface):
                 ElasticPlanKind.PRESSURE_RECLAIM,
             }:
                 raise RuntimeError("elastic maintenance lost its scheduler shape")
+        elif self._elastic_admission_controller.pending_maintenance_plan is not None:
+            # Readiness may change after preflight without committing a USER.
+            # An administrative output gets a newer transaction ID, so an
+            # unstarted serving proposal must not survive it and execute later.
+            self._clear_pre_mutation_serving_maintenance(
+                reason="uncommitted_serving_wave"
+            )
         # Candidate admission may keep one immediate GDN lookahead mapped so a
         # cache hit cannot pin the tail needed by the next request. Return it
         # only at a real resource commit. An administrative zero-token output
@@ -5037,8 +5087,8 @@ class Scheduler(SchedulerInterface):
                     self.num_sampled_tokens_per_step + self.num_spec_tokens
                 ),
             )
-            manifest_physical_keys = self._resolve_elastic_step_physical_keys(
-                elastic_graph_step_key
+            manifest_physical_keys, successor_keys, _residency_union = (
+                self._elastic_step_residency_intent(elastic_graph_step_key)
             )
             execution_manifest, current_dispatch = build_execution_manifest(
                 step_key=cast(tuple[int, int, int, int, int], elastic_graph_step_key),
@@ -5070,9 +5120,6 @@ class Scheduler(SchedulerInterface):
                 policy=policy,
                 max_num_batched_tokens=(self.scheduler_config.max_num_batched_tokens),
                 physical_keys=manifest_physical_keys,
-            )
-            _current_keys, successor_keys, _residency_union = (
-                self._elastic_step_residency_intent(elastic_graph_step_key)
             )
         elastic_step_plan = maintenance_plan
         if elastic_graph_step_key is not None:
@@ -5214,6 +5261,18 @@ class Scheduler(SchedulerInterface):
                     useful_started = self._elastic_useful_started = {}
                 useful_started[elastic_step_plan.transaction_id] = time.monotonic()
             elif elastic_step_plan.kind == ElasticPlanKind.MAINTENANCE:
+                if getattr(
+                    self, "_elastic_forbid_serving_maintenance", False
+                ) and not getattr(self, "_elastic_restore_mode", False):
+                    cold_identities = tuple(
+                        key.identity for key in elastic_step_plan.cold_misses
+                    )
+                    raise RuntimeError(
+                        "elastic serving reached a COLD graph after startup; "
+                        "runtime maintenance is forbidden: "
+                        f"step_key={elastic_graph_step_key!r} "
+                        f"cold={cold_identities!r}"
+                    )
                 stats_before = self._elastic_admission_controller.stats
                 external_before = self._elastic_admission_controller.resident_bytes
                 self._elastic_admission_controller.begin_maintenance(elastic_step_plan)
@@ -5538,6 +5597,12 @@ class Scheduler(SchedulerInterface):
                     else actual_x
                 )
             inventory_xs = short_decode_inventory_xs(max_x)
+        minimum_x = getattr(self, "_elastic_short_decode_min_x", 1)
+        inventory_xs = tuple(x for x in inventory_xs if x >= minimum_x)
+        if not inventory_xs:
+            raise RuntimeError(
+                "short-decode inventory has no cohort at or above its minimum"
+            )
         if (
             terminal_x is not None
             and not getattr(self, "_elastic_restore_mode", False)
@@ -5694,6 +5759,34 @@ class Scheduler(SchedulerInterface):
         successor = self._resolve_elastic_step_physical_keys(
             self._elastic_graph_carrier_closure_step_key(step_key)
         )
+        # Mixed execution retains semantic X for token-major target/prefill,
+        # while its request-major q=1 owner reuses the smallest already-HOT
+        # decode carrier. This keeps one bounded X inventory for both lanes.
+        if (
+            step_key[1] > 0
+            and step_key[4] == 0
+            and not getattr(self, "_elastic_restore_mode", False)
+        ):
+            carrier_owner = self._elastic_graph_catalog_coverage.get(
+                "serving_carrier_owner"
+            )
+            exact_carrier = next(
+                (key for key in current if key.logical.owner == carrier_owner), None
+            )
+            padded_carrier = next(
+                (key for key in successor if key.logical.owner == carrier_owner), None
+            )
+            if exact_carrier is not None and padded_carrier is not None:
+                entry = self._elastic_admission_controller.entries.get(padded_carrier)
+                if (
+                    padded_carrier.physical_num_reqs >= step_key[2]
+                    and entry is not None
+                    and entry.hot
+                ):
+                    current = tuple(
+                        padded_carrier if key == exact_carrier else key
+                        for key in current
+                    )
         current_set = set(current)
         protected_successor = tuple(
             key
@@ -6453,6 +6546,15 @@ class Scheduler(SchedulerInterface):
                 == step_key
                 else 0
             )
+            if first_replay_workspace:
+                # ``measured_bytes`` still names the COLD capture loan until
+                # this first replay settles its independent HOT observation.
+                # The capture is complete and every physical owner is HOT, so
+                # that historical transient cannot coexist with this replay.
+                return (
+                    self._elastic_admission_controller.resident_bytes
+                    + first_replay_workspace
+                ), False
             return max(
                 self._elastic_admission_controller.resident_bytes
                 + first_replay_workspace,
@@ -9939,8 +10041,17 @@ class Scheduler(SchedulerInterface):
             False,
         )
         capture_envelope = self._elastic_capture_envelope(step_key)
+        # A retained restore epoch has already paid the COLD capture peak and
+        # published every declared physical owner HOT.  Charging that
+        # transient peak again while rebuilding the synthetic request cohort
+        # can turn a large first-capture allocator loan into a false MaxX
+        # contraction.  The HOT replay price below remains authoritative and
+        # includes resident Graph bytes plus any measured first-replay
+        # workspace.  A genuinely COLD wave still reserves the capture peak.
         capture_envelope_bytes = (
-            0 if capture_envelope is None else int(capture_envelope[0])
+            0
+            if retain_hot_graphs or capture_envelope is None
+            else int(capture_envelope[0])
         )
         # Use the same complete physical-loan estimator as commit.  A catalog
         # row can describe only the resident graph subset (125.8 MiB for the

@@ -458,6 +458,59 @@ def _release_idle_graph_cache(scheduler_output: SchedulerOutput) -> bool:
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
+    def _full_graph_replay_context(
+        self,
+        *,
+        attn_metadata,
+        input_batch,
+        batch_desc,
+        scheduler_output,
+        dp_sync,
+        ubatch_slices,
+        slot_mappings_by_layer,
+        skip_compiled,
+    ):
+        """Publish current request state to eager callbacks in FULL replay."""
+        assert self.cudagraph_manager is not None
+        tp3_sd_phase_reduce = (
+            envs.VLLM_TP3_SD_PHASE_REDUCE and scheduler_output.is_pure_decode_step
+        )
+        tp3_owner_prequant_decode = (
+            self.cudagraph_manager.uses_tp3_owner_prequant_decode(batch_desc)
+        )
+        batch_descriptor = BatchDescriptor(
+            num_tokens=input_batch.num_tokens_after_padding,
+            has_lora=self.lora_config is not None,
+            num_active_loras=batch_desc.num_active_loras,
+            tp3_sd_phase_reduce=tp3_sd_phase_reduce,
+            tp3_owner_prequant_decode=tp3_owner_prequant_decode,
+            cudagraph_owner=self.cudagraph_manager.dynamic_graph_owner,
+            physical_num_reqs=batch_desc.physical_num_reqs,
+            runtime_generation=batch_desc.runtime_generation,
+        )
+        return set_forward_context(
+            attn_metadata,
+            self.vllm_config,
+            num_tokens=input_batch.num_tokens_after_padding,
+            cudagraph_runtime_mode=batch_desc.cg_mode,
+            num_tokens_across_dp=(
+                dp_sync.num_tokens_across_dp if dp_sync is not None else None
+            ),
+            batch_descriptor=batch_descriptor,
+            ubatch_slices=ubatch_slices,
+            slot_mapping=slot_mappings_by_layer,
+            skip_compiled=skip_compiled,
+            is_padding=input_batch.is_padding,
+            num_tokens_unpadded=input_batch.num_tokens,
+            tp3_sd_phase_reduce=tp3_sd_phase_reduce,
+            tp3_owner_prequant_decode=tp3_owner_prequant_decode,
+            marlin_request_layout_cpu=(
+                self.input_buffers.marlin_request_layout_cpu
+                if envs.AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL
+                else None
+            ),
+        )
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -1195,6 +1248,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ),
         )
         target_cudagraph_mode = self.model_state.resolve_cudagraph_mode(cudagraph_mode)
+        target_full_cudagraph_max_tokens = (
+            self.model_state.get_full_cudagraph_max_tokens()
+        )
         if target_cudagraph_mode != cudagraph_mode:
             logger.info(
                 "Target model capture requirements select %s from backend mode %s",
@@ -1212,6 +1268,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             full_decode_cap_query_lens=(
                 {self.decode_query_len} if envs.AG2_VLLM_TP3_OWNER_PREQUANT else None
             ),
+            full_decode_max_tokens=target_full_cudagraph_max_tokens,
             tp3_sd_phase_reduce=envs.VLLM_TP3_SD_PHASE_REDUCE,
             tp3_owner_prequant=envs.AG2_VLLM_TP3_OWNER_PREQUANT,
             max_uniform_decode_reqs=(
@@ -2569,7 +2626,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             trimmed_wrappers, wrapper_reclaimed = (
                 self._trim_dynamic_attention_cudagraph_state(working_set)
             )
-        working_set.reconcile_retained_cleanup(wrapper_reclaimed)
+        working_set.reconcile_retained_cleanup(
+            wrapper_reclaimed,
+            force_rank_consensus=release_idle_cache,
+        )
         if working_set.active_graph_bytes == 0:
             self._clear_elastic_cublas_workspaces(working_set)
         cublas_workspace_bytes = self._measure_elastic_cublas_workspace_bytes()
@@ -2809,12 +2869,37 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         _trimmed_wrappers, wrapper_reclaimed = (
             self._trim_dynamic_attention_cudagraph_state(working_set)
         )
-        working_set.reconcile_retained_cleanup(wrapper_reclaimed)
+        # X0 is a common scheduler transaction, while wrapper/capture cleanup
+        # is physically rank-local. Every rank must publish once even when its
+        # local cleanup delta is zero; otherwise one rank can enter a device
+        # MAX while peers advance to the following CPU floor vote.
+        working_set.reconcile_retained_cleanup(
+            wrapper_reclaimed,
+            force_rank_consensus=True,
+        )
         if working_set.active_graph_bytes == 0:
             self._clear_elastic_cublas_workspaces(working_set)
         return (
             working_set.resident_bytes + self._measure_elastic_cublas_workspace_bytes()
         )
+
+    @staticmethod
+    def _rank_common_idle_external_floor(local_floor: int) -> int:
+        """Choose one physical X0 floor before any rank branches on it."""
+        floor = torch.tensor(local_floor, dtype=torch.int64)
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(
+                floor,
+                op=torch.distributed.ReduceOp.MAX,
+                group=get_tp_group().cpu_group,
+            )
+        common_floor = int(floor.item())
+        if common_floor < local_floor:
+            raise RuntimeError(
+                "rank-common idle external floor is below the local floor: "
+                f"local={local_floor} common={common_floor}"
+            )
+        return common_floor
 
     def _apply_next_elastic_kv_step(
         self,
@@ -3095,10 +3180,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         )
                     for owner in compiled_dispatch_owners:
                         manager = managers[owner]
+                        dispatch = next(
+                            item
+                            for item in elastic_plan.current_dispatch
+                            if item.invocation.owner == owner
+                        )
+                        invocation = dispatch.invocation
                         if not manager.is_compiled_piecewise_shape(
-                            early_num_toks,
-                            num_reqs=early_num_reqs,
-                            semantic_decode=semantic_short_decode,
+                            invocation.live_num_tokens,
+                            num_reqs=invocation.semantic_num_reqs,
+                            semantic_decode=invocation.phase == "decode",
                         ):
                             raise ElasticExecutionPlanMismatch(
                                 "ELASTIC_EXECUTION_PLAN_MISMATCH: explicit compiled "
@@ -3149,23 +3240,41 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             if managers_to_queue:
                 for manager in managers_to_queue:
+                    planned_invocation = None
                     if (
+                        elastic_plan is not None
+                        and elastic_plan.kind == ElasticPlanKind.USER
+                    ):
+                        planned_invocation = next(
+                            dispatch.invocation
+                            for dispatch in elastic_plan.current_dispatch
+                            if dispatch.invocation.owner == manager.dynamic_graph_owner
+                        )
+                    if planned_invocation is not None:
+                        num_reqs = planned_invocation.semantic_num_reqs
+                        num_tokens = planned_invocation.live_num_tokens
+                        uniform_token_count = planned_invocation.uniform_query_len
+                        manager_semantic_decode = planned_invocation.phase == "decode"
+                    elif (
                         manager.elastic_graph_activation == "speculative"
                         and not speculative_active
                     ):
                         num_reqs, num_tokens, uniform_token_count = (0, 0, None)
+                        manager_semantic_decode = False
                     elif manager.elastic_graph_token_source == "step":
                         num_reqs, num_tokens, uniform_token_count = (
                             early_num_reqs,
                             early_num_toks,
                             early_uniform_tok_count,
                         )
+                        manager_semantic_decode = semantic_short_decode
                     elif manager.elastic_graph_token_source == "requests":
                         num_reqs, num_tokens, uniform_token_count = (
                             early_num_reqs,
                             early_num_reqs,
                             1,
                         )
+                        manager_semantic_decode = semantic_short_decode
                     elif manager.elastic_graph_token_source == "fixed_query":
                         query_len = manager.elastic_graph_fixed_query_len
                         if query_len is None:
@@ -3177,16 +3286,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             early_num_reqs * query_len,
                             query_len,
                         )
+                        manager_semantic_decode = semantic_short_decode
                     else:
                         raise RuntimeError(
                             "Graph manager omitted its runtime token-source contract: "
                             f"owner={manager.dynamic_graph_owner!r} "
                             f"source={manager.elastic_graph_token_source!r}"
                         )
+                    # An explicit COMPILED_ONLY dispatch is authoritative: a
+                    # coincidentally pure-decode SchedulerOutput must not
+                    # upgrade it to a new FULL graph after READY.
                     allow_full = bool(
-                        manager.elastic_graph_token_source
-                        in {"requests", "fixed_query"}
-                        or scheduler_output.is_pure_decode_step
+                        planned_invocation is None
+                        and (
+                            manager.elastic_graph_token_source
+                            in {"requests", "fixed_query"}
+                            or scheduler_output.is_pure_decode_step
+                        )
                     )
                     manager.queue_runtime_descriptor(
                         num_reqs,
@@ -3194,7 +3310,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         uniform_token_count,
                         0,
                         allow_full=allow_full,
-                        semantic_decode=semantic_short_decode,
+                        semantic_decode=manager_semantic_decode,
                     )
             idle_external_floor = None
             if (
@@ -3209,6 +3325,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 idle_external_floor = self._prepare_dynamic_graph_idle_kv_return(
                     working_set,
                     elastic_transaction_id or "",
+                )
+                idle_external_floor = self._rank_common_idle_external_floor(
+                    idle_external_floor
                 )
                 self._elastic_dynamic_wave_observed = True
             elif (
@@ -3247,6 +3366,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             with record_function_or_nullcontext("ag2.elastic_kv_transition"):
                 if (
                     elastic_equal_kv_noop_validated
+                    and idle_external_floor is None
                     and transition is None
                     and requested_external
                     == scheduler_output.elastic_external_memory_bytes
@@ -4045,7 +4165,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if graph_receipt is not None
                 else record_function_or_nullcontext("ag2.target_forward.full")
             )
-            with forward_scope:
+            # FULL replay itself does not execute model() under
+            # set_forward_context(), but breakable/QSA graphs may contain
+            # eager callbacks before or between captured segments.  Those
+            # callbacks consume the *current step's* attention metadata.  A
+            # capture-time context is valid for request-free allocation
+            # profiling only; using it here would silently replay stale route
+            # and attention state.  Publish the real request context across
+            # the complete replay, including padded x3 -> physical x4 steps.
+            with (
+                self._full_graph_replay_context(
+                    attn_metadata=attn_metadata,
+                    input_batch=input_batch,
+                    batch_desc=batch_desc,
+                    scheduler_output=scheduler_output,
+                    dp_sync=dp_sync,
+                    ubatch_slices=ubatch_slices,
+                    slot_mappings_by_layer=slot_mappings_by_layer,
+                    skip_compiled=skip_compiled,
+                ),
+                forward_scope,
+            ):
                 model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().

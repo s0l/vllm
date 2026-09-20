@@ -733,6 +733,7 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
                 return_value=object(),
             ),
             patch.object(cudagraph_utils.gc, "collect"),
+            patch.object(torch.accelerator, "synchronize"),
             patch.object(torch.accelerator, "empty_cache") as empty_cache,
             patch.object(torch.accelerator, "get_memory_info", return_value=(64, 128)),
             patch.object(torch.cuda, "synchronize"),
@@ -1267,6 +1268,54 @@ class TestMTPPhasePolicyV2(unittest.TestCase):
 
         self.assertEqual(attention.committed + gdn.committed, 24)
         self.assertEqual(controller._external_memory_bytes, 0)
+
+    def test_v2_elastic_external_return_uses_cpu_rank_free_oracle(self):
+        controller = ElasticKVController(torch.device("cpu"))
+        attention = _Owner(12)
+        gdn = _Owner(4)
+        controller.backings = {
+            "elastic-attention-0": attention,
+            "elastic-gdn": gdn,
+        }
+        controller.geometry = {
+            "elastic-attention-0": 4,
+            "elastic-gdn": 4,
+        }
+        controller.configure_physical_budget(24, 4, (3, 1))
+        cpu_group = object()
+        device_group = object()
+
+        def rank_min(free, *, op, group):
+            if group is device_group:
+                return
+            self.assertIs(group, cpu_group)
+            self.assertEqual(free.device.type, "cpu")
+            if free.numel() == 3:
+                self.assertEqual(op, torch.distributed.ReduceOp.MIN)
+                free.copy_(torch.tensor((0, 0, 4)))
+            else:
+                self.assertEqual(op, torch.distributed.ReduceOp.MAX)
+                # Another rank cannot return any pages, so all ranks retain the
+                # common 8-byte floor and still enter apply's device votes.
+                free.fill_(8)
+
+        with (
+            patch.object(torch.cuda, "Event", return_value=_Event()),
+            patch.object(torch.cuda, "current_stream", return_value=object()),
+            patch.object(torch.cuda, "mem_get_info", return_value=(12, 24)),
+            patch.object(torch.distributed, "is_initialized", return_value=True),
+            patch.object(torch.distributed, "all_reduce", side_effect=rank_min),
+            patch(
+                "vllm.v1.worker.gpu.elastic_gdn.get_tp_group",
+                return_value=SimpleNamespace(
+                    cpu_group=cpu_group, device_group=device_group
+                ),
+            ),
+        ):
+            controller.apply((2, 2), external_memory_bytes=8)
+            self.assertEqual(controller.reconcile_external_memory(0), 8)
+
+        self.assertEqual(controller._external_memory_bytes, 8)
 
     def test_v2_scheduler_step_reconciles_only_external_loan(self):
         controller = object.__new__(ElasticKVController)

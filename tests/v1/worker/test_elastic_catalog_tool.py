@@ -4,6 +4,7 @@
 import json
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from vllm.v1.core.elastic_catalog import (
     ELASTIC_GRAPH_CATALOG_SCHEMA_VERSION,
     expected_semantic_token_witnesses,
+    load_calibration_surface_with_digest,
     load_sealed_catalog,
     write_json_exclusive,
 )
@@ -29,6 +31,46 @@ from vllm.v1.worker.elastic_catalog_tool import (
     rebind_catalog,
 )
 from vllm.v1.worker.startup_plan import ElasticGraphCatalog
+
+
+def test_calibration_surface_loader_binds_reviewed_bytes(tmp_path):
+    surface = tmp_path / "surface.json"
+    payload = {
+        "schema": ELASTIC_GRAPH_CATALOG_SCHEMA_VERSION,
+        "status": "UNMEASURED_SURFACE_NOT_A_SERVING_CATALOG",
+        "coverage": {},
+    }
+    surface.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded, digest = load_calibration_surface_with_digest(surface)
+
+    assert loaded == payload
+    assert len(digest) == 64
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {
+            "schema": ELASTIC_GRAPH_CATALOG_SCHEMA_VERSION,
+            "status": "UNMEASURED_SURFACE_NOT_A_SERVING_CATALOG",
+            "coverage": {},
+            "shapes": [],
+        },
+        {
+            "schema": ELASTIC_GRAPH_CATALOG_SCHEMA_VERSION,
+            "status": "complete",
+            "coverage": {},
+        },
+    ],
+)
+def test_calibration_surface_loader_rejects_non_surface_objects(tmp_path, payload):
+    surface = tmp_path / "surface.json"
+    surface.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="offline-reviewed object"):
+        load_calibration_surface_with_digest(surface)
 
 
 def _source(tmp_path, **updates):
@@ -616,7 +658,9 @@ def test_publish_measured_catalog_is_atomic_and_complete(tmp_path, monkeypatch):
         verifier_contract="batched-causal-q1-v1",
         verifier_configuration="verifier-config",
         math_contract="math",
-        mode_for=lambda _owner, query_len: "FULL" if query_len == 1 else "PIECEWISE",
+        mode_for=lambda _owner, query_len, _tokens=None: (
+            "FULL" if query_len == 1 else "PIECEWISE"
+        ),
         to_payload=lambda: {"fingerprint": "policy"},
     )
     monkeypatch.setattr(
@@ -653,6 +697,11 @@ def test_publish_measured_catalog_is_atomic_and_complete(tmp_path, monkeypatch):
         scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
         num_speculative_tokens=3,
         speculative_config=None,
+        additional_config={
+            "elastic_serving_hotset_xs": [1],
+            "elastic_short_decode_min_x": 1,
+            "elastic_forbid_serving_maintenance": True,
+        },
     )
 
     witnesses = expected_semantic_token_witnesses(
@@ -699,6 +748,13 @@ def test_publish_measured_catalog_is_atomic_and_complete(tmp_path, monkeypatch):
         "retained-terminal-mtp-no-cold-serving-v1"
     )
     assert payload["coverage"]["serving_carrier_owner"] == "mtp_decode"
+    assert payload["coverage"]["serving_hotset_xs"] == [1]
+    assert payload["coverage"]["serving_hotset_step_keys"] == [
+        [0, 3, 1, 1, 0],
+        list(verification_key),
+    ]
+    assert payload["coverage"]["short_decode_min_x"] == 1
+    assert payload["coverage"]["forbid_serving_maintenance"] is True
     assert all(
         shape["resident_key_bytes"] == [["a" * 64, 1]] for shape in payload["shapes"]
     )
@@ -1059,7 +1115,7 @@ def test_calibrator_resumes_only_missing_rows_after_bounded_process_epoch(
         mixed_max_x=2,
         full_context_max_x=1,
     )
-    saved = {}
+    saved: dict[str, Any] = {}
     first = ElasticCatalogCalibrator(owner)
     monkeypatch.setattr(first, "_validate_surface_before_mutation", lambda _s: None)
     monkeypatch.setattr(first, "_balanced_prefill_pair", balanced)
@@ -1122,7 +1178,7 @@ def test_calibrator_resumes_partial_row_in_fresh_producer_epoch(monkeypatch):
         mixed_max_x=1,
         full_context_max_x=1,
     )
-    saved = {}
+    saved: dict[str, Any] = {}
     first = ElasticCatalogCalibrator(owner)
     monkeypatch.setattr(first, "_validate_surface_before_mutation", lambda _s: None)
     monkeypatch.setattr(first, "_balanced_prefill_pair", balanced)
@@ -1498,7 +1554,7 @@ def test_calibrator_checkpoints_partial_restore_family_before_restart(monkeypatc
         mixed_max_x=38,
         full_context_max_x=1,
     )
-    saved = {}
+    saved: dict[str, Any] = {}
 
     with pytest.raises(ElasticCalibrationRestartRequired):
         calibrator.calibrate(
@@ -1519,7 +1575,7 @@ def test_calibrator_checkpoints_partial_restore_family_before_restart(monkeypatc
         resumed, "_validate_surface_before_mutation", lambda _surface: None
     )
     monkeypatch.setattr(resumed, "_balanced_prefill_pair", balanced_mock)
-    resumed_saved = {}
+    resumed_saved: dict[str, Any] = {}
     with pytest.raises(ElasticCalibrationRestartRequired):
         resumed.calibrate(
             surface,
@@ -1538,7 +1594,7 @@ def test_calibrator_checkpoints_partial_restore_family_before_restart(monkeypatc
 
 def test_calibrator_executes_live_m3_against_physical_m4(monkeypatch):
     key = (0, 3, 1, 4, 0)
-    catalog = {}
+    catalog: dict[tuple[int, ...], dict[str, Any]] = {}
     scheduler = SimpleNamespace(
         _elastic_graph_catalog=catalog,
         _elastic_restore_mode=False,

@@ -173,7 +173,7 @@ def init_attn_backend(
     # Attention groups execute sequentially in V2. Select the largest
     # compatible owner before binding scratch so group order cannot produce an
     # undersized shared workspace. Metadata buffers remain group-private.
-    shareable_builders = [
+    shareable_builders: list[Any] = [
         builder
         for groups in attn_groups
         for group in groups
@@ -326,13 +326,13 @@ def _allocate_kv_cache(
                     f"{raw.numel()} and {kv_cache_tensor.size}"
                 )
             if elastic_geometry is not None:
-                geometry = elastic_geometry.setdefault(
+                block_geometry = elastic_geometry.setdefault(
                     backing_id, kv_cache_tensor.logical_block_size
                 )
-                if geometry != kv_cache_tensor.logical_block_size:
+                if block_geometry != kv_cache_tensor.logical_block_size:
                     raise ValueError(
                         f"KV backing {backing_id!r} has inconsistent geometry: "
-                        f"{geometry} and {kv_cache_tensor.logical_block_size}"
+                        f"{block_geometry} and {kv_cache_tensor.logical_block_size}"
                     )
             previous = packed_backings.setdefault(backing_id, raw)
             if previous.data_ptr() != raw.data_ptr():
@@ -395,11 +395,14 @@ def _allocate_kv_cache(
                 if group_id < len(kernel_block_sizes)
                 else None
             )
+            view_layer_stride = cast(
+                Any, None if legacy_aliases else kv_cache_tensor.layer_stride
+            )
             view_config = replace(
                 kv_cache_tensor,
                 layers=view_layers,
                 shared_by=view_layers,
-                layer_stride=None if legacy_aliases else kv_cache_tensor.layer_stride,
+                layer_stride=view_layer_stride,
                 block_stride=(
                     kv_cache_tensor.block_stride or spec.page_size_bytes
                     if legacy_aliases
@@ -517,6 +520,11 @@ def build_attn_metadata(
         seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound[:num_reqs]
 
     attn_metadata: dict[str, Any] = {}
+    # V2 hybrid layouts can have one KV-cache group per layer.  Building the
+    # same backend/spec metadata for every group repeats CPU classification,
+    # pinned allocations and H2D copies.  Reuse the first build when a backend
+    # explicitly supplies the block-table rebinding contract.
+    cached_attn_metadata: dict[tuple[KVCacheSpec, type[Any]], Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
     for i in range(num_kv_cache_groups):
         block_table = block_tables[i]
@@ -563,9 +571,27 @@ def build_attn_metadata(
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(ubatch_idx)
+            kv_cache_spec = kv_cache_config.kv_cache_groups[i].kv_cache_spec
+            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
+            cache_key = (kv_cache_spec, type(attn_metadata_builder))
             if for_cudagraph_capture:
                 metadata = attn_metadata_builder.build_for_cudagraph_capture(
                     common_attn_metadata
+                )
+            elif (
+                cache_key in cached_attn_metadata
+                and attn_metadata_builder.supports_update_block_table
+                and getattr(
+                    attn_metadata_builder,
+                    "can_update_block_table",
+                    lambda metadata: True,
+                )(cached_attn_metadata[cache_key])
+            ):
+                metadata = attn_metadata_builder.update_block_table(
+                    cached_attn_metadata[cache_key],
+                    common_attn_metadata.block_table_tensor,
+                    common_attn_metadata.slot_mapping,
                 )
             else:
                 attn_metadata_extra_kwargs = (
@@ -581,6 +607,8 @@ def build_attn_metadata(
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )
+                if attn_metadata_builder.supports_update_block_table:
+                    cached_attn_metadata[cache_key] = metadata
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
     return attn_metadata

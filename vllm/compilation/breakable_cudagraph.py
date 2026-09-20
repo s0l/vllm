@@ -444,7 +444,16 @@ class BreakableCUDAGraphWrapper:
         # pre-capture prefetches are complete and don't leak into the graph.
         get_offloader().sync_prev_onload()
 
-        capture = BreakableCUDAGraphCapture(pool=self.graph_pool)
+        capture_type = BreakableCUDAGraphCapture
+        import os
+
+        if os.environ.get("AG2_FLASHNEXT_QSA_COMMAND_CAPTURE") == "1":
+            from vllm.models.qwen4_exp.nvidia.qsa_command_capture import (
+                QSACommandCapture,
+            )
+
+            capture_type = QSACommandCapture
+        capture = capture_type(pool=self.graph_pool)
         try:
             with capture:
                 output = self.runnable(*args, **kwargs)

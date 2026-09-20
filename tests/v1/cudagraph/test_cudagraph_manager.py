@@ -74,6 +74,53 @@ def _create_vllm_config(
     return vllm_config
 
 
+def test_full_decode_token_limit_preserves_piecewise_large_shapes(monkeypatch):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform,
+        "get_global_graph_pool",
+        lambda: object(),
+    )
+    config = _create_vllm_config(
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+    )
+    config.scheduler_config.max_num_seqs = 8
+    manager = gpu_cudagraph_utils.ModelCudaGraphManager(
+        vllm_config=config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        decode_query_len=2,
+        full_decode_max_tokens=4,
+        owner="target",
+    )
+    full = [
+        desc
+        for descs in manager._capture_descs.values()
+        for desc in descs
+        if desc.cg_mode == CUDAGraphMode.FULL
+    ]
+    assert {desc.num_tokens for desc in full} == {2, 4}
+    policy = gpu_cudagraph_utils.graph_execution_policy_from_managers((manager,))
+    assert policy.mode_for("target", 2, 4) == "FULL"
+    assert policy.mode_for("target", 2, 8) == "PIECEWISE"
+    assert (
+        manager.runtime_descriptor(
+            4, 8, 2, 0, allow_full=False, semantic_decode=True
+        ).cg_mode
+        == CUDAGraphMode.PIECEWISE
+    )
+    assert (
+        manager.runtime_descriptor(
+            4, 8, 2, 0, allow_full=True, semantic_decode=True
+        ).cg_mode
+        == CUDAGraphMode.PIECEWISE
+    )
+
+
 def test_worker_policy_publishes_backend_shape_contract_and_order() -> None:
     target = MagicMock()
     target.dynamic_graph_owner = "target"
@@ -2170,7 +2217,9 @@ def test_dynamic_working_set_forwards_reclaim_authority(kind, administrative):
         transaction_id="idle-x0",
         reason="elastic_admission_plan",
         administrative=administrative,
+        defer_rank_consensus=True,
     )
+    manager._publish_deferred_eviction_consensus.assert_called_once_with(None)
 
 
 def test_elastic_target_defers_startup_family_without_manual_budget(monkeypatch):
@@ -3456,6 +3505,34 @@ def test_working_set_prices_future_eviction_floor_from_physical_pool_ledger():
     assert working_set.resident_bytes == (41 + 44 + 44 + 65) * mib
 
 
+def test_forced_idle_cleanup_joins_cpu_consensus_with_zero_local_delta(monkeypatch):
+    cpu_group = object()
+    manager = object.__new__(gpu_cudagraph_utils.CudaGraphManager)
+    manager.device = torch.device("cuda:0")
+    manager.tp_size = 3
+    manager._dynamic_retention_ledger = (
+        gpu_cudagraph_utils.DynamicGraphRetentionLedger()
+    )
+
+    def rank_max(retained, *, op, group):
+        assert retained.device.type == "cpu"
+        assert op == torch.distributed.ReduceOp.MAX
+        assert group is cpu_group
+        retained.fill_(17)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", rank_max)
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=cpu_group),
+    )
+
+    delta = manager._reconcile_dynamic_retained_cleanup(0, force_rank_consensus=True)
+
+    assert delta == 17
+    assert manager._dynamic_retention_ledger.rank_safe_bytes == 17
+
+
 def test_working_set_reuses_one_lazy_capture_stream_across_owners(monkeypatch):
     managers = []
     for owner in ("target", "mtp_prefill", "mtp_decode"):
@@ -3651,7 +3728,9 @@ def test_working_set_administrative_x0_evicts_only_unpinned_hot_entries():
         evictable,
         transaction_id="x0-19",
         reason="administrative_idle_x0",
+        defer_rank_consensus=True,
     )
+    manager._publish_deferred_eviction_consensus.assert_called_once_with(None)
 
 
 def test_working_set_idle_finish_releases_allocator_before_measurement(monkeypatch):

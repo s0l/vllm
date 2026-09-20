@@ -699,6 +699,8 @@ class BlockPool:
         """
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+        if num_blocks == 0:
+            return []
 
         if self.prefer_low_id_allocations:
             frontier = self.cache_preservation_num_blocks
@@ -708,22 +710,31 @@ class BlockPool:
                 frontier = min(frontier, self.active_num_gpu_blocks)
                 uncached: list[KVCacheBlock] = []
                 cached: list[KVCacheBlock] = []
-                tail = []
-                for block in self.blocks[1 : self.active_num_gpu_blocks]:
+                for block_id in range(1, frontier):
+                    block = self.blocks[block_id]
                     if block.ref_cnt != 0:
                         continue
-                    if block.block_id >= frontier:
-                        tail.append(block)
-                    elif (
+                    if (
                         block.block_hash is not None
                         or block.block_id in self.cached_block_hashes_by_block
                     ):
                         cached.append(block)
                     else:
                         uncached.append(block)
+                        if len(uncached) == num_blocks:
+                            break
                 # Fill every low hole before entering the shrinkable tail.
-                cached.sort(key=self._cache_eviction_key)
-                ret = (uncached + cached + tail)[:num_blocks]
+                ret = uncached
+                if len(ret) < num_blocks:
+                    cached.sort(key=self._cache_eviction_key)
+                    ret.extend(cached[: num_blocks - len(ret)])
+                if len(ret) < num_blocks:
+                    for block_id in range(frontier, self.active_num_gpu_blocks):
+                        block = self.blocks[block_id]
+                        if block.ref_cnt == 0:
+                            ret.append(block)
+                            if len(ret) == num_blocks:
+                                break
             elif self.active_num_gpu_blocks == self.num_gpu_blocks:
                 # At the fully expanded attention mapping, unused capacity can
                 # preserve prefix-cache entries without constraining an
@@ -731,7 +742,8 @@ class BlockPool:
                 # evict cached blocks only after unused capacity is exhausted.
                 uncached = []
                 cached = []
-                for block in self.blocks[1 : self.active_num_gpu_blocks]:
+                for block_id in range(1, self.active_num_gpu_blocks):
+                    block = self.blocks[block_id]
                     if block.ref_cnt != 0:
                         continue
                     has_cached_hash = (
@@ -739,9 +751,11 @@ class BlockPool:
                         or block.block_id in self.cached_block_hashes_by_block
                     )
                     (cached if has_cached_hash else uncached).append(block)
-                cached.sort(key=self._cache_eviction_key)
-                ret = uncached[:num_blocks]
+                    if len(uncached) == num_blocks:
+                        break
+                ret = uncached
                 if len(ret) < num_blocks:
+                    cached.sort(key=self._cache_eviction_key)
                     ret.extend(cached[: num_blocks - len(ret)])
             else:
                 # Once elastic GDN growth has reduced the attention mapping,
@@ -750,11 +764,13 @@ class BlockPool:
                 # into the tail and make the next attention->GDN handoff
                 # impossible. Under that real memory pressure, evict the
                 # lowest cached hole rather than pinning the tail.
-                ret = [
-                    block
-                    for block in self.blocks[1 : self.active_num_gpu_blocks]
-                    if block.ref_cnt == 0
-                ][:num_blocks]
+                ret = []
+                for block_id in range(1, self.active_num_gpu_blocks):
+                    block = self.blocks[block_id]
+                    if block.ref_cnt == 0:
+                        ret.append(block)
+                        if len(ret) == num_blocks:
+                            break
             if len(ret) != num_blocks:
                 raise RuntimeError(
                     "active/free block accounting diverged during low-ID allocation"

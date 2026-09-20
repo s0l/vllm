@@ -68,6 +68,32 @@ def test_native_boundary_rejects_strided_inputs_before_cuda(index):
         consumer(*inputs)
 
 
+def test_mapped_consumer_requires_one_layer_of_global_hot_table():
+    from vllm.models.qwen4_exp.nvidia.expert_offload_bank import (
+        NativeMappedBankConsumer,
+    )
+
+    bank = SimpleNamespace(
+        state="READY",
+        staging=32,
+        source=SimpleNamespace(layers=48, experts=512),
+        consumer_views={
+            "w13_weight": torch.empty(32, 128, 64, dtype=torch.uint8),
+            "w2_weight": torch.empty(32, 128, 32, dtype=torch.uint8),
+            "w13_weight_scale": torch.empty(32, 128, 8, dtype=torch.uint8),
+            "w2_weight_scale": torch.empty(32, 128, 4, dtype=torch.uint8),
+        },
+    )
+    global_map = torch.full((48 * 512,), -1, dtype=torch.int32)
+    global_map[512 + 13] = 7
+    with pytest.raises(RuntimeError, match="invalid mapped native consumer geometry"):
+        NativeMappedBankConsumer(bank, global_map.clamp_min(0), num_groups=512)
+    layer_map = global_map.view(bank.source.layers, bank.source.experts)[1].clamp_min(0)
+    consumer = NativeMappedBankConsumer(bank, layer_map, num_groups=512)
+    assert consumer.expert_rows[13] == 7
+    assert consumer.expert_rows.shape == (512,)
+
+
 @pytest.mark.parametrize("peer", ["ready", "missing", "bad_owner", "mapping", "mode"])
 def test_joint_vote_rejects_divergent_ownership_before_conditional_execution(
     monkeypatch, peer
@@ -367,3 +393,28 @@ def test_stream_scan_policy_is_explicit_and_rejects_truthy_strings():
     assert StreamExpertConfig.from_options(dict(options, scan_order=True), 3).scan_order
     with pytest.raises(ValueError, match="requires a bool"):
         StreamExpertConfig.from_options(dict(options, scan_order="false"), 3)
+    with pytest.raises(ValueError):
+        StreamExpertConfig.from_options(dict(options, max_m=8), 3)
+    for m in (8, 32, 64):
+        config = StreamExpertConfig.from_options(
+            dict(options, max_m=m, ready_pipeline=True, column_jobs=True), 3
+        )
+        assert config.cpu.max_m == m and config.ready_pipeline and config.column_jobs
+        captured = StreamExpertConfig.from_options(
+            dict(
+                options, max_m=m, capture_max_m=4, ready_pipeline=True, column_jobs=True
+            ),
+            3,
+        )
+        assert captured.cpu.max_m == m and captured.capture_max_m == 4
+    for overrides in (
+        dict(max_m=65, ready_pipeline=True),
+        dict(column_jobs=True),
+        dict(ready_pipeline="true"),
+        dict(ready_pipeline=True, column_jobs=1),
+        dict(capture_max_m=0),
+        dict(capture_max_m=5),
+        dict(capture_max_m=True),
+    ):
+        with pytest.raises(ValueError):
+            StreamExpertConfig.from_options(dict(options, **overrides), 3)

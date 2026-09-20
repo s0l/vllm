@@ -85,6 +85,8 @@ _ELASTIC_RUNTIME_SOURCE_MODULES = (
     "vllm.models.qwen4_exp.nvidia.ple_offload",
     "vllm.models.qwen4_exp.nvidia.indexer_qsa",
     "vllm.models.qwen4_exp.nvidia.qsa",
+    "vllm.models.qwen4_exp.nvidia.qsa_command_capture",
+    "vllm.utils.nvfp4_expert_dispatch",
     "vllm.models.qwen4_exp.nvidia.qsa_flashinfer",
     "vllm.models.qwen4_exp.nvidia.qsa_qkv",
     "vllm.models.qwen4_exp.nvidia.ops.hc",
@@ -176,15 +178,13 @@ def elastic_catalog_physical_source_hashes() -> dict[str, str]:
 
 
 def elastic_auto_calibration_enabled() -> bool:
-    """Admit automatic calibration only in an explicit maintenance job."""
+    """Admit calibration only before READY in a declared startup epoch."""
     requested = os.environ.get("AG2_VLLM_ELASTIC_AUTO_CALIBRATE", "0") == "1"
     role = os.environ.get("AG2_VLLM_ELASTIC_CALIBRATION_ROLE", "")
-    if requested and role != "maintenance":
+    if requested and role not in {"maintenance", "startup"}:
         raise RuntimeError(
-            "automatic elastic calibration is maintenance-only; set "
-            "AG2_VLLM_ELASTIC_CALIBRATION_ROLE=maintenance in an explicit "
-            "calibration job, or disable AG2_VLLM_ELASTIC_AUTO_CALIBRATE "
-            "for serving"
+            "automatic elastic calibration requires the pre-READY startup "
+            "role (or the legacy explicit maintenance role)"
         )
     return requested
 

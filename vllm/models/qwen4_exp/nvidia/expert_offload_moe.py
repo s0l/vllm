@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+import threading
 import weakref
 
 import torch
@@ -83,7 +85,7 @@ def get_native_provider(vllm_config):
             archive_path=budget.prepared_archive,
             partition=budget.partition,
         )
-        cpu = None
+        cpu = dispatch_policy = None
         if budget.stream_experts is not None:
             from .expert_offload_archive import row_schema
 
@@ -96,6 +98,26 @@ def get_native_provider(vllm_config):
                 topk=text.num_experts_per_tok,
                 partition=budget.partition,
             )
+            if budget.dispatch_profile is not None:
+                try:
+                    binding = dict(
+                        width=cpu.i,
+                        cores=budget.stream_experts.cpu.rank_cores(rank, source.tp),
+                        device_uuid=torch.cuda.get_device_properties(
+                            get_tp_group().device
+                        ).uuid,
+                    )
+                    if budget.target_cpu_only:
+                        dispatch_policy = budget.dispatch_profile.bind_cpu_only(
+                            rank, **binding
+                        )
+                    else:
+                        dispatch_policy = budget.dispatch_profile.bind(
+                            rank, native_sha=budget.stream_experts.cpu.sha256, **binding
+                        )
+                except BaseException:
+                    cpu.close()
+                    raise
             archive = source.archive
             assert archive is not None
             cpu.source(
@@ -113,7 +135,7 @@ def get_native_provider(vllm_config):
             device,
             hot_rows=0,
             max_hot_rows=budget.max_hot_rows,
-            staging=budget.staging,
+            staging=budget.scratch_rows,
         )
         if (
             sum(bank.targets(0).values()) != budget.rank_mapped_bytes(source.rank, 0)
@@ -132,6 +154,28 @@ def get_native_provider(vllm_config):
         provider = NativeExpertProvider(
             bank, get_tp_group(), vllm_config, topk=text.num_experts_per_tok
         )
+        if budget.e8_archive is not None:
+            from vllm.logger import init_logger
+
+            from .expert_offload_e8 import E8ExpertExecutor
+
+            provider.e8_path = E8ExpertExecutor(
+                budget.e8_archive,
+                source.rank,
+                device,
+                topk=text.num_experts_per_tok,
+                hidden=text.hidden_size,
+            )
+            init_logger(__name__).info(
+                "FlashNext whole-expert E8 attached: rank=%d owners=%d resident=%d "
+                "cold=%d pinned_bytes=%d",
+                source.rank,
+                provider.e8_path.owner,
+                provider.e8_path.resident,
+                provider.e8_path.cold,
+                provider.e8_path.archive.pinned_bytes,
+            )
+        provider.target_cpu_only = budget.target_cpu_only
         provider.use_hot_path = budget.hot_read
         provider.use_scan_order = (
             budget.stream_experts is not None and budget.stream_experts.scan_order
@@ -141,7 +185,9 @@ def get_native_provider(vllm_config):
 
             from .expert_offload_stream import NativeStreamExperts
 
-            provider.stream_path = NativeStreamExperts(provider, cpu)
+            provider.stream_path = NativeStreamExperts(
+                provider, cpu, max_m=budget.stream_experts.capture_max_m
+            )
             provider.enable_frequency_admission(
                 history_steps=budget.stream_experts.history_steps,
                 max_promotions=budget.stream_experts.max_promotions,
@@ -173,6 +219,35 @@ def get_native_provider(vllm_config):
             provider.enable_cpu_experts(executor)
             init_logger(__name__).info(
                 "FlashNext CPU experts attached: %s", executor.identity
+            )
+        if budget.wave_slots > 1:
+            provider.enable_wave_pipeline(budget.wave_slots)
+        if dispatch_policy is not None:
+            assert cpu is not None
+            provider.enable_mixed_dispatch(cpu, dispatch_policy)
+            mixed_path = provider.mixed_path
+            stream_path = provider.stream_path
+            assert mixed_path is not None and stream_path is not None
+            if mixed_path.workspace() != budget.dispatch_workspace():
+                provider.retire()
+                raise RuntimeError(
+                    "mixed workspace differs from its admitted byte ledger"
+                )
+            provider.caller_affinity = (
+                threading.get_native_id(),
+                os.sched_getaffinity(0),
+            )
+            os.sched_setaffinity(0, {dispatch_policy.caller_core})
+            init_logger(__name__).info(
+                "FlashNext mixed dispatch attached: rank=%d profile=%s "
+                "CPU=%d capture=%d "
+                "caller=%d workspace=%s scope=local-candidate",
+                source.rank,
+                dispatch_policy.profile_sha,
+                cpu.max_m,
+                stream_path.max_m,
+                dispatch_policy.caller_core,
+                mixed_path.workspace(),
             )
         _providers[key] = provider
     return provider
@@ -317,6 +392,11 @@ def reject_native_expert_reload(model):
 
 
 def finish_native_expert_load(model):
+    providers = {}
     for module in model.modules():
         if isinstance(module, NativeOffloadedExperts):
             module.finish_load()
+            providers[id(module.provider)] = module.provider
+    for provider in providers.values():
+        if provider.e8_path is not None:
+            provider.e8_path.warmup()

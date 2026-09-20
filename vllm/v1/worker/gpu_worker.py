@@ -9,7 +9,7 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
 from types import NoneType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import regex as re
@@ -595,7 +595,10 @@ class Worker(WorkerBase):
         """
         maybe_apply_startup_plan(self)
 
-        additional_config = self.vllm_config.additional_config or {}
+        configured_additional = self.vllm_config.additional_config
+        additional_config = (
+            configured_additional if isinstance(configured_additional, dict) else {}
+        )
         if additional_config.get("tp3_ce_reduce", False):
             from vllm.distributed.device_communicators.tp3_ce_all_reduce import (
                 initialize_tp3_ce_workspace,
@@ -658,10 +661,10 @@ class Worker(WorkerBase):
         ) as profile_result:
             self.model_runner.profile_run()
 
-        additional_config = self.vllm_config.additional_config
+        runtime_additional_config = self.vllm_config.additional_config
         elastic_dynamic_kv = bool(
-            isinstance(additional_config, dict)
-            and additional_config.get("elastic_gdn_backing", False)
+            isinstance(runtime_additional_config, dict)
+            and runtime_additional_config.get("elastic_gdn_backing", False)
         )
 
         # Profile CUDA graph memory if graphs will be captured.
@@ -983,6 +986,9 @@ class Worker(WorkerBase):
         kernel_warmup(self)
 
         if self.use_v2_model_runner:
+            # Initialization may consume different RNG offsets on TP ranks.
+            # Warmup carries sampled tokens into the next distributed forward.
+            set_random_seed(self.model_config.seed)
             # A workspace resize after capture frees what the graphs point at.
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
 
@@ -1142,10 +1148,12 @@ class Worker(WorkerBase):
 
         from vllm.distributed.parallel_state import set_tp3_ce_runtime_enabled
 
+        additional_config = self.vllm_config.additional_config
         set_tp3_ce_runtime_enabled(
             bool(
-                self.vllm_config.additional_config
-                and self.vllm_config.additional_config.get("tp3_ce_reduce", False)
+                additional_config.get("tp3_ce_reduce", False)
+                if isinstance(additional_config, dict)
+                else False
             )
         )
 
@@ -1695,10 +1703,11 @@ class Worker(WorkerBase):
         manager = getattr(self.model_runner, "cudagraph_manager", None)
         if manager is None:
             raise RuntimeError("elastic residency receipt requires Graph manager")
+        model_runner = cast(Any, self.model_runner)
         resident, floor, transition_floor = (
-            self.model_runner._current_dynamic_graph_receipt()
+            model_runner._current_dynamic_graph_receipt()
         )
-        return self.model_runner._dynamic_graph_working_set().residency_receipt(
+        return model_runner._dynamic_graph_working_set().residency_receipt(
             transaction_id=None,
             resident_bytes=resident,
             floor_bytes=floor,
@@ -1714,7 +1723,8 @@ class Worker(WorkerBase):
         self, max_x: int, transaction_id: str
     ) -> tuple[int, int, int]:
         """Remove only calibration probes outside the accepted FULL prefix."""
-        return self.model_runner._dynamic_graph_working_set().prune_pinned_full_above(
+        model_runner = cast(Any, self.model_runner)
+        return model_runner._dynamic_graph_working_set().prune_pinned_full_above(
             max_x, transaction_id
         )
 
@@ -1725,7 +1735,8 @@ class Worker(WorkerBase):
             return "static"
         from vllm.v1.core.elastic_graph import RuntimeGeneration
 
-        self.model_runner._dynamic_graph_working_set().rebind_runtime_generation(
+        model_runner = cast(Any, self.model_runner)
+        model_runner._dynamic_graph_working_set().rebind_runtime_generation(
             RuntimeGeneration(generation)
         )
         return generation
@@ -1740,7 +1751,7 @@ class Worker(WorkerBase):
         )
 
         policy = graph_execution_policy_from_managers(
-            self.model_runner._dynamic_graph_working_set().managers
+            cast(Any, self.model_runner)._dynamic_graph_working_set().managers
         )
         return policy.to_payload()
 

@@ -4812,12 +4812,11 @@ def test_generate_scheduler_elastic_capacity_uses_worst_rank_geometry():
             elastic_budget_bytes=budget,
         )
 
-    scheduler_config = generate_scheduler_kv_cache_config(
-        [
-            make_config(attention_block_size=5, budget=64),
-            make_config(attention_block_size=7, budget=60),
-        ]
-    )
+    worker_configs = [
+        make_config(attention_block_size=5, budget=64),
+        make_config(attention_block_size=7, budget=60),
+    ]
+    scheduler_config = generate_scheduler_kv_cache_config(worker_configs)
 
     # At three GDN blocks the first rank can map nine attention blocks, but
     # the second can map only six. A common scheduler transition must use six.
@@ -4826,6 +4825,11 @@ def test_generate_scheduler_elastic_capacity_uses_worst_rank_geometry():
     assert scheduler_config.elastic_rank_budget_bytes == (64, 60)
     assert scheduler_config.elastic_rank_primary_mapped_bytes[1][6] == 44
     assert scheduler_config.elastic_rank_gdn_mapped_bytes[1][3] == 16
+    assert all(
+        config.elastic_attention_capacity_by_gdn_blocks
+        == scheduler_config.elastic_attention_capacity_by_gdn_blocks
+        for config in worker_configs
+    )
 
     mismatched = make_config(attention_block_size=7, budget=60)
     mismatched.elastic_gdn_blocks_per_request = 4

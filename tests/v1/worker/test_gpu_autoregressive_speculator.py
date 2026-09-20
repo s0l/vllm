@@ -634,8 +634,10 @@ def test_run_model_piecewise_selects_its_own_manager(monkeypatch, owner):
     ),
     [
         ("_multi_step_decode", CUDAGraphMode.NONE, 3, 0),
+        ("_multi_step_decode", CUDAGraphMode.PIECEWISE, 3, 0),
         ("_multi_step_decode", CUDAGraphMode.FULL, 0, 3),
         ("_fused_multi_step_decode", CUDAGraphMode.NONE, 3, 0),
+        ("_fused_multi_step_decode", CUDAGraphMode.PIECEWISE, 3, 0),
         ("_fused_multi_step_decode", CUDAGraphMode.FULL, 0, 1),
     ],
 )
@@ -663,6 +665,8 @@ def test_multi_step_decode_replays_captured_graph_as_expected(
         cg_mode=cg_mode,
         num_tokens=2,
         num_reqs=2,
+        physical_num_reqs=2,
+        runtime_generation="accepted-generation",
     )
 
     getattr(speculator, method_name)(
@@ -675,6 +679,9 @@ def test_multi_step_decode_replays_captured_graph_as_expected(
 
     assert generate_draft.call_count == expected_eager_calls
     assert run_fullgraph.call_count == expected_graph_replays
+    for call in generate_draft.call_args_list:
+        assert call.kwargs.get("physical_num_reqs") == 2
+        assert call.kwargs.get("runtime_generation") == "accepted-generation"
 
 
 def test_update_draft_decode_metadata_updates_fa3_scheduler_metadata(

@@ -4,6 +4,7 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import Mock
 
 import pytest
@@ -39,6 +40,51 @@ def make_config(options, tp=3):
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=tp),
     )
+
+
+@pytest.mark.parametrize("wave_slots", [1, 2])
+def test_native_residency_reserves_every_staging_slot_before_attach(wave_slots):
+    from vllm.models.qwen4_exp.nvidia.expert_offload_residency import (
+        NativeExpertResidency,
+    )
+
+    budget = cast(
+        NativeExpertBudget,
+        make_budget(max_hot_rows=128, staging=32, wave_slots=wave_slots),
+    )
+    rows = 32 * wave_slots
+    sizes = [budget.round(rows * stride) for stride in budget.strides]
+    sizes.append(budget.round((128 + rows) * 24))
+    targets = {str(i): size for i, size in enumerate(sizes)}
+    bank = SimpleNamespace(
+        source=SimpleNamespace(
+            geometry=budget.geometry, rank=0, layers=48, experts=512
+        ),
+        tables=SimpleNamespace(pool_rows=0),
+        targets=lambda hot: targets,
+        max_rows=128 + rows - 1,
+        quantum=2 << 20,
+        backings={
+            name: SimpleNamespace(info=SimpleNamespace(committed=size))
+            for name, size in targets.items()
+        },
+    )
+    controller = SimpleNamespace(
+        auxiliary_owner=None, backings={}, auxiliary_targets={}
+    )
+    provider = SimpleNamespace(bank=bank)
+    with pytest.raises(ValueError, match="initial residency"):
+        NativeExpertResidency(provider, controller, budget)
+    assert controller.auxiliary_owner is None and not controller.backings
+    bank.max_rows += 1
+    owner = NativeExpertResidency(provider, controller, budget)
+    assert owner is not None
+    assert budget is not None
+    assert owner.grant is not None
+    assert cast(Any, controller).auxiliary_owner is owner
+    assert bank.elastic_controller is controller
+    assert owner.grant == ElasticExpertGrant(0, 0)
+    assert sum(controller.auxiliary_targets.values()) == budget.rank_mapped_bytes(0, 0)
 
 
 @pytest.mark.parametrize("staging", [1, 2, 32])

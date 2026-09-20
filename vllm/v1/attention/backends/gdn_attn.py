@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Backend for GatedDeltaNet attention."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import torch
@@ -110,6 +110,11 @@ class GDNAttentionMetadata:
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
     kv_cache_spec: MambaSpec
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+    # Hybrid models commonly place every GDN layer in its own KV-cache group.
+    # Decode geometry is identical across those groups; only the state block
+    # table changes.  Let the runner build the expensive common metadata once
+    # and rebind the state indices for each remaining group.
+    supports_update_block_table = True
 
     reorder_batch_threshold: int = 1
 
@@ -136,8 +141,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         else:
             self.num_spec = 0
         self.use_spec_decode: bool = self.num_spec > 0
+        additional_config = vllm_config.additional_config
         self.use_mtp_replay_commit = bool(
-            vllm_config.additional_config.get("gdn_mtp_replay_commit", False)
+            additional_config.get("gdn_mtp_replay_commit", False)
+            if isinstance(additional_config, dict)
+            else False
         )
         if self.use_mtp_replay_commit:
             assert self.use_spec_decode
@@ -611,3 +619,68 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         assert num_decode_draft_tokens_cpu.shape == num_accepted_tokens.shape
 
         return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
+
+    def can_update_block_table(self, metadata: GDNAttentionMetadata) -> bool:
+        """Whether ``update_block_table`` covers this metadata shape.
+
+        The first bounded optimization is deliberately decode-only.  Prefill
+        and mixed batches keep the existing full builder until their chunk and
+        convolution metadata have a separate equivalence proof.
+        """
+        return (
+            self.kv_cache_spec.separate_pool
+            and metadata.num_prefills == 0
+            and (metadata.num_decodes == 0 or metadata.num_spec_decodes == 0)
+        )
+
+    def update_block_table(
+        self,
+        metadata: GDNAttentionMetadata,
+        blk_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> GDNAttentionMetadata:
+        """Rebind decode state indices while sharing group-invariant metadata."""
+        del slot_mapping
+        if not self.can_update_block_table(metadata):
+            raise ValueError("GDN block-table reuse only supports pure decode batches")
+
+        block_table_tensor = mamba_get_block_table_tensor(
+            blk_table,
+            # Align/separate-pool decode selects physical state columns from the
+            # block table.  ``seq_lens`` is unused for separate-pool mode; the
+            # cached metadata therefore need not retain another step tensor.
+            torch.empty(0, dtype=torch.int32, device=blk_table.device),
+            self.kv_cache_spec,
+            self.vllm_config.cache_config.mamba_cache_mode,
+        )
+        if self.use_mtp_replay_commit:
+            block_table_tensor = block_table_tensor[:, :1].expand(-1, self.num_spec + 1)
+
+        if metadata.num_spec_decodes:
+            assert metadata.spec_batch_indices is not None
+            rows = metadata.spec_batch_indices[: metadata.num_spec_decodes].long()
+            state_indices = block_table_tensor.index_select(0, rows)[
+                :, : self.num_spec + 1
+            ]
+            if self.use_full_cuda_graph:
+                assert metadata.spec_sequence_masks is not None
+                self.spec_state_indices_tensor[: metadata.num_spec_decodes].copy_(
+                    state_indices, non_blocking=True
+                )
+                state_indices = self.spec_state_indices_tensor[
+                    : metadata.spec_sequence_masks.shape[0]
+                ]
+                state_indices[metadata.num_spec_decodes :].fill_(NULL_BLOCK_ID)
+            return replace(metadata, spec_state_indices_tensor=state_indices)
+
+        state_indices = block_table_tensor[: metadata.num_decodes, 0]
+        if self.use_full_cuda_graph:
+            assert metadata.non_spec_query_start_loc is not None
+            self.non_spec_state_indices_tensor[: metadata.num_decodes].copy_(
+                state_indices, non_blocking=True
+            )
+            state_indices = self.non_spec_state_indices_tensor[
+                : metadata.non_spec_query_start_loc.shape[0] - 1
+            ]
+            state_indices[metadata.num_decodes :].fill_(NULL_BLOCK_ID)
+        return replace(metadata, non_spec_state_indices_tensor=state_indices)

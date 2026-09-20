@@ -100,6 +100,7 @@ def _plan_worker(
     max_num_seqs=64,
     async_scheduling=False,
     skip_mm_profiling=False,
+    gpu_memory_utilization=0.9,
 ):
     """The minimal Worker surface the startup-plan entry points touch."""
     scheduler_config = SimpleNamespace(
@@ -125,6 +126,10 @@ def _plan_worker(
             compute_hash=lambda **_kwargs: config_hash,
             scheduler_config=scheduler_config,
             model_config=SimpleNamespace(multimodal_config=multimodal_config),
+            cache_config=SimpleNamespace(
+                gpu_memory_utilization=gpu_memory_utilization,
+                kv_cache_memory_bytes=kv_bytes,
+            ),
             parallel_config=SimpleNamespace(world_size=3),
         ),
         rank=0,
@@ -170,6 +175,8 @@ def test_startup_plan_fingerprint_sensitivity(plan_env):
     assert base != fp(_plan_worker(max_num_seqs=40).vllm_config, 0, 1)
     assert base != fp(_plan_worker(async_scheduling=True).vllm_config, 0, 1)
     assert base != fp(_plan_worker(skip_mm_profiling=True).vllm_config, 0, 1)
+    assert base != fp(_plan_worker(gpu_memory_utilization=0.92).vllm_config, 0, 1)
+    assert base != fp(_plan_worker(kv_bytes=7 * GiB_bytes).vllm_config, 0, 1)
     assert base != fp(_plan_worker().vllm_config, 1, 2)
     with patch.object(startup_plan, "current_platform", _plan_platform("NVIDIA A100")):
         assert base != fp(_plan_worker().vllm_config, 0, 1)

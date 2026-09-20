@@ -50,6 +50,7 @@ def cache_snapshot(bank):
         ram_keys = set(ram)
         overlap = hot_keys & ram_keys
         pinned = source.pinned_pool
+        registered = getattr(bank, "registered_source_region", None)
         controller = getattr(bank, "elastic_controller", None)
         return dict(
             schema="native-expert-residency-v1",
@@ -70,7 +71,7 @@ def cache_snapshot(bank):
             ram_retained_bytes=source.used,
             ram_budget_bytes=source.limit,
             ram_registered_bytes=(0 if pinned is None else pinned.allocated)
-            + getattr(bank, "promotion_registered_source_bytes", 0),
+            + (0 if registered is None else registered.registered_bytes),
             ram_registered_active_rows=0
             if pinned is None
             else sum(slab.active for slab in pinned.slabs),
@@ -226,6 +227,7 @@ class ExpertFrequencyAdmission:
         max_promotions,
         protected=(),
         fill_free=False,
+        upload_limit=None,
     ):
         arrays = [
             np.fromiter(self._keys(values), dtype=np.int64)
@@ -237,6 +239,7 @@ class ExpertFrequencyAdmission:
             capacity=capacity,
             max_promotions=max_promotions,
             fill_free=fill_free,
+            upload_limit=upload_limit,
         )
 
     def plan_arrays(
@@ -248,6 +251,7 @@ class ExpertFrequencyAdmission:
         max_promotions,
         protected=None,
         fill_free=False,
+        upload_limit=None,
     ):
         if (
             type(capacity) is not int
@@ -255,6 +259,10 @@ class ExpertFrequencyAdmission:
             or type(max_promotions) is not int
             or max_promotions < 0
             or type(fill_free) is not bool
+            or (
+                upload_limit is not None
+                and (type(upload_limit) is not int or upload_limit < 0)
+            )
         ):
             raise ValueError("invalid expert admission budget")
         scores = self.frequency.reshape(-1)
@@ -294,6 +302,8 @@ class ExpertFrequencyAdmission:
         desired[retained[: capacity - protected_count]] = True
         size = int(desired.sum())
         limit = max_promotions + (capacity - size if fill_free else 0)
+        if upload_limit is not None:
+            limit = min(limit, upload_limit)
         candidates = ranked(available & ~current & (scores > 0))
         victims = ranked(desired & ~protected, weakest=True)
         victim_index = 0
@@ -352,6 +362,7 @@ class NativeExpertAdmission:
         asynchronous=True,
         registered_source=False,
         host_control=False,
+        max_upload_bytes=None,
     ):
         import torch
 
@@ -370,6 +381,31 @@ class NativeExpertAdmission:
             bank.source.layers, bank.source.experts, history_steps=history_steps
         )
         self.max_promotions, self.exclusive_ram = max_promotions, exclusive_ram
+        self.row_payload_bytes = sum(bank.strides.values())
+        if self.row_payload_bytes <= 0:
+            raise ValueError("expert transfer cost must have positive source bytes")
+        if max_upload_bytes is None:
+            max_upload_bytes = max_promotions * self.row_payload_bytes
+        if type(max_upload_bytes) is not int or max_upload_bytes < 0:
+            raise ValueError("invalid in-flight expert byte budget")
+        self.max_upload_bytes = max_upload_bytes
+        self.upload_rows_limit = max_upload_bytes // self.row_payload_bytes
+        if hasattr(bank.source, "cpu"):
+            cpu = bank.source.cpu
+            capacity = cpu.source_stats()["capacity"]
+            demand = (
+                1
+                if getattr(cpu, "ready_enabled", False)
+                else min(cpu.experts, cpu.max_m * cpu.topk)
+            )
+            # GPU fallback may hold every wave slot while promotion is still
+            # in flight. Native external leases also retain one CPU demand row.
+            demand = max(
+                demand, bank.staging + int(getattr(cpu, "ready_enabled", False))
+            )
+            self.upload_rows_limit = min(
+                self.upload_rows_limit, max(0, capacity - demand)
+            )
         self.counts = np.zeros(self.policy.frequency.shape, np.uint32)
         self.next_layer, self.tokens = 0, None
         self.last_step = {}
@@ -383,12 +419,12 @@ class NativeExpertAdmission:
             bank.promotion_staging_bytes = self.promotion.staging_bytes
         packed = (self.counts.size + 7) // 8
         self.availability = torch.empty(
-            packed + 33,
+            packed + 41,
             dtype=torch.uint8,
             device="cpu" if host_control else bank.device,
         )
         self.peer_availability = torch.empty(
-            (packed + 33) * provider.coordinator.ranks,
+            (packed + 41) * provider.coordinator.ranks,
             dtype=torch.uint8,
             device=self.availability.device,
         )
@@ -518,6 +554,7 @@ class NativeExpertAdmission:
             (
                 np.array([int(error is None)], np.uint8),
                 np.frombuffer(identity, np.uint8),
+                np.frombuffer(self.upload_rows_limit.to_bytes(8, "little"), np.uint8),
                 np.packbits(available),
             )
         )
@@ -549,7 +586,10 @@ class NativeExpertAdmission:
                 wall_ms=(time.perf_counter() - started) * 1000,
             )
             return
-        common = np.unpackbits(np.bitwise_and.reduce(peers[:, 33:], axis=0))[
+        upload_limit = min(
+            int.from_bytes(row[33:41].tobytes(), "little") for row in peers
+        )
+        common = np.unpackbits(np.bitwise_and.reduce(peers[:, 41:], axis=0))[
             : self.counts.size
         ]
         resident = np.fromiter(
@@ -563,6 +603,7 @@ class NativeExpertAdmission:
             max_promotions=self.max_promotions,
             # Zero disables admission, including bootstrap, for frozen controls.
             fill_free=self.max_promotions > 0,
+            upload_limit=upload_limit,
         )
         # The bank validates actual current ownership again before retirement.
         mark("placement_plan_ms")

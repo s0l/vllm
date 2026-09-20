@@ -147,7 +147,7 @@ def canonical_graph_step_key(
         raise ValueError("physical Graph cohort underfills semantic requests")
     if semantic.phase == "decode":
         assert qlen is not None
-        if policy.mode_for("target", qlen) == "FULL":
+        if policy.mode_for("target", qlen, semantic.num_tokens) == "FULL":
             return (1, k, physical_x, physical_x * qlen, qlen)
         if policy.verifier_contract == "batched-causal-q1-v1" and qlen == k + 1:
             return (0, k, physical_x, physical_x * qlen, qlen)
@@ -164,6 +164,7 @@ class OwnerGraphExecutionPolicy:
     owner: str
     full_query_lens: tuple[int, ...]
     piecewise_mode: str
+    full_max_tokens: int | None = None
     compiled_piecewise_sizes: tuple[int, ...] = ()
     capability_contract: str = "cuda-graph-manager-v1"
     full_exact_x: bool = True
@@ -189,6 +190,14 @@ class OwnerGraphExecutionPolicy:
             raise ValueError("unknown PIECEWISE padding contract")
         if self.full_query_lens and not self.full_exact_x:
             raise ValueError("FULL Graph policy must preserve exact X")
+        if self.full_max_tokens is not None and (
+            isinstance(self.full_max_tokens, bool)
+            or not isinstance(self.full_max_tokens, int)
+            or self.full_max_tokens <= 0
+        ):
+            raise ValueError("FULL Graph token limit must be a positive integer")
+        if self.full_max_tokens is not None and not self.full_query_lens:
+            raise ValueError("FULL Graph token limit requires a FULL query length")
         if self.piecewise_mode not in {"PIECEWISE", "NONE"}:
             raise ValueError("piecewise mode must be PIECEWISE or NONE")
         if self.activation not in {"legacy-v1", "always", "speculative"}:
@@ -238,8 +247,14 @@ class OwnerGraphExecutionPolicy:
         ):
             raise ValueError("compiled PIECEWISE sizes must be sorted unique positives")
 
-    def mode_for(self, uniform_query_len: int | None) -> str:
-        if uniform_query_len in self.full_query_lens:
+    def mode_for(
+        self, uniform_query_len: int | None, num_tokens: int | None = None
+    ) -> str:
+        if uniform_query_len in self.full_query_lens and (
+            self.full_max_tokens is None
+            or num_tokens is None
+            or num_tokens <= self.full_max_tokens
+        ):
             return "FULL"
         return self.piecewise_mode
 
@@ -256,6 +271,15 @@ class OwnerGraphExecutionPolicy:
                     "physical FULL key violates graph execution policy: "
                     f"owner={self.owner} query_len={query_len} "
                     f"allowed={self.full_query_lens}"
+                )
+            if (
+                self.full_max_tokens is not None
+                and key.logical.token_bucket > self.full_max_tokens
+            ):
+                raise ElasticGraphError(
+                    "physical FULL key exceeds graph execution policy token limit: "
+                    f"owner={self.owner} tokens={key.logical.token_bucket} "
+                    f"limit={self.full_max_tokens}"
                 )
             if key.logical.logical_num_reqs != key.physical_num_reqs:
                 raise ElasticGraphError("FULL key lost exact request cardinality")
@@ -328,8 +352,13 @@ class GraphExecutionPolicy:
                 return policy
         raise ElasticGraphError(f"graph execution policy has no owner {owner!r}")
 
-    def mode_for(self, owner: str, uniform_query_len: int | None) -> str:
-        return self.owner_policy(owner).mode_for(uniform_query_len)
+    def mode_for(
+        self,
+        owner: str,
+        uniform_query_len: int | None,
+        num_tokens: int | None = None,
+    ) -> str:
+        return self.owner_policy(owner).mode_for(uniform_query_len, num_tokens)
 
     def to_payload(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -387,11 +416,20 @@ class GraphExecutionPolicy:
                     "graph execution policy piecewise_query_len_min_tokens "
                     "must be an integer or null"
                 )
+            full_max_tokens = raw.get("full_max_tokens")
+            if full_max_tokens is not None and (
+                isinstance(full_max_tokens, bool)
+                or not isinstance(full_max_tokens, int)
+            ):
+                raise ValueError(
+                    "graph execution policy full_max_tokens must be an integer or null"
+                )
             owners.append(
                 OwnerGraphExecutionPolicy(
                     owner=required_string(raw, "owner"),
                     full_query_lens=integer_sequence(raw, "full_query_lens"),
                     piecewise_mode=required_string(raw, "piecewise_mode"),
+                    full_max_tokens=full_max_tokens,
                     compiled_piecewise_sizes=integer_sequence(
                         raw, "compiled_piecewise_sizes"
                     ),
@@ -1244,7 +1282,7 @@ def resolve_step_physical_keys(
                     "runtime Graph owner has no physical shape contract"
                 )
 
-            mode = owner_policy.mode_for(owner_uniform)
+            mode = owner_policy.mode_for(owner_uniform, owner_tokens)
             if (
                 owner_policy.token_source == "step"
                 and semantic_uniform is None
@@ -1481,7 +1519,19 @@ def build_execution_manifest(
             raise ElasticGraphError("current physical owner set has stale generation")
         policy.owner_policy(key.logical.owner).validate_physical_key(key)
         exact_key = exact_by_owner[key.logical.owner]
-        if key != exact_key:
+        owner_policy = policy.owner_policy(key.logical.owner)
+        padded_request_carrier = bool(
+            phase == "mixed"
+            and requested_output_k > 0
+            and owner_policy.token_source == "requests"
+            and exact_key.logical.mode == "FULL"
+            and key.logical.mode == "FULL"
+            and exact_key.logical.uniform_query_len == 1
+            and key.logical.uniform_query_len == 1
+            and key.physical_num_reqs >= semantic_x
+            and key.logical.token_bucket == key.physical_num_reqs
+        )
+        if key != exact_key and not padded_request_carrier:
             raise ElasticGraphError(
                 "current physical key differs from the execution step: "
                 f"owner={key.logical.owner} expected={exact_key.identity} "
@@ -1514,12 +1564,16 @@ def build_execution_manifest(
                 "execution manifest requires an explicit owner token source"
             )
 
-        key = keys_by_owner.pop(owner_policy.owner, None)
-        if key is not None:
-            physical_tokens = key.logical.token_bucket
+        physical_key = (
+            keys_by_owner.pop(owner_policy.owner)
+            if owner_policy.owner in keys_by_owner
+            else None
+        )
+        if physical_key is not None:
+            physical_tokens = physical_key.logical.token_bucket
             representation = DispatchRepresentation.HOT_GRAPH
         else:
-            mode = owner_policy.mode_for(owner_uniform)
+            mode = owner_policy.mode_for(owner_uniform, live_tokens)
             if (
                 owner_policy.token_source == "step"
                 and phase == "mixed"
@@ -1544,7 +1598,9 @@ def build_execution_manifest(
                 )
             representation = DispatchRepresentation.COMPILED_ONLY
 
-        owner_physical_x = physical_x if key is None else key.physical_num_reqs
+        owner_physical_x = (
+            physical_x if physical_key is None else physical_key.physical_num_reqs
+        )
         invocation = OwnerInvocation(
             owner=owner_policy.owner,
             activation=owner_policy.activation,
@@ -1564,7 +1620,7 @@ def build_execution_manifest(
             OwnerDispatch(
                 invocation=invocation,
                 representation=representation,
-                physical_key=key,
+                physical_key=physical_key,
             )
         )
         invocations.append(invocation)
@@ -2012,7 +2068,11 @@ class ElasticAdmissionController:
                         )
                     )
                 )
-            envelope = tuple(max(prior[index], envelope[index]) for index in range(3))
+            envelope = (
+                max(prior[0], envelope[0]),
+                max(prior[1], envelope[1]),
+                max(prior[2], envelope[2]),
+            )
             provenance = selected_provenance
         self.capture_envelopes[owner_key] = envelope
         self._capture_envelope_provenance[owner_key] = envelope, provenance
@@ -2162,11 +2222,11 @@ class ElasticAdmissionController:
                     f"observed={observed_ids!r}"
                 )
         for key, price in observed.items():
-            entry = self._entries.get(key)
+            observed_entry = self._entries.get(key)
             if (
-                entry is not None
-                and entry.price is not None
-                and entry.price.reclaim_group != price.reclaim_group
+                observed_entry is not None
+                and observed_entry.price is not None
+                and observed_entry.price.reclaim_group != price.reclaim_group
             ):
                 raise ElasticGraphError(
                     "graph reclaim identity changed inside one generation"
@@ -2345,11 +2405,11 @@ class ElasticAdmissionController:
                     f"observed={observed_ids!r}"
                 )
         for key, (price, _pinned, _reclaimable_bytes) in observed.items():
-            entry = self._entries.get(key)
+            observed_entry = self._entries.get(key)
             if (
-                entry is not None
-                and entry.price is not None
-                and entry.price.reclaim_group != price.reclaim_group
+                observed_entry is not None
+                and observed_entry.price is not None
+                and observed_entry.price.reclaim_group != price.reclaim_group
             ):
                 raise ElasticGraphError(
                     "graph reclaim identity changed inside one generation"

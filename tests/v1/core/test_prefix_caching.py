@@ -48,6 +48,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -4942,6 +4943,92 @@ def test_fine_dcp_real_geometry_automatic_tail_reuse(
     )
 
 
+@pytest.mark.parametrize("prompt_len", [193, 3000, 4096, 9216, 14885, 16065])
+def test_fine_dcp_flash_next_geometry_automatic_tail_reuse(monkeypatch, prompt_len):
+    """FlashNext 64/192/DCP3 geometry publishes exact K1 tail checkpoints."""
+    monkeypatch.setenv("AG2_VLLM_DCP_FINE_PREFIX", "1")
+    full = FullAttentionSpec(
+        block_size=192, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    gdn = MambaSpec(
+        block_size=3072,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        separate_pool=True,
+        separate_pool_num_blocks=16,
+        state_update_chunk_alignment=64,
+    )
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=128,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["target_attention"], full),
+                KVCacheGroupSpec(["mtp_attention"], full),
+                KVCacheGroupSpec(["gdn"], gdn),
+            ],
+        ),
+        max_model_len=262144,
+        enable_caching=True,
+        use_eagle=True,
+        dcp_world_size=3,
+        scheduler_block_size=9216,
+        hash_block_size=192,
+    )
+    scheduler = object.__new__(Scheduler)
+    scheduler.kv_cache_manager = manager
+    scheduler.block_size = 9216
+    scheduler.hash_block_size = 192
+    scheduler.mamba_state_update_alignment = 64
+    scheduler.use_eagle = True
+    scheduler.use_eagle_block_drop = True
+    scheduler.mamba_has_prefill_checkpoint_blocks = False
+    scheduler.mamba_prefill_checkpoint_alignment = None
+    scheduler.mamba_fine_grained_prefix_cache = False
+    scheduler.mamba_partial_cache_hit = True
+    scheduler.max_num_scheduled_tokens = 4096
+    scheduler._long_prefill_chunk_cap = lambda request: 0
+
+    def run_prime(request):
+        while request.num_computed_tokens < request.num_prompt_tokens:
+            count = scheduler._mamba_block_aligned_split(
+                request,
+                min(4096, request.num_prompt_tokens - request.num_computed_tokens),
+            )
+            assert count > 0
+            assert manager.allocate_slots(request, count) is not None
+            request.num_computed_tokens += count
+            if scheduler._should_save_gdn_checkpoint(
+                request, request.num_computed_tokens
+            ):
+                key = scheduler._gdn_boundary_key(request, request.num_computed_tokens)
+                if key:
+                    manager.coordinator.register_gdn_checkpoint(key)
+            manager.new_step_starts()
+        manager.free(request)
+
+    tokens = list(range(prompt_len))
+    run_prime(make_request("prime", tokens, 192, sha256))
+    expected = max(0, (prompt_len - 1) // 192 * 192 - 192)
+    warm = make_request("warm", tokens, 192, sha256)
+    blocks, hit, _ = manager.get_computed_blocks(warm)
+    assert hit == expected
+    if hit:
+        lease = manager.lease_computed_blocks(blocks)
+        assert manager.allocate_slots(warm, prompt_len - hit, hit, blocks) is not None
+        lease.release()
+    manager.free(warm)
+
+    changed = make_request("changed", [-1] + tokens[1:], 192, sha256)
+    assert manager.get_computed_blocks(changed)[1] == 0
+    recovery = make_request("recovery", tokens, 192, sha256)
+    assert manager.get_computed_blocks(recovery)[1] == expected
+    manager.coordinator.sync_gdn_checkpoints(())
+    evicted = make_request("evicted", tokens, 192, sha256)
+    assert manager.get_computed_blocks(evicted)[1] == 0
+
+
 def test_dcp_separate_gdn_fine_prefix_positive_negative_recovery(monkeypatch):
     """A partial attention hit is usable only with the exact GDN checkpoint."""
     monkeypatch.setenv("AG2_VLLM_DCP_FINE_PREFIX", "1")
@@ -5014,6 +5101,61 @@ def test_dcp_separate_gdn_fine_prefix_positive_negative_recovery(monkeypatch):
     recovery = request("recovery", shared + [40, 41, 42, 43])
     _, computed, _ = manager.get_computed_blocks(recovery)
     assert computed == len(shared)
+
+
+def test_dcp_fine_prefix_ignores_replicated_noncacheable_qsa_scratch(monkeypatch):
+    """FlashNext QSA's raw-tail ring is state, never a prefix hash owner."""
+    monkeypatch.setenv("AG2_VLLM_DCP_FINE_PREFIX", "1")
+    physical_block_size = 6
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["attention"],
+                    FullAttentionSpec(
+                        block_size=physical_block_size,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                    ),
+                ),
+                KVCacheGroupSpec(
+                    ["gdn"],
+                    MambaSpec(
+                        block_size=physical_block_size,
+                        shapes=((1,),),
+                        dtypes=(torch.float32,),
+                        mamba_cache_mode="align",
+                        separate_pool=True,
+                        separate_pool_num_blocks=16,
+                    ),
+                ),
+                KVCacheGroupSpec(
+                    ["qsa_raw_tail"],
+                    CircularBufferSpec(
+                        # Replicated scratch still participates in the global
+                        # scheduling LCM even though it owns no prefix hashes.
+                        block_size=9,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                        dcp_replicated=True,
+                    ),
+                ),
+            ],
+        ),
+        max_model_len=128,
+        enable_caching=True,
+        dcp_world_size=3,
+        scheduler_block_size=physical_block_size * 3,
+        hash_block_size=3,
+    )
+    assert manager.coordinator.enable_dcp_fine_prefix
+    assert not manager.kv_cache_config.kv_cache_groups[
+        -1
+    ].kv_cache_spec.prefix_cacheable
 
 
 def test_dcp_separate_gdn_fine_prefix_with_eagle_overlap(monkeypatch):

@@ -32,6 +32,26 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 logger = init_logger(__name__)
 
 
+def _flashnext_e8_large_prefill_tokens(model_runner: GPUModelRunner) -> int:
+    """Return the exact serving prefill shape required by the E8 path.
+
+    The standalone E8 load warmup does not cover the compiled model callsite's
+    Triton specializations.  Compile one full scheduler chunk before READY so
+    the first product request cannot pay that cost while holding the worker
+    future open with idle GPUs.
+    """
+    additional = getattr(model_runner.vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        return 0
+    experts = additional.get("flashnext_native_experts")
+    if not isinstance(experts, dict) or not isinstance(experts.get("e8_archive"), dict):
+        return 0
+    return min(
+        model_runner.scheduler_config.max_num_batched_tokens,
+        model_runner.max_model_len,
+    )
+
+
 def _reserved_block_count(
     num_tokens: int,
     kvcache_spec: KVCacheSpec,
@@ -60,6 +80,13 @@ def _reserved_block_count(
         # mode; align mode sizes from the uncapped, lookahead-free token range.
         num_speculative_blocks = kvcache_spec.num_speculative_blocks
         if kvcache_spec.mamba_cache_mode == "align":
+            # A separate elastic GDN pool owns one recurrent-state slot per
+            # request. Its virtual block id is independent of prompt length;
+            # expanding it like a position-indexed in-band Mamba table both
+            # overstates physical demand and exceeds the worker's one-column
+            # block-table contract.
+            if kvcache_spec.separate_pool:
+                return 1
             return cdiv(num_tokens, kvcache_spec.block_size) + num_speculative_blocks
     num_tokens = min(num_tokens + num_lookahead_tokens, max_model_len)
     return cdiv(num_tokens, kvcache_spec.block_size) + num_speculative_blocks
@@ -102,6 +129,54 @@ def _make_warmup_block_allocator(
     return alloc, next_block_ids
 
 
+def _cap_elastic_warmup_reqs(
+    model_runner: GPUModelRunner,
+    specs: list[KVCacheSpec],
+    blocks_per_req: list[int],
+    upper_bound: int,
+) -> int:
+    """Fit the synthetic shape to the shared attention/GDN byte budget."""
+    config = model_runner.kv_cache_config
+    if not getattr(config, "elastic_mapping_quantum", 0):
+        return upper_bound
+    primary = secondary = 0
+    for spec, count in zip(specs, blocks_per_req, strict=True):
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = spec.first_spec
+        if isinstance(spec, MambaSpec) and spec.separate_pool:
+            secondary += count
+        else:
+            primary += count
+    rank_safe_capacity = config.elastic_attention_capacity_by_gdn_blocks
+    planner = None
+    if not rank_safe_capacity:
+        planner = PhysicalPoolCapacityPlanner(
+            primary_block_sizes=tuple(
+                tensor.logical_block_size
+                for tensor in config.kv_cache_tensors
+                if tensor.backing_id.startswith("elastic-attention-")
+            ),
+            secondary_block_stride=config.elastic_gdn_stride,
+            mapping_quantum=config.elastic_mapping_quantum,
+            budget_bytes=config.elastic_budget_bytes,
+        )
+    for num_reqs in range(upper_bound, 0, -1):
+        gdn_blocks = 1 + num_reqs * secondary
+        required_attention = 1 + num_reqs * primary
+        available_attention = (
+            rank_safe_capacity[gdn_blocks]
+            if rank_safe_capacity and gdn_blocks < len(rank_safe_capacity)
+            else (
+                planner.max_primary_blocks(gdn_blocks, upper_bound=config.num_blocks)
+                if planner is not None
+                else 0
+            )
+        )
+        if available_attention >= required_attention:
+            return num_reqs
+    raise RuntimeError("elastic KV cannot host one synthetic warmup request")
+
+
 def _set_elastic_warmup_transition(
     scheduler_output: SchedulerOutput,
     model_runner: GPUModelRunner,
@@ -112,7 +187,7 @@ def _set_elastic_warmup_transition(
     """Map enough elastic capacity for a scheduler-bypassing warmup batch."""
     scheduler_output.is_synthetic_warmup = True
     config = model_runner.kv_cache_config
-    if not config.elastic_mapping_quantum:
+    if not getattr(config, "elastic_mapping_quantum", 0):
         return
 
     primary_block_sizes = tuple(
@@ -360,6 +435,9 @@ def _warmup_kernels(
             num_reqs,
             max(1, (model_runner.kv_cache_config.num_blocks - 1) // max_blocks_per_req),
         )
+    num_reqs = _cap_elastic_warmup_reqs(
+        model_runner, kv_cache_specs, decode_block_counts, num_reqs
+    )
 
     req_ids = [f"_warmup_{i}_" for i in range(num_reqs)]
 
@@ -509,12 +587,128 @@ def _warmup_kernels(
         for step_indices, step_spec_flags in decode_steps:
             _run_decode_step(step_indices, step_spec_flags)
 
-    # Clean up - process finish_req_ids.
+    # Release the ordinary sampler/decode warmup before reserving the full E8
+    # scheduler chunk.  The synthetic allocator models simultaneously held
+    # blocks; carrying its high-water mark into the second wave would charge
+    # both disjoint requests against the elastic pool and can reduce available
+    # attention capacity to zero.
     cleanup_output = SchedulerOutput.make_empty()
     cleanup_output.finished_req_ids = set(req_ids)
     _set_elastic_warmup_transition(
         cleanup_output, model_runner, next_block_ids, restore_initial=True
     )
     worker_execute_model(cleanup_output)
+
+    # E8's real 4096-row prefill enters a different compiled callsite than the
+    # many-request sampler warmup above.  Without this exact shape, the first
+    # product prompt lazily compiles route compaction, task construction,
+    # Hadamard, activation and scatter kernels inside execute_model().
+    large_prefill_tokens = _flashnext_e8_large_prefill_tokens(model_runner)
+    if large_prefill_tokens:
+        large_prefill_req_id = "_warmup_e8_large_prefill_"
+        large_alloc_blocks, large_next_block_ids = _make_warmup_block_allocator(
+            kv_cache_specs
+        )
+        vocab_size = model_runner.model_config.get_vocab_size()
+        large_token_ids = [i % vocab_size for i in range(large_prefill_tokens)]
+        large_block_counts = [
+            block_count(large_prefill_tokens, spec) for spec in kv_cache_specs
+        ]
+        large_output = SchedulerOutput.make_empty()
+        large_output.scheduled_new_reqs = [
+            NewRequestData.from_request(
+                Request(
+                    large_prefill_req_id,
+                    large_token_ids,
+                    sampling_params,
+                    pooling_params,
+                    mm_features=warmup_mm_features,
+                ),
+                block_ids=tuple(
+                    large_alloc_blocks(count, spec)
+                    for count, spec in zip(
+                        large_block_counts, kv_cache_specs, strict=True
+                    )
+                ),
+                prefill_token_ids=large_token_ids,
+            )
+        ]
+        large_output.num_scheduled_tokens = {large_prefill_req_id: large_prefill_tokens}
+        large_output.total_num_scheduled_tokens = large_prefill_tokens
+        large_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+        _set_elastic_warmup_transition(large_output, model_runner, large_next_block_ids)
+        worker_execute_model(large_output)
+        if not model_runner.is_pooling_model:
+            worker_sample_tokens(None)
+        large_cleanup_output = SchedulerOutput.make_empty()
+        large_cleanup_output.finished_req_ids = {large_prefill_req_id}
+        _set_elastic_warmup_transition(
+            large_cleanup_output,
+            model_runner,
+            large_next_block_ids,
+            restore_initial=True,
+        )
+        worker_execute_model(large_cleanup_output)
+
+        # The product route commonly overlaps title generation with the main
+        # request.  That produces a two-request PLE prefill contract which is
+        # absent from both ordinary tiny-prompt warmup and the x1 4096-token
+        # E8 warmup above.  Cover its observed 512-token boundary before READY
+        # so PLE convolution and E8 demand kernels cannot compile in the first
+        # title/main overlap.  The two requests and their KV allocations are
+        # discarded immediately after this one prefill step.
+        overlap_reqs = 2
+        overlap_tokens_per_req = min(256, large_prefill_tokens // overlap_reqs)
+        if overlap_tokens_per_req > 0:
+            overlap_ids = [f"_warmup_e8_overlap_{i}_" for i in range(overlap_reqs)]
+            overlap_alloc_blocks, overlap_next_block_ids = _make_warmup_block_allocator(
+                kv_cache_specs
+            )
+            overlap_token_ids = [i % vocab_size for i in range(overlap_tokens_per_req)]
+            overlap_block_counts = [
+                block_count(overlap_tokens_per_req, spec) for spec in kv_cache_specs
+            ]
+            overlap_output = SchedulerOutput.make_empty()
+            overlap_output.scheduled_new_reqs = [
+                NewRequestData.from_request(
+                    Request(
+                        req_id,
+                        overlap_token_ids,
+                        sampling_params,
+                        pooling_params,
+                        mm_features=warmup_mm_features,
+                    ),
+                    block_ids=tuple(
+                        overlap_alloc_blocks(count, spec)
+                        for count, spec in zip(
+                            overlap_block_counts, kv_cache_specs, strict=True
+                        )
+                    ),
+                    prefill_token_ids=overlap_token_ids,
+                )
+                for req_id in overlap_ids
+            ]
+            overlap_output.num_scheduled_tokens = {
+                req_id: overlap_tokens_per_req for req_id in overlap_ids
+            }
+            overlap_output.total_num_scheduled_tokens = (
+                overlap_reqs * overlap_tokens_per_req
+            )
+            overlap_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+            _set_elastic_warmup_transition(
+                overlap_output, model_runner, overlap_next_block_ids
+            )
+            worker_execute_model(overlap_output)
+            if not model_runner.is_pooling_model:
+                worker_sample_tokens(None)
+            overlap_cleanup_output = SchedulerOutput.make_empty()
+            overlap_cleanup_output.finished_req_ids = set(overlap_ids)
+            _set_elastic_warmup_transition(
+                overlap_cleanup_output,
+                model_runner,
+                overlap_next_block_ids,
+                restore_initial=True,
+            )
+            worker_execute_model(overlap_cleanup_output)
     model_runner.kv_connector.set_disabled(False)
     torch.accelerator.synchronize()

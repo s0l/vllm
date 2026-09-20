@@ -22,7 +22,7 @@ class CpuExpertConfig:
     max_m: int = 4
 
     @classmethod
-    def from_options(cls, options, tp):
+    def from_options(cls, options, tp, *, max_supported_m=4):
         if options is None:
             return None
         if not isinstance(options, dict) or set(options) != {
@@ -46,7 +46,7 @@ class CpuExpertConfig:
             or len(set(cores)) != len(cores)
             or not tp <= len(cores) <= tp * 32
             or type(max_m) is not int
-            or not 1 <= max_m <= 4
+            or not 1 <= max_m <= max_supported_m
         ):
             raise ValueError("unsupported CPU expert resource/identity configuration")
         return cls(lib, digest, tuple(cores), max_m)

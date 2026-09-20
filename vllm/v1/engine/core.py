@@ -248,6 +248,13 @@ class EngineCore:
         self._ag2_step_trace_limit = int(
             os.environ.get("AG2_VLLM_ENGINE_STEP_TRACE_STEPS", "64")
         )
+        self._ag2_step_trace_include_context = (
+            os.environ.get("AG2_VLLM_ENGINE_STEP_TRACE_INCLUDE_CONTEXT", "0") == "1"
+        )
+        self._ag2_step_trace_require_context = (
+            os.environ.get("AG2_VLLM_ENGINE_STEP_TRACE_REQUIRE_CONTEXT", "0") == "1"
+        )
+        self._ag2_step_trace_saw_context = False
         self._ag2_step_trace_records: list[dict[str, int | float]] = []
         self._ag2_step_trace_previous_start_ns: int | None = None
         self._ag2_step_trace_complete = False
@@ -256,11 +263,21 @@ class EngineCore:
                 raise ValueError("engine step trace requires MIN_RUNNING >= 1")
             if self._ag2_step_trace_limit < 1:
                 raise ValueError("engine step trace requires STEPS >= 1")
+            if (
+                self._ag2_step_trace_require_context
+                and not self._ag2_step_trace_include_context
+            ):
+                raise ValueError(
+                    "engine step trace REQUIRE_CONTEXT requires INCLUDE_CONTEXT"
+                )
             logger.info(
-                "AG2 engine-step trace initialized: path=%s min_running=%d steps=%d",
+                "AG2 engine-step trace initialized: path=%s min_running=%d "
+                "steps=%d include_context=%s require_context=%s",
                 self._ag2_step_trace_path,
                 self._ag2_step_trace_min_running,
                 self._ag2_step_trace_limit,
+                self._ag2_step_trace_include_context,
+                self._ag2_step_trace_require_context,
             )
 
         self.aborts_queue = queue.Queue[list[str]]()
@@ -464,6 +481,66 @@ class EngineCore:
             scheduler._elastic_serving_carrier_resident_bytes = (
                 scheduler._elastic_serving_carrier_bytes()
             )
+            hotset_xs = tuple(getattr(scheduler, "_elastic_serving_hotset_xs", ()))
+            hotset_steps: list[tuple[int, ...]] = []
+            for semantic_x in hotset_xs:
+                # Mixed/prefill target and MTP-prefill owners are compiled-only;
+                # this shape retains the exact-X MTP decode owner used while a
+                # long prompt is in flight.
+                hotset_steps.append((0, k, semantic_x, semantic_x, 0))
+                physical_x = scheduler._elastic_short_decode_physical_x(semantic_x)
+                hotset_steps.append(
+                    (
+                        0,
+                        k,
+                        physical_x,
+                        physical_x * terminal_query_len,
+                        terminal_query_len,
+                    )
+                )
+            hotset_steps = list(dict.fromkeys(hotset_steps))
+            declared_hotset_steps = [
+                tuple(key) for key in coverage.get("serving_hotset_step_keys", ())
+            ]
+            if hotset_xs and (
+                coverage.get("serving_hotset_contract")
+                != "pre-ready-hot-no-runtime-maintenance-v1"
+                or declared_hotset_steps != hotset_steps
+            ):
+                raise RuntimeError(
+                    "configured serving hotset differs from the sealed catalog: "
+                    f"declared={declared_hotset_steps!r} "
+                    f"configured={hotset_steps!r}"
+                )
+            required_steps = {
+                tuple(key) for key in coverage.get("required_step_keys", ())
+            }
+            missing_hotset_steps = tuple(
+                key for key in hotset_steps if key not in required_steps
+            )
+            if missing_hotset_steps:
+                raise RuntimeError(
+                    "configured serving hotset is absent from the sealed catalog: "
+                    f"missing={missing_hotset_steps!r}"
+                )
+            for step_key in hotset_steps:
+                scheduler._elastic_restore_mode = True
+                self._prepare_elastic_restore_capture(step_key)
+                scheduler.assert_elastic_restore_captures_hot((step_key,))
+                physical_keys = scheduler._resolve_elastic_step_physical_keys(step_key)
+                if not physical_keys:
+                    continue
+                retention = scheduler.retain_elastic_restore_captures((step_key,))
+                try:
+                    scheduler.promote_elastic_restore_retention_to_serving(
+                        retention, physical_keys
+                    )
+                finally:
+                    if scheduler._elastic_restore_retention_id == retention:
+                        scheduler.release_elastic_restore_retention(retention)
+            scheduler._elastic_serving_carrier_resident_bytes = (
+                scheduler._elastic_serving_carrier_bytes()
+            )
             if not carrier_keys or any(
                 not (
                     (entry := scheduler._elastic_admission_controller.entries.get(key))
@@ -479,8 +556,10 @@ class EngineCore:
         scheduler.max_num_running_reqs = int(coverage["mixed_max_x"])
         logger.warning(
             "Elastic bounded terminal carrier restored before READY: "
-            "restore_shapes=%d max_x=%d resident_bytes=%d wall_seconds=%.3f",
+            "restore_shapes=%d hotset_shapes=%d max_x=%d resident_bytes=%d "
+            "wall_seconds=%.3f",
             len(restore),
+            len(hotset_steps),
             coverage["mixed_max_x"],
             scheduler._elastic_serving_carrier_resident_bytes,
             time.monotonic() - started,
@@ -488,7 +567,7 @@ class EngineCore:
 
     def _synchronize_elastic_startup_residency(self) -> None:
         """Publish restored HOT state and its replay workspace before READY."""
-        receipts = self.collective_rpc("get_elastic_graph_residency_receipt")
+        receipts: list[Any] = self.collective_rpc("get_elastic_graph_residency_receipt")
         if not receipts:
             raise RuntimeError("elastic startup returned no worker residency receipt")
 
@@ -1466,7 +1545,7 @@ class EngineCore:
     def _has_scheduler_step_work(self) -> bool:
         return bool(
             self.scheduler.has_requests()
-            or self.scheduler.has_pending_elastic_maintenance()
+            or cast(Any, self.scheduler).has_pending_elastic_maintenance()
         )
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
@@ -1488,13 +1567,15 @@ class EngineCore:
             self._should_throttle_prefills(), physical_quiescent=True
         )
         self._last_scheduler_output = scheduler_output
-        expected_calibration_ids = getattr(
+        expected_calibration_ids: frozenset[str] = getattr(
             self, "_elastic_restore_expected_decode_ids", frozenset()
         )
         if expected_calibration_ids and scheduler_output.is_pure_decode_step:
             scheduled_ids = frozenset(scheduler_output.num_scheduled_tokens)
             if scheduled_ids != expected_calibration_ids:
-                self.scheduler.cancel_unexecuted_elastic_restore_step(scheduler_output)
+                cast(Any, self.scheduler).cancel_unexecuted_elastic_restore_step(
+                    scheduler_output
+                )
                 raise _ElasticRestorePartialWave(
                     len(scheduled_ids), len(expected_calibration_ids)
                 )
@@ -1519,13 +1600,13 @@ class EngineCore:
                 # Match the ordinary result path: aborts accepted while the
                 # worker future was running take effect before its output.
                 self._process_aborts_queue()
-                failed = self.scheduler.recover_elastic_execution_plan_mismatch(
-                    scheduler_output
-                )
+                failed = cast(
+                    Any, self.scheduler
+                ).recover_elastic_execution_plan_mismatch(scheduler_output)
                 recovered_outputs = {
                     client_index: EngineCoreOutputs(finished_requests=set(request_ids))
                     for client_index, request_ids in (
-                        self.scheduler.take_finished_request_ids().items()
+                        cast(Any, self.scheduler).take_finished_request_ids().items()
                     )
                 }
                 for request in failed:
@@ -1561,14 +1642,17 @@ class EngineCore:
         if trace_enabled:
             details = compute_iteration_details(scheduler_output)
             if (
-                details.num_ctx_tokens == 0
-                and details.num_generation_requests >= self._ag2_step_trace_min_running
-            ):
+                self._ag2_step_trace_include_context and details.num_ctx_tokens > 0
+            ) or details.num_generation_requests >= self._ag2_step_trace_min_running:
+                self._ag2_step_trace_saw_context |= details.num_ctx_tokens > 0
                 previous_start_ns = self._ag2_step_trace_previous_start_ns
                 self._ag2_step_trace_records.append(
                     {
+                        "context_requests": details.num_ctx_requests,
+                        "context_tokens": details.num_ctx_tokens,
                         "generation_requests": details.num_generation_requests,
                         "generation_tokens": details.num_generation_tokens,
+                        "scheduled_tokens": scheduler_output.total_num_scheduled_tokens,
                         "step_start_ns": step_start_ns,
                         "start_spacing_ms": (
                             (step_start_ns - previous_start_ns) / 1e6
@@ -1584,10 +1668,15 @@ class EngineCore:
                     }
                 )
                 self._ag2_step_trace_previous_start_ns = step_start_ns
-                if len(self._ag2_step_trace_records) >= self._ag2_step_trace_limit:
+                if len(self._ag2_step_trace_records) >= self._ag2_step_trace_limit and (
+                    not self._ag2_step_trace_require_context
+                    or self._ag2_step_trace_saw_context
+                ):
                     payload = {
-                        "schema": "ag2-engine-step-trace-v1",
+                        "schema": "ag2-engine-step-trace-v2",
                         "min_running": self._ag2_step_trace_min_running,
+                        "include_context": self._ag2_step_trace_include_context,
+                        "require_context": self._ag2_step_trace_require_context,
                         "records": self._ag2_step_trace_records,
                     }
                     path = self._ag2_step_trace_path
@@ -1744,14 +1833,17 @@ class EngineCore:
         if trace_enabled:
             details = compute_iteration_details(scheduler_output)
             if (
-                details.num_ctx_tokens == 0
-                and details.num_generation_requests >= self._ag2_step_trace_min_running
-            ):
+                self._ag2_step_trace_include_context and details.num_ctx_tokens > 0
+            ) or details.num_generation_requests >= self._ag2_step_trace_min_running:
+                self._ag2_step_trace_saw_context |= details.num_ctx_tokens > 0
                 previous_start_ns = self._ag2_step_trace_previous_start_ns
                 self._ag2_step_trace_records.append(
                     {
+                        "context_requests": details.num_ctx_requests,
+                        "context_tokens": details.num_ctx_tokens,
                         "generation_requests": details.num_generation_requests,
                         "generation_tokens": details.num_generation_tokens,
+                        "scheduled_tokens": scheduler_output.total_num_scheduled_tokens,
                         "step_start_ns": step_start_ns,
                         "start_spacing_ms": (
                             (step_start_ns - previous_start_ns) / 1e6
@@ -1772,10 +1864,15 @@ class EngineCore:
                     }
                 )
                 self._ag2_step_trace_previous_start_ns = step_start_ns
-                if len(self._ag2_step_trace_records) >= self._ag2_step_trace_limit:
+                if len(self._ag2_step_trace_records) >= self._ag2_step_trace_limit and (
+                    not self._ag2_step_trace_require_context
+                    or self._ag2_step_trace_saw_context
+                ):
                     payload = {
-                        "schema": "ag2-engine-step-trace-v1",
+                        "schema": "ag2-engine-step-trace-v2",
                         "min_running": self._ag2_step_trace_min_running,
+                        "include_context": self._ag2_step_trace_include_context,
+                        "require_context": self._ag2_step_trace_require_context,
                         "records": self._ag2_step_trace_records,
                     }
                     path = self._ag2_step_trace_path

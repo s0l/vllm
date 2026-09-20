@@ -19,12 +19,20 @@ class StreamExpertConfig:
     history_steps: int
     max_promotions: int
     scan_order: bool = False
+    ready_pipeline: bool = False
+    column_jobs: bool = False
+    capture_max_m: int | None = None
 
     @classmethod
     def from_options(cls, options, tp):
         if options is None:
             return None
-        if not isinstance(options, dict) or set(options) - {"scan_order"} != {
+        if not isinstance(options, dict) or set(options) - {
+            "scan_order",
+            "ready_pipeline",
+            "column_jobs",
+            "capture_max_m",
+        } != {
             "library",
             "sha256",
             "cores",
@@ -35,6 +43,14 @@ class StreamExpertConfig:
             raise ValueError("stream experts require explicit resources and placement")
         history, promotions = options["history_steps"], options["max_promotions"]
         scan_order = options.get("scan_order", False)
+        ready = options.get("ready_pipeline", False)
+        columns = options.get("column_jobs", False)
+        if (
+            type(ready) is not bool
+            or type(columns) is not bool
+            or (columns and not ready)
+        ):
+            raise ValueError("column jobs require the admitted ready pipeline")
         if type(scan_order) is not bool:
             raise ValueError("scan_order requires a bool")
         if (
@@ -45,9 +61,16 @@ class StreamExpertConfig:
         ):
             raise ValueError("invalid stream expert placement budget")
         cpu = CpuExpertConfig.from_options(
-            {key: options[key] for key in ("library", "sha256", "cores", "max_m")}, tp
+            {key: options[key] for key in ("library", "sha256", "cores", "max_m")},
+            tp,
+            max_supported_m=64 if ready else 4,
         )
-        return cls(cpu, history, promotions, scan_order)
+        capture_m = options.get("capture_max_m")
+        if capture_m is not None and (
+            type(capture_m) is not int or not 1 <= capture_m <= cpu.max_m
+        ):
+            raise ValueError("captured expert domain exceeds the CPU workspace")
+        return cls(cpu, history, promotions, scan_order, ready, columns, capture_m)
 
     def create(self, geometry, rank, *, layers, experts, topk, partition="legacy"):
         cores = self.cpu.rank_cores(rank, geometry.tp)
@@ -77,6 +100,27 @@ class StreamExpertConfig:
             ):
                 raise ValueError("native expert library lacks scan-order support")
             cpu.pin(cores)
+            if hasattr(cpu.lib, "fn_executor_team_limit"):
+                # The capacity-control native defaults to four active workers.
+                # Serving consumes the full explicitly configured team.
+                limit = cpu.lib.fn_executor_team_limit
+                limit.argtypes = [ct.c_void_p, ct.c_int, ct.c_int]
+                limit.restype = ct.c_int
+                if limit(cpu.ptr, len(cores), 0) != 0:
+                    raise RuntimeError("failed to activate configured expert team")
+            cpu.active_threads = len(cores)
+            if self.ready_pipeline:
+                for symbol in (
+                    "fn_executor_ready_pipeline",
+                    "fn_executor_source_acquire",
+                    "fn_executor_source_pipeline_stats",
+                    "fn_task_cancel",
+                    "fn_executor_tile_jobs",
+                ):
+                    if not hasattr(cpu.lib, symbol):
+                        raise ValueError("native ready executor ABI missing: " + symbol)
+                cpu.ready_pipeline()
+                cpu.tile_jobs(self.column_jobs)
             cpu.begin(1)
         except BaseException:
             cpu.close()
@@ -146,7 +190,21 @@ def load_library(path, expected_sha):
         "fn_task_destroy": ([ct.c_void_p], ct.c_int),
     }
     for name, signature in {
+        "fn_executor_ready_pipeline": ([ct.c_void_p, ct.c_int], ct.c_int),
+        "fn_executor_tile_jobs": ([ct.c_void_p, ct.c_int], ct.c_int),
+        "fn_task_cancel": ([ct.c_void_p], ct.c_int),
+        "fn_task_progress": ([ct.c_void_p] * 2, ct.c_int),
+        "fn_executor_source_pipeline_stats": ([ct.c_void_p] * 2, ct.c_int),
+        "fn_executor_source_acquire": (
+            [ct.c_void_p, ct.c_int, ct.c_void_p, ct.c_int] + [ct.c_void_p] * 2,
+            ct.c_int,
+        ),
         "fn_executor_source_scan_order": ([ct.c_void_p, ct.c_int], ct.c_int),
+        "fn_executor_source_trace": ([ct.c_void_p, ct.c_size_t], ct.c_int),
+        "fn_executor_source_trace_read": (
+            [ct.c_void_p, ct.c_void_p, ct.c_size_t, ct.c_void_p],
+            ct.c_int,
+        ),
         "fn_executor_source_scores": ([ct.c_void_p] * 2 + [ct.c_size_t], ct.c_int),
         "fn_executor_source_replacement_stats": ([ct.c_void_p] * 2, ct.c_int),
     }.items():
@@ -202,6 +260,8 @@ class StreamExecutor:
             raise ValueError("executor scratch admission failed")
         self.owners, self.tasks, self.graphs = {}, [], set()
         self.epoch = 0
+        self.active_threads = threads
+        self.ready_enabled = False
         self.scratch_bytes = max_m * topk * (6 * hidden + 10 * width + 8)
 
     def pin(self, cores):
@@ -211,6 +271,43 @@ class StreamExecutor:
         require(
             self.lib.fn_executor_pin(self.ptr, pointer(values), len(values)),
             "worker affinity",
+        )
+
+    def ready_pipeline(self, enabled=True):
+        if type(enabled) is not bool:
+            raise ValueError("ready pipeline requires a bool")
+        require(
+            self.lib.fn_executor_ready_pipeline(self.ptr, int(enabled)),
+            "ready pipeline admission",
+        )
+        self.ready_enabled = enabled
+
+    def tile_jobs(self, enabled=True):
+        if type(enabled) is not bool:
+            raise ValueError("column jobs require a bool")
+        require(
+            self.lib.fn_executor_tile_jobs(self.ptr, int(enabled)),
+            "column job admission",
+        )
+
+    def pipeline_stats(self):
+        values = np.zeros(5, np.uint64)
+        require(
+            self.lib.fn_executor_source_pipeline_stats(self.ptr, pointer(values)),
+            "source pipeline snapshot",
+        )
+        return dict(
+            zip(
+                (
+                    "reserved_bytes",
+                    "ready_bytes",
+                    "leased_bytes",
+                    "reserved_high_water",
+                    "external_lease_bytes",
+                ),
+                map(int, values),
+                strict=True,
+            )
         )
 
     def quiesce(self):
@@ -299,6 +396,25 @@ class StreamExecutor:
             "source scan order",
         )
 
+    def source_trace(self, limit=65536):
+        if type(limit) is not int or not 0 <= limit <= 1048576:
+            raise ValueError("invalid source trace capacity")
+        require(self.lib.fn_executor_source_trace(self.ptr, limit), "source trace")
+
+    def source_trace_read(self):
+        info = np.zeros(4, np.uint64)
+        fn = self.lib.fn_executor_source_trace_read
+        require(fn(self.ptr, None, 0, pointer(info)), "source trace size")
+        if info[1]:
+            raise RuntimeError("source trace overflow: evidence is incomplete")
+        rows = np.zeros((int(info[3]), 9), np.uint64)
+        require(
+            fn(self.ptr, pointer(rows), len(rows), pointer(info)), "source trace read"
+        )
+        if info[1]:
+            raise RuntimeError("source trace overflow: evidence is incomplete")
+        return rows[: int(info[0])].copy()
+
     def source_stats(self):
         values = np.zeros(12, np.uint64)
         require(
@@ -366,7 +482,8 @@ class StreamExecutor:
             if not (0 <= layer < self.layers and 0 <= expert < self.experts):
                 raise ValueError("source HOT identity")
             values[layer, expert] = 1
-        self.quiesce()
+        if not self.ready_enabled:
+            self.quiesce()
         require(
             self.lib.fn_executor_source_hot(self.ptr, pointer(values), values.size),
             "source HOT hints",
@@ -391,7 +508,8 @@ class StreamExecutor:
             or len(destination) != len(keys)
         ):
             raise ValueError("source export destination")
-        self.quiesce()
+        if not self.ready_enabled:
+            self.quiesce()
         require(
             self.lib.fn_executor_source_export(
                 self.ptr,
@@ -435,8 +553,8 @@ class StreamExecutor:
         )
         return int(values[0]), int(values[1]), SourceLease(self, int(values[2]))
 
-    def borrow_rows(self, keys, fields, row_bytes):
-        """No source I/O or weight copy; each returned view retains its lease."""
+    def borrow_rows(self, keys, fields, row_bytes, *, load_layer=None):
+        """Borrow ready rows, or atomically load and borrow a layer's rows."""
         values = np.asarray(keys, np.int32)
         if values.ndim != 1 or not len(values) or values.tolist() != list(keys):
             raise ValueError("source borrow identities")
@@ -451,16 +569,24 @@ class StreamExecutor:
         ):
             raise ValueError("source borrow layout")
         addresses, token = np.zeros(len(values), np.uint64), np.zeros(1, np.uint64)
-        require(
-            self.lib.fn_executor_source_borrow(
+        if load_layer is None:
+            code = self.lib.fn_executor_source_borrow(
                 self.ptr,
                 pointer(values),
                 len(values),
                 pointer(addresses),
                 pointer(token),
-            ),
-            "source resident borrow",
-        )
+            )
+        else:
+            code = self.lib.fn_executor_source_acquire(
+                self.ptr,
+                load_layer,
+                pointer(values),
+                len(values),
+                pointer(addresses),
+                pointer(token),
+            )
+        require(code, "source resident borrow")
         lease = SourceLease(self, int(token[0]))
         rows = []
         for address in addresses:
@@ -556,6 +682,18 @@ class StreamTask:
 
     def run(self):
         return self.owner.lib.fn_task_run(self.ptr)
+
+    def cancel(self):
+        require(self.owner.lib.fn_task_cancel(self.ptr), "task cancellation")
+
+    def progress(self):
+        values = np.zeros(3, np.uint64)
+        require(
+            self.owner.lib.fn_task_progress(self.ptr, pointer(values)), "task progress"
+        )
+        return dict(
+            zip(("computed", "active", "cancelled"), map(int, values), strict=True)
+        )
 
     def enqueue(self, stream):
         self.streams.add(stream)

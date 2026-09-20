@@ -117,9 +117,15 @@ class Qwen4ExpModelState(MambaHybridModelState):
         for provider in self._native_providers:
             provider.finish_execution(dummy=dummy)
 
+    def finish_native_capture_forward(self):
+        """Close state owned by one completed capture forward invocation."""
+        for provider in self._native_providers:
+            provider.finish_capture_forward()
+
     def finish_native_capture(self):
         """End capture-only read leases without committing dummy observations."""
         for provider in self._native_providers:
+            provider.abort_capture()
             if (
                 provider.stream_path is not None
                 and provider.stream_path.lease is not None
@@ -142,9 +148,31 @@ class Qwen4ExpModelState(MambaHybridModelState):
             raise RuntimeError(
                 "FlashNext host weight providers require breakable Graphs"
             )
-        # Host demand resolution and staging are ordered eager callbacks between
-        # GPU graph segments. Attention's FULL support cannot cover these edges.
+        # PLE rows are copied into fixed-address device staging before model
+        # replay. Temporal E8 similarly owns a bounded device-only replay path.
+        # Keep FULL only when every native provider explicitly exposes that
+        # path; the runner applies its token bound to FULL descriptors and
+        # retains PIECEWISE for every larger shape.
+        if self.get_full_cudagraph_max_tokens() is not None:
+            return mode
         return CUDAGraphMode.PIECEWISE
+
+    def get_full_cudagraph_max_tokens(self) -> int | None:
+        providers = getattr(self, "_native_providers", ())
+        ple_modules = getattr(self, "_mmap_ple_modules", ())
+        if ple_modules and any(
+            module.ngram_embedding.raw is None
+            or module.ngram_embedding.pinned is None
+            or module.ngram_embedding.event is None
+            for module in ple_modules
+        ):
+            return None
+        if not providers:
+            return getattr(self, "max_num_tokens", 2**31 - 1) if ple_modules else None
+        limits = tuple(provider.full_cudagraph_max_tokens() for provider in providers)
+        if not limits or any(limit <= 0 for limit in limits):
+            return None
+        return min(limits)
 
     def _initialize_mmap_staging(self, vllm_config, model):
         modules = tuple(

@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from itertools import product
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast
 
 import regex as re
 import torch
@@ -231,6 +231,7 @@ def graph_execution_policy_from_managers(
                 owner=manager.dynamic_graph_owner,
                 full_query_lens=full_query_lens,
                 piecewise_mode=manager.cudagraph_mode.mixed_mode().name,
+                full_max_tokens=manager.full_decode_max_tokens,
                 compiled_piecewise_sizes=tuple(
                     sorted(manager.compiled_piecewise_sizes)
                 ),
@@ -238,7 +239,8 @@ def graph_execution_policy_from_managers(
                     "effective-cudagraph-manager-v2:math-lane-identity-v1:"
                     f"{manager.cudagraph_mode.name}:"
                     f"decode={decode_mode.name}:"
-                    f"mixed={manager.cudagraph_mode.mixed_mode().name}"
+                    f"mixed={manager.cudagraph_mode.mixed_mode().name}:"
+                    f"full_max_tokens={manager.full_decode_max_tokens}"
                 ),
                 piecewise_padding_contract=(
                     "exact-batched-decode-m-v1"
@@ -667,12 +669,18 @@ class DynamicGraphWorkingSet:
         for manager in self.managers:
             manager.begin_dynamic_step()
 
-    def reconcile_retained_cleanup(self, local_reclaimed_bytes: int) -> int:
+    def reconcile_retained_cleanup(
+        self,
+        local_reclaimed_bytes: int,
+        *,
+        force_rank_consensus: bool = False,
+    ) -> int:
         """Retire only this step's retention with graph-owned cleanup."""
         if not self.managers:
             return 0
         return self.managers[0]._reconcile_dynamic_retained_cleanup(
-            local_reclaimed_bytes
+            local_reclaimed_bytes,
+            force_rank_consensus=force_rank_consensus,
         )
 
     def clear_idle_retention_after_physical_reconcile(self) -> None:
@@ -865,17 +873,30 @@ class DynamicGraphWorkingSet:
             managers[key.logical.owner].acquire_physical_key_lease(
                 key, plan.transaction_id
             )
+        local_eviction_error: Exception | None = None
         for key in plan.victim_keys:
-            managers[key.logical.owner].evict_physical_key(
-                key,
-                transaction_id=plan.transaction_id,
-                reason="elastic_admission_plan",
-                administrative=plan.kind
-                in {
-                    ElasticPlanKind.RECLAIM,
-                    ElasticPlanKind.PRESSURE_RECLAIM,
-                },
-            )
+            if local_eviction_error is not None:
+                break
+            try:
+                managers[key.logical.owner].evict_physical_key(
+                    key,
+                    transaction_id=plan.transaction_id,
+                    reason="elastic_admission_plan",
+                    administrative=plan.kind
+                    in {
+                        ElasticPlanKind.RECLAIM,
+                        ElasticPlanKind.PRESSURE_RECLAIM,
+                    },
+                    defer_rank_consensus=True,
+                )
+            except Exception as error:
+                local_eviction_error = error
+        if plan.victim_keys and self.managers:
+            # A common scheduler key does not imply identical local CUDA graph
+            # segments or teardown timing. Publish once after the whole local
+            # victim set instead of joining the TP device communicator from
+            # inside each physical eviction.
+            self.managers[0]._publish_deferred_eviction_consensus(local_eviction_error)
         dispatch_keys = tuple(
             dispatch.physical_key
             for dispatch in getattr(plan, "current_dispatch", ())
@@ -1484,12 +1505,26 @@ class DynamicGraphWorkingSet:
             )
         )
         charged = sum(entry.charged_bytes for _manager, entry in victims)
+        local_error: Exception | None = None
         for manager, entry in victims:
-            manager._evict_dynamic_entry(
-                entry,
-                transaction_id=transaction_id,
-                reason="administrative_idle_x0",
-            )
+            if local_error is not None:
+                break
+            try:
+                manager._evict_dynamic_entry(
+                    entry,
+                    transaction_id=transaction_id,
+                    reason="administrative_idle_x0",
+                    defer_rank_consensus=True,
+                )
+            except Exception as error:
+                local_error = error
+        # Victim sets are physical and may legitimately differ by rank. Never
+        # put a TP collective inside that rank-local loop: X32 left rank0 with
+        # one extra victim and collided its eviction vote with peers' next KV
+        # vote. All managers share one device retention ledger, so publish it
+        # exactly once after every local victim has been processed.
+        if self.managers:
+            self.managers[0]._publish_deferred_eviction_consensus(local_error)
         return charged
 
     def prune_pinned_full_above(
@@ -1516,13 +1551,22 @@ class DynamicGraphWorkingSet:
             )
         )
         charged = sum(entry.charged_bytes for _manager, entry in victims)
+        local_error: Exception | None = None
         for manager, entry in victims:
-            manager._evict_dynamic_entry(
-                entry,
-                transaction_id=transaction_id,
-                reason="calibration_unreachable_full_prune",
-                administrative=True,
-            )
+            if local_error is not None:
+                break
+            try:
+                manager._evict_dynamic_entry(
+                    entry,
+                    transaction_id=transaction_id,
+                    reason="calibration_unreachable_full_prune",
+                    administrative=True,
+                    defer_rank_consensus=True,
+                )
+            except Exception as error:
+                local_error = error
+        if self.managers:
+            self.managers[0]._publish_deferred_eviction_consensus(local_error)
         return len(victims), charged, self.resident_bytes
 
 
@@ -1537,6 +1581,7 @@ class CudaGraphManager:
         varlen_decode: bool = False,
         full_decode_query_lens: set[int] | None = None,
         full_decode_cap_query_lens: set[int] | None = None,
+        full_decode_max_tokens: int | None = None,
         expand_dynamic_decode_query_lens: bool = True,
         max_uniform_decode_reqs: int | None = None,
         owner: str = "unknown",
@@ -1561,6 +1606,9 @@ class CudaGraphManager:
         self.varlen_decode = varlen_decode
         self.full_decode_query_lens = full_decode_query_lens
         self.full_decode_cap_query_lens = full_decode_cap_query_lens
+        if full_decode_max_tokens is not None and full_decode_max_tokens <= 0:
+            raise ValueError("full_decode_max_tokens must be positive")
+        self.full_decode_max_tokens = full_decode_max_tokens
         self.expand_dynamic_decode_query_lens = expand_dynamic_decode_query_lens
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
@@ -2262,6 +2310,10 @@ class CudaGraphManager:
                     if (
                         rounded_num_tokens > max_decode_tokens
                         or (
+                            self.full_decode_max_tokens is not None
+                            and rounded_num_tokens > self.full_decode_max_tokens
+                        )
+                        or (
                             rounded_num_tokens > max_cg_capture_size
                             and not (
                                 capture_cap_boundary
@@ -2483,6 +2535,10 @@ class CudaGraphManager:
             allow_full
             and decode_mode == CUDAGraphMode.FULL
             and uniform_token_count in self._runtime_decode_query_lens()
+            and (
+                self.full_decode_max_tokens is None
+                or num_tokens <= self.full_decode_max_tokens
+            )
             and num_reqs <= self.max_uniform_decode_reqs
             and num_tokens == num_reqs * uniform_token_count
         ):
@@ -2823,6 +2879,7 @@ class CudaGraphManager:
         transaction_id: str,
         reason: str,
         administrative: bool = False,
+        defer_rank_consensus: bool = False,
     ) -> None:
         """Destroy one scheduler-selected executable, with exact provenance."""
         matching = self._entries_for_physical_key(key)
@@ -2837,6 +2894,7 @@ class CudaGraphManager:
             transaction_id=transaction_id,
             reason=reason,
             administrative=administrative,
+            defer_rank_consensus=defer_rank_consensus,
         )
 
     def discard_failed_physical_key(
@@ -3123,8 +3181,9 @@ class CudaGraphManager:
         )
         graph = self.graphs.pop(entry.descriptor, None)
         if graph is not None:
+            physical_segments = int(getattr(graph, "num_graphs", 1))
             graph.reset()
-            evicted += 1
+            evicted += physical_segments
         # Reset the executable before releasing its external input owners.
         entry.capture_state = None
         self._release_dynamic_capture_state(entry.descriptor)
@@ -3211,6 +3270,7 @@ class CudaGraphManager:
         transaction_id: str,
         reason: str,
         administrative: bool = False,
+        defer_rank_consensus: bool = False,
     ) -> None:
         self._validate_dynamic_entry_eviction(
             entry,
@@ -3234,18 +3294,23 @@ class CudaGraphManager:
         torch.accelerator.empty_cache()
         torch.accelerator.synchronize(self.device)
         local_reclaimed = max(0, torch.accelerator.get_memory_info()[0] - free_before)
-        pool_reclaimed = torch.tensor(
-            int(local_reclaimed + (1 << 20) >= entry.local_pool_bytes),
-            dtype=torch.int32,
-            device=self.device,
+        local_pool_reclaimed = bool(
+            local_reclaimed + (1 << 20) >= entry.local_pool_bytes
         )
-        if self.tp_size > 1:
-            torch.distributed.all_reduce(
-                pool_reclaimed,
-                op=torch.distributed.ReduceOp.MIN,
-                group=get_tp_group().device_group,
+        if not defer_rank_consensus:
+            pool_reclaimed = torch.tensor(
+                int(local_pool_reclaimed),
+                dtype=torch.int32,
+                device=self.device,
             )
-        if not bool(pool_reclaimed.item()):
+            if self.tp_size > 1:
+                torch.distributed.all_reduce(
+                    pool_reclaimed,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=get_tp_group().device_group,
+                )
+            local_pool_reclaimed = bool(pool_reclaimed.item())
+        if not local_pool_reclaimed:
             raise RuntimeError(
                 "Dynamic CUDA graph eviction did not physically reclaim its "
                 f"pool: owner={self.dynamic_graph_owner} "
@@ -3256,6 +3321,7 @@ class CudaGraphManager:
         retained_increment = self._account_dynamic_retained_bytes(
             entry.local_charged_bytes,
             local_reclaimed,
+            publish=not defer_rank_consensus,
         )
         self._dynamic_retention_ledger.step_released_capture_state_bytes += (
             released_capture_state
@@ -3286,6 +3352,8 @@ class CudaGraphManager:
         self,
         local_charge: int,
         local_reclaimed: int,
+        *,
+        publish: bool = True,
     ) -> int:
         """Publish CUDA bytes that graph teardown could not return.
 
@@ -3299,6 +3367,8 @@ class CudaGraphManager:
             0,
             ledger.local_bytes + local_charge - local_reclaimed,
         )
+        if not publish:
+            return ledger.local_bytes - ledger.rank_safe_bytes
         retained = torch.tensor(
             ledger.local_bytes,
             dtype=torch.int64,
@@ -3314,7 +3384,39 @@ class CudaGraphManager:
         ledger.rank_safe_bytes = int(retained.item())
         return ledger.rank_safe_bytes - previous
 
-    def _reconcile_dynamic_retained_cleanup(self, local_reclaimed_bytes: int) -> int:
+    def _publish_deferred_eviction_consensus(
+        self, local_error: Exception | None
+    ) -> None:
+        """Publish one fixed-order result after rank-local idle evictions."""
+        accepted = torch.tensor(int(local_error is None), dtype=torch.int32)
+        retained = torch.tensor(
+            self._dynamic_retention_ledger.local_bytes,
+            dtype=torch.int64,
+        )
+        if self.tp_size > 1:
+            cpu_group = get_tp_group().cpu_group
+            torch.distributed.all_reduce(
+                accepted,
+                op=torch.distributed.ReduceOp.MIN,
+                group=cpu_group,
+            )
+            torch.distributed.all_reduce(
+                retained,
+                op=torch.distributed.ReduceOp.MAX,
+                group=cpu_group,
+            )
+        self._dynamic_retention_ledger.rank_safe_bytes = int(retained.item())
+        if not bool(accepted.item()):
+            raise RuntimeError(
+                "administrative CUDA Graph eviction failed on at least one rank"
+            ) from local_error
+
+    def _reconcile_dynamic_retained_cleanup(
+        self,
+        local_reclaimed_bytes: int,
+        *,
+        force_rank_consensus: bool = False,
+    ) -> int:
         """Publish delayed cleanup without consuming older retained memory.
 
         Graph eviction runs before attention wrappers are trimmed. Capture state
@@ -3332,6 +3434,7 @@ class CudaGraphManager:
             step_increase == 0
             and local_reclaimed_bytes == 0
             and ledger.step_released_capture_state_bytes == 0
+            and not force_rank_consensus
         ):
             # Steady HOT replay did not change the physical retention ledger.
             # Its already-published rank-safe value remains valid, so do not
@@ -3342,7 +3445,7 @@ class CudaGraphManager:
             local_reclaimed_bytes + ledger.step_released_capture_state_bytes,
         )
         ledger.local_bytes -= cleanup_credit
-        if self.tp_size > 1 and self.device.type == "cuda":
+        if not force_rank_consensus and self.tp_size > 1 and self.device.type == "cuda":
             # Captured model graphs may contain NCCL on their own streams.  A
             # retention collective submitted before those streams finish can
             # invert the global communicator order across ranks.  Retention
@@ -3352,13 +3455,17 @@ class CudaGraphManager:
         retained = torch.tensor(
             ledger.local_bytes,
             dtype=torch.int64,
-            device=self.device,
+            device="cpu" if force_rank_consensus else self.device,
         )
         if self.tp_size > 1:
             torch.distributed.all_reduce(
                 retained,
                 op=torch.distributed.ReduceOp.MAX,
-                group=get_tp_group().device_group,
+                group=(
+                    get_tp_group().cpu_group
+                    if force_rank_consensus
+                    else get_tp_group().device_group
+                ),
             )
         previous = ledger.rank_safe_bytes
         ledger.rank_safe_bytes = int(retained.item())
@@ -3681,18 +3788,47 @@ class CudaGraphManager:
                             and desc.uniform_token_count == 3
                             and desc.num_tokens == 6
                         )
-                        graph = torch.cuda.CUDAGraph(
-                            keep_graph=(
-                                debug_p3_graph
-                                or bool(
-                                    getattr(
-                                        self,
-                                        "_standalone_keep_full_graph",
-                                        False,
+                        native_config = self.vllm_config.additional_config
+                        breakable_native_full = bool(
+                            self.use_breakable_cg
+                            and self.dynamic_graph_owner == "target"
+                            and isinstance(native_config, dict)
+                            and native_config.get("flashnext_native_experts")
+                        )
+                        if breakable_native_full:
+                            import os
+
+                            if (
+                                os.environ.get("AG2_FLASHNEXT_QSA_COMMAND_CAPTURE")
+                                == "1"
+                            ):
+                                from vllm.models.qwen4_exp.nvidia import (
+                                    qsa_command_capture,
+                                )
+
+                                capture_type: Any = (
+                                    qsa_command_capture.QSACommandCapture
+                                )
+                            else:
+                                from vllm.compilation.breakable_cudagraph import (
+                                    BreakableCUDAGraphCapture,
+                                )
+
+                                capture_type = BreakableCUDAGraphCapture
+                            graph = capture_type(pool=self.pool)
+                        else:
+                            graph = torch.cuda.CUDAGraph(
+                                keep_graph=(
+                                    debug_p3_graph
+                                    or bool(
+                                        getattr(
+                                            self,
+                                            "_standalone_keep_full_graph",
+                                            False,
+                                        )
                                     )
                                 )
                             )
-                        )
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
@@ -3709,11 +3845,19 @@ class CudaGraphManager:
                             self.vllm_config.parallel_config.rank,
                             desc,
                         )
-                        # Match PIECEWISE: FULL must consume the declared
-                        # capture context, not PyTorch's implicit side stream.
-                        with torch.cuda.graph(
-                            graph, self.pool, stream=torch.cuda.current_stream()
-                        ):
+                        # Native CPU/GPU experts contain host work between GPU
+                        # segments. A monolithic CUDA Graph freezes that work at
+                        # capture time, so native target FULL retains callbacks.
+                        active_capture_scope: Any = (
+                            graph
+                            if breakable_native_full
+                            else torch.cuda.graph(
+                                graph,
+                                self.pool,
+                                stream=torch.cuda.current_stream(),
+                            )
+                        )
+                        with active_capture_scope:
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid
                             # unjoined stream error. The last layer's start_prefetch
@@ -4223,6 +4367,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         varlen_decode: bool = False,
         full_decode_query_lens: set[int] | None = None,
         full_decode_cap_query_lens: set[int] | None = None,
+        full_decode_max_tokens: int | None = None,
         tp3_sd_phase_reduce: bool = False,
         tp3_owner_prequant: bool = False,
         max_uniform_decode_reqs: int | None = None,
@@ -4237,6 +4382,7 @@ class ModelCudaGraphManager(CudaGraphManager):
             varlen_decode=varlen_decode,
             full_decode_query_lens=full_decode_query_lens,
             full_decode_cap_query_lens=full_decode_cap_query_lens,
+            full_decode_max_tokens=full_decode_max_tokens,
             max_uniform_decode_reqs=max_uniform_decode_reqs,
             owner=owner,
         )
@@ -4462,6 +4608,15 @@ class ModelCudaGraphManager(CudaGraphManager):
                     else:
                         model_output = model(**model_inputs)
 
+                # Capture invokes the retained closure outside execute_model's
+                # normal completion seam.  E8 host sequencing belongs to each
+                # invocation (warmup and capture), not to the whole capture call.
+                finish_capture_forward = getattr(
+                    model_state, "finish_native_capture_forward", None
+                )
+                if finish_capture_forward is not None:
+                    finish_capture_forward()
+
                 if cg_mode == CUDAGraphMode.PIECEWISE:
                     # PW CUDA graph (compiled or breakable) internally handles the
                     # model outputs. No need to keep track of the hidden states.
@@ -4533,6 +4688,40 @@ class ModelCudaGraphManager(CudaGraphManager):
                         )
                     for k, v in intermediate_tensors.tensors.items():
                         capture_outputs.intermediate_tensors[k][:num_tokens] = v
+
+            def allocation_profile_replay_context():
+                # Allocation profiling replays a retained FULL descriptor
+                # outside execute_model. Recreate the capture-time context so
+                # every eager boundary (QSA, GDN and future callbacks) sees the
+                # same complete contract rather than adding callback-specific
+                # no-context fallbacks.
+                tp3_sd_phase_reduce = (
+                    self.tp3_sd_phase_reduce
+                    and desc.cg_mode == CUDAGraphMode.FULL
+                    and desc.uniform_token_count == 1
+                )
+                tp3_owner_prequant_decode = self.uses_tp3_owner_prequant_decode(desc)
+                return set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens,
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    slot_mapping=slot_mappings,
+                    batch_descriptor=None,
+                    is_padding=input_buffers.is_padding[:num_tokens],
+                    tp3_sd_phase_reduce=tp3_sd_phase_reduce,
+                    tp3_owner_prequant_decode=tp3_owner_prequant_decode,
+                    marlin_request_layout_cpu=(
+                        input_buffers.marlin_request_layout_cpu
+                        if envs.AG2_VLLM_NVFP4_MARLIN_ISOLATE_PREFILL
+                        else None
+                    ),
+                )
+
+            cast(
+                Any, forward_fn
+            ).allocation_profile_replay_context = allocation_profile_replay_context
 
             return forward_fn
 
@@ -4736,7 +4925,11 @@ class ModelCudaGraphManager(CudaGraphManager):
             + BreakableCUDAGraphWrapper.count_batch_descriptor(
                 runtime_desc, entry.graph_pool
             )
-            + int(desc in self.graphs)
+            + (
+                int(getattr(self.graphs[desc], "num_graphs", 1))
+                if desc in self.graphs
+                else 0
+            )
         )
         end_free = torch.accelerator.get_memory_info()[0]
         local_capture_delta = max(0, start_free - end_free)
@@ -4860,6 +5053,18 @@ class ModelCudaGraphManager(CudaGraphManager):
                 receipt,
             )
         return self._dynamic_capture_output(desc)
+
+    def allocation_profile_replay_context(self, desc: BatchExecutionDescriptor):
+        """Restore the complete capture-time context for request-free replay."""
+        entry = self._dynamic_capture_state_direct_entry(desc)
+        if entry.capture_state is None:
+            raise RuntimeError("allocation profile lacks retained capture state")
+        factory = getattr(
+            entry.capture_state, "allocation_profile_replay_context", None
+        )
+        if factory is None:
+            raise RuntimeError("allocation profile capture omitted its replay context")
+        return factory()
 
     def run_dynamic_capture_state_direct_control(
         self, desc: BatchExecutionDescriptor

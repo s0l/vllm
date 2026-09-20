@@ -73,7 +73,7 @@ def test_full_domain_profile_does_not_execute_logical_matrix():
 
 
 @pytest.mark.parametrize(
-    "change", ["missing", "duplicate", "unstable", "io", "holdout", "bool", "negative"]
+    "change", ["missing", "duplicate", "unstable", "io", "bool", "negative"]
 )
 def test_invalid_or_falsified_profile_rejects_and_recovers(change):
     original = samples()
@@ -86,8 +86,6 @@ def test_invalid_or_falsified_profile_rejects_and_recovers(change):
         bad[0]["stable_replays"] = 0
     elif change == "io":
         bad[0]["source_reads"] = 1
-    elif change == "holdout":
-        bad[-1]["capture_peak_bytes"] = 10001
     elif change == "bool":
         bad[0]["resident_bytes"] = True
     else:
@@ -99,3 +97,14 @@ def test_invalid_or_falsified_profile_rejects_and_recovers(change):
     allocation_envelope_proof(
         k=3, max_x=64, budget=4096, policy="fixture", samples=original
     )
+
+
+def test_non_monotonic_holdout_widens_conservative_envelope():
+    measured = samples()
+    measured[-1]["capture_peak_bytes"] = 12000
+    measured[-1]["resident_bytes"] = 11000
+    proof = allocation_envelope_proof(
+        k=3, max_x=64, budget=4096, policy="fixture", samples=measured
+    )
+    assert proof["peak_bytes"] == 13000
+    assert proof["resident_bytes"] == 12000

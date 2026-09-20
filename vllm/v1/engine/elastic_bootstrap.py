@@ -10,8 +10,10 @@ explicit rather than documentary.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,9 +62,143 @@ def _require_measurement_request(fingerprint: str, surface_sha256: str) -> None:
     )
 
 
+def _auto_profile_runtime_catalog(owner: Any) -> None:
+    """Build, price, publish and activate the effective pre-READY surface."""
+    from vllm import envs
+    from vllm.v1.engine.elastic_calibrator import (
+        _catalog_producer_lock,
+        derive_runtime_calibration_surface,
+    )
+    from vllm.v1.engine.elastic_memory_profile import profile_allocation_catalog
+    from vllm.v1.worker.elastic_catalog_tool import publish_measured_catalog
+    from vllm.v1.worker.startup_plan import (
+        _elastic_graph_catalog_path,
+        compute_elastic_graph_catalog_fingerprint,
+        load_elastic_graph_catalog,
+        load_elastic_graph_catalog_coverage,
+    )
+
+    scheduler = owner.scheduler
+    fingerprint = compute_elastic_graph_catalog_fingerprint(
+        owner.vllm_config, scheduler.kv_cache_config
+    )
+    destination = Path(_elastic_graph_catalog_path(fingerprint))
+    if destination.exists() or destination.is_symlink():
+        raise RuntimeError(
+            "automatic startup calibration refuses an unaccepted canonical "
+            f"destination: {destination}"
+        )
+    payload, surface = derive_runtime_calibration_surface(owner)
+    surface_bytes = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+    surface_sha256 = hashlib.sha256(surface_bytes).hexdigest()
+    catalog_dir = Path(envs.VLLM_CACHE_ROOT) / "elastic_graph_catalog"
+    catalog_dir.mkdir(parents=True, exist_ok=True)
+    surface_path = catalog_dir / f"auto_surface_{fingerprint}.json"
+    if surface_path.exists():
+        if surface_path.is_symlink() or surface_path.read_bytes() != surface_bytes:
+            raise RuntimeError("runtime-derived calibration surface identity differs")
+    else:
+        temporary = surface_path.with_suffix(f".tmp.{os.getpid()}")
+        temporary.write_bytes(surface_bytes)
+        os.replace(temporary, surface_path)
+    receipt_path = Path(
+        os.environ.get("AG2_VLLM_ELASTIC_CALIBRATION_RECEIPT")
+        or catalog_dir / f"auto_calibration_{fingerprint}.json"
+    )
+    previous_attempts = 0
+    if receipt_path.exists() and not receipt_path.is_symlink():
+        try:
+            previous = json.loads(receipt_path.read_text(encoding="utf-8"))
+            previous_attempts = int(previous.get("attempt", 0))
+        except (OSError, ValueError, TypeError) as error:
+            raise RuntimeError(
+                "automatic calibration receipt cannot be resumed"
+            ) from error
+    receipt: dict[str, Any] = {
+        "schema": "ag2-elastic-startup-calibration-v1",
+        "stage": "profiling",
+        "attempt": previous_attempts + 1,
+        "fingerprint": fingerprint,
+        "surface": str(surface_path),
+        "surface_sha256": surface_sha256,
+        "policy_fingerprint": scheduler._elastic_graph_execution_policy.fingerprint,
+        "required_shapes": len(surface.required) + len(surface.serving_hotset),
+        "physical_samples": [],
+    }
+    _write_calibration_receipt(receipt_path, receipt)
+    started = time.monotonic()
+
+    def progress(samples: list[dict[str, Any]], next_key: Any, wall: float) -> None:
+        receipt.update(
+            stage="profiling",
+            physical_samples=samples,
+            next_physical_key=next_key,
+            profiling_wall_seconds=wall,
+        )
+        _write_calibration_receipt(receipt_path, receipt)
+
+    try:
+        with _catalog_producer_lock(Path(envs.VLLM_CACHE_ROOT), fingerprint):
+            rows = profile_allocation_catalog(owner, surface, progress=progress)
+            publish_rows = dict(rows)
+            for alias in surface.serving_hotset:
+                if alias in publish_rows:
+                    raise RuntimeError("serving hotset alias duplicates a measured row")
+                publish_rows[alias] = dict(next(iter(rows.values())))
+            required = tuple(
+                sorted(set(surface.required).union(surface.serving_hotset))
+            )
+            published = publish_measured_catalog(
+                owner.vllm_config,
+                scheduler.kv_cache_config,
+                publish_rows,
+                required=required,
+                restore=surface.restore,
+                decode_max_x=surface.decode_max_x,
+                mixed_max_x=surface.mixed_max_x,
+                full_context_max_x=surface.full_context_max_x,
+                calibration_wall_seconds=time.monotonic() - started,
+                output_root=Path(envs.VLLM_CACHE_ROOT),
+                semantic_token_witnesses=surface.semantic_token_witnesses,
+                mixed_query_witnesses=surface.mixed_query_witnesses,
+                restore_decode=surface.restore_decode,
+            )
+        if published != destination:
+            raise RuntimeError("automatic calibration published a noncanonical catalog")
+        catalog = load_elastic_graph_catalog(
+            owner.vllm_config, scheduler.kv_cache_config
+        )
+        coverage = load_elastic_graph_catalog_coverage(
+            owner.vllm_config, scheduler.kv_cache_config
+        )
+        scheduler.activate_elastic_graph_catalog(catalog, coverage)
+        receipt.update(
+            stage="complete",
+            destination=str(published),
+            measured_shapes=len(publish_rows),
+            wall_seconds=time.monotonic() - started,
+        )
+        _write_calibration_receipt(receipt_path, receipt)
+        logger.warning(
+            "Elastic catalog profiled automatically before READY: "
+            "fingerprint=%s shapes=%d destination=%s",
+            fingerprint,
+            len(publish_rows),
+            published,
+        )
+    except BaseException as error:
+        receipt.update(
+            stage="failed",
+            error={"type": type(error).__name__, "message": str(error)},
+            wall_seconds=time.monotonic() - started,
+        )
+        _write_calibration_receipt(receipt_path, receipt)
+        raise
+
+
 def _auto_calibrate_missing_catalog(owner: Any) -> None:
     from vllm import envs
-    from vllm.v1.core.elastic_catalog import load_sealed_catalog_with_digest
+    from vllm.v1.core.elastic_catalog import load_calibration_surface_with_digest
     from vllm.v1.engine.elastic_calibrator import (
         ElasticCalibrationRestartRequired,
         calibrate_and_publish_catalog,
@@ -75,16 +211,10 @@ def _auto_calibrate_missing_catalog(owner: Any) -> None:
 
     surface_value = os.environ.get("AG2_VLLM_ELASTIC_CALIBRATION_SURFACE", "")
     if not surface_value:
-        raise RuntimeError(
-            "automatic elastic calibration requires "
-            "AG2_VLLM_ELASTIC_CALIBRATION_SURFACE"
-        )
+        _auto_profile_runtime_catalog(owner)
+        return
     surface_path = Path(surface_value)
-    surface_payload, surface_sha256 = load_sealed_catalog_with_digest(
-        surface_path,
-        require_migration=False,
-        allow_previous_schema=True,
-    )
+    surface_payload, surface_sha256 = load_calibration_surface_with_digest(surface_path)
     scheduler = owner.scheduler
     fingerprint = compute_elastic_graph_catalog_fingerprint(
         owner.vllm_config, scheduler.kv_cache_config
@@ -436,6 +566,33 @@ def restore_profiled_graph_carrier(owner: Any) -> None:
                 if scheduler._elastic_restore_retention_id == retention:
                     scheduler.release_elastic_restore_retention(retention)
             owner._reclaim_elastic_restore_hotset_before_wave()
+        hotset_steps = tuple(
+            tuple(key) for key in coverage.get("serving_hotset_step_keys", ())
+        )
+        configured_hotset = tuple(getattr(scheduler, "_elastic_serving_hotset_xs", ()))
+        if configured_hotset and not hotset_steps:
+            raise RuntimeError("profiled startup omitted the configured hotset")
+        for key in hotset_steps:
+            owner._prepare_elastic_restore_capture(key)
+            scheduler.assert_elastic_restore_captures_hot((key,))
+            receipts = owner.collective_rpc(replay_allocation_profile, args=(key,))
+            if not receipts or any(
+                receipt["source_reads"] or receipt["stable_replays"] < 1
+                for receipt in receipts
+            ):
+                raise RuntimeError("request-free hotset replay failed its profile")
+            physical_keys = scheduler._resolve_elastic_step_physical_keys(key)
+            if not physical_keys:
+                continue
+            retention = scheduler.retain_elastic_restore_captures((key,))
+            try:
+                scheduler.promote_elastic_restore_retention_to_serving(
+                    retention, physical_keys
+                )
+            finally:
+                if scheduler._elastic_restore_retention_id == retention:
+                    scheduler.release_elastic_restore_retention(retention)
+            owner._reclaim_elastic_restore_hotset_before_wave()
         if not scheduler._elastic_serving_carrier_keys or any(
             not scheduler._elastic_admission_controller.entries[key].hot
             for key in scheduler._elastic_serving_carrier_keys
@@ -443,12 +600,76 @@ def restore_profiled_graph_carrier(owner: Any) -> None:
             raise RuntimeError("request-free startup lost its serving carrier")
         scheduler.max_num_running_reqs = coverage["mixed_max_x"]
         logger.info(
-            "Restored profiled MTP carrier without model requests: X=%d owners=%d",
+            "Restored profiled MTP carrier without model requests: "
+            "X=%d owners=%d hotset_shapes=%d",
             x,
             len(scheduler._elastic_serving_carrier_keys),
+            len(hotset_steps),
         )
     finally:
         scheduler._elastic_restore_mode = previous_mode
+
+
+def preload_full_expert_source(worker: Any) -> list[dict[str, Any]]:
+    """Load and lock a full-capacity expert source after executable restore.
+
+    Partial caches retain demand loading. No HOT placement or model state is
+    changed, and repeated calls must perform no further archive reads.
+    """
+    import time
+
+    results = []
+    state = worker.model_runner.model_state
+    for provider in getattr(state, "_native_providers", ()):
+        if provider.stream_path is None:
+            continue
+        source = provider.bank.source
+        cpu = provider.stream_path.cpu
+        before = cpu.source_stats()
+        total = source.layers * source.experts
+        if before["capacity"] < total:
+            continue
+        if before["capacity"] != total or provider.admission.exclusive_ram:
+            raise RuntimeError("full expert source has incompatible ownership")
+        registration = provider.admission.promotion.registration
+        resident = set(cpu.resident_keys())
+        started = time.monotonic()
+        for layer in range(source.layers):
+            pending = [
+                e
+                for e in range(source.experts)
+                if layer * source.experts + e not in resident
+            ]
+            for offset in range(0, len(pending), 32):
+                cpu.load_rows(layer, pending[offset : offset + 32])
+            if layer % 8 == 7 or layer + 1 == source.layers:
+                logger.info(
+                    "EXPERT_SOURCE_PRELOAD rank=%d layers=%d/%d rows=%d",
+                    worker.rank,
+                    layer + 1,
+                    source.layers,
+                    cpu.source_stats()["rows"],
+                )
+        after = cpu.source_stats()
+        if (
+            set(cpu.resident_keys()) != set(range(total))
+            or after["rows"] != total
+            or after["evictions"] != before["evictions"]
+        ):
+            raise RuntimeError("full expert source did not retain every row")
+        registration.ensure([registration.address], [registration.nbytes])
+        if registration.registered_bytes != registration.nbytes:
+            raise RuntimeError("full expert source is not completely page locked")
+        results.append(
+            dict(
+                rank=worker.rank,
+                rows=total,
+                registered_bytes=registration.registered_bytes,
+                read_bytes=after["read_bytes"] - before["read_bytes"],
+                wall_s=time.monotonic() - started,
+            )
+        )
+    return results
 
 
 def complete_elastic_startup(owner: Any) -> str:
@@ -487,6 +708,13 @@ def complete_elastic_startup(owner: Any) -> str:
                     owner._restore_elastic_bounded_hotset()
             else:
                 owner._restore_elastic_pinned_full_family()
+            vllm_config = getattr(owner, "vllm_config", None)
+            additional_config = getattr(vllm_config, "additional_config", None)
+            if isinstance(additional_config, dict) and additional_config.get(
+                "flashnext_native_experts"
+            ):
+                source_rows = owner.collective_rpc(preload_full_expert_source)
+                logger.info("EXPERT_SOURCE_PRE_READY: %s", source_rows)
         except ElasticCalibrationRestartRequired:
             logger.warning(
                 "ELASTIC_CALIBRATION_RESTART_REQUIRED: bounded pre-READY "

@@ -142,6 +142,17 @@ class ModelState(ABC):
         """
         return mode
 
+    def get_full_cudagraph_max_tokens(self) -> int | None:
+        """Return a model-state limit for FULL graph token shapes.
+
+        ``None`` means that the state adds no limit. A positive value keeps
+        larger shapes on the PIECEWISE path while permitting bounded FULL
+        descriptors. This is separate from attention support: host-backed
+        model state can have a graph-safe, pre-staged small-token lane without
+        making its general host callback path capturable.
+        """
+        return None
+
     def preprocess_state(
         self,
         input_batch: InputBatch,

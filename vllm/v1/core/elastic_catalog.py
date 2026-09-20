@@ -489,6 +489,31 @@ def load_sealed_catalog_with_digest(
     return payload, hashlib.sha256(source_bytes).hexdigest()
 
 
+def load_calibration_surface_with_digest(
+    path: Path | str,
+) -> tuple[dict[str, Any], str]:
+    """Load the immutable-by-request offline calibration surface."""
+    path = Path(path)
+    try:
+        source_bytes = path.read_bytes()
+        payload: Any = json.loads(source_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"calibration surface is unreadable: {path}") from error
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"schema", "status", "coverage"}
+        or payload.get("schema")
+        not in {
+            ELASTIC_GRAPH_CATALOG_SCHEMA_VERSION - 1,
+            ELASTIC_GRAPH_CATALOG_SCHEMA_VERSION,
+        }
+        or payload.get("status") != "UNMEASURED_SURFACE_NOT_A_SERVING_CATALOG"
+        or not isinstance(payload.get("coverage"), dict)
+    ):
+        raise RuntimeError("calibration surface is not an offline-reviewed object")
+    return payload, hashlib.sha256(source_bytes).hexdigest()
+
+
 def finalize_migrated_catalog(source: Path, output_root: Path) -> Path:
     """Finalize an explicit migrated artifact without mutating its source."""
     finalized = load_sealed_catalog(source, require_migration=True)

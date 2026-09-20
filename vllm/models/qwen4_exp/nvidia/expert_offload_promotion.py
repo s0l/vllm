@@ -37,9 +37,6 @@ class NativeExpertPromotion:
             if self.registration is not None:
                 self.registration.close()
             raise
-        self.bank.promotion_registered_source_bytes = (
-            0 if self.registration is None else self.registration.nbytes
-        )
         self.bank.registered_source_region = self.registration
         self.future, self.pending = None, None
         self.sequence = 0
@@ -79,6 +76,9 @@ class NativeExpertPromotion:
                     raise RuntimeError(
                         "asynchronous admission requires exclusive placement authority"
                     )
+                admitted_bytes = len(assignments) * sum(bank.strides.values())
+                if admitted_bytes > self.provider.admission.max_upload_bytes:
+                    raise ValueError("expert upload exceeds its admitted byte budget")
                 # Borrow all existing cache rows before releasing the lock.
                 # CPU/source eviction may drop a cache ref, but not these leases.
                 rows = bank.source.borrow_resident(
@@ -160,7 +160,7 @@ class NativeExpertPromotion:
             staging_bytes=self.staging_bytes,
             registered_source_bytes=0
             if self.registration is None
-            else self.registration.nbytes,
+            else self.registration.registered_bytes,
         )
 
     def _copy(self, rows):
@@ -203,6 +203,7 @@ class NativeExpertPromotion:
                             src.append(address)
                             dst.append(target.data_ptr() + slot * bank.strides[name])
                             sizes.append(nbytes)
+                    region.ensure(src, sizes)
                     descriptors = [
                         torch.from_numpy(np.asarray(v, np.int64))
                         for v in (src, dst, sizes)
@@ -338,5 +339,4 @@ class NativeExpertPromotion:
             self.worker.shutdown(wait=True, cancel_futures=True)
             if self.registration is not None:
                 self.registration.close()
-                self.bank.promotion_registered_source_bytes = 0
                 self.bank.registered_source_region = None

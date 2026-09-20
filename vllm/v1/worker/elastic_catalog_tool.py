@@ -226,6 +226,26 @@ def publish_measured_catalog(
 
     policy = startup_plan._effective_graph_execution_policy(kv_cache_config)
     compiled = configured_compiled_piecewise_sizes(vllm_config)
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    if not isinstance(additional, dict):
+        raise RuntimeError("measured catalog additional_config must be a mapping")
+    hotset_xs = tuple(additional.get("elastic_serving_hotset_xs", ()))
+    minimum_decode_x = additional.get("elastic_short_decode_min_x", 1)
+    forbid_serving_maintenance = additional.get(
+        "elastic_forbid_serving_maintenance", False
+    )
+    if (
+        not isinstance(hotset_xs, tuple)
+        or any(type(value) is not int or value <= 0 for value in hotset_xs)
+        or hotset_xs != tuple(sorted(set(hotset_xs)))
+        or any(value > decode_max_x for value in hotset_xs)
+        or type(minimum_decode_x) is not int
+        or minimum_decode_x <= 0
+        or minimum_decode_x > decode_max_x
+        or (minimum_decode_x > 1 and minimum_decode_x not in hotset_xs)
+        or type(forbid_serving_maintenance) is not bool
+    ):
+        raise RuntimeError("measured catalog has an invalid serving hotset policy")
     from vllm.v1.core.elastic_price_identity import (
         PRICE_OWNER_GENERATION,
         remap_catalog_resident_keys,
@@ -297,6 +317,33 @@ def publish_measured_catalog(
             "measured catalog omits the terminal prefill/q1/q(K+1) carrier: "
             f"missing={sorted(set(serving_carrier) - set(required))!r}"
         )
+    decode_inventory = tuple(
+        x for x in short_decode_inventory_xs(decode_max_x) if x >= minimum_decode_x
+    )
+    serving_hotset: tuple[tuple[int, ...], ...] = tuple(
+        dict.fromkeys(
+            key
+            for semantic_x in hotset_xs
+            for physical_x in (
+                select_short_decode_physical_x(semantic_x, decode_inventory),
+            )
+            for key in (
+                (0, decode_k, semantic_x, semantic_x, 0),
+                (
+                    0,
+                    decode_k,
+                    physical_x,
+                    physical_x * (decode_k + 1),
+                    decode_k + 1,
+                ),
+            )
+        )
+    )
+    if not set(serving_hotset).issubset(required):
+        raise RuntimeError(
+            "measured catalog omits the configured serving hotset: "
+            f"missing={sorted(set(serving_hotset) - set(required))!r}"
+        )
     coverage = {
         "required_step_keys": [list(key) for key in sorted(required)],
         "required_shapes": len(required),
@@ -315,6 +362,11 @@ def publish_measured_catalog(
         "serving_carrier_step_keys": [list(key) for key in serving_carrier],
         "serving_carrier_contract": "retained-terminal-mtp-no-cold-serving-v1",
         "serving_carrier_owner": "mtp_decode",
+        "serving_hotset_step_keys": [list(key) for key in serving_hotset],
+        "serving_hotset_xs": list(hotset_xs),
+        "serving_hotset_contract": "pre-ready-hot-no-runtime-maintenance-v1",
+        "short_decode_min_x": minimum_decode_x,
+        "forbid_serving_maintenance": forbid_serving_maintenance,
         "calibration_wall_seconds": calibration_wall_seconds,
         "decode_max_x": decode_max_x,
         "mixed_max_x": mixed_max_x,
