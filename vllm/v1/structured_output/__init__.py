@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import itertools
 import multiprocessing
 from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -311,6 +312,41 @@ class StructuredOutputManager:
         validated = grammar.validate_tokens(spec_tokens[constraint_start:])
         return prefix + validated
 
+    @staticmethod
+    def _find_reasoning_end_index(
+        reasoner: "ReasoningParser",
+        all_token_ids: Sequence[int],
+        start: int,
+        delta_ids: Sequence[int],
+        *,
+        delta_appended: bool,
+    ) -> int | None:
+        """Locate the token that ends reasoning within ``delta_ids``.
+
+        ``delta_ids`` occupy positions ``start..``; ``delta_appended`` says
+        whether they are already present in ``all_token_ids`` (accepted
+        tokens) or are a speculative draft window.
+        """
+        if (
+            isinstance(reasoner, ParserEngineReasoningAdapter)
+            and reasoner.reasoning_end_token_ids
+        ):
+            offset = reasoner.find_reasoning_end_offset(delta_ids)
+            return None if offset is None else start + offset
+
+        if delta_appended and not reasoner.is_reasoning_end_streaming(
+            all_token_ids, delta_ids
+        ):
+            return None
+        prefix = list(itertools.islice(all_token_ids, start))
+        for offset, token in enumerate(delta_ids):
+            prefix.append(token)
+            if reasoner.is_reasoning_end_streaming(prefix, [token]):
+                return start + offset
+        if delta_appended:
+            return len(all_token_ids) - 1
+        return None
+
     def grammar_bitmask(
         self,
         requests: dict[str, "Request"],
@@ -382,18 +418,16 @@ class StructuredOutputManager:
                 grammar = structured_output_request.grammar
                 if TYPE_CHECKING:
                     assert isinstance(grammar, StructuredOutputGrammar)
-                reasoner = self._get_reasoner(request)
-
                 req_tokens = scheduled_spec_decode_tokens.get(req_id, list())
                 constraint_start = self._get_constraint_start(
                     request, strip_speculative_padding(req_tokens)
                 )
+                reasoner = self._get_reasoner(request) if constraint_start > 0 else None
                 state_advancements = 0
                 seen_padding = False
                 failed = False
                 post_reasoning_end_in_window = False
                 post_reasoning_draft_prefix_valid = True
-                req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
                 # Locate the reasoning-end marker in the draft window once.
                 # Rejected-draft padding (-1) is trailing, so the window is
                 # cut there and the reasoner never sees a placeholder.
