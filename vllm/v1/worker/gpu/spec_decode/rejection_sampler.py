@@ -308,10 +308,12 @@ class RejectionSampler:
             "thinking_end_token_ids": thinking_end_token_ids,
         }
         if bool(use_penalty.any()):
-            payload["prompt_bin_mask"] = penalties.prompt_bin_mask[state_idx]
-            payload["prompt_bin_mask"] = payload["prompt_bin_mask"].detach().cpu()
-            payload["output_bin_counts"] = penalties.output_bin_counts[state_idx]
-            payload["output_bin_counts"] = payload["output_bin_counts"].detach().cpu()
+            payload["prompt_bin_mask"] = (
+                penalties.prompt_bin_mask[state_idx].detach().cpu()
+            )
+            payload["output_bin_counts"] = (
+                penalties.output_bin_counts[state_idx].detach().cpu()
+            )
         return payload
 
     def _get_logprobs_tensors(
@@ -625,6 +627,7 @@ class RejectionSampler:
             )
         draft_sampled = input_batch.input_ids[input_batch.logits_indices]
         pos = input_batch.positions[input_batch.logits_indices]
+        seq_lens_upper_bound_np = input_batch.seq_lens_cpu_upper_bound.numpy()
         processed_local = self.sampler.apply_sampling_params(
             local_logits,
             input_batch.expanded_idx_mapping,
@@ -633,6 +636,7 @@ class RejectionSampler:
             pos,
             draft_sampled,
             input_batch.expanded_local_pos,
+            seq_lens_upper_bound_np,
             skip_top_k_top_p=True,
             vocab_start=vocab_start,
         )
@@ -690,6 +694,7 @@ class RejectionSampler:
                 pos,
                 draft_sampled,
                 input_batch.expanded_local_pos,
+                seq_lens_upper_bound_np,
             )
             if not torch.equal(processed_logits, oracle_processed):
                 sparse_finite = torch.isfinite(processed_logits)
