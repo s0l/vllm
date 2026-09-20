@@ -512,6 +512,13 @@ class CommonAttentionMetadata:
     at the current decode run's last full-state write. write_pos counts from
     here, so a preemption-resumed request re-anchors past the prompt boundary."""
 
+    # Deprecated lazy CPU mirrors retained for downstream backends that have
+    # not yet migrated to a device-native metadata path.  Keep these as
+    # explicit dataclass fields: callers may provide an already available CPU
+    # copy, and unpadded() must preserve it without forcing a device sync.
+    _seq_lens_cpu: torch.Tensor | None = None
+    _num_computed_tokens_cpu: torch.Tensor | None = None
+
     _num_computed_tokens_cache: torch.Tensor | None = None
     _token_to_req_indices_cache: torch.Tensor | None = None
 
@@ -604,6 +611,8 @@ class CommonAttentionMetadata:
             query_start_loc=self.query_start_loc[: num_actual_reqs + 1],
             query_start_loc_cpu=self.query_start_loc_cpu[: num_actual_reqs + 1],
             seq_lens=self.seq_lens[:num_actual_reqs],
+            _seq_lens_cpu=maybe_slice_reqs(self._seq_lens_cpu),
+            _num_computed_tokens_cpu=maybe_slice_reqs(self._num_computed_tokens_cpu),
             num_reqs=num_actual_reqs,
             num_actual_tokens=num_actual_tokens,
             max_query_len=self.max_query_len,
