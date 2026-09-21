@@ -14,6 +14,7 @@ from vllm.v1.core.elastic_graph import (
     GraphExecutionPolicy,
     OwnerGraphExecutionPolicy,
     RuntimeGeneration,
+    resolve_step_physical_keys,
 )
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import elastic_bootstrap, elastic_calibrator
@@ -68,9 +69,9 @@ def _k0_calibration_owner(*, scheduler_k: int = 0, prefill_k: int = 0):
         owners=(
             OwnerGraphExecutionPolicy(
                 owner="target",
-                full_query_lens=(),
+                full_query_lens=(1,),
                 piecewise_mode="PIECEWISE",
-                compiled_piecewise_sizes=(1, 2, 4, 8),
+                compiled_piecewise_sizes=(2, 4, 8),
                 activation="always",
                 token_source="step",
                 execution_order=0,
@@ -78,10 +79,25 @@ def _k0_calibration_owner(*, scheduler_k: int = 0, prefill_k: int = 0):
         ),
     )
 
-    def canonical(lengths, k, _is_decode):
+    def canonical(lengths, k, is_decode):
         tokens = sum(lengths.values())
+        if is_decode and len(set(lengths.values())) == 1:
+            query_len = next(iter(lengths.values()))
+            if query_len == 1:
+                return (1, k, len(lengths), tokens, query_len)
         bucket = min(1 << (tokens - 1).bit_length(), 8)
         return (0, k, len(lengths), bucket, 0)
+
+    generation = RuntimeGeneration("k0-calibration-test")
+
+    def physical_keys(key):
+        return resolve_step_physical_keys(
+            key,
+            generation,
+            max_num_batched_tokens=8,
+            compiled_piecewise_sizes=(2, 4, 8),
+            policy=policy,
+        )
 
     scheduler = SimpleNamespace(
         _elastic_graph_execution_policy=policy,
@@ -89,6 +105,7 @@ def _k0_calibration_owner(*, scheduler_k: int = 0, prefill_k: int = 0):
         max_num_running_reqs=2,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
         _canonical_elastic_graph_step_key=canonical,
+        _resolve_elastic_step_physical_keys=physical_keys,
         _elastic_restore_mode=False,
     )
     owner = SimpleNamespace(
@@ -96,28 +113,28 @@ def _k0_calibration_owner(*, scheduler_k: int = 0, prefill_k: int = 0):
         vllm_config=SimpleNamespace(additional_config={}),
         _elastic_restore_prefill_k=MagicMock(return_value=prefill_k),
         _elastic_restore_wave_step_keys=MagicMock(
-            return_value=((0, prefill_k, 2, 4, 0), (0, scheduler_k, 2, 2, 0))
+            return_value=((0, prefill_k, 2, 4, 0), (1, scheduler_k, 2, 2, 1))
         ),
     )
     return owner
 
 
-def test_runtime_calibration_derives_target_only_k0_surface(monkeypatch) -> None:
+def test_runtime_calibration_derives_target_only_k0_surface() -> None:
     owner = _k0_calibration_owner()
-    monkeypatch.setattr(
-        elastic_calibrator.ElasticCatalogCalibrator,
-        "_validate_surface_before_mutation",
-        lambda _self, _surface: None,
-    )
 
     payload, surface = elastic_calibrator.derive_runtime_calibration_surface(owner)
 
     assert payload["coverage"]["restore_decode"] == {"k": 0, "x": 2, "query_len": 1}
     assert surface.restore_decode is not None
     assert surface.restore_decode.k == 0
+    assert surface.restore == ((1, 0, 2, 2, 1),)
+    assert surface.required == (
+        (0, 0, 1, 1, 0),
+        (1, 0, 1, 1, 1),
+        (1, 0, 2, 2, 1),
+    )
     assert {key[1] for key in surface.required} == {0}
-    assert len(surface.mixed_query_witnesses) == len(set(surface.mixed_query_witnesses))
-    assert {query_len for _key, query_len in surface.mixed_query_witnesses} == {1}
+    assert surface.mixed_query_witnesses == ()
 
 
 @pytest.mark.parametrize(

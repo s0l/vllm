@@ -408,6 +408,10 @@ def derive_runtime_calibration_surface(
         tokens *= 2
     boundaries.append(budget)
     required: set[tuple[int, int, int, int, int]] = set()
+
+    def graph_backed(key: tuple[int, int, int, int, int]) -> bool:
+        return bool(scheduler._resolve_elastic_step_physical_keys(key))
+
     for x in range(1, max_x + 1):
         for m in boundaries:
             if m < x:
@@ -416,7 +420,8 @@ def derive_runtime_calibration_surface(
             key = scheduler._canonical_elastic_graph_step_key(lengths, prefill_k, False)
             if key is None:
                 raise RuntimeError("runtime-derived prefill shape has no identity")
-            required.add(key)
+            if graph_backed(key):
+                required.add(key)
     inventory_xs = short_decode_inventory_xs(max_x)
     for x in range(1, max_x + 1):
         for query_len in range(1, k + 2):
@@ -426,7 +431,8 @@ def derive_runtime_calibration_surface(
                 )
                 if key is None:
                     raise RuntimeError("runtime-derived decode shape has no identity")
-                required.add(key)
+                if graph_backed(key):
+                    required.add(key)
 
     additional = owner.vllm_config.additional_config or {}
     hotset_xs = tuple(additional.get("elastic_serving_hotset_xs", ()))
@@ -440,10 +446,18 @@ def derive_runtime_calibration_surface(
             )
         )
     serving_hotset = list(dict.fromkeys(serving_hotset))
-    serving_hotset = [key for key in serving_hotset if key not in required]
+    serving_hotset = [
+        key for key in serving_hotset if key not in required and graph_backed(key)
+    ]
     restore = tuple(
-        dict.fromkeys(owner._elastic_restore_wave_step_keys(k=k, x=max_x, query_len=1))
+        key
+        for key in dict.fromkeys(
+            owner._elastic_restore_wave_step_keys(k=k, x=max_x, query_len=1)
+        )
+        if graph_backed(key)
     )
+    if not restore:
+        raise RuntimeError("runtime-derived restore has no Graph-backed owner")
     if not set(restore).issubset(required):
         raise RuntimeError("runtime-derived restore shapes exceed the surface")
     payload = {
@@ -845,13 +859,13 @@ class ElasticCatalogCalibrator:
         geometry = surface.restore_decode or resolve_restore_decode_geometry(
             surface.restore
         )
-        expected_restore = set(
-            self.owner._elastic_restore_wave_step_keys(
-                k=geometry.k,
-                x=geometry.x,
-                query_len=geometry.query_len,
+        expected_restore = {
+            key
+            for key in self.owner._elastic_restore_wave_step_keys(
+                k=geometry.k, x=geometry.x, query_len=geometry.query_len
             )
-        )
+            if self.scheduler._resolve_elastic_step_physical_keys(key)
+        }
         if set(surface.restore) != expected_restore:
             raise RuntimeError(
                 "calibration restore pair differs from effective runtime: "
@@ -1171,7 +1185,9 @@ class ElasticCatalogCalibrator:
                         allow_restart=True,
                         producer_completed=True,
                     )
-                    if not self._complete(restore_prefill):
+                    if restore_prefill in surface.restore and not self._complete(
+                        restore_prefill
+                    ):
                         prompt_len = self.owner._elastic_restore_prefill_prompt_len()
                         prefill_actual, prefill_admitted = self._balanced_prefill_pair(
                             k=restore_prefill[1],
