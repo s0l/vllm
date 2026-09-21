@@ -3803,12 +3803,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.enable_cuda_graph = (
             self.compilation_config.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
         )
+        self._decode_wrappers_cudagraph: dict[
+            int, BatchDecodeWithPagedKVCacheWrapper
+        ] = {}
+        self._decode_cudagraph_max_bs = 0
         if self.enable_cuda_graph:
             # For full cudagraph capture, one `decode_wrapper` for each batch
             # size is needed for FlashInfer.
-            self._decode_wrappers_cudagraph: dict[
-                int, BatchDecodeWithPagedKVCacheWrapper
-            ] = {}
             self._decode_cudagraph_max_bs = (1 + num_spec_tokens) * max_num_reqs
             if self.compilation_config.max_cudagraph_capture_size is not None:
                 self._decode_cudagraph_max_bs = min(
