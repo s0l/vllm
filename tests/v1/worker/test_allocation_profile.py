@@ -145,3 +145,32 @@ def test_non_monotonic_holdout_widens_conservative_envelope():
     )
     assert proof["peak_bytes"] == 13000
     assert proof["resident_bytes"] == 12000
+
+
+def test_policy_filtered_physical_controls_are_sealed_and_validated():
+    measured = samples()[:2]
+    controls = tuple(tuple(sample["step_key"]) for sample in measured)
+    proof = allocation_envelope_proof(
+        k=3,
+        max_x=64,
+        budget=4096,
+        policy="fixture",
+        samples=measured,
+        controls=controls,
+    )
+    row = allocation_envelope_row(proof)
+
+    assert proof["controls"] == [list(key) for key in controls]
+    validate_allocation_envelope_row(
+        (0, 3, 1, 1, 0), row, policy="fixture", budget=4096
+    )
+
+    missing = copy.deepcopy(proof)
+    missing["controls"].pop()
+    with pytest.raises(ValueError, match="missing or repeats"):
+        validate_allocation_envelope_row(
+            (0, 3, 1, 1, 0),
+            allocation_envelope_row(missing),
+            policy="fixture",
+            budget=4096,
+        )

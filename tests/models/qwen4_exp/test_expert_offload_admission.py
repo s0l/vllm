@@ -173,6 +173,7 @@ def test_failed_allocation_rpc_keeps_primary_error_and_restores_core_state(monke
         _elastic_graph_execution_policy=SimpleNamespace(fingerprint="policy"),
         _elastic_restore_mode=False,
         _elastic_graph_catalog=previous,
+        _resolve_elastic_step_physical_keys=lambda key: (key,),
         num_spec_tokens=3,
         prepare_elastic_restore_idle_reclaim=lambda: events.append("reclaim"),
         prepare_elastic_restore_capture=lambda key: True,

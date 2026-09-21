@@ -184,6 +184,13 @@ def profile_allocation_catalog(owner: Any, surface: Any, *, progress=None):
         surface.decode_max_x,
         config.scheduler_config.max_num_batched_tokens,
     )
+    controls = tuple(
+        key
+        for key in corners + holdouts
+        if scheduler._resolve_elastic_step_physical_keys(key)
+    )
+    if not controls:
+        raise RuntimeError("allocation profile has no Graph-backed physical controls")
     ElasticCatalogCalibrator(owner)._validate_surface_before_mutation(surface)
     previous_mode, previous_catalog = (
         scheduler._elastic_restore_mode,
@@ -213,7 +220,7 @@ def profile_allocation_catalog(owner: Any, surface: Any, *, progress=None):
     completed = False
     try:
         reclaim()
-        for key in corners + holdouts:
+        for key in controls:
             if progress is not None:
                 progress(samples, key, time.monotonic() - started)
             if not scheduler.prepare_elastic_restore_capture(key):
@@ -241,6 +248,7 @@ def profile_allocation_catalog(owner: Any, surface: Any, *, progress=None):
             budget=config.scheduler_config.max_num_batched_tokens,
             policy=policy.fingerprint,
             samples=samples,
+            controls=controls,
         )
         rows = {key: allocation_envelope_row(proof) for key in surface.required}
         ElasticCatalogCalibrator(owner).validate_capacity(surface, rows)

@@ -58,10 +58,28 @@ def allocation_envelope_proof(
     budget: int,
     policy: str,
     samples: Sequence[Mapping[str, Any]],
+    controls: Sequence[Sequence[int]] | None = None,
 ) -> dict[str, Any]:
-    corners, holdouts = allocation_profile_shapes(k, max_x, budget)
+    if controls is None:
+        corners, holdouts = allocation_profile_shapes(k, max_x, budget)
+        expected_controls = corners + holdouts
+    else:
+        expected_controls = tuple(tuple(key) for key in controls)
+        if (
+            not expected_controls
+            or len(set(expected_controls)) != len(expected_controls)
+            or any(
+                len(key) != 5
+                or any(type(value) is not int for value in key)
+                or key[1] != k
+                or not 1 <= key[2] <= max_x
+                or not key[2] <= key[3] <= budget
+                for key in expected_controls
+            )
+        ):
+            raise ValueError("allocation profile has invalid physical controls")
     measured = {tuple(sample["step_key"]): dict(sample) for sample in samples}
-    if len(measured) != len(samples) or set(measured) != set(corners + holdouts):
+    if len(measured) != len(samples) or set(measured) != set(expected_controls):
         raise ValueError("allocation profile is missing or repeats physical controls")
     for sample in measured.values():
         for name in (
@@ -82,18 +100,17 @@ def allocation_envelope_proof(
     # non-monotonic shape must widen the conservative envelope rather than make
     # an otherwise complete profile unpublishable. Scratch is independently
     # maximized and added; no inferred owner overlap is subtracted.
-    controls = corners + holdouts
-    peak = max(measured[key]["capture_peak_bytes"] for key in controls)
-    scratch = max(measured[key]["replay_extra_bytes"] for key in controls)
-    resident = max(measured[key]["resident_bytes"] for key in controls)
-    floor = max(measured[key]["floor_bytes"] for key in controls)
-    return dict(
+    peak = max(measured[key]["capture_peak_bytes"] for key in expected_controls)
+    scratch = max(measured[key]["replay_extra_bytes"] for key in expected_controls)
+    resident = max(measured[key]["resident_bytes"] for key in expected_controls)
+    floor = max(measured[key]["floor_bytes"] for key in expected_controls)
+    proof = dict(
         contract=CONTRACT,
         k=k,
         max_x=max_x,
         budget=budget,
         policy=policy,
-        samples=[measured[key] for key in corners + holdouts],
+        samples=[measured[key] for key in expected_controls],
         peak_bytes=peak + scratch,
         # A replay can introduce persistent inner graphs or library state.
         # Treat all extra memory as retained until physical teardown proves
@@ -102,6 +119,9 @@ def allocation_envelope_proof(
         floor_bytes=floor + scratch,
         shared_owner_credit_bytes=0,
     )
+    if controls is not None:
+        proof["controls"] = [list(key) for key in expected_controls]
+    return proof
 
 
 def allocation_envelope_row(proof: Mapping[str, Any]) -> dict[str, Any]:
@@ -124,7 +144,8 @@ def validate_allocation_envelope_row(step_key, row, *, policy=None, budget=None)
     if not isinstance(proof, dict) or proof.get("contract") != CONTRACT:
         raise ValueError("missing allocation envelope contract")
     rebuilt = allocation_envelope_proof(
-        **{name: proof[name] for name in ("k", "max_x", "budget", "policy", "samples")}
+        **{name: proof[name] for name in ("k", "max_x", "budget", "policy", "samples")},
+        controls=proof.get("controls"),
     )
     if rebuilt != proof or allocation_envelope_row(proof) != {
         name: row.get(name) for name in allocation_envelope_row(proof)
