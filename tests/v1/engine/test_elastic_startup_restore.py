@@ -11,10 +11,12 @@ import pytest
 from vllm.v1.core.elastic_graph import (
     ElasticAdmissionController,
     ElasticResidencyReceipt,
+    GraphExecutionPolicy,
+    OwnerGraphExecutionPolicy,
     RuntimeGeneration,
 )
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.engine import elastic_bootstrap
+from vllm.v1.engine import elastic_bootstrap, elastic_calibrator
 from vllm.v1.engine.core import EngineCore
 
 
@@ -56,6 +58,82 @@ def receipt(
         cublas_workspace_bytes=workspace,
         entries=(),
     )
+
+
+def _k0_calibration_owner(*, scheduler_k: int = 0, prefill_k: int = 0):
+    policy = GraphExecutionPolicy(
+        verifier_contract="target-only-v1",
+        math_contract="target-only-v1",
+        verifier_configuration="disabled-v1",
+        owners=(
+            OwnerGraphExecutionPolicy(
+                owner="target",
+                full_query_lens=(),
+                piecewise_mode="PIECEWISE",
+                compiled_piecewise_sizes=(1, 2, 4, 8),
+                activation="always",
+                token_source="step",
+                execution_order=0,
+            ),
+        ),
+    )
+
+    def canonical(lengths, k, _is_decode):
+        tokens = sum(lengths.values())
+        bucket = min(1 << (tokens - 1).bit_length(), 8)
+        return (0, k, len(lengths), bucket, 0)
+
+    scheduler = SimpleNamespace(
+        _elastic_graph_execution_policy=policy,
+        num_spec_tokens=scheduler_k,
+        max_num_running_reqs=2,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+        _canonical_elastic_graph_step_key=canonical,
+        _elastic_restore_mode=False,
+    )
+    owner = SimpleNamespace(
+        scheduler=scheduler,
+        vllm_config=SimpleNamespace(additional_config={}),
+        _elastic_restore_prefill_k=MagicMock(return_value=prefill_k),
+        _elastic_restore_wave_step_keys=MagicMock(
+            return_value=((0, prefill_k, 2, 4, 0), (0, scheduler_k, 2, 2, 0))
+        ),
+    )
+    return owner
+
+
+def test_runtime_calibration_derives_target_only_k0_surface(monkeypatch) -> None:
+    owner = _k0_calibration_owner()
+    monkeypatch.setattr(
+        elastic_calibrator.ElasticCatalogCalibrator,
+        "_validate_surface_before_mutation",
+        lambda _self, _surface: None,
+    )
+
+    payload, surface = elastic_calibrator.derive_runtime_calibration_surface(owner)
+
+    assert payload["coverage"]["restore_decode"] == {"k": 0, "x": 2, "query_len": 1}
+    assert surface.restore_decode is not None
+    assert surface.restore_decode.k == 0
+    assert {key[1] for key in surface.required} == {0}
+    assert len(surface.mixed_query_witnesses) == len(set(surface.mixed_query_witnesses))
+    assert {query_len for _key, query_len in surface.mixed_query_witnesses} == {1}
+
+
+@pytest.mark.parametrize(
+    "scheduler_k,prefill_k",
+    [(-1, -1), (0, 1)],
+)
+def test_runtime_calibration_rejects_invalid_or_split_k(
+    scheduler_k: int, prefill_k: int
+) -> None:
+    owner = _k0_calibration_owner(
+        scheduler_k=scheduler_k,
+        prefill_k=prefill_k,
+    )
+
+    with pytest.raises(RuntimeError, match="requires one shared K"):
+        elastic_calibrator.derive_runtime_calibration_surface(owner)
 
 
 def test_startup_residency_publishes_one_typed_consensus_before_ready() -> None:

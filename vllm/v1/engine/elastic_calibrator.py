@@ -296,7 +296,7 @@ class CalibrationSurface:
                 (key, query_len)
                 for key in required
                 if key[0] == 0 and key[4] == 0 and key[2] >= 2
-                for query_len in (1, 1 + configured_k)
+                for query_len in dict.fromkeys((1, 1 + configured_k))
                 if semantic_token_witnesses.get(key, key[3]) > (key[2] - 1) * query_len
             )
         else:
@@ -398,8 +398,8 @@ def derive_runtime_calibration_surface(
     max_x = scheduler.max_num_running_reqs
     budget = scheduler.scheduler_config.max_num_batched_tokens
     prefill_k = owner._elastic_restore_prefill_k(k)
-    if k <= 0 or prefill_k != k:
-        raise RuntimeError("runtime-derived calibration requires one shared positive K")
+    if k < 0 or prefill_k != k:
+        raise RuntimeError("runtime-derived calibration requires one shared K")
 
     boundaries: list[int] = []
     tokens = 1
