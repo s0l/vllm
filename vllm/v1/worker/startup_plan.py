@@ -23,7 +23,7 @@ import importlib.util
 import json
 import os
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -761,7 +761,11 @@ def load_elastic_graph_catalog_coverage(
         restore_step_keys,
         label="sealed elastic Graph catalog",
     )
-    from vllm.v1.core.elastic_graph import configured_compiled_piecewise_sizes
+    from vllm.v1.core.elastic_graph import (
+        RuntimeGeneration,
+        configured_compiled_piecewise_sizes,
+        resolve_step_physical_keys,
+    )
 
     configured_compiled = configured_compiled_piecewise_sizes(vllm_config)
     declared_compiled = (
@@ -884,13 +888,22 @@ def load_elastic_graph_catalog_coverage(
             if speculative is not None and speculative.disable_speculation_on_non_decode
             else k
         )
-        if set(
-            geometry.step_keys(
+        expected_restore = {
+            key
+            for key in geometry.step_keys(
                 policy=policy,
                 prefill_k=prefill_k,
                 max_num_batched_tokens=budget,
             )
-        ) != set(restore_inventory):
+            if resolve_step_physical_keys(
+                cast(tuple[int, int, int, int, int], key),
+                generation=RuntimeGeneration("catalog-policy-projection"),
+                max_num_batched_tokens=budget,
+                compiled_piecewise_sizes=configured_compiled,
+                policy=policy,
+            )
+        }
+        if expected_restore != set(restore_inventory):
             raise RuntimeError("sealed catalog restore pair differs from runtime")
     return dict(coverage) | {"_catalog_source_sha256": source_sha256}
 
