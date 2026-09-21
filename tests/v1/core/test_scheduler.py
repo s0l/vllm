@@ -15760,6 +15760,20 @@ def test_elastic_serving_carrier_is_only_shared_terminal_mtp_owner():
     assert carrier[0].physical_num_reqs == 37
 
 
+def test_elastic_k0_serving_carrier_is_terminal_target_owner():
+    scheduler = _new_elastic_scheduler()
+    scheduler._elastic_restore_mode = True
+    scheduler._elastic_graph_catalog_coverage = {"serving_carrier_owner": "target"}
+
+    carrier = scheduler.resolve_elastic_serving_carrier_physical_keys(
+        ((1, 0, 25, 25, 1),)
+    )
+
+    assert len(carrier) == 1
+    assert carrier[0].logical.owner == "target"
+    assert carrier[0].physical_num_reqs == 25
+
+
 def test_elastic_serving_carrier_rejects_non_shared_mtp_geometry():
     scheduler = _new_elastic_scheduler()
     scheduler._elastic_restore_mode = True

@@ -145,7 +145,9 @@ def publish_measured_catalog(
     from vllm.v1.core.elastic_graph import (
         EXECUTION_MANIFEST_SCHEMA,
         DispatchRepresentation,
+        RuntimeGeneration,
         configured_compiled_piecewise_sizes,
+        resolve_step_physical_keys,
         select_short_decode_physical_x,
         short_decode_inventory_xs,
     )
@@ -294,7 +296,22 @@ def publish_measured_catalog(
         prefill_k=prefill_k,
         max_num_batched_tokens=max_num_batched_tokens,
     )
-    if set(geometry.step_keys(**key_options)) != set(restore):
+    price_generation = RuntimeGeneration(PRICE_OWNER_GENERATION)
+
+    def graph_backed(keys):
+        return tuple(
+            key
+            for key in keys
+            if resolve_step_physical_keys(
+                key,
+                generation=price_generation,
+                max_num_batched_tokens=max_num_batched_tokens,
+                compiled_piecewise_sizes=compiled,
+                policy=policy,
+            )
+        )
+
+    if set(graph_backed(geometry.step_keys(**key_options))) != set(restore):
         raise RuntimeError("measured catalog restore pair differs from runtime")
     q1 = RestoreDecodeGeometry(k=decode_k, x=decode_max_x, query_len=1)
     verification = RestoreDecodeGeometry(
@@ -302,7 +319,7 @@ def publish_measured_catalog(
         x=decode_max_x,
         query_len=decode_k + 1,
     )
-    serving_carrier = tuple(
+    serving_carrier = graph_backed(
         sorted(
             set(
                 (
@@ -320,7 +337,7 @@ def publish_measured_catalog(
     decode_inventory = tuple(
         x for x in short_decode_inventory_xs(decode_max_x) if x >= minimum_decode_x
     )
-    serving_hotset: tuple[tuple[int, ...], ...] = tuple(
+    serving_hotset: tuple[tuple[int, ...], ...] = graph_backed(
         dict.fromkeys(
             key
             for semantic_x in hotset_xs
@@ -360,8 +377,12 @@ def publish_measured_catalog(
         "restore_step_keys": [list(key) for key in sorted(restore)],
         "restore_decode": geometry.to_payload(),
         "serving_carrier_step_keys": [list(key) for key in serving_carrier],
-        "serving_carrier_contract": "retained-terminal-mtp-no-cold-serving-v1",
-        "serving_carrier_owner": "mtp_decode",
+        "serving_carrier_contract": (
+            "retained-terminal-target-no-cold-serving-v1"
+            if decode_k == 0
+            else "retained-terminal-mtp-no-cold-serving-v1"
+        ),
+        "serving_carrier_owner": "target" if decode_k == 0 else "mtp_decode",
         "serving_hotset_step_keys": [list(key) for key in serving_hotset],
         "serving_hotset_xs": list(hotset_xs),
         "serving_hotset_contract": "pre-ready-hot-no-runtime-maintenance-v1",

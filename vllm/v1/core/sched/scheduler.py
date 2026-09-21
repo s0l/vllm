@@ -5776,7 +5776,7 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[PhysicalReplayKey, ...]:
         """Resolve the one persistent owner shared by all restore recipes."""
         owner = self._elastic_graph_catalog_coverage.get("serving_carrier_owner")
-        if owner != "mtp_decode":
+        if owner not in {"target", "mtp_decode"}:
             raise RuntimeError(
                 "bounded elastic catalog has an unsupported serving carrier owner"
             )
@@ -5791,7 +5791,7 @@ class Scheduler(SchedulerInterface):
         if len(carrier) != 1:
             raise RuntimeError(
                 "bounded elastic restore recipes do not share exactly one "
-                f"terminal MTP carrier: keys={tuple(key.identity for key in carrier)!r}"
+                f"terminal carrier: keys={tuple(key.identity for key in carrier)!r}"
             )
         return carrier
 

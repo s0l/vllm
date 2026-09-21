@@ -579,10 +579,15 @@ def restore_profiled_graph_carrier(owner: Any) -> None:
     scheduler = owner.scheduler
     coverage = scheduler._elastic_graph_catalog_coverage
     x = coverage["decode_max_x"]
+    expected_owner = "target" if scheduler.num_spec_tokens == 0 else "mtp_decode"
+    expected_contract = (
+        "retained-terminal-target-no-cold-serving-v1"
+        if scheduler.num_spec_tokens == 0
+        else "retained-terminal-mtp-no-cold-serving-v1"
+    )
     if (
-        coverage.get("serving_carrier_contract")
-        != "retained-terminal-mtp-no-cold-serving-v1"
-        or coverage.get("serving_carrier_owner") != "mtp_decode"
+        coverage.get("serving_carrier_contract") != expected_contract
+        or coverage.get("serving_carrier_owner") != expected_owner
         or type(x) is not int
         or not 1 <= x <= scheduler.max_num_running_reqs
         or scheduler.has_unfinished_requests()
@@ -592,7 +597,7 @@ def restore_profiled_graph_carrier(owner: Any) -> None:
     scheduler._elastic_restore_mode = True
     try:
         owner._reclaim_elastic_restore_hotset_before_wave()
-        for query_len in (1, scheduler.num_spec_tokens + 1):
+        for query_len in dict.fromkeys((1, scheduler.num_spec_tokens + 1)):
             # Preserve semantic q for the independent MTP prefill manager,
             # even when the target's catalog key is token-major PIECEWISE.
             key = (0, scheduler.num_spec_tokens, x, x * query_len, query_len)
@@ -650,7 +655,7 @@ def restore_profiled_graph_carrier(owner: Any) -> None:
             raise RuntimeError("request-free startup lost its serving carrier")
         scheduler.max_num_running_reqs = coverage["mixed_max_x"]
         logger.info(
-            "Restored profiled MTP carrier without model requests: "
+            "Restored profiled terminal carrier without model requests: "
             "X=%d owners=%d hotset_shapes=%d",
             x,
             len(scheduler._elastic_serving_carrier_keys),

@@ -391,13 +391,17 @@ class EngineCore:
 
         scheduler = cast(Any, self.scheduler)
         coverage = scheduler._elastic_graph_catalog_coverage
-        if coverage.get("serving_carrier_contract") != (
-            "retained-terminal-mtp-no-cold-serving-v1"
-        ):
+        expected_owner = "target" if scheduler.num_spec_tokens == 0 else "mtp_decode"
+        expected_contract = (
+            "retained-terminal-target-no-cold-serving-v1"
+            if scheduler.num_spec_tokens == 0
+            else "retained-terminal-mtp-no-cold-serving-v1"
+        )
+        if coverage.get("serving_carrier_contract") != expected_contract:
             raise RuntimeError(
                 "bounded elastic serving carrier contract is unsupported"
             )
-        if coverage.get("serving_carrier_owner") != "mtp_decode":
+        if coverage.get("serving_carrier_owner") != expected_owner:
             raise RuntimeError("bounded elastic serving carrier owner is unsupported")
         _required, restore_inventory = validate_elastic_catalog_key_inventory(
             coverage.get("required_step_keys"),
@@ -438,7 +442,11 @@ class EngineCore:
                 x=terminal_x,
                 query_len=terminal_query_len,
             )
-            expected_restore = set((*q1_execution, *verification_execution))
+            expected_restore = {
+                key
+                for key in (*q1_execution, *verification_execution)
+                if scheduler._resolve_elastic_step_physical_keys(key)
+            }
             if restore != expected_restore:
                 raise RuntimeError(
                     "bounded elastic serving carrier differs from the exact "
@@ -503,6 +511,11 @@ class EngineCore:
                         terminal_query_len,
                     )
                 )
+            hotset_steps = [
+                key
+                for key in hotset_steps
+                if scheduler._resolve_elastic_step_physical_keys(key)
+            ]
             hotset_steps = list(dict.fromkeys(hotset_steps))
             declared_hotset_steps = [
                 tuple(key) for key in coverage.get("serving_hotset_step_keys", ())
