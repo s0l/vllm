@@ -4292,8 +4292,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector.pre_forward(
                 **connector_kwargs, attn_metadata=attn_metadata
             )
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
-            self.kv_connector.pre_forward(scheduler_output)
             additional_config = self.vllm_config.additional_config
             if (
                 isinstance(additional_config, dict)
